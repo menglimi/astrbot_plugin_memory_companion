@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>记忆放映馆</title>
+  <link rel="stylesheet" href="./app.css?v=20260702-mc-pages160" />
+</head>
+<body>
+  <main id="app" class="film-app">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">我会牢牢记住你</p>
+        <h1>记忆放映馆</h1>
+      </div>
+    </header>
+
+    <section class="projection-stage" aria-label="记忆放映馆首页">
+      <button class="filmstrip" style="--a:-18deg;--z:2;--off:240px"  data-view="objects"    data-tip-title="知识图谱" data-tip-sub="关系 · 线程 · 时间线"     type="button"><span class="strip-label"><b>知识图谱</b><small>关系 · 节点</small></span></button>
+      <button class="filmstrip" style="--a:76deg; --z:4;--off:-200px" data-view="film"       data-tip-title="群聊记忆" data-tip-sub="群聊范围内的记忆"      type="button"><span class="strip-label"><b>群聊记忆</b><small>群聊 · 记忆</small></span></button>
+      <button class="filmstrip" style="--a:44deg; --z:7;--off:260px"  data-view="microscope" data-tip-title="记忆显微镜" data-tip-sub="模拟召回 · 检查注入"     type="button"><span class="strip-label" style="--label-edge:-260px"><b>记忆显微镜</b><small>模拟召回</small></span></button>
+      <button class="filmstrip" style="--a:14deg; --z:5;--off:-225px;--tx:-440px" data-view="relations"  data-tip-title="用户记忆"     data-tip-sub="用户画像 · 偏好 · 关系"     type="button"><span class="strip-label" style="--label-edge:380px"><b>用户记忆</b><small>画像 · 偏好</small></span></button>
+      <button class="filmstrip" style="--a:162deg;--z:1;--off:215px;--tx:-260px"  data-view="review"     data-tip-title="个人记忆"       data-tip-sub="Bot 日程 · 生活细化"         type="button"><span class="strip-label is-flipped"><b>个人记忆</b><small>日程 · 细化</small></span></button>
+      <button class="filmstrip" style="--a:136deg;--z:3;--off:-390px" data-view="archive"    data-tip-title="维护/迁移/配置"   data-tip-sub="工具 · 迁移 · 配置"        type="button"><span class="strip-label is-flipped"><b>维护/迁移/配置</b><small>工具 · 配置</small></span></button>
+      <button class="filmstrip" style="--a:106deg;--z:6;--off:220px"  data-view="maintain"   data-tip-title="私聊记忆"  data-tip-sub="私聊范围内的记忆" type="button"><span class="strip-label is-flipped"><b>私聊记忆</b><small>私聊 · 记忆</small></span></button>
+
+      <section class="overview-core" aria-live="polite">
+        <div class="core-ring"></div>
+        <p class="eyebrow">Memory Cinema</p>
+        <h2>记忆放映馆</h2>
+        <p id="subtitle" class="subtitle">正在读取结构化记忆库...</p>
+        <div id="stats" class="stats-grid"></div>
+      </section>
+    </section>
+
+    <section id="workspace" class="workspace-frame" aria-label="二级工作区">
+      <div class="workspace-head">
+        <div>
+          <p class="eyebrow">Locked Frame</p>
+          <h2 id="workspaceTitle">对象</h2>
+          <p id="workspaceHint">选择左侧对象后，所有检查视图都会收束到同一范围。</p>
+        </div>
+        <div class="workspace-tools">
+          <div class="top-actions workspace-actions">
+            <span id="activeTarget" class="target-pill">全部记忆</span>
+            <div class="projection-controls" role="toolbar" aria-label="放映控制">
+              <button id="backHomeBtn" class="projection-control control-home hidden" type="button" title="返回总览" aria-label="返回总览">
+                <span class="control-icon" aria-hidden="true"></span>
+                <span class="control-text">总览</span>
+              </button>
+              <button id="refreshBtn" class="projection-control control-refresh" type="button" title="刷新当前页面" aria-label="刷新当前页面">
+                <span class="control-icon" aria-hidden="true"></span>
+                <span class="control-text">刷新</span>
+              </button>
+            </div>
+          </div>
+          <div class="workspace-search">
+            <input id="globalSearch" type="search" placeholder="搜索内容、证据或 ID" />
+            <button id="loadActiveBtn" type="button">重载当前帧</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="workspace-grid">
+        <aside class="object-rail">
+          <div class="rail-head">
+            <b>观察对象</b>
+            <button id="clearTargetBtn" type="button">全部</button>
+          </div>
+          <div class="bucket-window">
+            <div id="bucketList" class="bucket-list"></div>
+          </div>
+        </aside>
+
+        <section class="workspace-main">
+          <section id="view-objects" class="view is-active">
+              <div class="section-head">
+                <h3>知识图谱</h3>
+                <p>查看记忆节点、关系边、跨窗口线程和时间线概览。</p>
+              </div>
+            <div id="contextPanel" class="page-panel-stack"></div>
+            </section>
+
+          <section id="view-film" class="view">
+            <div class="section-head">
+              <div>
+                <h3 id="groupMemoryTitle">群聊记忆</h3>
+                <p id="groupMemoryHint">查看群聊范围内可被召回和管理的结构化记忆。</p>
+              </div>
+              <button id="groupMemoryModeBtn" class="section-mode-toggle" type="button" data-scope-mode-toggle="film">群聊设置</button>
+            </div>
+            <div id="groupMemoryList" class="row-list"></div>
+          </section>
+
+          <section id="view-microscope" class="view">
+            <div class="section-head">
+              <h3>记忆显微镜</h3>
+              <p>输入一句话，模拟当前对象下会召回什么、过滤什么。</p>
+            </div>
+            <div class="microscope-box">
+              <textarea id="searchQuery" rows="4" placeholder="例如：你最近写了什么 / 那个蓝色渐变小猪是什么"></textarea>
+              <button id="runSearchBtn" type="button">开始检索</button>
+            </div>
+            <div id="searchResult" class="result-grid"></div>
+          </section>
+
+          <section id="view-relations" class="view">
+            <div class="section-head">
+              <h3>用户记忆</h3>
+              <p>聚焦用户画像、偏好、称呼、关系声明等以用户为核心的记忆。</p>
+            </div>
+            <div id="relationList" class="row-list"></div>
+          </section>
+
+          <section id="view-review" class="view">
+            <div class="section-head">
+              <h3>个人记忆</h3>
+              <p>查看 Bot 自身的每日生活日程、当前状态和细化片段。</p>
+            </div>
+            <div id="personalMemoryList" class="row-list"></div>
+          </section>
+
+          <section id="view-maintain" class="view">
+            <div class="section-head">
+              <div>
+                <h3 id="privateMemoryTitle">私聊记忆</h3>
+                <p id="privateMemoryHint">查看私聊范围内的对话、偏好、事实和稳定记忆。</p>
+              </div>
+              <button id="privateMemoryModeBtn" class="section-mode-toggle" type="button" data-scope-mode-toggle="maintain">私聊设置</button>
+            </div>
+            <div id="privateMemoryList" class="row-list"></div>
+          </section>
+
+          <section id="view-archive" class="view">
+            <div class="section-head">
+              <h3>维护 / 迁移 / 配置</h3>
+              <p>执行维护、LivingMemory 迁移、清理和导入修复。</p>
+            </div>
+            <div class="archive-grid">
+              <section class="archive-section is-active" data-archive-section="retrieval">
+                <h4>检索配置</h4>
+                <div id="selfMemoryList" class="config-panel-stack"></div>
+              </section>
+              <section class="archive-section" data-archive-section="maintenance">
+                <h4>维护工具</h4>
+                <div class="maintenance-box">
+                  <p class="archive-note">修复索引、刷新统计并整理数据库状态。适合导入、清理或配置调整后手动执行一次。</p>
+                  <button id="maintenanceBtn" type="button">运行维护</button>
+                </div>
+              </section>
+              <section class="archive-section" data-archive-section="repair">
+                <h4>LivingMemory 内容修复</h4>
+                <div class="maintenance-box">
+                  <input class="livingmemory-path" type="text" placeholder="LivingMemory 数据库路径，可留空自动扫描" />
+                  <button id="repairLivingMemoryBtn" type="button">修复 LivingMemory 内容</button>
+                </div>
+              </section>
+              <section class="archive-section" data-archive-section="migration">
+                <h4>LivingMemory 迁移导入</h4>
+                <div class="maintenance-box">
+                  <input class="livingmemory-path" type="text" placeholder="LivingMemory 数据库路径，可留空自动扫描" />
+                  <div class="inline-actions">
+                    <button id="previewImportBtn" type="button">预览导入</button>
+                    <button id="runImportBtn" type="button">执行导入</button>
+                  </div>
+                </div>
+              </section>
+              <section class="archive-section" data-archive-section="clear">
+                <h4>清理数据</h4>
+                <div class="maintenance-box">
+                  <p class="archive-note">清空会先备份数据库，再删除记忆、权限规则、时间线、关系、身份、注入日志和导入批次。</p>
+                  <button id="clearAllMemoryBtn" class="danger" type="button">清空全部记忆</button>
+                </div>
+              </section>
+            </div>
+            <div id="importResult" class="archive-result" hidden></div>
+          </section>
+        </section>
+
+        <aside id="detailDrawer" class="detail-drawer empty">
+          选择一格胶片或一条记忆查看详情。
+        </aside>
+      </div>
+    </section>
+    <div class="screen-film-wipe" aria-hidden="true"><span id="transitionFace" class="screen-film-face">(๑•̀ㅂ•́)و✧</span></div>
+    <div id="busyLayer" class="busy-layer" aria-hidden="true">
+      <span></span>
+      <b id="busyText">正在处理...</b>
+    </div>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  </main>
+  <script src="/api/plugin/page/bridge-sdk.js"></script>
+  <script src="./app.js?v=20260702-mc-pages160"></script>
+</body>
+</html>

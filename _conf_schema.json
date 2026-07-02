@@ -1,0 +1,719 @@
+{
+  "appearance": {
+    "description": "拓展页外观",
+    "hint": "控制记忆放映馆拓展页的配色主题。",
+    "type": "object",
+    "items": {
+      "theme": {
+        "description": "配色主题",
+        "hint": "选择拓展页使用的四色主题。默认月白。",
+        "type": "string",
+        "options": [
+          "黄白游",
+          "天缥",
+          "海天霞",
+          "盈盈",
+          "欧碧",
+          "青冥",
+          "紫蒲",
+          "山岚",
+          "窃蓝",
+          "退红",
+          "葱倩",
+          "月白",
+          "墨黪",
+          "骨缥"
+        ],
+        "default": "月白"
+      }
+    }
+  },
+  "memory_capture": {
+    "description": "记忆捕获",
+    "hint": "控制插件是否记录用户消息、Bot 回复和轻量身份信息。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用记忆捕获",
+        "hint": "关闭后不会自动写入新记忆，但管理命令和手动写入仍可使用。",
+        "type": "bool",
+        "default": true
+      },
+      "capture_user_messages": {
+        "description": "记录用户消息",
+        "hint": "记录触发主链 LLM 的用户消息到时间线，供阶段性总结使用；默认不直接写入长期记忆。",
+        "type": "bool",
+        "default": true
+      },
+      "capture_bot_responses": {
+        "description": "记录 Bot 回复",
+        "hint": "记录 Bot 回复到时间线，供阶段性总结使用；默认不直接写入长期记忆。",
+        "type": "bool",
+        "default": true
+      },
+      "capture_min_chars": {
+        "description": "最短记录字数",
+        "hint": "短于该长度的普通文本不自动记录。命令、纯符号和空消息也会跳过。",
+        "type": "int",
+        "default": 2
+      },
+      "extract_stable_facts": {
+        "description": "抽取稳定事实",
+        "hint": "从明确表达中抽取偏好、称呼、生日、记住事项等稳定事实。不会把含糊猜测当事实。",
+        "type": "bool",
+        "default": true
+      },
+      "record_relationship_edges": {
+        "description": "记录关系边",
+        "hint": "记录群成员归属等结构化关系。身份冒领类关系声明不会自动沉淀为稳定记忆。",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "memory_summary": {
+    "description": "长期记忆总结",
+    "hint": "把时间线整理为可长期保存、可召回的阶段性记忆。模型、触发阈值和证据长度都在这里配置。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用阶段性总结",
+        "hint": "开启后，同一会话累计到阈值时会调用当前会话模型生成 conversation_summary 长期记忆。",
+        "type": "bool",
+        "default": true
+      },
+      "provider_id": {
+        "description": "总结模型提供商",
+        "_special": "select_provider",
+        "hint": "选择用于阶段性记忆总结的 LLM 提供商。留空则使用当前会话正在使用的模型。",
+        "type": "string",
+        "default": ""
+      },
+      "fallback_provider_id": {
+        "description": "备用总结模型提供商",
+        "_special": "select_provider",
+        "hint": "主总结模型不可用或总结失败时使用。留空则直接回退当前会话模型。",
+        "type": "string",
+        "default": ""
+      },
+      "min_events": {
+        "description": "最少事件数",
+        "hint": "未总结的时间线事件少于该数量时不会总结。",
+        "type": "int",
+        "default": 8
+      },
+      "trigger_event_count": {
+        "description": "按条数触发",
+        "hint": "未总结事件达到该数量时触发总结。建议 10-20。",
+        "type": "int",
+        "default": 12
+      },
+      "trigger_interval_minutes": {
+        "description": "按时间触发",
+        "hint": "最早未总结事件距今超过该分钟数且达到最少事件数时触发总结。0 表示只按条数触发。",
+        "type": "int",
+        "default": 60
+      },
+      "max_events_per_summary": {
+        "description": "单次最多事件",
+        "hint": "单次交给模型总结的时间线事件上限，避免输入过长。",
+        "type": "int",
+        "default": 40
+      },
+      "max_input_chars": {
+        "description": "总结输入字数",
+        "hint": "单次总结最多发送给模型的时间线消息字符数。",
+        "type": "int",
+        "default": 6000
+      },
+      "max_summary_chars": {
+        "description": "总结记忆字数",
+        "hint": "生成的长期记忆内容最大字符数。",
+        "type": "int",
+        "default": 1200
+      },
+      "evidence_events": {
+        "description": "证据事件条数",
+        "hint": "长期总结记忆中最多保留多少条原始时间线事件作为 evidence，便于排查总结来源。",
+        "type": "int",
+        "default": 12
+      },
+      "max_retries": {
+        "description": "失败重试次数",
+        "hint": "同一会话阶段性总结连续失败达到该次数后，会跳过当前窗口，避免坏窗口无限阻塞后续记忆整理。",
+        "type": "int",
+        "default": 3
+      }
+    }
+  },
+  "retrieval": {
+    "description": "记忆召回模型",
+    "hint": "控制长期记忆如何被找出来：嵌入模型负责语义候选，重排模型负责二阶段排序；权限和窗口隔离始终优先。",
+    "type": "object",
+    "items": {
+      "embedding_enabled": {
+        "description": "启用嵌入召回",
+        "hint": "开启后使用 Embedding Provider 为长期记忆建立向量索引，并额外召回语义相近候选；失败时自动回退本地检索。",
+        "type": "bool",
+        "default": false
+      },
+      "embedding_provider_id": {
+        "description": "嵌入模型 Provider",
+        "hint": "选择 AstrBot 中 provider_type=embedding 的 Provider。留空时自动使用第一个可用嵌入模型。",
+        "type": "string",
+        "options": [
+          "",
+          "qhaigc_embedding",
+          "openai_embedding",
+          "gitee_embedding"
+        ],
+        "default": ""
+      },
+      "mode": {
+        "description": "重排使用方式",
+        "hint": "auto 推荐；basic 不调用重排；rerank 会强制尝试下方重排 Provider，失败时仍回退本地排序。",
+        "type": "string",
+        "options": [
+          "auto",
+          "basic",
+          "rerank"
+        ],
+        "default": "auto"
+      },
+      "rerank_provider_id": {
+        "description": "重排模型 Provider",
+        "hint": "选择 AstrBot 中具备 rerank() 能力的 Provider。留空时 auto 自动扫描第一个可用重排模型。",
+        "type": "string",
+        "options": [
+          "",
+          "vllm_rerank"
+        ],
+        "default": ""
+      },
+      "embedding_candidate_limit": {
+        "description": "向量扫描上限",
+        "hint": "每轮最多从本地向量索引中扫描多少条候选。记忆库很大时可适当降低；想提高旧记忆召回覆盖面可提高。",
+        "type": "int",
+        "default": 1200
+      },
+      "embedding_top_k": {
+        "description": "向量合并数量",
+        "hint": "向量相似度最高的多少条会并入本地候选池，再经过权限过滤、本地评分和可选重排。",
+        "type": "int",
+        "default": 32
+      },
+      "embedding_score_threshold": {
+        "description": "向量相似度阈值",
+        "hint": "低于该相似度的向量结果不会进入候选池。建议 0.30-0.42；过高会漏召回，过低会带来无关记忆。",
+        "type": "float",
+        "default": 0.34
+      },
+      "embedding_weight": {
+        "description": "向量加权分",
+        "hint": "向量相似度在最终本地评分中的软加分权重。建议 0.45-0.75；重排启用时不宜过高。",
+        "type": "float",
+        "default": 0.55
+      },
+      "rerank_candidate_multiplier": {
+        "description": "重排候选倍率",
+        "hint": "实际注入 TopK 的多少倍进入二阶段重排。建议 3-5；过大会增加重排耗时。",
+        "type": "int",
+        "default": 4
+      },
+      "rerank_candidate_limit": {
+        "description": "重排候选上限",
+        "hint": "每轮最多送入重排模型的候选记忆数量。建议 24-40。",
+        "type": "int",
+        "default": 32
+      },
+      "embedding_timeout_ms": {
+        "description": "嵌入超时毫秒",
+        "hint": "生成查询向量或记忆向量超过该时间会回退/跳过。0 表示不限制。",
+        "type": "int",
+        "default": 1500
+      },
+      "rerank_timeout_ms": {
+        "description": "重排超时毫秒",
+        "hint": "重排模型超过该时间会回退本地检索。0 表示不限制；测试期建议 800-1500。",
+        "type": "int",
+        "default": 1200
+      },
+      "embedding_max_text_chars": {
+        "description": "嵌入文本上限",
+        "hint": "送入 Embedding Provider 的单条记忆文本最大长度。会包含类型、范围、标签、内容、摘要字段和证据。",
+        "type": "int",
+        "default": 1200
+      },
+      "embedding_backfill_enabled": {
+        "description": "补齐旧记忆向量",
+        "hint": "开启嵌入召回后，每次检索会小批量补齐旧记忆的向量索引，不阻塞当前回复。",
+        "type": "bool",
+        "default": true
+      },
+      "embedding_backfill_batch_size": {
+        "description": "补向量批量",
+        "hint": "每次后台最多补齐多少条旧记忆向量。值越大，首次开启后建索引越快，但会增加 Embedding Provider 调用量。",
+        "type": "int",
+        "default": 50
+      }
+    }
+  },
+  "memory_injection": {
+    "description": "记忆注入包",
+    "hint": "控制每轮主链请求前注入多少记忆、最多多少字，以及是否记录注入日志。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用记忆注入",
+        "hint": "开启后会在主链 LLM 请求前注入 MemoryCompanion 记忆包；关闭后只保留记录、检索命令和工具读取。",
+        "type": "bool",
+        "default": true
+      },
+      "top_k": {
+        "description": "注入条数",
+        "hint": "每轮最多注入多少条记忆。建议 3-8。",
+        "type": "int",
+        "default": 6
+      },
+      "max_chars": {
+        "description": "最大注入字数",
+        "hint": "限制单轮注入长度，避免拖慢主链和污染上下文。",
+        "type": "int",
+        "default": 1800
+      },
+      "temporal_aggregate_max_chars": {
+        "description": "时间聚合注入字数",
+        "hint": "当用户问最近一周、最近几天、本周这类需要汇总多条记忆的问题时使用。默认更宽，且会用精简证据格式注入。",
+        "type": "int",
+        "default": 3600
+      },
+      "include_raw_events": {
+        "description": "允许注入原始事件",
+        "hint": "默认关闭。关闭后只注入总结、稳定事实和外部稳定记录，避免流水账污染回复。",
+        "type": "bool",
+        "default": false
+      },
+      "enable_injection_logs": {
+        "description": "记录注入日志",
+        "hint": "记录每轮选中了哪些记忆、过滤了哪些候选和原因，便于排障。",
+        "type": "bool",
+        "default": true
+      },
+      "debug_log_injection_enabled": {
+        "description": "日志打印注入内容",
+        "hint": "开启后会把检索 query、命中记忆、过滤原因、连续对话记忆状态和实际注入包打印到 AstrBot 日志，便于排障。",
+        "type": "bool",
+        "default": true
+      },
+      "debug_log_max_chars": {
+        "description": "注入调试日志字数",
+        "hint": "单轮注入调试日志最多打印多少字符。调大可查看完整注入块，调小可避免日志过长。",
+        "type": "int",
+        "default": 12000
+      }
+    }
+  },
+  "conversation_memory": {
+    "description": "连续对话记忆",
+    "hint": "记录群聊中连续发生的可见对话，阶段性整理为 conversation_summary，用于之后衔接话题；不会把原始消息窗口直接注入给模型。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用连续对话记忆",
+        "hint": "开启后会记录群聊连续发言，并通过阶段性总结沉淀为可召回的连续对话记忆。",
+        "type": "bool",
+        "default": true
+      },
+      "capture_group_messages": {
+        "description": "记录群聊普通发言",
+        "hint": "开启后，即使 Bot 没被唤醒，也会记录群聊中的普通文本发言，用于形成连续对话片段。",
+        "type": "bool",
+        "default": true
+      },
+      "idle_gap_minutes": {
+        "description": "连续片段间隔",
+        "hint": "群聊相邻消息超过该分钟数时，视为新的连续对话片段。当前主要用于标记和后续展示。",
+        "type": "int",
+        "default": 20
+      },
+      "recent_events_for_followup": {
+        "description": "追问补全事件数",
+        "hint": "处理“还有的吧”“刚才那个”等连续追问时，最多读取多少条最近群聊事件来补全检索词。",
+        "type": "int",
+        "default": 12
+      },
+      "time_window_timeline_limit": {
+        "description": "时间窗口时间线条数",
+        "hint": "当用户问今天、昨天、最近一周、上个月等时间问题时，最多补充多少条该窗口内的原始时间线事件。",
+        "type": "int",
+        "default": 12
+      },
+      "low_information_guard_enabled": {
+        "description": "低信息输入保护",
+        "hint": "开启后，摸摸、贴贴、嗯、哈哈等弱语义输入不会轻易继承过期话题。",
+        "type": "bool",
+        "default": true
+      },
+      "low_information_gap_minutes": {
+        "description": "低信息过期分钟",
+        "hint": "弱语义输入距离上一条同会话事件超过该分钟数时，会隔离旧话题。摸摸/贴贴类亲昵输入始终隔离旧话题。",
+        "type": "int",
+        "default": 20
+      },
+      "suppress_memory_on_low_information": {
+        "description": "弱语义禁用长期召回",
+        "hint": "开启后，弱语义输入不使用长期记忆和陪伴插件检索线索，只根据当前消息与必要的近期原始上下文回复。",
+        "type": "bool",
+        "default": true
+      },
+      "topic_shift_guard_enabled": {
+        "description": "新话题隔离保护",
+        "hint": "开启后，发自拍、上传图、生成图、查询等明确新请求若与最近历史无主题重叠，会隔离旧话题，避免旧话题抢答。",
+        "type": "bool",
+        "default": true
+      },
+      "suppress_memory_on_topic_shift": {
+        "description": "新话题禁用长期召回",
+        "hint": "开启后，新话题隔离触发时也会跳过长期记忆召回；用户明确说记得、之前、上次、按我喜欢的等需要记忆时不会跳过。",
+        "type": "bool",
+        "default": true
+      },
+      "topic_shift_guard_recent_events": {
+        "description": "新话题比较事件数",
+        "hint": "判断新请求是否与最近历史重叠时，最多比较多少条同会话时间线事件。",
+        "type": "int",
+        "default": 6
+      }
+    }
+  },
+  "context_orchestration": {
+    "description": "注入编排",
+    "hint": "把自我时间线、用户画像、当前窗口、阶段总结和稳定记忆分槽编排到最终注入包。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用分槽调度",
+        "hint": "开启后按分槽检索与注入；关闭时退回普通稳定记忆检索。",
+        "type": "bool",
+        "default": true
+      },
+      "query_mode": {
+        "description": "检索架构模式",
+        "hint": "current_message 为默认安全模式，只用当前用户消息检索；guarded_companion 仅在陪伴线索与当前消息有主题重叠时扩展检索；companion_augmented 为旧式增强检索，会直接拼接陪伴线索。",
+        "type": "string",
+        "options": [
+          "current_message",
+          "guarded_companion",
+          "companion_augmented"
+        ],
+        "default": "current_message"
+      },
+      "include_intent_context": {
+        "description": "注入检索意图",
+        "hint": "在上下文包中加入本轮检索意图摘要，帮助模型理解这些记忆为什么被取出。",
+        "type": "bool",
+        "default": true
+      },
+      "intent_max_chars": {
+        "description": "意图摘要字数",
+        "hint": "限制检索意图摘要长度，避免陪伴插件线索过长。",
+        "type": "int",
+        "default": 520
+      },
+      "current_state_relevance_guard_enabled": {
+        "description": "当前状态问题相关性保护",
+        "hint": "开启后，今天穿什么、现在在干嘛、吃什么、心情怎样这类当前状态问题，只允许直接命中对应锚点的长期记忆进入注入包，避免旧阶段总结抢答。",
+        "type": "bool",
+        "default": true
+      },
+      "self_timeline_limit": {
+        "description": "Bot 自我时间线槽",
+        "hint": "每轮最多放入多少条 Bot 自己的日程、主动行为和陪伴笔记。",
+        "type": "int",
+        "default": 2
+      },
+      "user_profile_limit": {
+        "description": "用户画像槽",
+        "hint": "每轮最多放入多少条当前用户偏好、身份、关系和明确记住事项。",
+        "type": "int",
+        "default": 2
+      },
+      "current_window_limit": {
+        "description": "当前窗口槽",
+        "hint": "每轮最多放入多少条当前私聊或群聊窗口相关记忆。",
+        "type": "int",
+        "default": 3
+      },
+      "conversation_summary_limit": {
+        "description": "阶段总结槽",
+        "hint": "每轮最多放入多少条阶段性对话总结，用于保持连续性。",
+        "type": "int",
+        "default": 2
+      },
+      "stable_memory_limit": {
+        "description": "稳定记忆槽",
+        "hint": "每轮最多放入多少条其他可见稳定记忆；总数仍受记忆注入 top_k 限制。",
+        "type": "int",
+        "default": 3
+      }
+    }
+  },
+  "private_companion_bridge": {
+    "description": "陪伴插件协同",
+    "hint": "与主动陪伴插件协调记忆、连续对话和自我时间线，减少重复注入和提示词污染。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用桥接 API",
+        "hint": "开启后插件实例会暴露 memory_companion 桥接对象，供其他插件记录主动消息、日程、创作、搜索等事件。",
+        "type": "bool",
+        "default": true
+      },
+      "accept_external_records": {
+        "description": "接受外部写入",
+        "hint": "关闭后只保留本插件自动捕获和管理命令写入。",
+        "type": "bool",
+        "default": true
+      },
+      "dedupe_prompt_context": {
+        "description": "协同去重陪伴注入",
+        "hint": "开启后会和陪伴插件协调，让重复的自我时间线、私聊上下文等段落只由一侧注入。",
+        "type": "bool",
+        "default": true
+      },
+      "prefer_memory_companion_memory": {
+        "description": "MemoryCompanion 接管记忆上下文",
+        "hint": "开启后陪伴插件会尽量让出自我时间线、私聊上下文和旧 LivingMemory 指引，由 MemoryCompanion 统一注入。",
+        "type": "bool",
+        "default": true
+      },
+      "preserve_external_prompt_context": {
+        "description": "保留外部临时片段",
+        "hint": "整理 AstrBot 原始历史时保留带 private_companion marker 或临时标记的上下文，避免误删陪伴插件当前轮提示。",
+        "type": "bool",
+        "default": true
+      },
+      "clean_proactive_history": {
+        "description": "清理主动消息历史提示",
+        "hint": "注入前清理 AstrBot 原始上下文中残留的主动消息生成提示、send_message_to_user 工具说明、主动承接占位和 TTS/定时控制标签，只保留用户可见的干净聊天内容。",
+        "type": "bool",
+        "default": true
+      },
+      "suppress_self_timeline_when_companion_seen": {
+        "description": "陪伴已注入时隐藏自我时间线槽",
+        "hint": "检测到陪伴插件已提供状态或自我时间线时，隐藏重复的 Bot 自我时间线槽。",
+        "type": "bool",
+        "default": true
+      },
+      "suppress_user_context_when_companion_seen": {
+        "description": "陪伴已注入时隐藏用户上下文槽",
+        "hint": "检测到陪伴插件已提供私聊状态时，隐藏重复的用户画像和阶段总结槽。",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "visibility": {
+    "description": "隔离与可见性",
+    "hint": "控制私聊、群聊、自我时间线之间的默认流动边界。",
+    "type": "object",
+    "items": {
+      "allow_self_timeline_everywhere": {
+        "description": "共享 Bot 自我时间线",
+        "hint": "Bot 自己做过的动作可作为所有窗口的自我背景，但仍会带来源标签。",
+        "type": "bool",
+        "default": true
+      },
+      "allow_group_public_in_private": {
+        "description": "私聊可见群公共记忆",
+        "hint": "默认关闭，避免把群友互动误当成与私聊用户的互动。需要跨窗口回话时建议通过桥接 API 显式创建线程。",
+        "type": "bool",
+        "default": false
+      },
+      "enable_acl_rules": {
+        "description": "启用卡片权限",
+        "hint": "开启后，可在私聊/群聊卡片中配置跨窗口读取权限；默认隔离仍然生效，只有显式授权的窗口会被额外放行。",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "memory_tools": {
+    "description": "主动记忆工具",
+    "hint": "允许模型在需要时主动回忆、记忆和整理 Bot 自己的陪伴笔记。",
+    "type": "object",
+    "items": {
+      "enable_recall_tool": {
+        "description": "启用主动回忆工具",
+        "hint": "开启后模型可调用 memory_companion_recall，按当前会话可见性主动检索记忆。",
+        "type": "bool",
+        "default": true
+      },
+      "enable_remember_tool": {
+        "description": "启用主动记忆工具",
+        "hint": "开启后模型可调用 memory_companion_remember 写入长期记忆；请配合总结防注入和召回日志观察效果。",
+        "type": "bool",
+        "default": true
+      },
+      "enable_note_tools": {
+        "description": "启用陪伴笔记工具",
+        "hint": "开启后模型可创建和读取 Bot 自己可见的 companion_note，用于日程、状态、创作草稿和陪伴线索整理。",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "knowledge_graph": {
+    "description": "图谱关联",
+    "hint": "从阶段性记忆抽取人物、话题和事实关联，用于辅助检索和拓展页排障。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用图谱建索引",
+        "hint": "开启后，阶段性总结成功时会自动写入知识图谱节点和边。",
+        "type": "bool",
+        "default": true
+      },
+      "retrieval_expansion_enabled": {
+        "description": "检索使用图谱一跳扩展",
+        "hint": "开启后，搜索某个人或话题时会从知识图谱取少量相关节点作为检索扩展词；最终结果仍受可见性和权限过滤。",
+        "type": "bool",
+        "default": true
+      },
+      "expansion_limit": {
+        "description": "扩展词上限",
+        "hint": "每次检索最多从图谱取多少个相关词。建议 6-12，过高会扩大召回范围。",
+        "type": "int",
+        "default": 12
+      },
+      "backfill_limit": {
+        "description": "维护补建条数",
+        "hint": "运行维护时，最多从多少条已有阶段性总结补建知识图谱。补建是幂等的，重复运行不会重复建边。",
+        "type": "int",
+        "default": 300
+      }
+    }
+  },
+  "livingmemory_migration": {
+    "description": "LivingMemory 导入",
+    "hint": "从旧 LivingMemory 数据库导入 documents 摘要。导入前建议预览并备份。",
+    "type": "object",
+    "items": {
+      "import_limit": {
+        "description": "单次导入上限",
+        "hint": "单次最多导入多少条 LivingMemory documents 完整记忆。0 表示不限制。",
+        "type": "int",
+        "default": 5000
+      },
+      "livingmemory_db_path": {
+        "description": "LivingMemory 数据库路径",
+        "hint": "留空则自动扫描常见位置。建议先执行 /mcomp import_livingmemory preview。",
+        "type": "string",
+        "default": ""
+      }
+    }
+  },
+  "maintenance": {
+    "description": "维护",
+    "hint": "控制数据保留和清理策略。",
+    "type": "object",
+    "items": {
+      "backup_before_import": {
+        "description": "导入前备份",
+        "hint": "执行旧记忆导入前先备份当前 SQLite 数据库。",
+        "type": "bool",
+        "default": true
+      },
+      "sleep_backup_enabled": {
+        "description": "睡眠维护前备份",
+        "hint": "开启后每次 /mcomp sleep run 或页面维护都会先备份数据库。默认关闭，避免频繁备份占用空间。",
+        "type": "bool",
+        "default": false
+      },
+      "retention_raw_event_days": {
+        "description": "原始事件保留天数",
+        "hint": "原始流水事件超过该天数后可进入清理。0 表示暂不自动清理。",
+        "type": "int",
+        "default": 7
+      },
+      "retention_raw_event_limit": {
+        "description": "原始事件单次归档上限",
+        "hint": "每次睡眠维护最多归档多少条过期 raw_event 长期记录，避免一次维护写入过多。",
+        "type": "int",
+        "default": 1000
+      },
+      "memory_decay_enabled": {
+        "description": "启用自然衰减",
+        "hint": "开启后，睡眠维护会筛选长期未访问、重要度较低的稳定记忆，先压缩成高层摘要，再归档原碎片。",
+        "type": "bool",
+        "default": true
+      },
+      "memory_decay_after_days": {
+        "description": "衰减年龄天数",
+        "hint": "稳定记忆存在超过该天数后才可能进入衰减候选。明确记住、画像、偏好、关系、手动记忆会被保护。",
+        "type": "int",
+        "default": 180
+      },
+      "memory_decay_idle_days": {
+        "description": "未访问天数",
+        "hint": "记忆距离上次被召回超过该天数后才可能衰减；被频繁召回的记忆会自然加固。",
+        "type": "int",
+        "default": 90
+      },
+      "memory_decay_max_importance_percent": {
+        "description": "最大衰减重要度",
+        "hint": "重要度高于该百分比的记忆不会自动衰减。建议 65-80。",
+        "type": "int",
+        "default": 74
+      },
+      "memory_decay_max_access_count": {
+        "description": "最大召回次数",
+        "hint": "被召回次数超过该值的记忆不会自动衰减，表示它仍然有用。",
+        "type": "int",
+        "default": 2
+      },
+      "memory_decay_score_threshold_percent": {
+        "description": "衰减分阈值",
+        "hint": "年龄、未访问时间、重要度和置信度共同计算的衰减分达到该百分比后才进入压缩。",
+        "type": "int",
+        "default": 75
+      },
+      "memory_decay_max_candidates": {
+        "description": "单次候选上限",
+        "hint": "每次睡眠维护最多处理多少条衰减候选。",
+        "type": "int",
+        "default": 120
+      },
+      "memory_decay_max_groups": {
+        "description": "单次窗口组上限",
+        "hint": "每次睡眠维护最多压缩多少个私聊/群聊窗口，确保不同窗口的隐私边界不混合。",
+        "type": "int",
+        "default": 8
+      },
+      "memory_decay_min_items_per_summary": {
+        "description": "摘要最少碎片",
+        "hint": "同一窗口至少累积多少条衰减候选才生成压缩摘要并归档原碎片。",
+        "type": "int",
+        "default": 4
+      },
+      "memory_decay_max_items_per_summary": {
+        "description": "单摘要碎片上限",
+        "hint": "单条衰减摘要最多合并多少条旧记忆碎片。",
+        "type": "int",
+        "default": 24
+      },
+      "memory_decay_summary_input_chars": {
+        "description": "衰减摘要输入字数",
+        "hint": "单次衰减压缩最多发送给模型的旧记忆字符数。",
+        "type": "int",
+        "default": 6000
+      },
+      "memory_decay_summary_chars": {
+        "description": "衰减摘要字数",
+        "hint": "衰减压缩生成的新长期摘要最大字数。",
+        "type": "int",
+        "default": 900
+      }
+    }
+  }
+}
