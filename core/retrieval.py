@@ -112,6 +112,7 @@ class RetrievalEngine:
         total = max(1, int(total_limit or 1))
         ranked = await self._maybe_rerank_results(query, ranked, total)
         slot_order = [
+            "open_loop",
             "self_timeline",
             "user_profile",
             "current_window",
@@ -1366,6 +1367,9 @@ class RetrievalEngine:
         tags = {str(tag).lower() for tag in (memory.tags or [])}
         memory_type = (memory.memory_type or "").lower()
         reality = (memory.reality_level or "").lower()
+        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+        if self._memory_is_open_loop(memory, metadata):
+            return "open_loop"
         if (
             memory.visibility == "bot_self"
             or reality in {"bot_action", "persona_life", "fictional_content"}
@@ -1405,6 +1409,25 @@ class RetrievalEngine:
         ):
             return "current_window"
         return "stable_memory"
+
+    @staticmethod
+    def _memory_is_open_loop(memory: MemoryRecord, metadata: dict[str, Any]) -> bool:
+        def weight(key: str) -> float:
+            try:
+                return max(0.0, min(1.0, float(metadata.get(key) or 0.0)))
+            except Exception:
+                return 0.0
+
+        tags = {clean_text(tag, 80).lower() for tag in (memory.tags or [])}
+        memory_type = clean_text(memory.memory_type, 80).lower()
+        phase = clean_text(metadata.get("relationship_phase"), 80).lower()
+        if max(weight("open_loop_weight"), weight("promise_weight"), weight("emotional_debt_weight")) >= 0.35:
+            return True
+        if max(weight("scar_weight"), weight("emotional_weight")) >= 0.58 and phase in {"conflict", "repair", "comfort", "sensitive"}:
+            return True
+        if memory_type in {"open_loop", "promise", "todo_memory"}:
+            return True
+        return bool(tags & {"open_loop", "promise", "todo", "unfinished", "emotional_debt"})
 
     async def _acl_state(self) -> dict[str, object]:
         rules = await self.store.list_acl_rules(enabled_only=True)
@@ -1597,7 +1620,13 @@ class RetrievalEngine:
             min_hits = min(3, max(2, len(exact_phrases[0]) // 3))
         elif len(terms) >= 4:
             min_hits = 2
-        return {"exact_phrases": exact_phrases, "min_hits": min_hits}
+        return {
+            "exact_phrases": exact_phrases,
+            "min_hits": min_hits,
+            "contextual_recall": contextual_recall,
+            "temporal_aggregate": temporal_aggregate,
+            "open_loop_followup": self._looks_like_open_loop_followup(compact),
+        }
 
     @staticmethod
     def _looks_like_current_state_query(text: str) -> bool:
@@ -1625,6 +1654,9 @@ class RetrievalEngine:
             "状态",
             "穿什么",
             "穿了什么",
+            "衣服颜色",
+            "什么颜色",
+            "什么色",
         )
         question_markers = ("吗", "呢", "了没", "了吗", "没有", "什么", "啥", "怎么样", "如何")
         return any(marker in compact for marker in markers) and any(marker in compact for marker in question_markers)
@@ -1642,8 +1674,8 @@ class RetrievalEngine:
             terms.extend(["做", "忙", "上课", "学习", "工作", "玩"])
         if any(marker in compact for marker in ("累", "困", "饿", "心情", "状态")):
             terms.extend(["累", "困", "饿", "心情", "状态", "感觉"])
-        if any(marker in compact for marker in ("穿", "衣服", "裙", "外套", "裤")):
-            terms.extend(["穿", "衣服", "裙", "外套", "裤"])
+        if any(marker in compact for marker in ("穿", "衣服", "穿搭", "裙", "外套", "裤", "颜色", "什么色")):
+            terms.extend(["穿", "衣服", "穿搭", "今日穿搭", "每日穿搭", "衣服颜色", "颜色", "裙", "外套", "裤"])
         return list(dict.fromkeys(term for term in terms if len(term) >= 2))
 
     @staticmethod
@@ -1721,6 +1753,27 @@ class RetrievalEngine:
         return any(marker in compact for marker in recall_markers) and any(
             marker in compact for marker in question_markers
         )
+
+    @staticmethod
+    def _looks_like_open_loop_followup(text: str) -> bool:
+        compact = re.sub(r"\s+", "", clean_text(text, 1000)).lower()
+        if not compact:
+            return False
+        markers = (
+            "继续",
+            "接着",
+            "还有呢",
+            "还有吗",
+            "还有的吧",
+            "还有什么",
+            "后来呢",
+            "然后呢",
+            "刚才那个",
+            "上次那个",
+            "没说完",
+            "还没说完",
+        )
+        return any(marker in compact for marker in markers) and len(compact) <= 18
 
     @staticmethod
     def _is_query_scaffold_term(term: str) -> bool:
@@ -1873,6 +1926,8 @@ class RetrievalEngine:
             scope_bonus += 0.08
 
         age_bonus = self._recency_bonus(memory.occurred_at or memory.created_at)
+        persona_bonus = self._persona_relevance_bonus(memory, profile)
+        dynamics_bonus = self._persona_dynamics_bonus(memory, profile)
         vector_bonus = 0.0
         if vector_relevant:
             if self.embedding_score_threshold < 1.0:
@@ -1880,13 +1935,81 @@ class RetrievalEngine:
             else:
                 normalized_vector = vector_score
             vector_bonus = self.embedding_weight * max(0.0, min(1.0, normalized_vector))
-        score = lexical + scope_bonus + memory.importance * 0.55 + memory.confidence * 0.25 + age_bonus + vector_bonus
+        score = lexical + scope_bonus + memory.importance * 0.55 + memory.confidence * 0.25 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus
         if not terms:
-            score = scope_bonus + memory.importance * 0.8 + age_bonus + vector_bonus
+            score = scope_bonus + memory.importance * 0.8 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus
         return score, (
             f"hits={term_hits};exact={int(exact_hit)};bm25={bm25:.2f};"
-            f"vector={vector_score:.3f};importance={memory.importance:.2f};recency={age_bonus:.2f}"
+            f"vector={vector_score:.3f};importance={memory.importance:.2f};"
+            f"persona={persona_bonus:.2f};dynamics={dynamics_bonus:.2f};recency={age_bonus:.2f}"
         )
+
+    @staticmethod
+    def _persona_relevance_bonus(memory: MemoryRecord, profile: dict[str, object]) -> float:
+        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+
+        def weight(key: str) -> float:
+            try:
+                return max(0.0, min(1.0, float(metadata.get(key) or 0.0)))
+            except Exception:
+                return 0.0
+
+        persona = weight("persona_importance")
+        if persona <= 0:
+            return 0.0
+        bonus = min(0.10, persona * 0.08)
+        contextual = bool(profile.get("contextual_recall"))
+        temporal = bool(profile.get("temporal_aggregate"))
+        if contextual:
+            bonus += min(
+                0.10,
+                max(weight("open_loop_weight"), weight("promise_weight"), weight("emotional_debt_weight")) * 0.10,
+            )
+            bonus += min(0.06, weight("relationship_weight") * 0.06)
+        if temporal:
+            bonus += min(0.06, max(weight("emotional_weight"), weight("self_continuity_weight")) * 0.06)
+        return min(0.22, bonus)
+
+    @staticmethod
+    def _persona_dynamics_bonus(memory: MemoryRecord, profile: dict[str, object]) -> float:
+        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+
+        def weight(key: str) -> float:
+            try:
+                return max(0.0, min(1.0, float(metadata.get(key) or 0.0)))
+            except Exception:
+                return 0.0
+
+        freshness = weight("freshness_weight")
+        scar = weight("scar_weight")
+        open_loop = weight("open_loop_weight")
+        promise = weight("promise_weight")
+        emotional_debt = weight("emotional_debt_weight")
+        creative = weight("creative_weight")
+        relationship = weight("relationship_weight")
+        emotional = weight("emotional_weight")
+        decay_mode = clean_text(metadata.get("decay_mode"), 60)
+        phase = clean_text(metadata.get("relationship_phase"), 60)
+
+        bonus = min(0.055, freshness * 0.055)
+        durable = max(scar, promise, open_loop, emotional_debt, creative)
+        if decay_mode in {"no_decay", "scar_slow_decay", "creative_milestone"}:
+            bonus += min(0.075, durable * 0.075)
+        elif decay_mode == "slow_decay":
+            bonus += min(0.045, max(relationship, emotional) * 0.045)
+        if phase in {"conflict", "repair", "comfort"}:
+            bonus += min(0.045, max(scar, emotional, relationship) * 0.045)
+
+        contextual = bool(profile.get("contextual_recall"))
+        temporal = bool(profile.get("temporal_aggregate"))
+        open_loop_followup = bool(profile.get("open_loop_followup"))
+        if contextual:
+            bonus += min(0.055, max(open_loop, promise, emotional_debt, scar) * 0.055)
+        if open_loop_followup:
+            bonus += min(0.11, max(open_loop, promise, emotional_debt, scar) * 0.11)
+        if temporal:
+            bonus += min(0.040, max(freshness, emotional) * 0.040)
+        return min(0.18, bonus)
 
     def _livingmemory_graph_relevance_guard(
         self,

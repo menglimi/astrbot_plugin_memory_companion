@@ -6,7 +6,7 @@ const VIEWS = {
   film: { title: "群聊记忆", hint: "查看群聊范围内可召回、可管理的结构化记忆。" },
   microscope: { title: "记忆显微镜", hint: "输入一句话，模拟当前对象下的召回和过滤。" },
   relations: { title: "用户记忆", hint: "聚焦用户画像、偏好、称呼和关系声明。" },
-  review: { title: "个人记忆", hint: "查看 Bot 自身的每日生活日程、当前状态和细化片段。" },
+  review: { title: "个人记忆", hint: "查看 Bot 自身的每日生活日程、相册、主观记忆和细化片段。" },
   archive: { title: "维护 / 迁移 / 配置", hint: "执行维护、迁移、清理和导入修复。" },
   maintain: { title: "私聊记忆", hint: "查看私聊范围内的对话、偏好、事实和稳定记忆。" },
 };
@@ -14,8 +14,8 @@ const VIEWS = {
 const PERSONAL_MEMORY_VIEW = {
   available: {
     title: "个人记忆",
-    hint: "查看 Bot 自身的每日生活日程、当前状态和细化片段。",
-    small: "日程 · 细化",
+    hint: "查看 Bot 自身的每日生活日程、相册、主观记忆和细化片段。",
+    small: "日程 · 相册 · 主观",
   },
   unavailable: {
     title: "个人记忆不可用",
@@ -63,6 +63,12 @@ const state = {
   personalDates: [],
   selectedPersonalDate: "",
   selectedScheduleIndex: "",
+  selectedPersonalAlbumIndex: "",
+  selectedSubjectiveMemoryIndex: "",
+  personalViewport: "schedule",
+  personalViewportSwitching: false,
+  animatePersonalViewportRail: false,
+  personalSnapshot: null,
   animatePersonalDateRail: false,
   pendingPersonalFilmReveal: false,
   personalEntranceRevealRequested: false,
@@ -151,6 +157,117 @@ function escapeHtml(value) {
 function compact(value, fallback = "-") {
   const text = String(value ?? "").trim();
   return text || fallback;
+}
+
+function finiteNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function percentLabel(value) {
+  return `${Math.round(Math.max(0, Math.min(1, finiteNumber(value))) * 100)}%`;
+}
+
+function mentionPolicyLabel(policy) {
+  if (policy === "direct") return "可直接提及";
+  if (policy === "soft_echo") return "轻触回声";
+  if (policy === "tone_only") return "只作语气";
+  if (policy === "avoid_unless_asked") return "被问再说";
+  return policy ? String(policy) : "未评估";
+}
+
+function mentionPolicyTone(policy) {
+  if (policy === "direct") return "teal";
+  if (policy === "soft_echo") return "blue";
+  if (policy === "tone_only") return "gold";
+  if (policy === "avoid_unless_asked") return "red";
+  return "violet";
+}
+
+function dimensionLabel(name) {
+  const labels = {
+    persona_importance: "拟人权重",
+    relationship: "关系",
+    relationship_weight: "关系",
+    emotional: "情绪",
+    emotional_weight: "情绪",
+    promise: "承诺",
+    promise_weight: "承诺",
+    open_loop: "未完成",
+    open_loop_weight: "未完成",
+    creative: "创作",
+    creative_weight: "创作",
+    preference: "偏好",
+    preference_weight: "偏好",
+    self_continuity: "自我连续",
+    self_continuity_weight: "自我连续",
+    freshness_weight: "新鲜感",
+    scar_weight: "伤痕感",
+    emotional_debt_weight: "情感债务",
+  };
+  return labels[name] || name;
+}
+
+function decayModeLabel(mode) {
+  const labels = {
+    normal: "普通衰减",
+    slow_decay: "慢衰减",
+    no_decay: "不衰减",
+    scar_slow_decay: "伤痕慢衰减",
+    creative_milestone: "创作节点",
+    ephemeral: "短期淡化",
+  };
+  return labels[mode] || mode;
+}
+
+function reactionLabel(reaction) {
+  const labels = {
+    accepted: "接受",
+    comforted: "被安慰到",
+    awkward: "尴尬",
+    denied: "否认",
+    corrected: "纠正",
+  };
+  return labels[reaction] || reaction;
+}
+
+function personaWeights(memory) {
+  const source = memory.persona_weights || memory.metadata || {};
+  const keys = [
+    "persona_importance",
+    "relationship_weight",
+    "emotional_weight",
+    "promise_weight",
+    "open_loop_weight",
+    "creative_weight",
+    "preference_weight",
+    "self_continuity_weight",
+    "freshness_weight",
+    "scar_weight",
+    "emotional_debt_weight",
+  ];
+  return keys
+    .map((key) => ({ key, value: finiteNumber(source[key], NaN) }))
+    .filter((item) => Number.isFinite(item.value) && item.value > 0.01);
+}
+
+function memorySignalBadges(memory, max = 4) {
+  const metadata = memory.metadata || {};
+  const policy = memory.mention_policy || metadata.mention_policy || "";
+  const mentionability = memory.mentionability_score ?? metadata.mentionability_score;
+  const weights = personaWeights(memory)
+    .filter((item) => item.key !== "persona_importance" && item.value >= 0.35)
+    .sort((a, b) => b.value - a.value)
+    .slice(0, Math.max(0, max - (policy ? 1 : 0)));
+  const badges = [];
+  if (policy) {
+    const score = mentionability !== undefined && mentionability !== null ? ` ${percentLabel(mentionability)}` : "";
+    badges.push(`<span class="badge ${escapeHtml(mentionPolicyTone(policy))}">${escapeHtml(mentionPolicyLabel(policy) + score)}</span>`);
+  }
+  weights.forEach((item) => {
+    badges.push(`<span class="badge violet">${escapeHtml(`${dimensionLabel(item.key)} ${percentLabel(item.value)}`)}</span>`);
+  });
+  return badges.join("");
 }
 
 function formatTime(value) {
@@ -792,7 +909,8 @@ function renderPersonalDateRail(dates, selectedDate) {
   rail?.classList.remove("is-scoped-rail");
   app?.style.removeProperty("--secondary-nav-shift");
   const animate = state.animatePersonalDateRail && !prefersReducedMotion();
-  if (app && list && !animate) {
+  const keepReelMotion = state.animatePersonalViewportRail && !prefersReducedMotion();
+  if (app && list && !animate && !keepReelMotion) {
     list.style.transition = "none";
     app.style.removeProperty("--personal-reel-shift");
     list.offsetHeight;
@@ -831,6 +949,8 @@ async function selectPersonalDate(date) {
   }
   state.selectedPersonalDate = nextDate;
   state.selectedScheduleIndex = "";
+  state.selectedPersonalAlbumIndex = "";
+  state.selectedSubjectiveMemoryIndex = "";
   state.animatePersonalDateRail = true;
   clearDetail();
   await loadPersonalMemory();
@@ -1292,6 +1412,7 @@ function memoryRow(memory) {
           <span class="badge teal">${escapeHtml(memory.memory_type)}</span>
           <span class="badge blue">${escapeHtml(memory.visibility)}</span>
           <span class="badge gold">${escapeHtml(memory.reality_level)}</span>
+          ${memorySignalBadges(memory, 3)}
           ${topicTags.map((tag) => `<span class="badge blue">${escapeHtml(tag)}</span>`).join("")}
         </div>
       </div>
@@ -1440,17 +1561,19 @@ async function loadContextPanel() {
     const data = await apiGet(`/timeline?${params.toString()}`);
     target.innerHTML = renderKnowledgeTimeline(data.items || []);
   } else {
-    const [graph, relations, threads, timeline] = await Promise.all([
+    const [graph, relations, threads, timeline, logs] = await Promise.all([
       apiGet(`/graph?${params.toString()}`),
       apiGet(`/relations?${params.toString()}`),
       apiGet(`/threads?${new URLSearchParams({ ...Object.fromEntries(params), status: "all" }).toString()}`),
       apiGet(`/timeline?${params.toString()}`),
+      apiGet(`/logs?${params.toString()}`),
     ]);
     target.innerHTML = renderKnowledgeOverview({
       graph: graph.items || [],
       relations: relations.items || [],
       threads: threads.items || [],
       timeline: timeline.items || [],
+      logs: logs.items || [],
     });
   }
   bindKnowledgeGraphRows(target);
@@ -1469,7 +1592,7 @@ function rawAttr(value) {
   return escapeHtml(JSON.stringify(value || {}));
 }
 
-function renderKnowledgeOverview({ graph = [], relations = [], threads = [], timeline = [] } = {}) {
+function renderKnowledgeOverview({ graph = [], relations = [], threads = [], timeline = [], logs = [] } = {}) {
   const activeThreads = threads.filter((item) => (item.status || "open") === "open").length;
   return `
     <section class="context-section film-panel">
@@ -1485,6 +1608,7 @@ function renderKnowledgeOverview({ graph = [], relations = [], threads = [], tim
     ${renderKnowledgeRelations(relations, "最近身份关系")}
     ${renderKnowledgeThreads(threads, "最近跨窗口线程")}
     ${renderKnowledgeTimeline(timeline, "最近时间线")}
+    ${renderContextLogs(logs)}
   `;
 }
 
@@ -1638,6 +1762,12 @@ function retrievalModeTone(mode) {
   return "teal";
 }
 
+function providerStateLabel(current, hasProvider, enabled = true) {
+  if (!enabled) return "未启用";
+  if (current) return current;
+  return hasProvider ? "自动探测" : "未检测到";
+}
+
 function configCard(title, value, note, tone = "blue", badge = "配置") {
   return `
     <article class="config-card">
@@ -1672,6 +1802,45 @@ function contextField({ label, hint, control, wide = false }) {
   `;
 }
 
+function blockedReasonLabel(reason) {
+  const text = String(reason || "");
+  if (text.includes("private_pair_not_current_private")) return "私聊隔离";
+  if (text.includes("other_group_public")) return "其他群聊";
+  if (text.includes("prefiltered_out_of_search_range")) return "范围外";
+  if (text.includes("companion_current_state_overlap")) return "陪伴状态重叠";
+  if (text.includes("mention_policy")) return "提及边界";
+  if (text.includes("current_state_relevance_guard")) return "当前状态保护";
+  if (text.includes("not_visible") || text.includes("visibility")) return "可见性";
+  if (text.includes("duplicate") || text.includes("redundant")) return "重复折叠";
+  return text.split(":")[0].replaceAll("_", " ") || "过滤";
+}
+
+function blockedReasonBadges(blocked = []) {
+  const counts = new Map();
+  blocked.forEach((item) => {
+    const label = blockedReasonLabel(item.reason || item);
+    counts.set(label, (counts.get(label) || 0) + 1);
+  });
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 4)
+    .map(([label, count]) => `<span class="badge ${count > 20 ? "red" : "teal"}">${escapeHtml(label)} ${escapeHtml(count)}</span>`)
+    .join("");
+}
+
+function renderSelectedMemoryChips(memories = [], limit = 4) {
+  return memories.slice(0, limit).map((memory) => {
+    const title = compact(memory.canonical_summary || memory.content, memory.id);
+    const policy = memory.mention_policy || "";
+    return `
+      <span class="memory-chip" title="${escapeHtml(title)}">
+        ${escapeHtml(compact(memory.memory_type, "memory"))}
+        ${policy ? `<small>${escapeHtml(mentionPolicyLabel(policy))}</small>` : ""}
+      </span>
+    `;
+  }).join("");
+}
+
 function renderContextLogs(logs) {
   return `
     <section class="context-section context-logs film-panel">
@@ -1681,17 +1850,21 @@ function renderContextLogs(logs) {
       </div>
       <div class="row-list">
         ${logs.length ? logs.map((item) => `
-          <article class="row-item memory-frame" data-raw="${escapeHtml(JSON.stringify(item))}">
+          <article class="row-item memory-frame" data-raw="${escapeHtml(JSON.stringify(item))}" data-detail-title="注入记录详情">
             <div class="memory-frame-time">
               <b>${escapeHtml(formatTime(item.created_at))}</b>
               <span>${escapeHtml(item.scope || "unknown")}</span>
             </div>
             <div class="memory-frame-main">
-              <span class="item-title">${escapeHtml(item.query || "未记录查询文本")}</span>
+              <div class="memory-frame-text">
+                <span class="item-title">${escapeHtml(item.query || "未记录查询文本")}</span>
+                <div class="memory-chip-row">${renderSelectedMemoryChips(item.selected_memories || [])}</div>
+              </div>
               <div class="badges">
                 <span class="badge blue">选中 ${escapeHtml((item.selected_memory_ids || []).length)} 条</span>
                 <span class="badge teal">过滤 ${escapeHtml((item.blocked_reasons || []).length)} 条</span>
                 <span class="badge gold">${escapeHtml(shortId(item.session_id || "-"))}</span>
+                ${blockedReasonBadges(item.blocked_reasons || [])}
               </div>
             </div>
           </article>
@@ -1733,6 +1906,7 @@ async function loadPersonalMemory() {
     return;
   }
   state.selectedPersonalDate = data.selected_date || state.selectedPersonalDate || "";
+  state.personalSnapshot = data.snapshot || {};
   if (shouldAnimateEntrance) state.animatePersonalDateRail = true;
   renderPersonalDateRail(data.dates || [], state.selectedPersonalDate);
   target.innerHTML = renderPersonalMemoryWorkspace(data.snapshot || {}, data);
@@ -1740,9 +1914,57 @@ async function loadPersonalMemory() {
 }
 
 function bindPersonalMemoryWorkspace(target, snapshot, data) {
+  target.querySelectorAll("[data-personal-viewport]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const next = button.dataset.personalViewport || "schedule";
+      if (next === state.personalViewport) return;
+      await switchPersonalViewport(next, target, snapshot, data);
+    });
+  });
+
   target.querySelectorAll("[data-memory-id]").forEach((row) => {
     row.addEventListener("click", () => showMemory(row.dataset.memoryId));
   });
+  target.querySelectorAll("[data-album-index]").forEach((card) => {
+    const selectAlbum = () => {
+      state.selectedPersonalAlbumIndex = card.dataset.albumIndex || "";
+      target.querySelectorAll("[data-album-index]").forEach((item) => {
+        item.classList.toggle("is-active", item.dataset.albumIndex === state.selectedPersonalAlbumIndex);
+      });
+      showPersonalAlbumDetail(snapshot, data, { animate: true });
+    };
+    card.addEventListener("click", selectAlbum);
+    card.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectAlbum();
+      }
+    });
+  });
+  target.querySelectorAll("[data-subjective-index]").forEach((card) => {
+    const selectSubjective = () => {
+      state.selectedSubjectiveMemoryIndex = card.dataset.subjectiveIndex || "";
+      target.querySelectorAll("[data-subjective-index]").forEach((item) => {
+        item.classList.toggle("is-active", item.dataset.subjectiveIndex === state.selectedSubjectiveMemoryIndex);
+      });
+      showPersonalSubjectiveDetail(snapshot, data, { animate: true });
+    };
+    card.addEventListener("click", selectSubjective);
+    card.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectSubjective();
+      }
+    });
+  });
+  if (state.personalViewport !== "schedule") {
+    removeRailMountedScheduleFilm();
+    state.pendingPersonalFilmReveal = false;
+    resetPersonalFilmLayout();
+    if (state.personalViewport === "album") showPersonalAlbumDetail(snapshot, data);
+    if (state.personalViewport === "subjective") showPersonalSubjectiveDetail(snapshot, data);
+    return;
+  }
   const film = target.querySelector("[data-schedule-film]");
   const selectSchedule = (index, options = {}) => {
     state.selectedScheduleIndex = index || "";
@@ -1772,6 +1994,53 @@ function bindPersonalMemoryWorkspace(target, snapshot, data) {
   }
   updateScheduleSummary(target, snapshot);
   showPersonalScheduleDetail(snapshot, data);
+}
+
+async function switchPersonalViewport(next, target, snapshot, data) {
+  if (state.personalViewportSwitching) return;
+  state.personalViewportSwitching = true;
+  const rail = document.querySelector(".object-rail");
+  const render = () => {
+    try {
+      state.animatePersonalViewportRail = true;
+      renderPersonalDateRail(state.personalDates, state.selectedPersonalDate);
+    } finally {
+      state.animatePersonalViewportRail = false;
+    }
+    target.innerHTML = renderPersonalMemoryWorkspace(snapshot, data);
+    bindPersonalMemoryWorkspace(target, snapshot, data);
+  };
+  try {
+    await retractScheduleFilmBeforeDateMove();
+    removeRailMountedScheduleFilm();
+    if (!prefersReducedMotion()) {
+      rail?.classList.add("is-reel-rolling-out");
+      await waitForMotion(220);
+      rail?.classList.remove("is-reel-rolling-out");
+    }
+    state.personalViewport = next;
+    state.pendingPersonalFilmReveal = next === "schedule" && !prefersReducedMotion();
+    resetPersonalFilmLayout();
+    render();
+    if (!prefersReducedMotion()) {
+      rail?.classList.add("is-reel-rolling-in");
+      await waitForMotion(540);
+      rail?.classList.remove("is-reel-rolling-in");
+    }
+    if (next === "schedule") requestAnimationFrame(alignPersonalScheduleToReel);
+  } finally {
+    rail?.classList.remove("is-reel-rolling-out", "is-reel-rolling-in");
+    state.personalViewportSwitching = false;
+  }
+}
+
+function resetPersonalFilmLayout() {
+  const app = $("#app");
+  if (!app) return;
+  app.style.removeProperty("--personal-film-lift");
+  app.style.removeProperty("--personal-film-shift");
+  app.style.removeProperty("--personal-detail-offset");
+  app.style.removeProperty("--personal-main-height");
 }
 
 function mountScheduleFilmToRail(film) {
@@ -2124,17 +2393,102 @@ function renderPersonalMemoryUnavailable(reason) {
     <div class="empty-state unavailable-state">
       <b>个人记忆不可用</b>
       <span>${escapeHtml(reason)}</span>
-      <p>这里用于联动主动陪伴插件，展示 Bot 自身的每日生活日程、当前状态、日程细化片段和由陪伴插件写入的个人记忆。</p>
+      <p>这里用于联动主动陪伴插件，展示 Bot 自身的每日生活日程、相册、主观记忆、日程细化片段和由陪伴插件写入的个人记忆。</p>
     </div>
   `;
 }
 
 function renderPersonalMemoryWorkspace(snapshot, status) {
+  const active = personalViewport();
   return `
     <section class="personal-memory-workspace">
-      ${renderCompanionSchedulePanel(snapshot, status)}
+      ${renderPersonalViewportSwitch(active)}
+      <div class="personal-viewport" data-personal-viewport-panel="${escapeHtml(active)}">
+        ${renderPersonalViewportPanel(active, snapshot, status)}
+      </div>
     </section>
   `;
+}
+
+function personalViewport() {
+  const views = ["schedule", "album", "subjective"];
+  if (!views.includes(state.personalViewport)) state.personalViewport = "schedule";
+  return state.personalViewport;
+}
+
+function renderPersonalViewportSwitch(active) {
+  const tabs = [
+    { id: "schedule", label: "日程" },
+    { id: "album", label: "相册" },
+    { id: "subjective", label: "主观记忆" },
+  ];
+  return `
+    <div class="personal-view-switch" role="tablist" aria-label="个人记忆视窗">
+      ${tabs.map((tab) => `
+        <button class="personal-view-tab${tab.id === active ? " is-active" : ""}" type="button" role="tab" aria-selected="${tab.id === active ? "true" : "false"}" data-personal-viewport="${escapeHtml(tab.id)}">
+          ${escapeHtml(tab.label)}
+        </button>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderPersonalViewportPanel(active, snapshot, status) {
+  if (active === "album") return renderCompanionAlbumPanel(snapshot, status);
+  if (active === "subjective") return renderSubjectiveMemoryPanel(snapshot, status);
+  return renderCompanionSchedulePanel(snapshot, status);
+}
+
+function renderCompanionAlbumPanel(snapshot, status) {
+  const album = Array.isArray(snapshot.album) ? snapshot.album : [];
+  const selected = activeAlbumIndex(album);
+  return `
+    <section class="personal-zone companion-album">
+      <div class="personal-zone-head">
+        <h4>相册</h4>
+        <span>${escapeHtml(status.selected_date || snapshot.plan?.date || "-")} · 每日穿搭</span>
+      </div>
+      ${album.length ? `
+        <div class="album-strip">
+          ${album.map((item, index) => renderAlbumCard(item, index, String(index) === selected)).join("")}
+        </div>
+      ` : `
+        <div class="album-empty">
+          <b>这一天还没有穿搭图</b>
+          <span>生成每日穿搭后会出现在这里。</span>
+        </div>
+      `}
+    </section>
+  `;
+}
+
+function renderAlbumCard(item, index = 0, active = false) {
+  const title = item.title || "照片";
+  const meta = [item.generated_at, item.backend].filter(Boolean).join(" · ");
+  const image = item.exists && item.url
+    ? `<img src="${escapeHtml(item.url)}" alt="${escapeHtml(title)}" loading="lazy">`
+    : `<div class="album-missing">${escapeHtml(item.error || "图片文件不可用")}</div>`;
+  return `
+    <article class="album-card${active ? " is-active" : ""}" data-album-index="${escapeHtml(index)}" role="button" tabindex="0">
+      <div class="album-image">${image}</div>
+      <div class="album-caption">
+        <b>${escapeHtml(title)}</b>
+        ${meta ? `<span>${escapeHtml(meta)}</span>` : ""}
+        ${item.note ? `<small>${escapeHtml(item.note)}</small>` : ""}
+      </div>
+    </article>
+  `;
+}
+
+function activeAlbumIndex(album) {
+  if (!album.length) {
+    state.selectedPersonalAlbumIndex = "";
+    return "";
+  }
+  const current = String(state.selectedPersonalAlbumIndex || "");
+  if (current && album[Number(current)]) return current;
+  state.selectedPersonalAlbumIndex = "0";
+  return "0";
 }
 
 function renderCompanionSchedulePanel(snapshot, status) {
@@ -2299,6 +2653,156 @@ function renderSelectedDetail(item, detail, items) {
   `;
 }
 
+function renderSubjectiveMemories(snapshot, options = {}) {
+  const memories = Array.isArray(snapshot.subjective_memories) ? snapshot.subjective_memories : [];
+  const selected = options.selectable ? activeSubjectiveIndex(memories) : "";
+  if (!memories.length) {
+    return `
+      <article class="subjective-memory empty-subjective">
+        <b>主观记忆</b>
+        <span>这一天还没有 Bot 日记或主观片段。</span>
+      </article>
+    `;
+  }
+  return `
+    <section class="subjective-memory">
+      <div class="subjective-head">
+        <b>主观记忆</b>
+        <span>${escapeHtml(memories[0].date || "")}</span>
+      </div>
+      ${memories.map((item, index) => `
+        <article class="subjective-card${options.selectable && String(index) === selected ? " is-active" : ""}"${options.selectable ? ` data-subjective-index="${escapeHtml(index)}" role="button" tabindex="0"` : ""}>
+          ${item.summary ? `<b>${escapeHtml(item.summary)}</b>` : ""}
+          ${item.body ? `<p>${escapeHtml(item.body)}</p>` : ""}
+          ${item.share_seed ? `<small>${escapeHtml(item.share_seed)}</small>` : ""}
+          ${renderSubjectiveTags(item.tags)}
+          ${renderSubjectiveLines(item)}
+        </article>
+      `).join("")}
+    </section>
+  `;
+}
+
+function renderSubjectiveMemoryPanel(snapshot, status) {
+  const date = status.selected_date || snapshot.plan?.date || "";
+  return `
+    <section class="personal-zone subjective-memory-panel">
+      <div class="personal-zone-head">
+        <h4>主观记忆</h4>
+        <span>${escapeHtml(date || "-")} · Bot 日记</span>
+      </div>
+      ${renderSubjectiveMemories(snapshot, { selectable: true })}
+    </section>
+  `;
+}
+
+function activeSubjectiveIndex(memories) {
+  if (!memories.length) {
+    state.selectedSubjectiveMemoryIndex = "";
+    return "";
+  }
+  const current = String(state.selectedSubjectiveMemoryIndex || "");
+  if (current && memories[Number(current)]) return current;
+  state.selectedSubjectiveMemoryIndex = "0";
+  return "0";
+}
+
+function showPersonalAlbumDetail(snapshot, status, options = {}) {
+  if (state.activeView !== "review") return;
+  const album = Array.isArray(snapshot.album) ? snapshot.album : [];
+  const selectedIndex = activeAlbumIndex(album);
+  const selected = album[Number(selectedIndex)] || null;
+  const drawer = $("#detailDrawer");
+  const render = () => {
+    drawer.className = selected ? "detail-drawer" : "detail-drawer empty";
+    drawer.innerHTML = `<div class="personal-detail-content">${renderAlbumDetail(selected, status)}</div>`;
+  };
+  if (options.animate) {
+    swapPanelContent(drawer, render);
+  } else {
+    render();
+  }
+}
+
+function renderAlbumDetail(item, status) {
+  if (!item) {
+    return `
+      <div class="detail-empty">
+        <b>相册为空</b>
+        <span>${escapeHtml(status.selected_date || "这一天")} 还没有每日穿搭图。</span>
+      </div>
+    `;
+  }
+  const title = item.title || "每日穿搭";
+  const meta = [item.generated_at, item.backend].filter(Boolean).join(" · ");
+  const image = item.exists && item.url
+    ? `<img src="${escapeHtml(item.url)}" alt="${escapeHtml(title)}" loading="lazy">`
+    : `<div class="album-missing">${escapeHtml(item.error || "图片文件不可用")}</div>`;
+  return `
+    <article class="album-detail">
+      <div class="album-detail-image">${image}</div>
+      <div class="album-detail-copy">
+        <b>${escapeHtml(title)}</b>
+        ${meta ? `<span>${escapeHtml(meta)}</span>` : ""}
+        ${item.note ? `<p>${escapeHtml(item.note)}</p>` : ""}
+      </div>
+    </article>
+  `;
+}
+
+function showPersonalSubjectiveDetail(snapshot, status, options = {}) {
+  if (state.activeView !== "review") return;
+  const memories = Array.isArray(snapshot.subjective_memories) ? snapshot.subjective_memories : [];
+  const selectedIndex = activeSubjectiveIndex(memories);
+  const selected = memories[Number(selectedIndex)] || null;
+  const drawer = $("#detailDrawer");
+  const render = () => {
+    drawer.className = selected ? "detail-drawer" : "detail-drawer empty";
+    drawer.innerHTML = `<div class="personal-detail-content">${renderSubjectiveDetail(selected, status)}</div>`;
+  };
+  if (options.animate) {
+    swapPanelContent(drawer, render);
+  } else {
+    render();
+  }
+}
+
+function renderSubjectiveDetail(item, status) {
+  if (!item) {
+    return `
+      <div class="detail-empty">
+        <b>主观记忆为空</b>
+        <span>${escapeHtml(status.selected_date || "这一天")} 还没有 Bot 日记或主观片段。</span>
+      </div>
+    `;
+  }
+  return `
+    <article class="selected-detail subjective-detail">
+      ${item.date ? `<span class="detail-time">${escapeHtml(item.date)}</span>` : ""}
+      ${item.summary ? `<b class="detail-summary">${escapeHtml(item.summary)}</b>` : ""}
+      ${item.body ? `<p>${escapeHtml(item.body)}</p>` : ""}
+      ${item.share_seed ? `<small>${escapeHtml(item.share_seed)}</small>` : ""}
+      ${renderSubjectiveTags(item.tags)}
+      ${renderSubjectiveLines(item)}
+    </article>
+  `;
+}
+
+function renderSubjectiveTags(tags) {
+  if (!Array.isArray(tags) || !tags.length) return "";
+  return `<div class="subjective-tags">${tags.slice(0, 6).map((tag) => `<span>${escapeHtml(tag)}</span>`).join("")}</div>`;
+}
+
+function renderSubjectiveLines(item) {
+  const lines = [
+    ...(item.today_events || []),
+    ...(item.proactive_events || []),
+    ...(item.long_term_events || []),
+  ].slice(0, 5);
+  if (!lines.length) return "";
+  return `<ul class="detail-lines subjective-lines">${lines.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul>`;
+}
+
 function renderDetailLines(item) {
   const lines = [
     ...(item.today_events || []),
@@ -2344,6 +2848,7 @@ async function runSearch() {
           <div class="badges">
             <span class="badge teal">${escapeHtml(item.memory_type)}</span>
             <span class="badge blue">${escapeHtml(item.visibility)}</span>
+            ${memorySignalBadges(item, 4)}
           </div>
         </article>
       `).join("") : `<div class="empty-state">没有命中可读取记忆。</div>`}
@@ -2407,68 +2912,104 @@ function renderRetrievalConfigForm(retrieval = {}, rerankOptions = [], embedding
   if (currentEmbeddingProvider && !embeddingProviderOptions.some((item) => item.id === currentEmbeddingProvider)) {
     embeddingProviderOptions.push({ id: currentEmbeddingProvider, label: `${currentEmbeddingProvider}（当前配置）` });
   }
+  const rerankState = providerStateLabel(currentProvider, hasProvider);
+  const embeddingState = providerStateLabel(currentEmbeddingProvider, hasEmbeddingProvider, Boolean(retrieval.embedding_enabled));
   return `
     <form id="retrievalConfigForm" class="context-form retrieval-config-form" autocomplete="off">
-      <div class="retrieval-explain">
-        <div>
-          <b>检索模型的作用</b>
-          <p>嵌入负责补充语义候选，Rerank 负责二阶段重排；两者都不保存记忆，也不突破权限。流程是：权限/黑白名单预过滤 -> 本地粗排与向量候选 -> 可选 Rerank -> 取 TopK 返回。</p>
+      <div class="retrieval-hero">
+        <div class="retrieval-hero-copy">
+          <b>检索配置</b>
+          <p>控制记忆候选、向量补召回和二阶段重排。权限与黑白名单始终先于模型生效。</p>
+        </div>
+        <div class="retrieval-status-grid">
+          <span><em>路径</em><strong data-retrieval-status="mode">${escapeHtml(retrievalModeLabel(mode))}</strong></span>
+          <span><em>Rerank</em><strong data-retrieval-status="rerank">${escapeHtml(rerankState)}</strong></span>
+          <span><em>Embedding</em><strong data-retrieval-status="embedding">${escapeHtml(embeddingState)}</strong></span>
+          <span><em>候选</em><strong data-retrieval-status="candidates">${escapeHtml(`${retrieval.rerank_candidate_limit ?? 32} / ${retrieval.embedding_top_k ?? 32}`)}</strong></span>
         </div>
         <div class="retrieval-flow">
-          <span>可见记忆</span>
+          <span>权限过滤</span>
           <span>本地/向量候选</span>
-          <span>Rerank</span>
-          <span>TopK 读取</span>
-        </div>
-        <div class="context-summary-strip">
-          <span>当前模式：${escapeHtml(retrievalModeLabel(mode))}</span>
-          <span>Rerank：${escapeHtml(currentProvider || (hasProvider ? "自动探测" : "未检测到"))}</span>
-          <span>Embedding：${escapeHtml(retrieval.embedding_enabled ? (currentEmbeddingProvider || (hasEmbeddingProvider ? "自动探测" : "未检测到")) : "未启用")}</span>
-          <span>日志看 retrieval_path 是否为 rerank</span>
+          <span>可选重排</span>
+          <span>注入组织</span>
         </div>
       </div>
-      ${contextField({
-        label: "检索实现路径",
-        hint: "推荐 auto。没有候选、没有 provider、超时或报错时都会回退 basic；这时重排模型不会实际参与。",
-        control: `
-          <select name="mode">
-            <option value="auto"${(retrieval.mode || "auto") === "auto" ? " selected" : ""}>自动选择</option>
-            <option value="rerank"${retrieval.mode === "rerank" ? " selected" : ""}>强制重排</option>
-            <option value="basic"${retrieval.mode === "basic" ? " selected" : ""}>本地检索</option>
-          </select>
-        `,
-      })}
-      ${contextField({
-        label: "Rerank Provider",
-        hint: "只列出真正具备 rerank() 能力的提供商。留空时 auto 会自动扫描；官方配置页若不能选择 rerank，可在这里填 Provider ID。",
-        control: `
-          <div class="provider-inline retrieval-provider-picker">
-            <select name="rerank_provider_select">
-              ${options.map((option) => `<option value="${escapeHtml(option.id || "")}"${(option.id || "") === currentProvider ? " selected" : ""}>${escapeHtml(option.label || option.id || "自动探测 / 不指定")}</option>`).join("")}
+      <section class="retrieval-quick-panel">
+        <div class="context-form-section-head">
+          <b>推荐档位</b>
+          <span>预设只会填入当前表单，保存后才生效。</span>
+        </div>
+        <div class="retrieval-preset-grid">
+          <button type="button" data-retrieval-preset="safe">
+            <b>保守</b>
+            <span>本地优先，少调用模型</span>
+          </button>
+          <button type="button" data-retrieval-preset="balanced">
+            <b>平衡</b>
+            <span>自动重排，启用向量补召回</span>
+          </button>
+          <button type="button" data-retrieval-preset="deep">
+            <b>深召回</b>
+            <span>扩大候选，适合旧记忆库</span>
+          </button>
+        </div>
+      </section>
+      <section class="context-form-section retrieval-core-section">
+        <div class="context-form-section-head">
+          <b>核心路径</b>
+          <span>日常只需要调这里；高级参数可保持默认。</span>
+        </div>
+        ${contextField({
+          label: "检索实现路径",
+          hint: "推荐自动选择。没有候选、没有 provider、超时或报错时会回退本地检索。",
+          control: `
+            <select name="mode">
+              <option value="auto"${(retrieval.mode || "auto") === "auto" ? " selected" : ""}>自动选择</option>
+              <option value="rerank"${retrieval.mode === "rerank" ? " selected" : ""}>强制重排</option>
+              <option value="basic"${retrieval.mode === "basic" ? " selected" : ""}>本地检索</option>
             </select>
-            <input name="rerank_provider_id" type="text" value="${escapeHtml(currentProvider)}" placeholder="留空自动选择可用重排 Provider" />
-          </div>
-        `,
-        wide: true,
-      })}
-      ${contextField({
-        label: "启用嵌入召回",
-        hint: "开启后会为记忆建立向量索引，并在本地关键词候选之外补充语义相近记忆；没有 Embedding Provider 或调用失败时会自动回退。",
-        control: contextSwitch("embedding_enabled", Boolean(retrieval.embedding_enabled)),
-      })}
-      ${contextField({
-        label: "Embedding Provider",
-        hint: "参考 Rerank Provider 的选择方式。下拉只尽量列出具备 embedding 能力的提供商；留空时自动扫描第一个可用 Provider。",
-        control: `
-          <div class="provider-inline retrieval-provider-picker">
-            <select name="embedding_provider_select">
-              ${embeddingProviderOptions.map((option) => `<option value="${escapeHtml(option.id || "")}"${(option.id || "") === currentEmbeddingProvider ? " selected" : ""}>${escapeHtml(option.label || option.id || "自动探测 / 不指定")}</option>`).join("")}
-            </select>
-            <input name="embedding_provider_id" type="text" value="${escapeHtml(currentEmbeddingProvider)}" placeholder="留空自动选择可用嵌入 Provider" />
-          </div>
-        `,
-        wide: true,
-      })}
+          `,
+        })}
+        ${contextField({
+          label: "启用嵌入召回",
+          hint: "在关键词之外补充语义相近记忆；没有 Embedding Provider 或调用失败时会自动回退。",
+          control: contextSwitch("embedding_enabled", Boolean(retrieval.embedding_enabled)),
+        })}
+      </section>
+      <section class="context-form-section retrieval-provider-section">
+        <div class="context-form-section-head">
+          <b>模型选择</b>
+          <span>下拉用于快速选择，右侧输入框支持手动填写 Provider ID。</span>
+        </div>
+        ${contextField({
+          label: "Rerank Provider",
+          hint: "只列出具备 rerank() 能力的提供商。留空时自动扫描可用重排 Provider。",
+          control: `
+            <div class="provider-inline retrieval-provider-picker">
+              <select name="rerank_provider_select">
+                <option value="">自动探测 / 不指定</option>
+                ${options.map((option) => `<option value="${escapeHtml(option.id || "")}"${(option.id || "") === currentProvider ? " selected" : ""}>${escapeHtml(option.label || option.id || "自动探测 / 不指定")}</option>`).join("")}
+              </select>
+              <input name="rerank_provider_id" type="text" value="${escapeHtml(currentProvider)}" placeholder="留空自动选择可用重排 Provider" />
+            </div>
+          `,
+          wide: true,
+        })}
+        ${contextField({
+          label: "Embedding Provider",
+          hint: "只列出尽量检测到的嵌入提供商。留空时自动扫描第一个可用 Provider。",
+          control: `
+            <div class="provider-inline retrieval-provider-picker">
+              <select name="embedding_provider_select">
+                <option value="">自动探测 / 不指定</option>
+                ${embeddingProviderOptions.map((option) => `<option value="${escapeHtml(option.id || "")}"${(option.id || "") === currentEmbeddingProvider ? " selected" : ""}>${escapeHtml(option.label || option.id || "自动探测 / 不指定")}</option>`).join("")}
+              </select>
+              <input name="embedding_provider_id" type="text" value="${escapeHtml(currentEmbeddingProvider)}" placeholder="留空自动选择可用嵌入 Provider" />
+            </div>
+          `,
+          wide: true,
+        })}
+      </section>
       <details class="context-advanced retrieval-advanced">
         <summary>高级重排参数</summary>
         <div class="context-advanced-note">候选倍率和上限只影响送给 rerank 的候选池大小，不改变最终读取 TopK；TopK 仍沿用记忆注入配置中的条数。</div>
@@ -2533,7 +3074,7 @@ function renderRetrievalConfigForm(retrieval = {}, rerankOptions = [], embedding
         })}
       </details>
       <div class="context-form-actions">
-        <span>保存后下一次检索或工具读取生效；调试日志会显示 retrieval_path。</span>
+        <span>保存后下一次检索或工具读取生效；注入日志会显示实际路径。</span>
         <button id="saveRetrievalConfigBtn" type="submit">保存检索配置</button>
       </div>
     </form>
@@ -2550,10 +3091,98 @@ function bindRetrievalConfigForm(root) {
     form.querySelector("[name='embedding_provider_select']"),
     form.querySelector("[name='embedding_provider_id']"),
   );
+  form.querySelectorAll("input, select").forEach((field) => {
+    field.addEventListener("input", () => updateRetrievalDraftStatus(form));
+    field.addEventListener("change", () => updateRetrievalDraftStatus(form));
+  });
+  form.querySelectorAll("[data-retrieval-preset]").forEach((button) => {
+    button.addEventListener("click", () => applyRetrievalPreset(form, button.dataset.retrievalPreset));
+  });
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     withButton(form.querySelector("#saveRetrievalConfigBtn"), "保存中", () => saveRetrievalConfig(form));
   });
+  updateRetrievalDraftStatus(form);
+}
+
+function setFormValue(form, name, value) {
+  const field = form.querySelector(`[name='${name}']`);
+  if (!field) return;
+  if (field.type === "checkbox") {
+    field.checked = Boolean(value);
+  } else {
+    field.value = String(value);
+  }
+  field.dispatchEvent(new Event("input", { bubbles: true }));
+  field.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function applyRetrievalPreset(form, preset) {
+  const presets = {
+    safe: {
+      mode: "basic",
+      embedding_enabled: false,
+      rerank_candidate_multiplier: 3,
+      rerank_candidate_limit: 24,
+      rerank_timeout_ms: 1000,
+      embedding_candidate_limit: 800,
+      embedding_top_k: 24,
+      embedding_score_threshold: 0.38,
+      embedding_weight: 0.45,
+      embedding_timeout_ms: 1200,
+      embedding_backfill_enabled: false,
+      embedding_backfill_batch_size: 24,
+    },
+    balanced: {
+      mode: "auto",
+      embedding_enabled: true,
+      rerank_candidate_multiplier: 4,
+      rerank_candidate_limit: 32,
+      rerank_timeout_ms: 1400,
+      embedding_candidate_limit: 1200,
+      embedding_top_k: 32,
+      embedding_score_threshold: 0.34,
+      embedding_weight: 0.55,
+      embedding_timeout_ms: 1500,
+      embedding_backfill_enabled: true,
+      embedding_backfill_batch_size: 50,
+    },
+    deep: {
+      mode: "auto",
+      embedding_enabled: true,
+      rerank_candidate_multiplier: 5,
+      rerank_candidate_limit: 48,
+      rerank_timeout_ms: 2000,
+      embedding_candidate_limit: 2200,
+      embedding_top_k: 48,
+      embedding_score_threshold: 0.30,
+      embedding_weight: 0.70,
+      embedding_timeout_ms: 2200,
+      embedding_backfill_enabled: true,
+      embedding_backfill_batch_size: 80,
+    },
+  };
+  const values = presets[preset];
+  if (!values) return;
+  Object.entries(values).forEach(([name, value]) => setFormValue(form, name, value));
+  form.querySelectorAll("[data-retrieval-preset]").forEach((button) => {
+    button.classList.toggle("is-active", button.dataset.retrievalPreset === preset);
+  });
+  updateRetrievalDraftStatus(form);
+  showToast("已套用预设，保存后生效");
+}
+
+function updateRetrievalDraftStatus(form) {
+  const value = (name, fallback = "") => String(form.querySelector(`[name='${name}']`)?.value ?? fallback);
+  const checked = (name) => Boolean(form.querySelector(`[name='${name}']`)?.checked);
+  const set = (key, text) => {
+    const target = form.querySelector(`[data-retrieval-status='${key}']`);
+    if (target) target.textContent = text;
+  };
+  set("mode", retrievalModeLabel(value("mode", "auto")));
+  set("rerank", value("rerank_provider_id") || "自动探测");
+  set("embedding", checked("embedding_enabled") ? (value("embedding_provider_id") || "自动探测") : "未启用");
+  set("candidates", `${value("rerank_candidate_limit", "32")} / ${value("embedding_top_k", "32")}`);
 }
 
 function bindProviderPicker(select, input) {
@@ -2908,9 +3537,47 @@ function renderMemoryStructuredMetadata(memory) {
   const topics = Array.isArray(metadata.topics) ? metadata.topics.filter(Boolean) : [];
   const participants = Array.isArray(metadata.participants) ? metadata.participants.filter(Boolean) : [];
   const canonical = compact(metadata.canonical_summary, "");
-  if (!keyFacts.length && !topics.length && !participants.length && !canonical) return "";
+  const policy = memory.mention_policy || metadata.mention_policy || "";
+  const mentionability = memory.mentionability_score ?? metadata.mentionability_score;
+  const memoryReason = memory.memory_reason || metadata.memory_reason || "";
+  const phase = memory.relationship_phase || metadata.relationship_phase || "";
+  const decayMode = memory.decay_mode || metadata.decay_mode || "";
+  const activeDimensions = Array.isArray(memory.active_dimensions) && memory.active_dimensions.length
+    ? memory.active_dimensions
+    : (Array.isArray(metadata.active_dimensions) ? metadata.active_dimensions : []);
+  const weights = personaWeights(memory).sort((a, b) => b.value - a.value);
+  const feedback = memory.mention_feedback || metadata.mention_feedback || {};
+  const correction = metadata.user_correction || {};
+  const hasPersona = policy || memoryReason || phase || decayMode || activeDimensions.length || weights.length || feedback.last_reaction || correction.text;
+  if (!keyFacts.length && !topics.length && !participants.length && !canonical && !hasPersona) return "";
   return `
     <section class="memory-structured-panel">
+      ${hasPersona ? `
+        <div class="memory-structured-block">
+          <b>提及策略</b>
+          <div class="memory-diagnostics-grid">
+            ${policy ? `<span><em>策略</em><strong>${escapeHtml(mentionPolicyLabel(policy))}</strong></span>` : ""}
+            ${mentionability !== undefined && mentionability !== null ? `<span><em>可提及性</em><strong>${escapeHtml(percentLabel(mentionability))}</strong></span>` : ""}
+            ${phase ? `<span><em>关系阶段</em><strong>${escapeHtml(phase)}</strong></span>` : ""}
+            ${decayMode ? `<span><em>衰减</em><strong>${escapeHtml(decayModeLabel(decayMode))}</strong></span>` : ""}
+            ${feedback.last_reaction ? `<span><em>上次反馈</em><strong>${escapeHtml(reactionLabel(feedback.last_reaction))}</strong></span>` : ""}
+          </div>
+          ${memoryReason ? `<p class="memory-reason">${escapeHtml(memoryReason)}</p>` : ""}
+          ${activeDimensions.length ? `<div class="memory-structured-tags">${activeDimensions.slice(0, 8).map((item) => `<span class="badge violet">${escapeHtml(dimensionLabel(item))}</span>`).join("")}</div>` : ""}
+          ${weights.length ? `
+            <div class="weight-meter-list">
+              ${weights.slice(0, 8).map((item) => `
+                <span class="weight-meter">
+                  <i style="--w:${Math.round(Math.max(0, Math.min(1, item.value)) * 100)}%"></i>
+                  <b>${escapeHtml(dimensionLabel(item.key))}</b>
+                  <em>${escapeHtml(percentLabel(item.value))}</em>
+                </span>
+              `).join("")}
+            </div>
+          ` : ""}
+          ${correction.text ? `<p class="memory-reason is-warning">用户纠正：${escapeHtml(correction.text)}</p>` : ""}
+        </div>
+      ` : ""}
       ${canonical ? `
         <div class="memory-structured-block">
           <b>检索摘要</b>
@@ -2964,7 +3631,65 @@ async function saveMemoryManagement(id, form) {
   await showMemory(id);
 }
 
+function showInjectionLogDetail(payload) {
+  const selected = Array.isArray(payload.selected_memories) ? payload.selected_memories : [];
+  const blocked = Array.isArray(payload.blocked_reasons) ? payload.blocked_reasons : [];
+  $("#detailDrawer").className = "detail-drawer";
+  $("#detailDrawer").innerHTML = `
+    <div class="memory-manage-head">
+      <div>
+        <h3>注入记录</h3>
+        <p class="item-meta">${escapeHtml(formatTime(payload.created_at))} · ${escapeHtml(payload.scope || "unknown")} · ${escapeHtml(shortId(payload.session_id || "-"))}</p>
+      </div>
+      <div class="badges">
+        <span class="badge blue">选中 ${escapeHtml((payload.selected_memory_ids || []).length)} 条</span>
+        <span class="badge teal">过滤 ${escapeHtml(blocked.length)} 条</span>
+        <span class="badge gold">${escapeHtml(payload.injection_chars || 0)} chars</span>
+      </div>
+    </div>
+    <section class="memory-structured-panel">
+      <div class="memory-structured-block">
+        <b>本轮查询</b>
+        <p>${escapeHtml(payload.query || "未记录查询文本")}</p>
+      </div>
+      ${selected.length ? `
+        <div class="memory-structured-block">
+          <b>进入注入的记忆</b>
+          <div class="log-memory-list">
+            ${selected.map((memory) => `
+              <button type="button" class="log-memory-item" data-memory-id="${escapeHtml(memory.id)}">
+                <span>${escapeHtml(compact(memory.canonical_summary || memory.content, memory.id))}</span>
+                <small>${escapeHtml(memory.memory_type || "memory")} · ${escapeHtml(mentionPolicyLabel(memory.mention_policy || ""))}</small>
+              </button>
+            `).join("")}
+          </div>
+        </div>
+      ` : `<div class="empty-state">这一轮没有实际注入长期记忆。</div>`}
+      ${blocked.length ? `
+        <div class="memory-structured-block">
+          <b>过滤原因</b>
+          <div class="badges">${blockedReasonBadges(blocked)}</div>
+          <ul class="log-blocked-list">
+            ${blocked.slice(0, 12).map((item) => `<li><b>${escapeHtml(blockedReasonLabel(item.reason || item))}</b><span>${escapeHtml(item.reason || JSON.stringify(item))}</span></li>`).join("")}
+          </ul>
+        </div>
+      ` : ""}
+    </section>
+    <details class="memory-raw-detail">
+      <summary>原始日志</summary>
+      <pre>${escapeHtml(JSON.stringify(payload || {}, null, 2))}</pre>
+    </details>
+  `;
+  $$("#detailDrawer [data-memory-id]").forEach((button) => {
+    button.addEventListener("click", () => showMemory(button.dataset.memoryId));
+  });
+}
+
 function showGenericDetail(title, payload) {
+  if (title === "注入记录详情") {
+    showInjectionLogDetail(payload || {});
+    return;
+  }
   $("#detailDrawer").classList.remove("empty");
   $("#detailDrawer").innerHTML = `
     <h3>${escapeHtml(title)}</h3>
@@ -2989,17 +3714,171 @@ function livingMemoryPathValue() {
   return (activeInput || fallbackInput)?.value.trim() || "";
 }
 
-function showArchiveResult(value) {
+function sumLivingMemoryRows(tables = [], importable = true) {
+  return tables
+    .filter((table) => Boolean(table.importable) === importable)
+    .reduce((total, table) => total + Math.max(0, Number(table.count) || 0), 0);
+}
+
+function archiveResultCard(label, value, note = "", tone = "blue") {
+  return `
+    <article class="archive-result-card">
+      <span class="badge ${escapeHtml(tone)}">${escapeHtml(label)}</span>
+      <b>${escapeHtml(value)}</b>
+      ${note ? `<small>${escapeHtml(note)}</small>` : ""}
+    </article>
+  `;
+}
+
+function renderArchiveResultDetails(value) {
+  return `
+    <details class="memory-raw-detail archive-raw-detail">
+      <summary>原始结果</summary>
+      <pre>${escapeHtml(JSON.stringify(value || {}, null, 2))}</pre>
+    </details>
+  `;
+}
+
+function renderLivingMemoryPreview(report = {}) {
+  const candidates = Array.isArray(report.candidates) ? report.candidates : [];
+  if (!candidates.length) {
+    return `
+      <section class="archive-result-panel">
+        <div class="archive-result-head">
+          <b>未找到 LivingMemory 数据库</b>
+          <span>可以填写数据库路径后重新预览。</span>
+        </div>
+        ${renderArchiveResultDetails(report)}
+      </section>
+    `;
+  }
+  const primary = candidates[0] || {};
+  const tables = Array.isArray(primary.tables) ? primary.tables : [];
+  const importableRows = sumLivingMemoryRows(tables, true);
+  const skippedRows = sumLivingMemoryRows(tables, false);
+  const importableTables = tables.filter((table) => table.importable);
+  const skippedTables = tables.filter((table) => !table.importable);
+  return `
+    <section class="archive-result-panel">
+      <div class="archive-result-head">
+        <b>LivingMemory 预览</b>
+        <span>${escapeHtml(primary.path || "未记录来源路径")}</span>
+      </div>
+      <div class="archive-result-grid">
+        ${archiveResultCard("可导入", `${importableRows} 条`, `${importableTables.length} 张表`, "teal")}
+        ${archiveResultCard("将跳过", `${skippedRows} 条`, "派生碎片或空表", "gold")}
+        ${archiveResultCard("候选库", `${candidates.length} 个`, candidates.length > 1 ? "默认导入第一项" : "已锁定来源", "blue")}
+      </div>
+      ${importableTables.length ? `
+        <div class="archive-table-list">
+          <b>将导入的表</b>
+          ${importableTables.slice(0, 6).map((table) => `
+            <span><strong>${escapeHtml(table.name || "-")}</strong><em>${escapeHtml(table.count || 0)} 行</em></span>
+          `).join("")}
+        </div>
+      ` : `<div class="empty-state">没有可导入的完整摘要表。</div>`}
+      ${skippedTables.length ? `
+        <div class="archive-table-list is-muted">
+          <b>跳过的碎片</b>
+          ${skippedTables.slice(0, 6).map((table) => `
+            <span><strong>${escapeHtml(table.name || "-")}</strong><em>${escapeHtml(table.note || "not_importable")}</em></span>
+          `).join("")}
+        </div>
+      ` : ""}
+      ${renderArchiveResultDetails(report)}
+    </section>
+  `;
+}
+
+function renderLivingMemoryImportResult(result = {}) {
+  if (result.reason && !result.source_path) {
+    return `
+      <section class="archive-result-panel">
+        <div class="archive-result-head">
+          <b>导入未执行</b>
+          <span>${escapeHtml(result.reason)}</span>
+        </div>
+        ${renderArchiveResultDetails(result)}
+      </section>
+    `;
+  }
+  return `
+    <section class="archive-result-panel">
+      <div class="archive-result-head">
+        <b>LivingMemory 导入完成</b>
+        <span>${escapeHtml(result.source_path || "未记录来源路径")}</span>
+      </div>
+      <div class="archive-result-grid">
+        ${archiveResultCard("已导入", `${result.imported || 0} 条`, result.batch_id ? `批次 ${shortId(result.batch_id)}` : "", "teal")}
+        ${archiveResultCard("异常跳过", `${result.skipped || 0} 条`, "空内容或无法识别", Number(result.skipped || 0) ? "gold" : "blue")}
+        ${archiveResultCard("审核状态", `${result.default_review_status || "auto"}`, "导入策略", "violet")}
+      </div>
+      ${Array.isArray(result.importable_tables) && result.importable_tables.length ? `
+        <div class="archive-table-list">
+          <b>导入明细</b>
+          ${result.importable_tables.slice(0, 8).map((table) => `
+            <span><strong>${escapeHtml(table.name || "-")}</strong><em>${escapeHtml(table.imported || 0)} / ${escapeHtml(table.count || 0)}</em></span>
+          `).join("")}
+        </div>
+      ` : ""}
+      ${renderArchiveResultDetails(result)}
+    </section>
+  `;
+}
+
+function renderLivingMemoryRepairResult(result = {}) {
+  return `
+    <section class="archive-result-panel">
+      <div class="archive-result-head">
+        <b>内容修复结果</b>
+        <span>${escapeHtml(result.source_path || result.reason || "未记录来源路径")}</span>
+      </div>
+      <div class="archive-result-grid">
+        ${archiveResultCard("已修复", `${result.updated || 0} 条`, "旧编号内容已替换", "teal")}
+        ${archiveResultCard("跳过", `${result.skipped || 0} 条`, result.error || "没有匹配内容", Number(result.skipped || 0) ? "gold" : "blue")}
+      </div>
+      ${renderArchiveResultDetails(result)}
+    </section>
+  `;
+}
+
+function renderGenericArchiveResult(value = {}, title = "执行结果") {
+  const entries = Object.entries(value || {}).filter(([, item]) => typeof item !== "object");
+  return `
+    <section class="archive-result-panel">
+      <div class="archive-result-head">
+        <b>${escapeHtml(title)}</b>
+        <span>操作已返回结果。</span>
+      </div>
+      ${entries.length ? `
+        <div class="archive-result-grid">
+          ${entries.slice(0, 6).map(([key, item]) => archiveResultCard(key, String(item), "", "blue")).join("")}
+        </div>
+      ` : ""}
+      ${renderArchiveResultDetails(value)}
+    </section>
+  `;
+}
+
+function showArchiveResult(value, kind = "generic") {
   const box = $("#importResult");
   if (!box) return;
   box.hidden = false;
-  box.innerHTML = `<pre>${escapeHtml(JSON.stringify(value, null, 2))}</pre>`;
+  if (kind === "preview") {
+    box.innerHTML = renderLivingMemoryPreview(value);
+  } else if (kind === "import") {
+    box.innerHTML = renderLivingMemoryImportResult(value);
+  } else if (kind === "repair") {
+    box.innerHTML = renderLivingMemoryRepairResult(value);
+  } else {
+    box.innerHTML = renderGenericArchiveResult(value, kind === "maintenance" ? "维护结果" : "执行结果");
+  }
 }
 
 async function runMaintenance() {
   const data = await apiPost("/maintenance");
   await refreshAll();
-  showArchiveResult(data.result);
+  showArchiveResult(data.result, "maintenance");
   showToast("维护已完成");
 }
 
@@ -3007,7 +3886,7 @@ async function repairLivingMemoryContent() {
   const path = livingMemoryPathValue();
   const data = await apiPost("/maintenance/repair_livingmemory_content", { path });
   await refreshAll();
-  showArchiveResult(data.result);
+  showArchiveResult(data.result, "repair");
   showToast(`已修复 ${data.result?.updated || 0} 条 LivingMemory 内容`);
 }
 
@@ -3067,7 +3946,7 @@ async function previewImport() {
   const params = new URLSearchParams();
   if (path) params.set("path", path);
   const data = await apiGet(`/import/livingmemory/preview?${params.toString()}`);
-  showArchiveResult(data.report);
+  showArchiveResult(data.report, "preview");
   showToast("预览已生成");
 }
 
@@ -3076,7 +3955,7 @@ async function runImport() {
   if (!confirm("确认开始导入？导入内容默认会按保守策略处理。")) return;
   const data = await apiPost("/import/livingmemory/run", { path });
   await refreshAll();
-  showArchiveResult(data.result);
+  showArchiveResult(data.result, "import");
   showToast("导入已完成");
 }
 

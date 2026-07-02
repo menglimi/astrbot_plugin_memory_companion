@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>记忆放映馆</title>
-  <link rel="stylesheet" href="./app.css?v=20260702-mc-pages160" />
+  <link rel="stylesheet" href="./app.css?v=20260702-mc-archivecheck01" />
 </head>
 <body>
   <main id="app" class="film-app">
@@ -151,6 +151,7 @@
               <section class="archive-section" data-archive-section="repair">
                 <h4>LivingMemory 内容修复</h4>
                 <div class="maintenance-box">
+                  <p class="archive-note">用于修复早期导入后只剩旧库编号的记忆。建议先确认 LivingMemory 数据库路径，再执行修复。</p>
                   <input class="livingmemory-path" type="text" placeholder="LivingMemory 数据库路径，可留空自动扫描" />
                   <button id="repairLivingMemoryBtn" type="button">修复 LivingMemory 内容</button>
                 </div>
@@ -158,6 +159,7 @@
               <section class="archive-section" data-archive-section="migration">
                 <h4>LivingMemory 迁移导入</h4>
                 <div class="maintenance-box">
+                  <p class="archive-note">先预览可导入数量和跳过原因，再执行导入。当前策略只导入完整摘要，跳过派生碎片。</p>
                   <input class="livingmemory-path" type="text" placeholder="LivingMemory 数据库路径，可留空自动扫描" />
                   <div class="inline-actions">
                     <button id="previewImportBtn" type="button">预览导入</button>
@@ -190,6 +192,6 @@
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </main>
   <script src="/api/plugin/page/bridge-sdk.js"></script>
-  <script src="./app.js?v=20260702-mc-pages160"></script>
+  <script src="./app.js?v=20260702-mc-archivecheck01"></script>
 </body>
 </html>

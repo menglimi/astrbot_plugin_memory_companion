@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import inspect
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from quart import jsonify, request
+from quart import jsonify, request, send_file
 
 from .core.bridge import serialize_memory
 from .core.identity import normalize_session_context_fields
@@ -67,6 +69,7 @@ class PluginPageApi:
             ("/context/config", self.context_config, ["GET"], "MemoryCompanion Page context config"),
             ("/retrieval/config/update", self.retrieval_config_update, ["POST"], "MemoryCompanion Page retrieval config update"),
             ("/companion/personal-memory", self.companion_personal_memory, ["GET"], "MemoryCompanion Page companion personal memory"),
+            ("/companion/personal-photo", self.companion_personal_photo, ["GET"], "MemoryCompanion Page companion personal photo"),
             ("/maintenance", self.maintenance, ["POST"], "MemoryCompanion Page maintenance"),
             ("/maintenance/sleep", self.sleep_maintenance, ["GET", "POST"], "MemoryCompanion Page sleep maintenance"),
             ("/maintenance/repair_livingmemory_content", self.repair_livingmemory_content, ["POST"], "MemoryCompanion Page repair LivingMemory content"),
@@ -317,6 +320,13 @@ class PluginPageApi:
             scope=clean_text(request.args.get("scope", ""), 40),
             session_id=clean_text(request.args.get("session_id", ""), 200),
         )
+        for row in rows:
+            selected = []
+            for memory_id in (row.get("selected_memory_ids") or [])[:12]:
+                record = await self.plugin.service.store.get_memory(clean_text(memory_id, 120))
+                if record:
+                    selected.append(serialize_memory(record))
+            row["selected_memories"] = selected
         return self._ok({"items": rows})
 
     async def context_config(self):
@@ -593,7 +603,7 @@ class PluginPageApi:
         query = clean_text(request.args.get("q", ""), 200)
         payload = dict(status)
         records = await self.plugin.service.store.list_memories(
-            limit=max(limit * 6, 240),
+            limit=max(limit * 12, 1200),
             include_pending=False,
             query=query,
             visibility="bot_self",
@@ -603,6 +613,14 @@ class PluginPageApi:
             selected_date = dates[0] if dates else ""
         if selected_date and selected_date not in dates:
             dates.insert(0, selected_date)
+        if selected_date:
+            date_records = await self.plugin.service.store.list_memories(
+                limit=240,
+                include_pending=False,
+                query=selected_date,
+                visibility="bot_self",
+            )
+            records = self._merge_records_by_id(records, date_records)
 
         payload["selected_date"] = selected_date
         payload["dates"] = dates
@@ -611,6 +629,24 @@ class PluginPageApi:
         filtered = [record for record in records if self._memory_date_key(record) == selected_date] if selected_date else records
         payload["actions"] = [serialize_memory(record) for record in filtered if self._is_personal_action(record)][:limit]
         return self._ok(payload)
+
+    async def companion_personal_photo(self):
+        status = self._private_companion_status()
+        if not status["available"]:
+            return self._err(status.get("reason") or "private companion unavailable", 404)
+        plugin = status.get("plugin")
+        data = getattr(plugin, "data", {}) if plugin is not None else {}
+        if not isinstance(data, dict):
+            data = {}
+        selected_date = clean_text(request.args.get("date", ""), 16)
+        photo_id = clean_text(request.args.get("id", ""), 120)
+        for item in self._private_companion_album(data, selected_date):
+            if photo_id and clean_text(item.get("id"), 120) != photo_id:
+                continue
+            path = Path(clean_text(item.get("path"), 500))
+            if path.is_file():
+                return await send_file(path)
+        return self._err("photo_not_found", 404)
 
     def _private_companion_status(self) -> dict[str, Any]:
         for module_name in (
@@ -643,6 +679,19 @@ class PluginPageApi:
             "reason": "未检测到已加载的主动陪伴插件",
         }
 
+    @staticmethod
+    def _merge_records_by_id(primary: list[Any], extra: list[Any]) -> list[Any]:
+        rows: list[Any] = []
+        seen: set[str] = set()
+        for record in [*(primary or []), *(extra or [])]:
+            record_id = clean_text(getattr(record, "id", ""), 160)
+            key = record_id or f"{getattr(record, 'memory_type', '')}:{getattr(record, 'content', '')}"
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(record)
+        return rows
+
     def _private_companion_snapshot(
         self,
         plugin: Any,
@@ -657,15 +706,13 @@ class PluginPageApi:
         plan = self._private_companion_plan_for_date(data, selected_date)
         if not isinstance(plan, dict):
             plan = {}
+        memory_plan = self._schedule_memory_plan_for_date(records or [], selected_date)
+        if memory_plan and len(memory_plan.get("items", []) or []) > len(plan.get("items", []) or []):
+            plan = memory_plan
         state = data.get("daily_state", {})
         if not isinstance(state, dict):
             state = {}
-        enhanced = data.get("detail_enhanced_segments", {})
-        if not isinstance(enhanced, dict):
-            enhanced = {}
-        detail_day = clean_text(data.get("detail_enhanced_day"), 16)
-        if selected_date and detail_day and selected_date != detail_day:
-            enhanced = {}
+        enhanced = self._private_companion_detail_segments_for_date(data, selected_date)
         current_item = None
         getter = getattr(plugin, "_get_current_plan_item", None)
         if callable(getter) and (not selected_date or selected_date == clean_text(plan.get("date"), 16)):
@@ -677,6 +724,7 @@ class PluginPageApi:
             current_item = {}
         details = self._merge_companion_details(
             self._compact_details(enhanced),
+            self._story_plan_details_for_date(data, selected_date, plan),
             self._schedule_memory_details(records or [], selected_date, plan),
         )
         return {
@@ -692,7 +740,88 @@ class PluginPageApi:
                 "note": clean_text(state.get("note"), 240),
             },
             "details": details,
+            "album": self._private_companion_album(data, selected_date),
+            "subjective_memories": self._private_companion_subjective_memories(data, selected_date),
         }
+
+    def _private_companion_album(self, data: dict[str, Any], selected_date: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add(raw: Any, source: str) -> None:
+            if not isinstance(raw, dict):
+                return
+            date = clean_text(raw.get("date"), 16)
+            generated_at = raw.get("generated_at") or raw.get("ts")
+            if not date and generated_at:
+                date = self._timestamp_date_key(generated_at)
+            if selected_date and date and date != selected_date:
+                return
+            path = clean_text(raw.get("path"), 500)
+            error = clean_text(raw.get("error"), 240)
+            if not path and not error:
+                return
+            item_id = clean_text(raw.get("trace"), 80)
+            if not item_id:
+                item_id = hashlib.sha1(f"{source}:{date}:{path or error}".encode("utf-8", errors="ignore")).hexdigest()[:16]
+            if item_id in seen:
+                return
+            seen.add(item_id)
+            exists = bool(path and Path(path).is_file())
+            rows.append(
+                {
+                    "id": item_id,
+                    "date": date,
+                    "kind": clean_text(raw.get("kind"), 40) or ("daily_outfit" if source == "daily_outfit_photo" else source),
+                    "title": "每日穿搭图" if source == "daily_outfit_photo" else "近期照片",
+                    "path": path,
+                    "url": f"{PAGE_API_PREFIXES[0]}/companion/personal-photo?date={date}&id={item_id}",
+                    "exists": exists,
+                    "backend": clean_text(raw.get("backend"), 80),
+                    "prompt": clean_text(raw.get("prompt"), 360),
+                    "note": clean_text(raw.get("note"), 220),
+                    "error": error if not exists else "",
+                    "generated_at": self._timestamp_label(generated_at),
+                }
+            )
+
+        add(data.get("daily_outfit_photo"), "daily_outfit_photo")
+        recent = data.get("recent_photo_generations", [])
+        if isinstance(recent, list):
+            for item in recent[:12]:
+                if isinstance(item, dict) and (item.get("session") == "daily_outfit" or item.get("kind") == "selfie"):
+                    add(item, "recent_photo")
+        return rows[:8]
+
+    def _private_companion_subjective_memories(self, data: dict[str, Any], selected_date: str) -> list[dict[str, Any]]:
+        diaries = data.get("bot_diaries", [])
+        if not isinstance(diaries, list):
+            return []
+        rows: list[dict[str, Any]] = []
+        for diary in reversed(diaries):
+            if not isinstance(diary, dict):
+                continue
+            date = clean_text(diary.get("date"), 16)
+            if selected_date and date != selected_date:
+                continue
+            story_plan = diary.get("story_plan") if isinstance(diary.get("story_plan"), dict) else {}
+            rows.append(
+                {
+                    "date": date,
+                    "summary": clean_text(diary.get("summary"), 220),
+                    "body": clean_text(diary.get("body"), 520),
+                    "share_seed": clean_text(diary.get("share_seed"), 180),
+                    "tags": [clean_text(tag, 40) for tag in (diary.get("tags") or []) if clean_text(tag, 40)][:8]
+                    if isinstance(diary.get("tags"), list)
+                    else [],
+                    "today_events": self._compact_detail_events(story_plan.get("today_events")) if story_plan else [],
+                    "proactive_events": self._compact_detail_events(story_plan.get("proactive_events")) if story_plan else [],
+                    "long_term_events": self._compact_detail_events(story_plan.get("long_term_events")) if story_plan else [],
+                }
+            )
+            if len(rows) >= 4:
+                break
+        return rows
 
     def _private_companion_plan_for_date(self, data: dict[str, Any], selected_date: str) -> dict[str, Any]:
         plan = data.get("daily_plan", {})
@@ -705,12 +834,39 @@ class PluginPageApi:
                     continue
                 if clean_text(entry.get("date"), 16) != selected_date:
                     continue
+                items = entry.get("items")
+                if isinstance(items, list) and items:
+                    return {
+                        "date": selected_date,
+                        "source": entry.get("source") or "history",
+                        "items": [
+                            self._compact_plan_item(item, index=index)
+                            for index, item in enumerate(items)
+                            if isinstance(item, dict)
+                        ][:18],
+                    }
                 return {
                     "date": selected_date,
                     "source": entry.get("source") or "history",
                     "items": self._history_samples_to_plan_items(entry.get("sample")),
                 }
         return plan if isinstance(plan, dict) else {}
+
+    def _private_companion_detail_segments_for_date(self, data: dict[str, Any], selected_date: str) -> dict[str, Any]:
+        current_day = clean_text(data.get("detail_enhanced_day"), 16)
+        current = data.get("detail_enhanced_segments", {})
+        if isinstance(current, dict) and (not selected_date or current_day == selected_date):
+            return current
+        history = data.get("detail_enhanced_history", [])
+        if isinstance(history, list):
+            for entry in reversed(history):
+                if not isinstance(entry, dict):
+                    continue
+                if clean_text(entry.get("date"), 16) != selected_date:
+                    continue
+                segments = entry.get("segments")
+                return segments if isinstance(segments, dict) else {}
+        return {}
 
     def _history_samples_to_plan_items(self, samples: Any) -> list[dict[str, Any]]:
         if not isinstance(samples, list):
@@ -740,8 +896,23 @@ class PluginPageApi:
                     for entry in history:
                         if isinstance(entry, dict) and clean_text(entry.get("date"), 16):
                             dates.add(clean_text(entry.get("date"), 16))
+                detail_history = data.get("detail_enhanced_history", [])
+                if isinstance(detail_history, list):
+                    for entry in detail_history:
+                        if isinstance(entry, dict) and clean_text(entry.get("date"), 16):
+                            dates.add(clean_text(entry.get("date"), 16))
+                story_history = data.get("daily_story_plan_history", [])
+                if isinstance(story_history, list):
+                    for entry in story_history:
+                        if isinstance(entry, dict) and clean_text(entry.get("date"), 16):
+                            dates.add(clean_text(entry.get("date"), 16))
                 if clean_text(data.get("detail_enhanced_day"), 16):
                     dates.add(clean_text(data.get("detail_enhanced_day"), 16))
+                diaries = data.get("bot_diaries", [])
+                if isinstance(diaries, list):
+                    for diary in diaries:
+                        if isinstance(diary, dict) and clean_text(diary.get("date"), 16):
+                            dates.add(clean_text(diary.get("date"), 16))
         for record in records:
             metadata = getattr(record, "metadata", {}) or {}
             if not isinstance(metadata, dict):
@@ -768,6 +939,24 @@ class PluginPageApi:
         except Exception:
             return text[:10] if len(text) >= 10 else ""
 
+    def _timestamp_date_key(self, value: Any) -> str:
+        try:
+            ts = float(value or 0)
+        except Exception:
+            return self._date_key(value)
+        if ts <= 0:
+            return ""
+        return datetime.fromtimestamp(ts, ZoneInfo("Asia/Shanghai")).date().isoformat()
+
+    def _timestamp_label(self, value: Any) -> str:
+        try:
+            ts = float(value or 0)
+        except Exception:
+            return clean_text(value, 40)
+        if ts <= 0:
+            return ""
+        return datetime.fromtimestamp(ts, ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
+
     def _is_personal_action(self, record: Any) -> bool:
         action_types = {
             "self_action",
@@ -777,6 +966,7 @@ class PluginPageApi:
             "image_action",
             "qzone_action",
             "reading_memory",
+            "persona_life",
         }
         return (
             getattr(record, "visibility", "") == "bot_self"
@@ -841,18 +1031,87 @@ class PluginPageApi:
             )
         return rows[-12:]
 
-    def _merge_companion_details(self, primary: list[dict[str, Any]], fallback: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _merge_companion_details(self, *sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for item in [*primary, *fallback]:
+        for source in sources:
+            if not isinstance(source, list):
+                continue
+            for item in source:
+                if not isinstance(item, dict):
+                    continue
+                key = clean_text(item.get("key"), 120) or f"{item.get('index')}:{item.get('time')}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(item)
+        return rows[-18:]
+
+    def _story_plan_details_for_date(
+        self,
+        data: dict[str, Any],
+        selected_date: str,
+        plan: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        story = self._story_plan_for_date(data, selected_date)
+        if not story:
+            return []
+        grouped: dict[str, dict[str, Any]] = {}
+
+        def ensure(window: str) -> dict[str, Any]:
+            key = clean_text(window, 40) or "story"
+            row = grouped.setdefault(
+                key,
+                {
+                    "key": f"story:{selected_date}:{key}",
+                    "index": self._schedule_detail_index_for_time(plan, key.split("-", 1)[0].strip()),
+                    "status": "story_plan",
+                    "time": key,
+                    "summary": "",
+                    "today_events": [],
+                    "proactive_events": [],
+                    "state_variables": [],
+                },
+            )
+            return row
+
+        for item in story.get("today_events") if isinstance(story.get("today_events"), list) else []:
             if not isinstance(item, dict):
                 continue
-            key = clean_text(item.get("key"), 120) or f"{item.get('index')}:{item.get('time')}"
-            if key in seen:
+            window = clean_text(item.get("window") or item.get("time") or item.get("range"), 40)
+            row = ensure(window)
+            text = clean_text(item.get("event") or item.get("content") or item.get("text"), 180)
+            if text and text not in row["today_events"]:
+                row["today_events"].append(text)
+            if not row["summary"]:
+                row["summary"] = text
+
+        for item in story.get("proactive_events") if isinstance(story.get("proactive_events"), list) else []:
+            if not isinstance(item, dict):
                 continue
-            seen.add(key)
-            rows.append(item)
+            window = clean_text(item.get("window") or item.get("time") or item.get("range"), 40)
+            row = ensure(window)
+            text = clean_text(
+                item.get("topic") or item.get("why") or item.get("motive") or item.get("reason") or item.get("action"),
+                180,
+            )
+            if text and text not in row["proactive_events"]:
+                row["proactive_events"].append(text)
+
+        rows = [row for row in grouped.values() if row["summary"] or row["today_events"] or row["proactive_events"]]
+        rows.sort(key=lambda item: clean_text(item.get("time"), 40))
         return rows[-18:]
+
+    def _story_plan_for_date(self, data: dict[str, Any], selected_date: str) -> dict[str, Any]:
+        current = data.get("daily_story_plan", {})
+        if isinstance(current, dict) and (not selected_date or clean_text(current.get("date"), 16) == selected_date):
+            return current
+        history = data.get("daily_story_plan_history", [])
+        if isinstance(history, list):
+            for entry in reversed(history):
+                if isinstance(entry, dict) and clean_text(entry.get("date"), 16) == selected_date:
+                    return entry
+        return {}
 
     def _schedule_memory_details(
         self,
@@ -897,6 +1156,61 @@ class PluginPageApi:
             )
         rows.sort(key=lambda item: clean_text(item.get("time"), 40))
         return rows[-18:]
+
+    def _schedule_memory_plan_for_date(self, records: list[Any], selected_date: str) -> dict[str, Any]:
+        if not selected_date:
+            return {}
+        best_items: list[dict[str, Any]] = []
+        for record in records:
+            if not self._is_personal_schedule_memory(record):
+                continue
+            metadata = getattr(record, "metadata", {}) or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            date = clean_text(metadata.get("date"), 16) or self._memory_date_key(record)
+            if date != selected_date:
+                continue
+            content = str(getattr(record, "content", "") or "")
+            if "当日生活日程" not in content and clean_text(getattr(record, "memory_type", ""), 80) != "schedule_fragment":
+                continue
+            items = self._schedule_plan_items_from_content(content)
+            if len(items) > len(best_items):
+                best_items = items
+        if not best_items:
+            return {}
+        return {"date": selected_date, "source": "memory_companion", "items": best_items[:18]}
+
+    def _schedule_plan_items_from_content(self, content: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for line in str(content or "").splitlines():
+            text = clean_text(line.strip("- "), 260)
+            if not text:
+                continue
+            if "日程细化" in text or text.startswith("生活片段：") or text.startswith("可能主动念头："):
+                continue
+            match = re.match(r"^(\d{1,2}:\d{2})(?:\s*[-~—至]\s*(\d{1,2}:\d{2}))?\s*(.+)$", text)
+            if not match:
+                continue
+            activity = clean_text(match.group(3), 220)
+            mood = ""
+            seed = ""
+            mood_match = re.search(r"情绪[:：]([^可]+)", activity)
+            if mood_match:
+                mood = clean_text(mood_match.group(1), 80)
+                activity = clean_text(activity[: mood_match.start()], 180)
+            seed_match = re.search(r"可分享[:：](.+)$", text)
+            if seed_match:
+                seed = clean_text(seed_match.group(1), 220)
+            rows.append(
+                {
+                    "index": len(rows),
+                    "time": clean_text(match.group(1), 20),
+                    "activity": activity,
+                    "mood": mood,
+                    "message_seed": seed,
+                }
+            )
+        return rows
 
     def _schedule_detail_index_for_time(self, plan: dict[str, Any], start: str) -> Any:
         if not start or not isinstance(plan, dict):

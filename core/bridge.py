@@ -39,6 +39,7 @@ class MemoryCompanionBridge:
         metadata: dict[str, Any] | None = None,
         source_plugin: str = "external",
         memory_id: str = "",
+        occurred_at: str = "",
     ) -> str:
         return await self._plugin.record_external_event(
             content=content,
@@ -61,6 +62,7 @@ class MemoryCompanionBridge:
             metadata=metadata or {},
             source_plugin=source_plugin,
             memory_id=memory_id,
+            occurred_at=occurred_at,
         )
 
     async def record_bot_action(self, *, content: str, **kwargs: Any) -> str:
@@ -237,6 +239,24 @@ def serialize_memory(record: MemoryRecord, score: float | None = None, reason: s
     key_facts = metadata.get("key_facts") if isinstance(metadata.get("key_facts"), list) else []
     topics = metadata.get("topics") if isinstance(metadata.get("topics"), list) else []
     participants = metadata.get("participants") if isinstance(metadata.get("participants"), list) else []
+    persona_weight_keys = [
+        "persona_importance",
+        "relationship_weight",
+        "emotional_weight",
+        "promise_weight",
+        "open_loop_weight",
+        "creative_weight",
+        "preference_weight",
+        "self_continuity_weight",
+        "freshness_weight",
+        "scar_weight",
+        "emotional_debt_weight",
+    ]
+    persona_weights = {
+        key: metadata.get(key)
+        for key in persona_weight_keys
+        if metadata.get(key) is not None
+    }
     data = {
         "id": record.id,
         "memory_type": record.memory_type,
@@ -253,6 +273,18 @@ def serialize_memory(record: MemoryRecord, score: float | None = None, reason: s
         "key_facts": [clean_text(item, 180) for item in key_facts if clean_text(item, 180)][:4],
         "topics": [clean_text(item, 80) for item in topics if clean_text(item, 80)][:5],
         "participants": [clean_text(item, 80) for item in participants if clean_text(item, 80)][:5],
+        "memory_reason": clean_text(metadata.get("memory_reason"), 260),
+        "mention_policy": clean_text(metadata.get("mention_policy"), 60),
+        "mentionability_score": metadata.get("mentionability_score"),
+        "relationship_phase": clean_text(metadata.get("relationship_phase"), 80),
+        "decay_mode": clean_text(metadata.get("decay_mode"), 80),
+        "active_dimensions": [
+            clean_text(item, 80)
+            for item in metadata.get("active_dimensions", [])
+            if clean_text(item, 80)
+        ][:6] if isinstance(metadata.get("active_dimensions"), list) else [],
+        "persona_weights": persona_weights,
+        "mention_feedback": metadata.get("mention_feedback") if isinstance(metadata.get("mention_feedback"), dict) else {},
         "confidence": record.confidence,
         "importance": record.importance,
         "review_status": record.review_status,

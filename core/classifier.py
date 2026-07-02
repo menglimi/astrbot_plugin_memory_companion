@@ -132,6 +132,7 @@ class MemoryClassifier:
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         source_plugin: str = "external",
+        occurred_at: str = "",
     ) -> MemoryRecord:
         return MemoryRecord(
             memory_type=memory_type,
@@ -153,6 +154,7 @@ class MemoryClassifier:
             review_status=review_status,
             tags=tags or ["external"],
             metadata=metadata or {},
+            occurred_at=clean_text(occurred_at, 80),
             source_plugin=source_plugin,
         )
 

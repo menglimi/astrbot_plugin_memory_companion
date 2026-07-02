@@ -4,7 +4,7 @@
 
 - 插件名：`astrbot_plugin_memory_companion`
 - 中文名：`我会牢牢记住你`
-- 版本：`1.0.0`
+- 版本：`1.1.0`
 - 适配平台：`aiocqhttp`
 - AstrBot 版本：`>=4.22.0`
 - 编码要求：UTF-8
@@ -127,6 +127,27 @@ astrbot_plugin_memory_companion
 ### 阶段性总结
 
 `memory_summary` 控制时间线压缩为长期记忆的节奏。总结输入会作为不可信消息处理，提示词注入、角色覆盖和系统指令伪装会被标记与清洗，降低总结被带偏的概率。
+
+### 重要性评估
+
+新记忆写入时会经过统一的重要性校准。插件会保留来源给出的基础分，再结合长期陪伴价值微调：明确要求记住、用户偏好/画像、关系变化、约定、日程、创作内容、情绪转折、阶段总结的关键事实数量和置信度都会提高分数；普通短句、寒暄、低信息原始事件会被压低。
+
+校准结果写回 `importance`，并在 metadata 中记录 `base_importance`、`importance_evaluator` 和 `importance_source`。同时会记录拟人化维度：`persona_importance`、`relationship_weight`、`emotional_weight`、`promise_weight`、`open_loop_weight`、`emotional_debt_weight`、`creative_weight`、`preference_weight`、`self_continuity_weight`、`freshness_weight`、`scar_weight`、`last_emotional_touch_at`、`relationship_phase`、`decay_mode`、`mention_policy`、`mentionability_score` 和 `memory_reason`。
+
+召回会轻微优先这些关系、承诺、未完成、情感债务、情绪伤痕和创作节点，但不会让硬规则压过语义相关性。“继续”“还有呢”“后来呢”这类低语义追问会优先查看 `open_loop` 槽，再走普通语义召回。普通事实会随时间逐渐降权；承诺、冲突/修复/安慰、重要创作节点会进入 `no_decay`、`scar_slow_decay` 或 `creative_milestone` 等慢衰减策略。
+
+注入结构会按拟人化用途分区：`open_loops` 放未完成事项和承诺，`relationship_memory` 放关系线索，`emotional_context` 放情绪脉络，`creative_threads` 放创作连续性，`self_continuity` 放 Bot 自我日程与主动行为，`stable_facts` 放偏好、画像和稳定事实。每条记忆仍保留“可明说/只调语气/不确定”的用法标记。
+
+与主动陪伴插件配合时，陪伴插件负责当前状态、即时日程、情绪底色和主动行为提示；MemoryCompanion 只补充长期解释层：为什么这个状态重要、它和用户有什么关系、过去是否有类似情境、还有什么未完成话题可以自然接上。检测到陪伴插件已注入当前状态后，MemoryCompanion 会过滤近期“当前状态复读”型记忆，只保留有关系、承诺、创作或伤痕意义的长期线索。
+
+记忆被自然提及后，下一条用户回复会作为轻量反馈写回对应记忆：接受会提高 `mentionability_score` 和置信度；被安慰到会提高情绪权重；尴尬、否认或纠正会降低可提及性，并设置 `mention_policy=avoid_unless_asked` 或记录 `user_correction`。这样 Bot 会逐渐学习哪些旧事可以轻轻提，哪些只能当语气底色。
+
+`mention_policy` 分为四档：
+
+- `direct`：稳定事实或用户明确要求记住的内容，可在需要时自然明说。
+- `soft_echo`：关系、承诺、创作和未完成事项，适合轻轻呼应，不要像查档案一样复述。
+- `tone_only`：情绪脉络、Bot 自我状态和敏感背景，只影响语气与分寸。
+- `avoid_unless_asked`：冲突伤痕、用户尴尬/否认/纠正过的内容，除非用户明确问起，否则不主动提。
 
 ### 连续对话
 
@@ -299,7 +320,7 @@ blocked_count: ...
 
 ## 数据与兼容
 
-主要数据存储在 SQLite 数据库中。1.0 保留旧版字段以兼容历史数据，但默认不再暴露记忆审核工作流。旧的 pending 数据不会参与普通检索和页面列表。
+主要数据存储在 SQLite 数据库中。插件保留旧版字段以兼容历史数据，但默认不再暴露记忆审核工作流。旧的 pending 数据不会参与普通检索和页面列表。
 
 建议不要手工复制 WAL/SHM 边车文件；迁移旧记忆请使用内置 LivingMemory 导入流程。
 

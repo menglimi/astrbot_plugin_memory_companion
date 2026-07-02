@@ -418,11 +418,65 @@ class MemoryStore:
                 ).fetchone()
             if duplicate:
                 merged_metadata = json_loads(duplicate["metadata"], {})
+                incoming_metadata = record.metadata if isinstance(record.metadata, dict) else {}
                 merged_metadata.setdefault("merged_from", [])
                 merged_from = merged_metadata.get("merged_from")
                 if isinstance(merged_from, list) and record.id not in merged_from:
                     merged_from.append(record.id)
                 merged_metadata["last_merge_source"] = record.source_plugin
+                for key, value in incoming_metadata.items():
+                    if key in {
+                        "persona_importance",
+                        "relationship_weight",
+                        "emotional_weight",
+                        "promise_weight",
+                        "open_loop_weight",
+                        "creative_weight",
+                        "preference_weight",
+                        "self_continuity_weight",
+                        "freshness_weight",
+                        "scar_weight",
+                        "emotional_debt_weight",
+                    }:
+                        try:
+                            merged_metadata[key] = max(float(merged_metadata.get(key) or 0.0), float(value or 0.0))
+                        except Exception:
+                            merged_metadata.setdefault(key, value)
+                    elif key in {
+                        "memory_reason",
+                        "relationship_phase",
+                        "decay_mode",
+                        "last_emotional_touch_at",
+                        "importance_evaluator",
+                        "importance_source",
+                    }:
+                        if value:
+                            merged_metadata[key] = value
+                    elif key == "mention_policy":
+                        incoming_policy = clean_text(value, 60)
+                        existing_policy = clean_text(merged_metadata.get(key), 60)
+                        policy_rank = {
+                            "direct": 0,
+                            "soft_echo": 1,
+                            "tone_only": 2,
+                            "avoid_unless_asked": 3,
+                        }
+                        if incoming_policy and policy_rank.get(incoming_policy, 1) > policy_rank.get(existing_policy, -1):
+                            merged_metadata[key] = incoming_policy
+                    elif key == "mentionability_score":
+                        try:
+                            incoming_score = float(value or 0.5)
+                            existing_score = float(merged_metadata.get(key, 0.5) or 0.5)
+                            merged_metadata[key] = round(min(incoming_score, existing_score), 3)
+                        except Exception:
+                            merged_metadata.setdefault(key, value)
+                    elif key == "mention_policy_source":
+                        merged_metadata.setdefault(key, value)
+                    elif key == "persona_dimensions" and isinstance(value, list):
+                        old_dimensions = merged_metadata.get("persona_dimensions")
+                        if not isinstance(old_dimensions, list):
+                            old_dimensions = []
+                        merged_metadata[key] = list(dict.fromkeys([*old_dimensions, *value]))
                 evidence = duplicate["evidence"] or record.evidence
                 if record.evidence and record.evidence not in evidence:
                     evidence = clean_text(f"{evidence}\n---\n{record.evidence}", 4000)
@@ -2265,6 +2319,110 @@ class MemoryStore:
                     utc_now(),
                     memory_id,
                 ),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    async def update_memory_reaction_feedback(
+        self,
+        memory_id: str,
+        *,
+        reaction: str,
+        evidence: str,
+        source_id: str = "",
+        mention_delta: float = 0.0,
+        confidence_delta: float = 0.0,
+        emotional_delta: float = 0.0,
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._update_memory_reaction_feedback_sync,
+            memory_id,
+            reaction,
+            evidence,
+            source_id,
+            mention_delta,
+            confidence_delta,
+            emotional_delta,
+        )
+
+    def _update_memory_reaction_feedback_sync(
+        self,
+        memory_id: str,
+        reaction: str,
+        evidence: str,
+        source_id: str,
+        mention_delta: float,
+        confidence_delta: float,
+        emotional_delta: float,
+    ) -> bool:
+        memory_id = clean_text(memory_id, 120)
+        reaction = clean_text(reaction, 60)
+        evidence = clean_text(evidence, 500)
+        with self._lock:
+            row = self._conn.execute("SELECT metadata, confidence FROM memories WHERE id=?", (memory_id,)).fetchone()
+            if not row:
+                return False
+            metadata = json_loads(row["metadata"], {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            feedback = metadata.get("mention_feedback")
+            if not isinstance(feedback, dict):
+                feedback = {}
+            source_id = clean_text(source_id, 120)
+            applied_sources = feedback.get("applied_sources")
+            if not isinstance(applied_sources, list):
+                applied_sources = []
+            if source_id and source_id in applied_sources:
+                return False
+            if source_id:
+                applied_sources.append(source_id)
+                feedback["applied_sources"] = applied_sources[-12:]
+            count_key = f"{reaction}_count"
+            try:
+                feedback[count_key] = int(feedback.get(count_key) or 0) + 1
+            except Exception:
+                feedback[count_key] = 1
+            now = utc_now()
+            feedback["last_reaction"] = reaction
+            feedback["last_reaction_at"] = now
+            if evidence:
+                feedback["last_evidence"] = evidence
+            metadata["mention_feedback"] = feedback
+            try:
+                mentionability = float(metadata.get("mentionability_score", 0.5) or 0.5)
+            except Exception:
+                mentionability = 0.5
+            mentionability = max(0.0, min(1.0, mentionability + float(mention_delta or 0.0)))
+            metadata["mentionability_score"] = round(mentionability, 3)
+            if reaction in {"awkward", "denied"} and mentionability <= 0.35:
+                metadata["mention_policy"] = "avoid_unless_asked"
+            elif reaction in {"accepted", "comforted"} and mentionability >= 0.62:
+                metadata["mention_policy"] = "soft_echo"
+            if reaction == "corrected" and evidence:
+                metadata["user_correction"] = {
+                    "text": evidence,
+                    "created_at": now,
+                }
+                metadata["mention_policy"] = "avoid_unless_asked"
+            try:
+                confidence = max(0.0, min(1.0, float(row["confidence"] or 0.5) + float(confidence_delta or 0.0)))
+            except Exception:
+                confidence = float(row["confidence"] or 0.5)
+            if emotional_delta:
+                try:
+                    emotional = float(metadata.get("emotional_weight") or 0.0)
+                except Exception:
+                    emotional = 0.0
+                metadata["emotional_weight"] = round(max(0.0, min(1.0, emotional + float(emotional_delta or 0.0))), 3)
+            cur = self._conn.execute(
+                """
+                UPDATE memories
+                SET metadata=?,
+                    confidence=?,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (json_dumps(metadata), confidence, now, memory_id),
             )
             self._conn.commit()
             return cur.rowcount > 0

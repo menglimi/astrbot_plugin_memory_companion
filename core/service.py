@@ -24,6 +24,7 @@ from .classifier import MemoryClassifier
 from .config import ConfigView
 from .context_orchestrator import RetrievalIntent, RetrievalIntentBuilder
 from .identity import IdentityResolver, maybe_await, normalize_session_context_fields
+from .importance import ImportanceEvaluator
 from .injection import (
     MEMORY_COMPANION_INJECTION_FOOTER,
     MEMORY_COMPANION_INJECTION_HEADER,
@@ -72,6 +73,7 @@ class MemoryCompanionService:
             max_input_chars=self.config.int("memory_summary.max_input_chars", 6000),
             max_summary_chars=self.config.int("memory_summary.max_summary_chars", 1200),
         )
+        self.importance = ImportanceEvaluator()
         self._summary_locks: dict[str, asyncio.Lock] = {}
         self._decay_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task[Any]] = set()
@@ -87,6 +89,8 @@ class MemoryCompanionService:
 
         if self._private_companion_internal_generation_event(event):
             return
+
+        await self._apply_user_reaction_feedback(ctx)
 
         try:
             await self.inject_memories(ctx, req, event=event)
@@ -129,6 +133,7 @@ class MemoryCompanionService:
         if self.config.bool("memory_capture.extract_stable_facts", True):
             for derived in self.classifier.derived_user_memories(ctx, source_memory_id=memory_id):
                 derived.id = self.stable_id("derived", derived.memory_type, ctx.session_id, derived.content)
+                self.importance.calibrate(derived, source="stable_fact_extraction")
                 derived_id = await self.store.insert_memory(derived)
                 self._schedule_memory_embedding(derived_id, derived)
                 relation_type = str(derived.metadata.get("relation_type") or "")
@@ -213,6 +218,7 @@ class MemoryCompanionService:
             return
 
         memory_id = ""
+        injection_state = self._memory_companion_injection_payload(event)
         await self.store.add_timeline_event(
             event_type="bot_response",
             session_id=ctx.session_id,
@@ -220,7 +226,10 @@ class MemoryCompanionService:
             subject_id="self",
             object_id=ctx.current_target_id,
             content=text,
-            metadata={"memory_id": memory_id},
+            metadata={
+                "memory_id": memory_id,
+                "memory_companion_injection_state": injection_state,
+            },
         )
         self._schedule_session_summary(ctx, reason="after_bot_response")
 
@@ -388,6 +397,7 @@ class MemoryCompanionService:
                 kwargs.get("session_id", ""),
                 kwargs.get("content", ""),
             )
+        self.importance.calibrate(record, source="external_bridge")
 
         memory_id = await self.store.insert_memory(record)
         self._schedule_memory_embedding(memory_id, record)
@@ -1080,6 +1090,7 @@ class MemoryCompanionService:
                     "summary_provider_source": clean_text(used_summary.get("source"), 40),
                 },
             )
+            self.importance.calibrate(record, source="conversation_summary")
             memory_id = await self.store.insert_memory(record)
             self._schedule_memory_embedding(memory_id, record)
             await self._index_summary_knowledge_graph(ctx, record, payload or {}, memory_id)
@@ -1481,6 +1492,7 @@ class MemoryCompanionService:
             review_status="auto",
             tags=["manual"],
         )
+        self.importance.calibrate(record, source="manual_memory")
         memory_id = await self.store.insert_memory(record)
         self._schedule_memory_embedding(memory_id, record)
         return memory_id
@@ -1518,6 +1530,7 @@ class MemoryCompanionService:
             tags=["llm_tool", note_type, ctx.scope],
             metadata={"tool": "memory_companion_remember", "note_type": note_type},
         )
+        self.importance.calibrate(record, source="tool_memory")
         memory_id = await self.store.insert_memory(record)
         self._schedule_memory_embedding(memory_id, record)
         return {"ok": True, "memory_id": memory_id, "review_status": record.review_status}
@@ -1560,6 +1573,7 @@ class MemoryCompanionService:
             metadata={"title": title, "tool": "memory_companion_note_create"},
             source_plugin="memory_companion_tool",
         )
+        self.importance.calibrate(record, source="companion_note")
         memory_id = await self.store.insert_memory(record)
         self._schedule_memory_embedding(memory_id, record)
         return {"ok": True, "memory_id": memory_id, "title": title}
@@ -1783,6 +1797,21 @@ class MemoryCompanionService:
             "no_decay",
             "keep",
         }
+        metadata = record.metadata if isinstance(record.metadata, dict) else {}
+        decay_mode = clean_text(metadata.get("decay_mode"), 80).lower()
+        phase = clean_text(metadata.get("relationship_phase"), 80).lower()
+        durable_weight = max(
+            self._metadata_weight(metadata, "promise_weight"),
+            self._metadata_weight(metadata, "open_loop_weight"),
+            self._metadata_weight(metadata, "creative_weight"),
+            self._metadata_weight(metadata, "scar_weight"),
+            self._metadata_weight(metadata, "emotional_debt_weight"),
+        )
+        if decay_mode == "no_decay" or durable_weight >= 0.78:
+            return None
+        if decay_mode in {"scar_slow_decay", "creative_milestone"} or phase in {"conflict", "repair", "comfort"}:
+            if record.importance >= 0.45 or record.access_count > 0:
+                return None
         if memory_type in protected_types or tags & protected_tags:
             return None
         if record.visibility == "bot_self" and not self.config.bool("maintenance.memory_decay_include_bot_self", False):
@@ -1818,6 +1847,12 @@ class MemoryCompanionService:
             + (1.0 - max(0.0, min(1.0, record.importance))) * 0.2
             + (1.0 - max(0.0, min(1.0, record.confidence))) * 0.1
         )
+        if decay_mode == "slow_decay":
+            decay_score *= 0.72
+        elif decay_mode == "summary_decay":
+            decay_score *= 0.86
+        if self._metadata_weight(metadata, "freshness_weight") >= 0.45:
+            decay_score *= 0.82
         if decay_score < self._config_percent("maintenance.memory_decay_score_threshold_percent", 75):
             return None
         return {
@@ -1830,6 +1865,13 @@ class MemoryCompanionService:
                 f"importance={record.importance:.2f} access={record.access_count}"
             ),
         }
+
+    @staticmethod
+    def _metadata_weight(metadata: dict[str, Any], key: str) -> float:
+        try:
+            return max(0.0, min(1.0, float(metadata.get(key) or 0.0)))
+        except Exception:
+            return 0.0
 
     def _decay_groups(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -1934,6 +1976,7 @@ class MemoryCompanionService:
             },
             source_plugin="memory_companion",
         )
+        self.importance.calibrate(summary_record, source="memory_decay_summary")
         summary_id = await self.store.insert_memory(summary_record)
         self._schedule_memory_embedding(summary_id, summary_record)
         archived = await self.store.archive_memories(
@@ -2218,6 +2261,10 @@ class MemoryCompanionService:
         companion_state = detect_private_companion_request(req) if req is not None else {}
         companion_deferred = self._companion_deferred_sections(event, req)
         companion_memory_present = self._companion_memory_context_present(companion_state, companion_deferred)
+        slot_map, companion_current_reasons = self._filter_companion_current_state_overlap(slot_map, companion_state, companion_memory_present)
+        if companion_current_reasons:
+            blocked.extend({"id": "", "reason": reason, "content": ""} for reason in companion_current_reasons)
+            results = self._flatten_slot_map(slot_map)
         slot_map, slot_dedupe_reasons = self._dedupe_slots_for_companion(
             slot_map,
             companion_state,
@@ -2450,6 +2497,10 @@ class MemoryCompanionService:
         slot_map, current_state_reasons = self._filter_current_state_memory_slots(ctx, slot_map)
         if current_state_reasons:
             blocked.extend({"id": "", "reason": reason, "content": clean_text(ctx.message_text, 180)} for reason in current_state_reasons)
+            results = self._flatten_slot_map(slot_map)
+        slot_map, companion_current_reasons = self._filter_companion_current_state_overlap(slot_map, companion_state, companion_memory_present)
+        if companion_current_reasons:
+            blocked.extend({"id": "", "reason": reason, "content": ""} for reason in companion_current_reasons)
             results = self._flatten_slot_map(slot_map)
         slot_map, slot_dedupe_reasons = self._dedupe_slots_for_companion(
             slot_map,
@@ -3611,8 +3662,110 @@ class MemoryCompanionService:
                 and not self._memory_companion_state_is_passive_only(companion_state)
             ):
                 drop("user_profile", "companion_context_detected:user_profile_slot_suppressed")
-                drop("conversation_summary", "companion_context_detected:conversation_summary_slot_suppressed")
         return cleaned, reasons
+
+    def _filter_companion_current_state_overlap(
+        self,
+        slot_map: dict[str, list[Any]],
+        companion_state: dict[str, Any],
+        companion_memory_present: bool,
+    ) -> tuple[dict[str, list[Any]], list[str]]:
+        if not companion_memory_present or not bool(companion_state.get("has_state")):
+            return slot_map, []
+        cleaned: dict[str, list[Any]] = {}
+        dropped_by_slot: Counter[str] = Counter()
+        for slot, items in (slot_map or {}).items():
+            kept = []
+            for item in items or []:
+                memory = getattr(item, "memory", None)
+                if memory is not None and self._memory_repeats_companion_current_state(memory):
+                    dropped_by_slot[slot] += 1
+                    continue
+                kept.append(item)
+            cleaned[slot] = kept
+        if not dropped_by_slot:
+            return slot_map, []
+        reasons = [
+            f"companion_current_state_overlap:{slot}:dropped={count}"
+            for slot, count in sorted(dropped_by_slot.items())
+        ]
+        return cleaned, reasons
+
+    def _memory_repeats_companion_current_state(self, memory: MemoryRecord) -> bool:
+        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+        if self._memory_has_long_term_explanatory_value(memory, metadata):
+            return False
+        memory_type = clean_text(memory.memory_type, 80).lower()
+        lifecycle = clean_text(memory.lifecycle, 80).lower()
+        reality = clean_text(memory.reality_level, 80).lower()
+        tags = {clean_text(tag, 80).lower() for tag in (memory.tags or [])}
+        content = re.sub(
+            r"\s+",
+            "",
+            " ".join(
+                clean_text(value, 1000)
+                for value in (
+                    memory.content,
+                    memory.evidence,
+                    " ".join(memory.tags or []),
+                    clean_text(metadata.get("canonical_summary"), 1000),
+                    clean_text(metadata.get("persona_summary"), 1000),
+                )
+                if clean_text(value, 1000)
+            ),
+        ).lower()
+        current_markers = (
+            "当前状态",
+            "情绪底色",
+            "当前情绪",
+            "当前日程",
+            "今日状态",
+            "今天的日程",
+            "这会儿",
+            "正在",
+            "睡着",
+            "休息",
+            "起床",
+            "吃饭",
+            "天气",
+        )
+        current_type = (
+            memory_type in {"schedule_fragment", "persona_life", "proactive_message", "self_action", "timeline_event"}
+            or reality in {"bot_action", "persona_life"}
+            or bool(tags & {"current_state", "self_timeline", "today", "recent"})
+            or lifecycle == "raw_event"
+        )
+        if not current_type:
+            return False
+        age_days = self._memory_age_days(memory)
+        recent = age_days is None or age_days <= 2.0
+        return recent and any(marker in content for marker in current_markers)
+
+    def _memory_has_long_term_explanatory_value(self, memory: MemoryRecord, metadata: dict[str, Any]) -> bool:
+        durable = max(
+            self._metadata_weight(metadata, "relationship_weight"),
+            self._metadata_weight(metadata, "promise_weight"),
+            self._metadata_weight(metadata, "open_loop_weight"),
+            self._metadata_weight(metadata, "creative_weight"),
+            self._metadata_weight(metadata, "scar_weight"),
+            self._metadata_weight(metadata, "emotional_debt_weight"),
+        )
+        phase = clean_text(metadata.get("relationship_phase"), 80).lower()
+        decay_mode = clean_text(metadata.get("decay_mode"), 80).lower()
+        if durable >= 0.45:
+            return True
+        if phase in {"conflict", "repair", "comfort", "closeness", "promise"}:
+            return True
+        if decay_mode in {"no_decay", "scar_slow_decay", "creative_milestone"}:
+            return True
+        return clean_text(memory.memory_type, 80).lower() in {
+            "manual_memory",
+            "explicit_memory",
+            "user_profile",
+            "user_preference",
+            "relationship_claim",
+            "creative_work",
+        }
 
     def _memory_companion_state_is_passive_only(self, state: dict[str, Any]) -> bool:
         return bool(state.get("has_state")) and not any(
@@ -3627,10 +3780,98 @@ class MemoryCompanionService:
             )
         )
 
+    async def _apply_user_reaction_feedback(self, ctx: SessionContext) -> None:
+        if not self.config.bool("memory_capture.enabled", True):
+            return
+        reaction = self._classify_memory_reaction(ctx.message_text)
+        if not reaction:
+            return
+        rows = await self.store.recent_timeline(
+            limit=8,
+            scope=ctx.scope,
+            session_id=ctx.session_id,
+            entity_id=ctx.current_target_id,
+        )
+        target_ids: list[str] = []
+        source_timeline_id = ""
+        for row in rows:
+            if clean_text(row.get("event_type"), 80) != "bot_response":
+                continue
+            metadata = json_loads(row.get("metadata"), {})
+            state = metadata.get("memory_companion_injection_state") if isinstance(metadata, dict) else {}
+            if not isinstance(state, dict):
+                state = {}
+            target_ids = [
+                clean_text(memory_id, 120)
+                for memory_id in (state.get("feedback_target_memory_ids") or [])
+                if clean_text(memory_id, 120)
+            ]
+            if target_ids:
+                source_timeline_id = clean_text(row.get("id"), 120)
+                break
+        if not target_ids:
+            return
+        deltas = self._reaction_feedback_deltas(reaction)
+        updated = 0
+        for memory_id in target_ids[:8]:
+            ok = await self.store.update_memory_reaction_feedback(
+                memory_id,
+                reaction=reaction,
+                evidence=ctx.message_text,
+                source_id=source_timeline_id,
+                mention_delta=deltas["mention"],
+                confidence_delta=deltas["confidence"],
+                emotional_delta=deltas["emotional"],
+            )
+            updated += int(bool(ok))
+        if updated:
+            logger.info(
+                "[MemoryCompanion] 已根据用户反应更新记忆提及反馈: session=%s reaction=%s memories=%s",
+                ctx.session_id,
+                reaction,
+                updated,
+            )
+
+    @staticmethod
+    def _classify_memory_reaction(text: str) -> str:
+        compact = re.sub(r"\s+", "", clean_text(text, 800)).lower()
+        if not compact:
+            return ""
+        correction_markers = ("不是", "不对", "错了", "记错", "不是这样", "应该是", "其实是", "我说的是")
+        denied_markers = ("没有这回事", "我没说过", "别乱记", "你记错了", "不是这个", "不要这么说")
+        awkward_markers = ("别提", "别说了", "尴尬", "不想提", "算了", "别翻", "别回忆", "有点怪")
+        comforted_markers = ("被安慰到", "安心了", "好多了", "谢谢你记得", "你还记得", "有被接住", "舒服多了")
+        accepted_markers = ("对", "是的", "没错", "嗯嗯", "就是这个", "你记得", "你还记得", "确实")
+        if any(marker in compact for marker in correction_markers):
+            return "corrected"
+        if any(marker in compact for marker in denied_markers):
+            return "denied"
+        if any(marker in compact for marker in awkward_markers):
+            return "awkward"
+        if any(marker in compact for marker in comforted_markers):
+            return "comforted"
+        if any(marker in compact for marker in accepted_markers) and len(compact) <= 40:
+            return "accepted"
+        return ""
+
+    @staticmethod
+    def _reaction_feedback_deltas(reaction: str) -> dict[str, float]:
+        if reaction == "accepted":
+            return {"mention": 0.08, "confidence": 0.03, "emotional": 0.02}
+        if reaction == "comforted":
+            return {"mention": 0.11, "confidence": 0.02, "emotional": 0.08}
+        if reaction == "awkward":
+            return {"mention": -0.12, "confidence": 0.0, "emotional": 0.02}
+        if reaction == "denied":
+            return {"mention": -0.18, "confidence": -0.12, "emotional": 0.0}
+        if reaction == "corrected":
+            return {"mention": -0.15, "confidence": -0.08, "emotional": 0.0}
+        return {"mention": 0.0, "confidence": 0.0, "emotional": 0.0}
+
     def _flatten_slot_map(self, slot_map: dict[str, list[Any]]) -> list[Any]:
         items: list[Any] = []
         seen: set[str] = set()
-        for slot in ["time_window_timeline", "self_timeline", "user_profile", "current_window", "conversation_summary", "stable_memory"]:
+        for slot in ["time_window_timeline", "open_loop", "self_timeline", "user_profile", "current_window", "conversation_summary", "stable_memory"]:
             for item in slot_map.get(slot) or []:
                 memory_id = clean_text(getattr(getattr(item, "memory", None), "id", ""), 120)
                 if memory_id and memory_id in seen:
@@ -3698,27 +3939,52 @@ class MemoryCompanionService:
 
         if confidence < 0.5:
             return "uncertain", "low_confidence"
+        text = clean_text(query_text or ctx.message_text, 800)
+        explicit_memory = self._message_is_contextual_memory_request(text) or self._message_requests_temporal_aggregate(text)
+        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+        mention_policy = clean_text(metadata.get("mention_policy"), 60)
+        try:
+            mentionability = float(metadata.get("mentionability_score", 0.5) or 0.5)
+        except Exception:
+            mentionability = 0.5
         if time_intent.active or decision.layer == "time_window":
             return "mention", "time_window_requested"
+        if not explicit_memory and mention_policy == "avoid_unless_asked":
+            return "tone", "mention_policy:avoid_unless_asked"
+        if not explicit_memory and mention_policy == "tone_only":
+            return "tone", "mention_policy:tone_only"
+        if not explicit_memory and mentionability <= 0.25:
+            return "tone", "user_reaction_boundary:low_mentionability"
+        if slot == "open_loop":
+            if confidence < 0.58:
+                return "uncertain", "open_loop_low_confidence"
+            if mention_policy == "avoid_unless_asked" and not explicit_memory:
+                return "tone", "open_loop_avoid_unless_asked"
+            if mention_policy == "tone_only" and not explicit_memory:
+                return "tone", "open_loop_tone_only"
+            return "mention", "open_loop_or_emotional_debt"
         if decision.layer in {"recent_context", "current_correction", "low_information", "short_context_followup"}:
             return "tone", f"route_layer:{decision.layer}"
         if decision.layer == "current_state_chat":
             return "mention", "current_state_recent_context"
-
-        text = clean_text(query_text or ctx.message_text, 800)
-        explicit_memory = self._message_is_contextual_memory_request(text) or self._message_requests_temporal_aggregate(text)
 
         if confidence < 0.58 or (age_days is not None and age_days >= 45 and score < 1.15):
             return "uncertain", "low_confidence_or_old"
         if ctx.scope == "group" and slot in {"self_timeline", "user_profile"} and not explicit_memory:
             return "tone", "group_boundary"
         if memory.visibility == "bot_self" or slot == "self_timeline" or reality in {"bot_action", "persona_life", "fictional_content"}:
+            if self._memory_has_long_term_explanatory_value(memory, metadata) and (explicit_memory or score >= 1.2):
+                return "mention", "self_memory_with_long_term_explanation"
             return ("mention", "explicit_self_memory_requested") if explicit_memory else ("tone", "self_timeline_background")
         if memory_type in {"conversation_summary", "timeline_event"} or "summary" in tags:
             if explicit_memory or slot == "time_window_timeline":
                 return "mention", "summary_requested"
             return "tone", "conversation_continuity_background"
         if memory_type in {"user_profile", "user_preference", "relationship_claim", "explicit_memory", "manual_memory"}:
+            if mention_policy == "tone_only" and not explicit_memory:
+                return "tone", "mention_policy:tone_only"
+            if mention_policy == "soft_echo" and not explicit_memory and score < 1.0:
+                return "tone", "mention_policy:soft_echo_background"
             if explicit_memory or score >= 1.0:
                 return "mention", "stable_user_fact"
             return "tone", "profile_background"
@@ -3758,11 +4024,29 @@ class MemoryCompanionService:
         conversation_memory: bool,
         slot_map: dict[str, list[Any]],
     ) -> None:
+        selected_ids: list[str] = []
+        feedback_ids: list[str] = []
+        seen: set[str] = set()
+        feedback_seen: set[str] = set()
+        for _slot, items in (slot_map or {}).items():
+            for item in items or []:
+                memory = getattr(item, "memory", None)
+                memory_id = clean_text(getattr(memory, "id", ""), 120)
+                if not memory_id:
+                    continue
+                if memory_id not in seen:
+                    selected_ids.append(memory_id)
+                    seen.add(memory_id)
+                if self._expression_from_reason(getattr(item, "reason", "")) == "mention" and memory_id not in feedback_seen:
+                    feedback_ids.append(memory_id)
+                    feedback_seen.add(memory_id)
         payload = {
             "active": True,
             "injected": bool(injected),
             "conversation_memory": bool(conversation_memory),
             "slots": [slot for slot, items in slot_map.items() if items],
+            "selected_memory_ids": selected_ids,
+            "feedback_target_memory_ids": feedback_ids,
         }
         for target in (event, req):
             if target is None:
@@ -3771,6 +4055,13 @@ class MemoryCompanionService:
                 setattr(target, "memory_companion_injection_state", payload)
             except Exception:
                 pass
+
+    @staticmethod
+    def _memory_companion_injection_payload(target: Any) -> dict[str, Any]:
+        payload = getattr(target, "memory_companion_injection_state", None)
+        if isinstance(payload, dict):
+            return payload
+        return {}
 
     def _query_for_time_intent(self, query: str, time_intent: TimeIntent) -> str:
         if time_intent.active and time_intent.summary_like:
@@ -3794,9 +4085,14 @@ class MemoryCompanionService:
     def _slot_limits(self, top_k: int, *, query: str = "", time_intent: TimeIntent | None = None) -> dict[str, int]:
         total = max(1, int(top_k or 1))
         conversation_limit = self.config.int("context_orchestration.conversation_summary_limit", 2)
+        open_loop_limit = 1
+        if self._message_is_vague_recent_followup(query):
+            open_loop_limit = min(total, 3)
         if (time_intent is not None and time_intent.active) or self._message_requests_temporal_aggregate(query):
             conversation_limit = max(conversation_limit, min(total, 8))
+            open_loop_limit = max(open_loop_limit, min(total, 2))
         return {
+            "open_loop": min(total, open_loop_limit),
             "self_timeline": min(total, self.config.int("context_orchestration.self_timeline_limit", 2)),
             "user_profile": min(total, self.config.int("context_orchestration.user_profile_limit", 2)),
             "current_window": min(total, self.config.int("context_orchestration.current_window_limit", 3)),
@@ -3891,6 +4187,7 @@ class MemoryCompanionService:
     def _slot_sections(self, slot_map: dict[str, list[Any]]) -> list[tuple[str, list[Any]]]:
         labels = {
             "time_window_timeline": "time_window_timeline",
+            "open_loop": "open_loop",
             "self_timeline": "bot_self_timeline",
             "user_profile": "current_user_profile",
             "current_window": "current_window_memory",
@@ -3898,7 +4195,7 @@ class MemoryCompanionService:
             "stable_memory": "stable_memory",
         }
         sections: list[tuple[str, list[Any]]] = []
-        for key in ["time_window_timeline", "self_timeline", "user_profile", "current_window", "conversation_summary", "stable_memory"]:
+        for key in ["time_window_timeline", "open_loop", "self_timeline", "user_profile", "current_window", "conversation_summary", "stable_memory"]:
             items = slot_map.get(key) or []
             if items:
                 sections.append((labels[key], items))

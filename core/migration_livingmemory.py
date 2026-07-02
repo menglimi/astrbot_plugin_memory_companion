@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .importance import ImportanceEvaluator
 from .models import EntityRef, MemoryRecord, clean_text, new_id
 from .store import MemoryStore
 
@@ -33,6 +34,7 @@ class LivingMemoryMigrator:
         self.store = store
         self.plugin_root = Path(plugin_root)
         self.data_dir = Path(data_dir)
+        self.importance = ImportanceEvaluator()
 
     def candidate_paths(self, configured_path: str = "") -> list[Path]:
         candidates: list[Path] = []
@@ -287,7 +289,7 @@ class LivingMemoryMigrator:
         metadata.update(self._promoted_metadata(source_metadata))
         metadata = {key: value for key, value in metadata.items() if value not in ("", None, {}, [])}
 
-        return MemoryRecord(
+        record = MemoryRecord(
             id=new_id("imported"),
             memory_type=memory_type,
             subject=EntityRef(kind="unknown", id="", role="imported_subject"),
@@ -311,6 +313,7 @@ class LivingMemoryMigrator:
             source_plugin="livingmemory",
             import_batch_id=batch_id,
         )
+        return self.importance.calibrate(record, source="livingmemory_import")
 
     def _memory_type_for_table(self, table_name: str, row: sqlite3.Row) -> str:
         if table_name == "memory_atoms":
