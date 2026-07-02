@@ -2446,7 +2446,7 @@ function renderRetrievalConfigForm(retrieval = {}, rerankOptions = [], embedding
             <select name="rerank_provider_select">
               ${options.map((option) => `<option value="${escapeHtml(option.id || "")}"${(option.id || "") === currentProvider ? " selected" : ""}>${escapeHtml(option.label || option.id || "自动探测 / 不指定")}</option>`).join("")}
             </select>
-            <input name="rerank_provider_id" type="text" value="${escapeHtml(currentProvider)}" placeholder="例如 vllm_rerank 或 siliconflow_rerank" />
+            <input name="rerank_provider_id" type="text" value="${escapeHtml(currentProvider)}" placeholder="留空自动选择可用重排 Provider" />
           </div>
         `,
         wide: true,
@@ -2464,7 +2464,7 @@ function renderRetrievalConfigForm(retrieval = {}, rerankOptions = [], embedding
             <select name="embedding_provider_select">
               ${embeddingProviderOptions.map((option) => `<option value="${escapeHtml(option.id || "")}"${(option.id || "") === currentEmbeddingProvider ? " selected" : ""}>${escapeHtml(option.label || option.id || "自动探测 / 不指定")}</option>`).join("")}
             </select>
-            <input name="embedding_provider_id" type="text" value="${escapeHtml(currentEmbeddingProvider)}" placeholder="例如 openai_embedding 或 siliconflow_embedding" />
+            <input name="embedding_provider_id" type="text" value="${escapeHtml(currentEmbeddingProvider)}" placeholder="留空自动选择可用嵌入 Provider" />
           </div>
         `,
         wide: true,

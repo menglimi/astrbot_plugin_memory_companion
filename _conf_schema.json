@@ -161,12 +161,6 @@
         "description": "嵌入模型 Provider",
         "hint": "选择 AstrBot 中 provider_type=embedding 的 Provider。留空时自动使用第一个可用嵌入模型。",
         "type": "string",
-        "options": [
-          "",
-          "qhaigc_embedding",
-          "openai_embedding",
-          "gitee_embedding"
-        ],
         "default": ""
       },
       "mode": {
@@ -184,10 +178,6 @@
         "description": "重排模型 Provider",
         "hint": "选择 AstrBot 中具备 rerank() 能力的 Provider。留空时 auto 自动扫描第一个可用重排模型。",
         "type": "string",
-        "options": [
-          "",
-          "vllm_rerank"
-        ],
         "default": ""
       },
       "embedding_candidate_limit": {
