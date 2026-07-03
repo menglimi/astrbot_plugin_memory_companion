@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>记忆放映馆</title>
-  <link rel="stylesheet" href="./app.css?v=20260702-mc-archivecheck01" />
+  <link rel="stylesheet" href="./app.css?v=20260703-mc-secondary-rail-v3" />
 </head>
 <body>
   <main id="app" class="film-app">
@@ -87,7 +87,13 @@
                 <h3 id="groupMemoryTitle">群聊记忆</h3>
                 <p id="groupMemoryHint">查看群聊范围内可被召回和管理的结构化记忆。</p>
               </div>
-              <button id="groupMemoryModeBtn" class="section-mode-toggle" type="button" data-scope-mode-toggle="film">群聊设置</button>
+              <div class="section-actions scoped-clear-actions">
+                <button id="clearCurrentGroupMemoryBtn" class="danger subtle" type="button" disabled>清空当前群</button>
+                <div class="group-member-clear">
+                  <input id="clearGroupMemberUserId" type="text" inputmode="numeric" placeholder="群成员 QQ" disabled />
+                  <button id="clearGroupMemberMemoryBtn" class="danger subtle" type="button" disabled>清空群成员</button>
+                </div>
+              </div>
             </div>
             <div id="groupMemoryList" class="row-list"></div>
           </section>
@@ -126,7 +132,7 @@
                 <h3 id="privateMemoryTitle">私聊记忆</h3>
                 <p id="privateMemoryHint">查看私聊范围内的对话、偏好、事实和稳定记忆。</p>
               </div>
-              <button id="privateMemoryModeBtn" class="section-mode-toggle" type="button" data-scope-mode-toggle="maintain">私聊设置</button>
+              <button id="clearCurrentPrivateMemoryBtn" class="danger subtle" type="button" disabled>清空当前用户</button>
             </div>
             <div id="privateMemoryList" class="row-list"></div>
           </section>
@@ -138,41 +144,45 @@
             </div>
             <div class="archive-grid">
               <section class="archive-section is-active" data-archive-section="retrieval">
-                <h4>检索配置</h4>
+                <h4>模块配置</h4>
                 <div id="selfMemoryList" class="config-panel-stack"></div>
               </section>
               <section class="archive-section" data-archive-section="maintenance">
-                <h4>维护工具</h4>
+                <h4>维护 / 迁移 / 清理</h4>
                 <div class="maintenance-box">
-                  <p class="archive-note">修复索引、刷新统计并整理数据库状态。适合导入、清理或配置调整后手动执行一次。</p>
-                  <button id="maintenanceBtn" type="button">运行维护</button>
-                </div>
-              </section>
-              <section class="archive-section" data-archive-section="repair">
-                <h4>LivingMemory 内容修复</h4>
-                <div class="maintenance-box">
-                  <p class="archive-note">用于修复早期导入后只剩旧库编号的记忆。建议先确认 LivingMemory 数据库路径，再执行修复。</p>
-                  <input class="livingmemory-path" type="text" placeholder="LivingMemory 数据库路径，可留空自动扫描" />
-                  <button id="repairLivingMemoryBtn" type="button">修复 LivingMemory 内容</button>
-                </div>
-              </section>
-              <section class="archive-section" data-archive-section="migration">
-                <h4>LivingMemory 迁移导入</h4>
-                <div class="maintenance-box">
-                  <p class="archive-note">先预览可导入数量和跳过原因，再执行导入。当前策略只导入完整摘要，跳过派生碎片。</p>
-                  <input class="livingmemory-path" type="text" placeholder="LivingMemory 数据库路径，可留空自动扫描" />
-                  <div class="inline-actions">
-                    <button id="previewImportBtn" type="button">预览导入</button>
-                    <button id="runImportBtn" type="button">执行导入</button>
+                  <p class="archive-note">推荐顺序：先预览 LivingMemory 导入，再执行导入；如旧导入出现纯编号内容，再修复内容；最后运行维护刷新索引和统计。清空数据会先备份数据库，请谨慎执行。</p>
+                  <div class="maintenance-tool-grid">
+                    <section class="maintenance-action">
+                      <b>1. LivingMemory 导入</b>
+                      <p class="archive-note">先预览可导入数量和跳过原因，再执行导入。当前策略只导入完整摘要，跳过派生碎片。</p>
+                      <input class="livingmemory-path" type="text" placeholder="LivingMemory 数据库路径，可留空自动扫描" />
+                      <div class="inline-actions">
+                        <button id="previewImportBtn" type="button">预览导入</button>
+                        <button id="runImportBtn" type="button">执行导入</button>
+                      </div>
+                    </section>
+                    <section class="maintenance-action">
+                      <b>2. 内容修复</b>
+                      <p class="archive-note">用于修复早期导入后只剩旧库编号的记忆。建议先确认 LivingMemory 数据库路径，再执行修复。</p>
+                      <input class="livingmemory-path" type="text" placeholder="LivingMemory 数据库路径，可留空自动扫描" />
+                      <button id="repairLivingMemoryBtn" type="button">修复 LivingMemory 内容</button>
+                    </section>
+                    <section class="maintenance-action">
+                      <b>3. 维护检查</b>
+                      <p class="archive-note">修复索引、刷新统计并整理数据库状态。适合导入、清理或配置调整后手动执行一次。</p>
+                      <button id="maintenanceBtn" type="button">运行维护</button>
+                    </section>
+                    <section class="maintenance-action">
+                      <b>4. 危险清理</b>
+                      <p class="archive-note">清空会先备份数据库，再删除记忆、权限规则、时间线、关系、身份、注入日志和导入批次。</p>
+                      <button id="clearAllMemoryBtn" class="danger" type="button">清空全部记忆</button>
+                    </section>
                   </div>
                 </div>
               </section>
-              <section class="archive-section" data-archive-section="clear">
-                <h4>清理数据</h4>
-                <div class="maintenance-box">
-                  <p class="archive-note">清空会先备份数据库，再删除记忆、权限规则、时间线、关系、身份、注入日志和导入批次。</p>
-                  <button id="clearAllMemoryBtn" class="danger" type="button">清空全部记忆</button>
-                </div>
+              <section class="archive-section" data-archive-section="topology">
+                <h4>权限拓扑</h4>
+                <div id="aclTopologyContainer" class="acl-topology-container"></div>
               </section>
             </div>
             <div id="importResult" class="archive-result" hidden></div>
@@ -192,6 +202,6 @@
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </main>
   <script src="/api/plugin/page/bridge-sdk.js"></script>
-  <script src="./app.js?v=20260702-mc-archivecheck01"></script>
+  <script src="./app.js?v=20260703-mc-config-list-top-v2"></script>
 </body>
 </html>

@@ -100,13 +100,13 @@
         "description": "最少事件数",
         "hint": "未总结的时间线事件少于该数量时不会总结。",
         "type": "int",
-        "default": 8
+        "default": 20
       },
       "trigger_event_count": {
         "description": "按条数触发",
-        "hint": "未总结事件达到该数量时触发总结。建议 10-20。",
+        "hint": "未总结事件达到该数量时触发总结。建议 12-20。",
         "type": "int",
-        "default": 12
+        "default": 20
       },
       "trigger_interval_minutes": {
         "description": "按时间触发",
@@ -172,7 +172,7 @@
           "basic",
           "rerank"
         ],
-        "default": "auto"
+        "default": "rerank"
       },
       "rerank_provider_id": {
         "description": "重排模型 Provider",
@@ -180,6 +180,25 @@
         "type": "string",
         "default": ""
       },
+      "rerank_candidate_multiplier": {
+        "description": "重排候选倍率",
+        "hint": "实际注入 TopK 的多少倍进入二阶段重排。建议 3-5；过大会增加重排耗时。",
+        "type": "int",
+        "default": 5
+      },
+      "rerank_candidate_limit": {
+        "description": "重排候选上限",
+        "hint": "每轮最多送入重排模型的候选记忆数量。建议 24-40。",
+        "type": "int",
+        "default": 32
+      }
+    }
+  },
+  "retrieval_advanced": {
+    "description": "检索高级参数",
+    "hint": "向量扫描上限、相似度阈值、超时和补索引等高级调优参数。日常使用可保持默认。",
+    "type": "object",
+    "items": {
       "embedding_candidate_limit": {
         "description": "向量扫描上限",
         "hint": "每轮最多从本地向量索引中扫描多少条候选。记忆库很大时可适当降低；想提高旧记忆召回覆盖面可提高。",
@@ -203,18 +222,6 @@
         "hint": "向量相似度在最终本地评分中的软加分权重。建议 0.45-0.75；重排启用时不宜过高。",
         "type": "float",
         "default": 0.55
-      },
-      "rerank_candidate_multiplier": {
-        "description": "重排候选倍率",
-        "hint": "实际注入 TopK 的多少倍进入二阶段重排。建议 3-5；过大会增加重排耗时。",
-        "type": "int",
-        "default": 4
-      },
-      "rerank_candidate_limit": {
-        "description": "重排候选上限",
-        "hint": "每轮最多送入重排模型的候选记忆数量。建议 24-40。",
-        "type": "int",
-        "default": 32
       },
       "embedding_timeout_ms": {
         "description": "嵌入超时毫秒",
@@ -325,10 +332,17 @@
         "hint": "群聊相邻消息超过该分钟数时，视为新的连续对话片段。当前主要用于标记和后续展示。",
         "type": "int",
         "default": 20
-      },
+      }
+    }
+  },
+  "conversation_memory_advanced": {
+    "description": "连续对话高级参数",
+    "hint": "低信息保护、新话题隔离、追问补全和时间窗口等高级参数。日常使用可保持默认。",
+    "type": "object",
+    "items": {
       "recent_events_for_followup": {
         "description": "追问补全事件数",
-        "hint": "处理“还有的吧”“刚才那个”等连续追问时，最多读取多少条最近群聊事件来补全检索词。",
+        "hint": "处理\u201c还有的吧\u201d\u201c刚才那个\u201d等连续追问时，最多读取多少条最近群聊事件来补全检索词。",
         "type": "int",
         "default": 12
       },
@@ -404,17 +418,24 @@
         "type": "bool",
         "default": true
       },
-      "intent_max_chars": {
-        "description": "意图摘要字数",
-        "hint": "限制检索意图摘要长度，避免陪伴插件线索过长。",
-        "type": "int",
-        "default": 520
-      },
       "current_state_relevance_guard_enabled": {
         "description": "当前状态问题相关性保护",
         "hint": "开启后，今天穿什么、现在在干嘛、吃什么、心情怎样这类当前状态问题，只允许直接命中对应锚点的长期记忆进入注入包，避免旧阶段总结抢答。",
         "type": "bool",
         "default": true
+      }
+    }
+  },
+  "context_orchestration_advanced": {
+    "description": "编排高级参数",
+    "hint": "各分槽条数上限和意图摘要字数等高级调优参数。日常使用可保持默认。",
+    "type": "object",
+    "items": {
+      "intent_max_chars": {
+        "description": "意图摘要字数",
+        "hint": "限制检索意图摘要长度，避免陪伴插件线索过长。",
+        "type": "int",
+        "default": 520
       },
       "self_timeline_limit": {
         "description": "Bot 自我时间线槽",
@@ -516,7 +537,7 @@
       },
       "allow_group_public_in_private": {
         "description": "私聊可见群公共记忆",
-        "hint": "默认关闭，避免把群友互动误当成与私聊用户的互动。需要跨窗口回话时建议通过桥接 API 显式创建线程。",
+        "hint": "开启后私聊中可看到群公共记忆，便于跨窗口回话。如需严格隔离私聊与群聊可关闭。",
         "type": "bool",
         "default": false
       },
@@ -637,7 +658,14 @@
         "hint": "开启后，睡眠维护会筛选长期未访问、重要度较低的稳定记忆，先压缩成高层摘要，再归档原碎片。",
         "type": "bool",
         "default": true
-      },
+      }
+    }
+  },
+  "maintenance_decay": {
+    "description": "自然衰减高级参数",
+    "hint": "衰减年龄、未访问天数、重要度阈值、候选上限和摘要字数等高级调优参数。日常使用可保持默认。",
+    "type": "object",
+    "items": {
       "memory_decay_after_days": {
         "description": "衰减年龄天数",
         "hint": "稳定记忆存在超过该天数后才可能进入衰减候选。明确记住、画像、偏好、关系、手动记忆会被保护。",

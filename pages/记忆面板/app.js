@@ -1,8 +1,9 @@
 const API = "/astrbot_plugin_memory_companion/page";
 const PAGE_ENDPOINT_PREFIX = "page";
+const TRANSPARENT_IMAGE = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
 
 const VIEWS = {
-  objects: { title: "知识图谱", hint: "查看关系边、跨窗口线程、时间线和记忆节点概览。" },
+  objects: { title: "知识图谱", hint: "查看关系边、跨窗口线程、时间线、记忆节点和拟人维度概览。" },
   film: { title: "群聊记忆", hint: "查看群聊范围内可召回、可管理的结构化记忆。" },
   microscope: { title: "记忆显微镜", hint: "输入一句话，模拟当前对象下的召回和过滤。" },
   relations: { title: "用户记忆", hint: "聚焦用户画像、偏好、称呼和关系声明。" },
@@ -30,6 +31,7 @@ const SECONDARY_NAV = {
     { id: "relations", label: "图谱边", sublabel: "人物、话题、事实与记忆关联", badge: "图谱" },
     { id: "threads", label: "跨窗口线程", sublabel: "不同私聊/群聊之间的待办线索", badge: "线程" },
     { id: "timeline", label: "时间线", sublabel: "最近记录的事件节点", badge: "时间" },
+    { id: "persona", label: "拟人维度", sublabel: "关系阶段 · 情绪连续性 · 称呼演进", badge: "拟人" },
   ],
   microscope: [
     { id: "query", label: "召回测试", sublabel: "输入一句话模拟检索", badge: "测试" },
@@ -44,12 +46,104 @@ const SECONDARY_NAV = {
     { id: "explicit", label: "明确记住", sublabel: "用户主动要求记住", badge: "记住" },
   ],
   archive: [
-    { id: "retrieval", label: "检索配置", sublabel: "本地检索 / 重排路径", badge: "配置" },
-    { id: "maintenance", label: "维护索引", sublabel: "修复索引和数据状态", badge: "维护" },
-    { id: "repair", label: "内容修复", sublabel: "修复 LivingMemory 导入内容", badge: "修复" },
-    { id: "migration", label: "迁移导入", sublabel: "LivingMemory 预览与导入", badge: "迁移" },
-    { id: "clear", label: "危险清理", sublabel: "清空全部记忆数据", badge: "清理" },
+    { id: "config:memory_capture", label: "记忆捕获", sublabel: "记录用户消息与稳定事实", badge: "捕获" },
+    { id: "config:memory_summary", label: "长期总结", sublabel: "阶段总结模型与阈值", badge: "总结" },
+    { id: "config:conversation_memory", label: "连续对话", sublabel: "群聊片段与低信息保护", badge: "连续" },
+    { id: "retrieval", label: "检索召回", sublabel: "候选、Embedding、Rerank", badge: "召回" },
+    { id: "config:memory_injection", label: "记忆注入", sublabel: "注入数量、字数与日志", badge: "注入" },
+    { id: "config:context_orchestration", label: "注入编排", sublabel: "分槽调度与当前状态保护", badge: "编排" },
+    { id: "config:private_companion_bridge", label: "陪伴协同", sublabel: "桥接、去重与提示清理", badge: "联动" },
+    { id: "config:visibility", label: "可见性", sublabel: "跨窗口默认边界", badge: "权限" },
+    { id: "topology", label: "权限拓扑", sublabel: "可视化记忆权限矩阵", badge: "拓扑" },
+    { id: "config:knowledge_graph", label: "图谱关联", sublabel: "节点、边与检索扩展", badge: "图谱" },
+    { id: "config:memory_tools", label: "主动工具", sublabel: "回忆、记住、陪伴笔记", badge: "工具" },
+    { id: "config:maintenance", label: "维护策略", sublabel: "备份、保留与自然衰减", badge: "维护" },
+    { id: "maintenance", label: "维护 / 迁移 / 清理", sublabel: "维护、修复、导入与清理", badge: "维护" },
+    { id: "config:appearance", label: "外观", sublabel: "拓展页主题", badge: "主题" },
   ],
+};
+
+const CONFIG_ADVANCED_MODULES = {
+  conversation_memory: "conversation_memory_advanced",
+  context_orchestration: "context_orchestration_advanced",
+  maintenance: "maintenance_decay",
+};
+
+const CONFIG_ADVANCED_FALLBACKS = {
+  "config:conversation_memory_advanced": "config:conversation_memory",
+  "config:context_orchestration_advanced": "config:context_orchestration",
+  "config:maintenance_decay": "config:maintenance",
+  "config:livingmemory_migration": "maintenance",
+  migration: "maintenance",
+  clear: "maintenance",
+};
+
+const CONFIG_MODULE_GUIDES = {
+  retrieval: {
+    purpose: "决定候选记忆怎么被找出来：本地检索负责稳，Embedding 负责语义补召回，Rerank 负责二阶段重排。",
+    tune: "召回太少时启用 Embedding 或提高候选；召回太杂时提高相似度阈值或切回本地检索。",
+    avoid: "权限问题不要用召回参数解决；无权限记忆不会进入候选池。",
+  },
+  memory_capture: {
+    purpose: "控制是否把用户消息、Bot 回复、稳定事实和关系边写入记忆流水。",
+    tune: "想减少数据库增长时先调最短记录字数或关闭普通消息记录；稳定事实通常建议保留。",
+    avoid: "不要随意关闭稳定事实抽取，否则偏好、称呼、生日等长期信息会断档。",
+  },
+  memory_summary: {
+    purpose: "把时间线整理成长期可召回的阶段性记忆，是从流水到长期记忆的主要入口。",
+    tune: "总结太慢时提高触发阈值；总结不及时或连续性弱时降低最少事件数和触发条数。",
+    avoid: "不要把单次总结事件上限调得过大，输入太长会降低总结质量。",
+  },
+  memory_injection: {
+    purpose: "控制每轮主链请求前注入多少记忆、最多多少字，以及是否记录注入日志。",
+    tune: "模型忽略记忆时提高条数或字数；被旧事带偏时降低 TopK 或关闭原始事件注入。",
+    avoid: "记忆只是辅助资料，不应该替代当前用户消息。",
+  },
+  conversation_memory: {
+    purpose: "记录连续对话线索，用于承接“继续”“还有呢”“刚才那个”等短句。",
+    tune: "群聊承接弱时保留群聊普通发言记录；旧话题污染时加强低信息和新话题保护。",
+    avoid: "它不是把最近 N 轮原文硬塞回模型，而是用于后续总结和检索。",
+  },
+  context_orchestration: {
+    purpose: "把自我时间线、用户画像、当前窗口、阶段总结和稳定记忆分槽编排进注入包。",
+    tune: "需要更强陪伴线索时调高对应分槽；当前状态问题被旧记忆抢答时保持相关性保护开启。",
+    avoid: "不要让所有分槽都过大，总注入仍应服务当前问题。",
+  },
+  private_companion_bridge: {
+    purpose: "与主动陪伴插件协调自我状态、私聊上下文和旧记忆提示，减少重复注入。",
+    tune: "看到主动提示或当前状态重复时保持去重开启；排障要看原始上下文时再临时保留外部片段。",
+    avoid: "不要让两个插件同时注入同一类状态，否则模型容易把临时状态当长期事实。",
+  },
+  visibility: {
+    purpose: "控制私聊、群聊、自我时间线之间的默认可见边界。",
+    tune: "跨窗口共享优先用权限拓扑配置对象级规则；全局开关只适合明确要整体放宽时使用。",
+    avoid: "不要用全局共享解决单个群或单个人的问题。",
+  },
+  memory_tools: {
+    purpose: "允许模型主动回忆、写入长期记忆或整理 Bot 自己的陪伴笔记。",
+    tune: "需要模型自主记录时开启记住工具；担心误写时先只开回忆工具并观察日志。",
+    avoid: "主动记忆工具不应替代阶段性总结，二者用途不同。",
+  },
+  knowledge_graph: {
+    purpose: "从阶段性记忆中建立人物、话题和事实关联，用于图谱展示和检索扩展。",
+    tune: "搜索人物/话题时漏召回可开启图谱一跳扩展；召回过宽时降低扩展上限。",
+    avoid: "图谱扩展不会绕过权限，不要把它当权限共享开关。",
+  },
+  livingmemory_migration: {
+    purpose: "控制 LivingMemory 旧库导入路径和单次导入上限。",
+    tune: "迁移前先预览；旧库很大时分批导入并观察跳过原因。",
+    avoid: "不要直接复制旧 SQLite 覆盖当前数据库。",
+  },
+  maintenance: {
+    purpose: "控制备份、原始事件保留和长期旧记忆自然衰减。",
+    tune: "数据库增长快时调整原始事件保留；旧碎片太多时开启自然衰减并设置合理阈值。",
+    avoid: "自然衰减会归档旧碎片，首次开启前建议备份。",
+  },
+  appearance: {
+    purpose: "控制拓展页主题显示。",
+    tune: "只影响管理页外观，不影响记忆行为。",
+    avoid: "外观配置不会改变召回、注入或权限逻辑。",
+  },
 };
 
 const state = {
@@ -67,16 +161,13 @@ const state = {
   selectedSubjectiveMemoryIndex: "",
   personalViewport: "schedule",
   personalViewportSwitching: false,
+  secondaryNavSwitching: false,
   animatePersonalViewportRail: false,
   personalSnapshot: null,
   animatePersonalDateRail: false,
   pendingPersonalFilmReveal: false,
   personalEntranceRevealRequested: false,
   personalAlignTimer: 0,
-  scopedModes: {
-    film: "memory",
-    maintain: "memory",
-  },
 };
 
 const DEFAULT_THEME = "yuebai";
@@ -123,8 +214,6 @@ const OVERVIEW_TO_WORKSPACE_WIPE_WAIT_MS = 520 + SCREEN_FILM_EXTRA_HOLD_MS;
 const WORKSPACE_WIPE_CLEANUP_MS = 620 + SCREEN_FILM_EXTRA_HOLD_MS;
 const HOME_WIPE_SWAP_WAIT_MS = 320 + SCREEN_FILM_EXTRA_HOLD_MS;
 const HOME_WIPE_TOTAL_WAIT_MS = 980 + SCREEN_FILM_EXTRA_HOLD_MS;
-const SECONDARY_NAV_LOOP_RADIUS = 5;
-
 let railCoverflowFrame = 0;
 let workspaceTransitionToken = 0;
 let homeReturnRunning = false;
@@ -204,6 +293,10 @@ function dimensionLabel(name) {
     freshness_weight: "新鲜感",
     scar_weight: "伤痕感",
     emotional_debt_weight: "情感债务",
+    intimacy: "亲密信任",
+    intimacy_weight: "亲密信任",
+    vulnerability: "脆弱时刻",
+    vulnerability_weight: "脆弱时刻",
   };
   return labels[name] || name;
 }
@@ -224,6 +317,8 @@ function reactionLabel(reaction) {
   const labels = {
     accepted: "接受",
     comforted: "被安慰到",
+    touched: "感动",
+    nostalgic: "怀念",
     awkward: "尴尬",
     denied: "否认",
     corrected: "纠正",
@@ -245,6 +340,8 @@ function personaWeights(memory) {
     "freshness_weight",
     "scar_weight",
     "emotional_debt_weight",
+    "intimacy_weight",
+    "vulnerability_weight",
   ];
   return keys
     .map((key) => ({ key, value: finiteNumber(source[key], NaN) }))
@@ -475,23 +572,8 @@ function windowKindLabel(scope) {
   return scope === "group" ? "群聊" : "私聊";
 }
 
-function windowOptionValue(scope, id) {
-  return `${scope}:${id}`;
-}
-
-function parseWindowOption(value) {
-  const parts = String(value || "").split(":");
-  const scope = parts.shift() || "";
-  return { scope, id: parts.join(":") };
-}
-
 function bucketByWindow(scope, id) {
   return state.buckets.find((bucket) => bucket.scope === scope && bucket.target_id === id);
-}
-
-function windowLabel(scope, id) {
-  const bucket = bucketByWindow(scope, id);
-  return bucket?.label || `${windowKindLabel(scope)} ${id || "未知窗口"}`;
 }
 
 function windowIdentifierLabel(scope, id) {
@@ -499,19 +581,50 @@ function windowIdentifierLabel(scope, id) {
   return scope === "group" ? `群号 ${id}` : `QQ ${id}`;
 }
 
+function stripLabeledPrefix(value) {
+  return String(value ?? "")
+    .replace(/\b(?:Group\s*ID|Group\s*Name|Name|User\s*ID|User\s*Name|QQ)\s*[:：]\s*/gi, "")
+    .trim();
+}
+
+function cleanWindowDisplayName(value) {
+  return stripLabeledPrefix(value)
+    .replace(/\s+(?:Avatar|Owner\s*ID|Admin\s*IDs?|Member\s*Count|Max\s*Member\s*Count|Description)\s*[:：].*$/i, "")
+    .trim();
+}
+
+function splitWindowBucketTitle(bucket = {}) {
+  const scope = bucket.scope || "";
+  const targetId = compact(bucket.target_id || bucket.group_id, "");
+  const rawLabel = cleanWindowDisplayName(bucket.label || "");
+  const rawSublabel = cleanWindowDisplayName(bucket.sublabel || "");
+  const escapedId = targetId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const nameFromLabel = escapedId
+    ? rawLabel.replace(new RegExp(`\\b${escapedId}\\b`, "g"), "").replace(/\s+/g, " ").trim()
+    : rawLabel;
+  const explicitName = cleanWindowDisplayName(bucket.target_name || bucket.display_name || "");
+  const inferredName = cleanWindowDisplayName(nameFromLabel || "");
+  const genericNames = new Set(["群聊", "私聊", "用户", "好友"]);
+  const name = explicitName || (genericNames.has(inferredName) ? "" : inferredName);
+  if (scope === "group") {
+    return {
+      primary: targetId ? `群号 ${targetId}` : "群号未知",
+      secondary: name && name !== targetId ? name : (rawSublabel && rawSublabel !== targetId ? rawSublabel : "未记录群名"),
+    };
+  }
+  if (scope === "private") {
+    return {
+      primary: targetId ? `QQ ${targetId}` : "QQ 未知",
+      secondary: name && name !== targetId ? name : (rawSublabel && rawSublabel !== targetId ? rawSublabel : "未记录昵称"),
+    };
+  }
+  return { primary: rawLabel || bucket.label || "未命名", secondary: rawSublabel || "" };
+}
+
 function windowDisplayLabel(scope, id, name = "") {
   const displayName = compact(name, "");
   if (displayName && displayName !== id) return displayName;
   return scope === "group" ? `群聊 ${id || "未知群聊"}` : `私聊 ${id || "未知用户"}`;
-}
-
-function permissionTargets(bucket) {
-  return state.buckets
-    .filter((item) => isWindowBucket(item) && !(item.scope === bucket.scope && item.target_id === bucket.target_id))
-    .sort((a, b) => {
-      if (a.scope !== b.scope) return a.scope === "group" ? -1 : 1;
-      return a.label.localeCompare(b.label, "zh-CN");
-    });
 }
 
 function secondaryNavItems(view = state.activeView) {
@@ -526,6 +639,14 @@ function activeSecondaryNav(view = state.activeView) {
   const items = secondaryNavItems(view);
   if (!items.length) return "";
   const active = state.secondaryNav[view];
+  if (view === "archive" && active === "repair") {
+    state.secondaryNav[view] = "maintenance";
+    return "maintenance";
+  }
+  if (view === "archive" && CONFIG_ADVANCED_FALLBACKS[active]) {
+    state.secondaryNav[view] = CONFIG_ADVANCED_FALLBACKS[active];
+    return state.secondaryNav[view];
+  }
   if (items.some((item) => item.id === active)) return active;
   state.secondaryNav[view] = items[0].id;
   return items[0].id;
@@ -536,24 +657,14 @@ function activeSecondaryItem(view = state.activeView) {
   return secondaryNavItems(view).find((item) => item.id === active) || null;
 }
 
-function loopedSecondaryNavItems(view = state.activeView) {
+function secondaryNavRenderItems(view = state.activeView) {
   const items = secondaryNavItems(view);
-  if (items.length <= 1) {
-    return items.map((item, index) => ({ ...item, renderKey: `${item.id}-${index}`, isActiveLoopItem: true }));
-  }
   const active = activeSecondaryNav(view);
-  const activeIndex = Math.max(0, items.findIndex((item) => item.id === active));
-  const looped = [];
-  for (let offset = -SECONDARY_NAV_LOOP_RADIUS; offset <= SECONDARY_NAV_LOOP_RADIUS; offset += 1) {
-    const sourceIndex = (activeIndex + offset + items.length * 16) % items.length;
-    const item = items[sourceIndex];
-    looped.push({
-      ...item,
-      renderKey: `${item.id}-${offset + SECONDARY_NAV_LOOP_RADIUS}`,
-      isActiveLoopItem: offset === 0,
-    });
-  }
-  return looped;
+  return items.map((item, index) => ({
+    ...item,
+    renderKey: `${item.id}-${index}`,
+    isActiveLoopItem: item.id === active,
+  }));
 }
 
 function renderSecondaryNav(view = state.activeView, immediate = false) {
@@ -568,9 +679,9 @@ function renderSecondaryNav(view = state.activeView, immediate = false) {
   const clearButton = $("#clearTargetBtn");
   rail?.classList.remove("is-scoped-rail");
   rail?.classList.add("is-secondary-nav", "is-looped-secondary-nav");
-  if (railTitle) railTitle.textContent = "二级导航";
-  if (clearButton) clearButton.textContent = "默认";
-  const renderItems = loopedSecondaryNavItems(view);
+  if (railTitle) railTitle.textContent = view === "archive" ? "配置列表" : "二级导航";
+  if (clearButton) clearButton.textContent = view === "archive" ? "回到顶部" : "默认";
+  const renderItems = secondaryNavRenderItems(view);
   $("#bucketList").innerHTML = renderItems.map((item) => `
     <button class="bucket secondary-nav-item${item.isActiveLoopItem ? " is-active" : ""}" data-secondary-nav="${escapeHtml(item.id)}" data-loop-key="${escapeHtml(item.renderKey)}" type="button" aria-current="${item.isActiveLoopItem ? "true" : "false"}">
       <b>${escapeHtml(item.label)}</b>
@@ -590,10 +701,28 @@ function renderSecondaryNav(view = state.activeView, immediate = false) {
 async function selectSecondaryNav(id) {
   const view = state.activeView;
   if (!secondaryNavItems(view).some((item) => item.id === id)) return;
+  const prevActive = state.secondaryNav[view];
+  if (prevActive === id || state.secondaryNavSwitching) return;
   state.secondaryNav[view] = id;
-  renderSecondaryNav(view);
-  clearDetail();
-  await loadActiveView();
+  try {
+    state.secondaryNavSwitching = true;
+    const list = $("#bucketList");
+    if (list) {
+      list.querySelectorAll(".secondary-nav-item").forEach((el) => {
+        const isActive = el.dataset.secondaryNav === id;
+        el.classList.toggle("is-active", isActive);
+        el.setAttribute("aria-current", isActive ? "true" : "false");
+      });
+      const activeItem = activeSecondaryItem(view);
+      $("#activeTarget").textContent = activeItem ? `${VIEWS[view]?.title || "二级页"} · ${activeItem.label}` : (VIEWS[view]?.title || "二级页");
+    }
+    moveSecondaryNavToStandard(false);
+    clearDetail();
+    await loadActiveView();
+    scrollActiveWorkspaceToTop({ immediate: true });
+  } finally {
+    state.secondaryNavSwitching = false;
+  }
 }
 
 function moveSecondaryNavToStandard(immediate = false) {
@@ -615,6 +744,28 @@ function moveSecondaryNavToStandard(immediate = false) {
     list.offsetHeight;
     list.style.transition = "";
   }
+}
+
+function scrollActiveWorkspaceToTop(options = {}) {
+  const behavior = options.immediate || prefersReducedMotion() ? "auto" : "smooth";
+  const activeView = document.querySelector(`#view-${state.activeView}`);
+  const candidates = [
+    activeView?.querySelector(".archive-grid"),
+    activeView?.querySelector(".config-panel-stack"),
+    activeView?.querySelector(".page-panel-stack"),
+    activeView?.querySelector(".row-list"),
+    activeView?.querySelector(".track-strip"),
+    activeView,
+    document.querySelector(".workspace-main"),
+  ].filter(Boolean);
+  const seen = new Set();
+  candidates.forEach((element) => {
+    if (seen.has(element)) return;
+    seen.add(element);
+    if (typeof element.scrollTo === "function") {
+      element.scrollTo({ top: 0, left: 0, behavior });
+    }
+  });
 }
 
 function contextParams(extra = {}) {
@@ -698,7 +849,7 @@ function normalizeBuckets(rawBuckets) {
     const scope = compact(item.scope, "unknown");
     const targetId = compact(item.target_id, "");
     if (!targetId) continue;
-    const name = compact(item.target_name, "");
+    const name = cleanWindowDisplayName(item.target_name || item.display_name || "");
     const label = windowDisplayLabel(scope, targetId, name);
     const identifierLabel = windowIdentifierLabel(scope, targetId);
     normalized.push({
@@ -721,48 +872,41 @@ function normalizeBuckets(rawBuckets) {
 
 function bucketCard(bucket) {
   const active = bucket.id === state.activeBucketId ? " is-active" : "";
-  const settingsTarget = isScopedSettingsMode() && isWindowBucket(bucket);
+  const windowTitle = isWindowBucket(bucket) ? splitWindowBucketTitle(bucket) : null;
+  const title = windowTitle ? `
+      <span class="bucket-title-lines">
+        <b>${escapeHtml(windowTitle.primary)}</b>
+        <em>${escapeHtml(windowTitle.secondary)}</em>
+      </span>
+    ` : `<b>${escapeHtml(bucket.label)}</b>`;
   return `
-    <article class="bucket${active}${settingsTarget ? " is-settings-target" : ""}" data-bucket-id="${escapeHtml(bucket.id)}" role="button" tabindex="0" aria-current="${bucket.id === state.activeBucketId ? "true" : "false"}">
-      <b>${escapeHtml(bucket.label)}</b>
-      <small>${escapeHtml(bucket.sublabel || "")}</small>
+    <article class="bucket${active}${windowTitle ? " bucket-window-card" : ""}" data-bucket-id="${escapeHtml(bucket.id)}" role="button" tabindex="0" aria-current="${bucket.id === state.activeBucketId ? "true" : "false"}">
+      ${title}
+      ${windowTitle ? "" : `<small>${escapeHtml(bucket.sublabel || "")}</small>`}
       <div class="badges">
         <span class="badge blue">${escapeHtml(bucket.memory_count || 0)} 条</span>
-        ${settingsTarget ? `<span class="badge gold">权限</span>` : ""}
       </div>
     </article>
   `;
 }
 
-function scopedRailConfig(scope, settingsMode = false) {
+function scopedRailConfig(scope) {
   if (scope === "group") {
-    return settingsMode
-      ? { title: "群聊设置", clear: "说明", label: "设置说明", sublabel: "选择具体群聊配置权限", badge: "群聊" }
-      : { title: "群聊列表", clear: "全部群聊", label: "全部群聊", sublabel: "不限定群聊", badge: "群聊" };
+    return { title: "群聊列表", clear: "全部群聊", label: "全部群聊", sublabel: "不限定群聊", badge: "群聊" };
   }
-  return settingsMode
-    ? { title: "私聊设置", clear: "说明", label: "设置说明", sublabel: "选择具体用户配置权限", badge: "私聊" }
-    : { title: "私聊用户", clear: "全部私聊", label: "全部私聊", sublabel: "不限定用户", badge: "私聊" };
+  return { title: "私聊用户", clear: "全部私聊", label: "全部私聊", sublabel: "不限定用户", badge: "私聊" };
 }
 
 function bindBucketListInteractions() {
   $$("#bucketList [data-bucket-id]").forEach((item) => {
     item.addEventListener("click", (event) => {
-      if (event.target.closest("[data-acl-bucket]")) return;
       selectBucket(item.dataset.bucketId);
     });
     item.addEventListener("keydown", (event) => {
-      if (event.target.closest("[data-acl-bucket]")) return;
       if (event.key === "Enter" || event.key === " ") {
         event.preventDefault();
         selectBucket(item.dataset.bucketId);
       }
-    });
-  });
-  $$("#bucketList [data-acl-bucket]").forEach((button) => {
-    button.addEventListener("click", (event) => {
-      event.stopPropagation();
-      openBucketPermissions(button.dataset.aclBucket);
     });
   });
 }
@@ -785,52 +929,37 @@ function scopedViewTarget(view = state.activeView) {
   return "";
 }
 
-function scopedMode(view = state.activeView) {
-  return state.scopedModes[view] === "settings" ? "settings" : "memory";
-}
-
-function isScopedSettingsMode(view = state.activeView) {
-  return scopedMode(view) === "settings";
-}
-
-function scopedDefaultModeLabel(scope) {
-  return scope === "group" ? "默认黑名单" : "默认白名单";
-}
-
-function scopedSettingsHint(scope) {
-  return scope === "group"
-    ? "群聊窗口默认黑名单模式：默认可跨群聊读取，加入名单后禁止读取；私聊流向群聊仍需要显式白名单。"
-    : "私聊窗口默认白名单模式：默认不开放给其它窗口，只有加入白名单后才能读取。";
-}
-
 function renderScopedModeControls(view = state.activeView) {
   const scope = scopedViewScope(view);
   if (!scope) return;
-  const isSettings = isScopedSettingsMode(view);
-  $("#app")?.classList.toggle("is-scoped-settings-mode", isSettings);
-  const button = view === "film" ? $("#groupMemoryModeBtn") : $("#privateMemoryModeBtn");
   const title = view === "film" ? $("#groupMemoryTitle") : $("#privateMemoryTitle");
   const hint = view === "film" ? $("#groupMemoryHint") : $("#privateMemoryHint");
-  if (title) title.textContent = isSettings ? `${windowKindLabel(scope)}设置` : `${windowKindLabel(scope)}记忆`;
-  if (button) {
-    button.textContent = isSettings ? `${windowKindLabel(scope)}记忆` : `${windowKindLabel(scope)}设置`;
-    button.classList.toggle("is-active", isSettings);
-    button.setAttribute("aria-pressed", isSettings ? "true" : "false");
-  }
-  if (hint) {
-    hint.textContent = isSettings
-      ? `点击左侧${scope === "group" ? "群聊" : "私聊用户"}，配置记忆读取黑名单/白名单。${scopedDefaultModeLabel(scope)}。`
-      : VIEWS[view]?.hint || "";
-  }
+  if (title) title.textContent = `${windowKindLabel(scope)}记忆`;
+  if (hint) hint.textContent = VIEWS[view]?.hint || "";
+  updateScopedClearButton(view);
 }
 
-async function toggleScopedMode(view) {
-  if (!scopedViewScope(view)) return;
-  state.scopedModes[view] = isScopedSettingsMode(view) ? "memory" : "settings";
-  renderScopedModeControls(view);
-  renderScopedBucketRail(scopedViewScope(view));
-  clearDetail();
-  await loadActiveView();
+function updateScopedClearButton(view = state.activeView) {
+  const button = view === "film" ? $("#clearCurrentGroupMemoryBtn") : view === "maintain" ? $("#clearCurrentPrivateMemoryBtn") : null;
+  const bucket = activeBucket();
+  const scope = scopedViewScope(view);
+  const canClear = Boolean(bucket && bucket.id !== "all" && bucket.scope === scope && bucket.target_id);
+  if (button) {
+    button.disabled = !canClear;
+    button.title = canClear ? `清空 ${bucket.label} 的记忆` : `请先选择具体${scope === "group" ? "群聊" : "私聊用户"}`;
+  }
+  if (view === "film") {
+    const memberInput = $("#clearGroupMemberUserId");
+    const memberButton = $("#clearGroupMemberMemoryBtn");
+    if (memberInput) {
+      memberInput.disabled = !canClear;
+      memberInput.placeholder = canClear ? "群成员 QQ" : "先选择具体群聊";
+    }
+    if (memberButton) {
+      memberButton.disabled = !canClear;
+      memberButton.title = canClear ? `清空 ${bucket.label} 中某个成员的记忆` : "请先选择具体群聊";
+    }
+  }
 }
 
 function renderScopedBucketRail(scope) {
@@ -839,8 +968,7 @@ function renderScopedBucketRail(scope) {
   rail?.classList.add("is-scoped-rail");
   $("#app")?.style.removeProperty("--secondary-nav-shift");
   renderScopedModeControls();
-  const settingsMode = isScopedSettingsMode();
-  const config = scopedRailConfig(scope, settingsMode);
+  const config = scopedRailConfig(scope);
   const railTitle = document.querySelector(".rail-head b");
   const clearButton = $("#clearTargetBtn");
   if (railTitle) railTitle.textContent = config.title;
@@ -860,6 +988,7 @@ function renderScopedBucketRail(scope) {
   $("#bucketList").innerHTML = [allBucket, ...scopedBuckets].map((bucket) => bucketCard(bucket)).join("");
   bindBucketListInteractions();
   $("#activeTarget").textContent = state.activeBucketId === "all" ? config.label : bucketLabel();
+  updateScopedClearButton();
   requestRailCoverflow();
   centerActiveBucket();
 }
@@ -887,15 +1016,22 @@ function renderBuckets() {
     `).join("");
   }
   bindBucketListInteractions();
-  $$("#objectCards [data-bucket-id]").forEach((item) => {
-    item.addEventListener("click", () => selectBucket(item.dataset.bucketId));
-    item.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") {
-        event.preventDefault();
-        selectBucket(item.dataset.bucketId);
+  // Event delegation: single handler for all bucket cards
+  if (objectCards) {
+    objectCards.onclick = (event) => {
+      const card = event.target.closest("[data-bucket-id]");
+      if (card && objectCards.contains(card)) {
+        selectBucket(card.dataset.bucketId);
       }
-    });
-  });
+    };
+    objectCards.onkeydown = (event) => {
+      const card = event.target.closest("[data-bucket-id]");
+      if (card && objectCards.contains(card) && (event.key === "Enter" || event.key === " ")) {
+        event.preventDefault();
+        selectBucket(card.dataset.bucketId);
+      }
+    };
+  }
   $("#activeTarget").textContent = bucketLabel();
   requestRailCoverflow();
   centerActiveBucket();
@@ -1267,7 +1403,6 @@ async function openView(view) {
   app.classList.remove("is-workspace-ready");
   if (!wasWorkspace) app.classList.remove("is-workspace-settled");
   app.classList.toggle("is-personal-memory", view === "review");
-  app.classList.toggle("is-scoped-settings-mode", Boolean(scopedViewScope(view)) && isScopedSettingsMode(view));
   app.dataset.workspaceView = view;
   $("#backHomeBtn").classList.remove("hidden");
   $$(".filmstrip").forEach((strip) => {
@@ -1317,7 +1452,6 @@ async function returnHome() {
   removeRailMountedScheduleFilm();
   app.classList.remove("is-workspace");
   app.classList.remove("is-personal-memory");
-  app.classList.remove("is-scoped-settings-mode");
   app.classList.remove("is-workspace-entering", "is-workspace-ready", "is-workspace-settled");
   app.classList.remove("is-view-switching", "is-view-exiting", "is-view-entering");
   app.classList.remove("is-scoped-view-switching", "is-scoped-view-exiting", "is-scoped-view-entering");
@@ -1339,11 +1473,7 @@ async function loadActiveView() {
     if (state.activeView === "objects") {
       await loadContextPanel();
     } else if (state.activeView === "film") {
-      if (isScopedSettingsMode("film")) {
-        await loadScopedSettings("#groupMemoryList", "group");
-      } else {
-        await loadScopedMemories("#groupMemoryList", "group", "正在读取群聊记忆...", "还没有群聊范围内的记忆。");
-      }
+      await loadScopedMemories("#groupMemoryList", "group", "正在读取群聊记忆...", "还没有群聊范围内的记忆。");
     } else if (state.activeView === "microscope") {
       applyMicroscopeView();
     } else if (state.activeView === "relations") {
@@ -1351,11 +1481,7 @@ async function loadActiveView() {
     } else if (state.activeView === "review") {
       await loadPersonalMemory();
     } else if (state.activeView === "maintain") {
-      if (isScopedSettingsMode("maintain")) {
-        await loadScopedSettings("#privateMemoryList", "private");
-      } else {
-        await loadScopedMemories("#privateMemoryList", "private", "正在读取私聊记忆...", "还没有私聊范围内的记忆。");
-      }
+      await loadScopedMemories("#privateMemoryList", "private", "正在读取私聊记忆...", "还没有私聊范围内的记忆。");
     } else if (state.activeView === "archive") {
       await loadArchive();
     }
@@ -1455,16 +1581,69 @@ function scopedMemoryParams(scope, extra = {}) {
   return { params, incompatible: false };
 }
 
+const MEMORY_RENDER_BATCH = 20;
+
 function renderMemoryList(selector, memories, emptyText) {
   const target = $(selector);
   if (!target) return;
   target.className = "row-list";
-  target.innerHTML = memories.length
-    ? memories.map(memoryRow).join("")
-    : `<div class="empty-state">${escapeHtml(emptyText)}</div>`;
-  target.querySelectorAll("[data-memory-id]").forEach((row) => {
-    row.addEventListener("click", () => showMemory(row.dataset.memoryId));
-  });
+  if (!memories.length) {
+    target.innerHTML = `<div class="empty-state">${escapeHtml(emptyText)}</div>`;
+    return;
+  }
+  // Progressive rendering: render first batch, then load more on scroll
+  let renderedCount = 0;
+  target.innerHTML = "";
+  // Event delegation: single click listener on container
+  target.onclick = (event) => {
+    const row = event.target.closest("[data-memory-id]");
+    if (row && target.contains(row)) {
+      showMemory(row.dataset.memoryId);
+    }
+  };
+
+  const sentinel = document.createElement("div");
+  sentinel.className = "progressive-sentinel";
+  sentinel.style.minHeight = "1px";
+
+  function renderBatch() {
+    const end = Math.min(renderedCount + MEMORY_RENDER_BATCH, memories.length);
+    const html = memories.slice(renderedCount, end).map(memoryRow).join("");
+    if (renderedCount === 0) {
+      target.innerHTML = html;
+    } else {
+      target.insertAdjacentHTML("beforeend", html);
+    }
+    renderedCount = end;
+    // Add or remove sentinel
+    if (renderedCount < memories.length) {
+      if (!target.contains(sentinel)) {
+        target.appendChild(sentinel);
+      }
+    } else if (target.contains(sentinel)) {
+      sentinel.remove();
+    }
+  }
+
+  renderBatch();
+
+  // Observe sentinel to load more when scrolled into view
+  if (renderedCount < memories.length) {
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting) && renderedCount < memories.length) {
+          renderBatch();
+        }
+      },
+      { rootMargin: "200px" },
+    );
+    observer.observe(sentinel);
+    // Store observer for cleanup
+    target._progressiveObserver = observer;
+  } else if (target._progressiveObserver) {
+    target._progressiveObserver.disconnect();
+    target._progressiveObserver = null;
+  }
 }
 
 function relationTypesForSecondary() {
@@ -1491,38 +1670,6 @@ async function loadScopedMemories(selector, scope, loadingText, emptyText, extra
   }
   const data = await apiGet(`/memories?${params.toString()}`);
   renderMemoryList(selector, data.memories || [], emptyText);
-}
-
-async function loadScopedSettings(selector, scope) {
-  const target = $(selector);
-  if (!target) return;
-  target.className = "settings-placeholder is-empty";
-  const bucket = activeBucket();
-  if (!isWindowBucket(bucket) || bucket.scope !== scope) {
-    target.innerHTML = "";
-    $("#detailDrawer").className = "detail-drawer permission-drawer empty";
-    $("#detailDrawer").innerHTML = renderScopedSettingsLanding(scope);
-    return;
-  }
-  target.innerHTML = "";
-  await showBucketPermissions(bucket.id, "#detailDrawer");
-}
-
-function renderScopedSettingsLanding(scope) {
-  const scopedBuckets = state.buckets.filter((bucket) => bucket.scope === scope);
-  return `
-    <section class="permission-landing">
-      <div>
-        <b>${escapeHtml(windowKindLabel(scope))}记忆设置</b>
-        <p>${escapeHtml(scopedSettingsHint(scope))}</p>
-      </div>
-      <div class="badges">
-        <span class="badge gold">${escapeHtml(scopedDefaultModeLabel(scope))}</span>
-        <span class="badge blue">${escapeHtml(scopedBuckets.length)} 个对象</span>
-      </div>
-      <p class="permission-instruction">请从左侧${escapeHtml(scope === "group" ? "群聊列表" : "私聊用户列表")}选择具体对象；右侧上方面板会显示读取权限、被读取权限和黑白名单配置。</p>
-    </section>
-  `;
 }
 
 function hasMemoryType(memory, types) {
@@ -1560,6 +1707,9 @@ async function loadContextPanel() {
   } else if (section === "timeline") {
     const data = await apiGet(`/timeline?${params.toString()}`);
     target.innerHTML = renderKnowledgeTimeline(data.items || []);
+  } else if (section === "persona") {
+    target.innerHTML = `<div id="personaStatePanel" class="persona-state-panel"></div>`;
+    await loadPersonaState();
   } else {
     const [graph, relations, threads, timeline, logs] = await Promise.all([
       apiGet(`/graph?${params.toString()}`),
@@ -1911,6 +2061,7 @@ async function loadPersonalMemory() {
   renderPersonalDateRail(data.dates || [], state.selectedPersonalDate);
   target.innerHTML = renderPersonalMemoryWorkspace(data.snapshot || {}, data);
   bindPersonalMemoryWorkspace(target, data.snapshot || {}, data);
+  hydratePersonalAlbumImages(target);
 }
 
 function bindPersonalMemoryWorkspace(target, snapshot, data) {
@@ -1961,7 +2112,10 @@ function bindPersonalMemoryWorkspace(target, snapshot, data) {
     removeRailMountedScheduleFilm();
     state.pendingPersonalFilmReveal = false;
     resetPersonalFilmLayout();
-    if (state.personalViewport === "album") showPersonalAlbumDetail(snapshot, data);
+    if (state.personalViewport === "album") {
+      showPersonalAlbumDetail(snapshot, data);
+      hydratePersonalAlbumImages(target);
+    }
     if (state.personalViewport === "subjective") showPersonalSubjectiveDetail(snapshot, data);
     return;
   }
@@ -2442,11 +2596,18 @@ function renderPersonalViewportPanel(active, snapshot, status) {
 function renderCompanionAlbumPanel(snapshot, status) {
   const album = Array.isArray(snapshot.album) ? snapshot.album : [];
   const selected = activeAlbumIndex(album);
+  const kindLabels = album.map((item) => item.kind || "");
+  const hasOutfit = kindLabels.some((k) => k === "daily_outfit");
+  const hasLife = kindLabels.some((k) => k === "life_photo");
+  const subtitleParts = [status.selected_date || snapshot.plan?.date || "-"];
+  if (hasOutfit) subtitleParts.push("穿搭");
+  if (hasLife) subtitleParts.push("生活分享");
+  if (!hasOutfit && !hasLife) subtitleParts.push("照片");
   return `
     <section class="personal-zone companion-album">
       <div class="personal-zone-head">
         <h4>相册</h4>
-        <span>${escapeHtml(status.selected_date || snapshot.plan?.date || "-")} · 每日穿搭</span>
+        <span>${escapeHtml(subtitleParts.join(" · "))}</span>
       </div>
       ${album.length ? `
         <div class="album-strip">
@@ -2454,8 +2615,8 @@ function renderCompanionAlbumPanel(snapshot, status) {
         </div>
       ` : `
         <div class="album-empty">
-          <b>这一天还没有穿搭图</b>
-          <span>生成每日穿搭后会出现在这里。</span>
+          <b>这一天还没有照片</b>
+          <span>生成穿搭图或生活分享图后会出现在这里。</span>
         </div>
       `}
     </section>
@@ -2465,8 +2626,8 @@ function renderCompanionAlbumPanel(snapshot, status) {
 function renderAlbumCard(item, index = 0, active = false) {
   const title = item.title || "照片";
   const meta = [item.generated_at, item.backend].filter(Boolean).join(" · ");
-  const image = item.exists && item.url
-    ? `<img src="${escapeHtml(item.url)}" alt="${escapeHtml(title)}" loading="lazy">`
+  const image = item.exists && (item.image_data_url || item.url)
+    ? albumImageTag(item, title)
     : `<div class="album-missing">${escapeHtml(item.error || "图片文件不可用")}</div>`;
   return `
     <article class="album-card${active ? " is-active" : ""}" data-album-index="${escapeHtml(index)}" role="button" tabindex="0">
@@ -2478,6 +2639,65 @@ function renderAlbumCard(item, index = 0, active = false) {
       </div>
     </article>
   `;
+}
+
+function albumImageTag(item, title) {
+  const source = item?.image_data_url || item?.url || "";
+  if (!source) return `<div class="album-missing">图片文件不可用</div>`;
+  return `<img src="${TRANSPARENT_IMAGE}" data-album-image-src="${escapeHtml(source)}" alt="${escapeHtml(title)}" loading="lazy">`;
+}
+
+function albumImageDataPath(source) {
+  const raw = String(source || "");
+  if (!raw || raw.startsWith("data:")) return raw;
+  try {
+    const url = new URL(raw, window.location.origin);
+    if (url.pathname.endsWith("/companion/personal-photo-data")) {
+      return `/companion/personal-photo-data${url.search}`;
+    }
+    if (url.pathname.endsWith("/companion/personal-photo")) {
+      return `/companion/personal-photo-data${url.search}`;
+    }
+  } catch (error) {
+    const dataMarker = "/companion/personal-photo-data?";
+    const photoMarker = "/companion/personal-photo?";
+    const dataIndex = raw.indexOf(dataMarker);
+    if (dataIndex >= 0) return `/companion/personal-photo-data?${raw.slice(dataIndex + dataMarker.length)}`;
+    const photoIndex = raw.indexOf(photoMarker);
+    if (photoIndex >= 0) return `/companion/personal-photo-data?${raw.slice(photoIndex + photoMarker.length)}`;
+  }
+  return raw;
+}
+
+async function hydratePersonalAlbumImages(root = document) {
+  const images = [...root.querySelectorAll("img[data-album-image-src]")];
+  await Promise.all(images.map(async (img) => {
+    if (img.dataset.loaded === "1" || img.dataset.loading === "1") return;
+    const source = img.dataset.albumImageSrc || "";
+    if (!source) return;
+    img.dataset.loading = "1";
+    const endpoint = albumImageDataPath(source);
+    try {
+      if (endpoint.startsWith("data:")) {
+        img.src = endpoint;
+      } else if (endpoint.startsWith("/companion/personal-photo-data")) {
+        const result = await apiGet(endpoint);
+        if (!result?.data_url) throw new Error("图片数据为空");
+        img.src = result.data_url;
+      } else {
+        img.src = source;
+      }
+      img.dataset.loaded = "1";
+    } catch (error) {
+      img.dataset.loaded = "0";
+      const fallback = document.createElement("div");
+      fallback.className = "album-missing";
+      fallback.textContent = "图片加载失败";
+      img.replaceWith(fallback);
+    } finally {
+      img.dataset.loading = "0";
+    }
+  }));
 }
 
 function activeAlbumIndex(album) {
@@ -2716,6 +2936,7 @@ function showPersonalAlbumDetail(snapshot, status, options = {}) {
   const render = () => {
     drawer.className = selected ? "detail-drawer" : "detail-drawer empty";
     drawer.innerHTML = `<div class="personal-detail-content">${renderAlbumDetail(selected, status)}</div>`;
+    requestAnimationFrame(() => hydratePersonalAlbumImages(drawer));
   };
   if (options.animate) {
     swapPanelContent(drawer, render);
@@ -2729,14 +2950,14 @@ function renderAlbumDetail(item, status) {
     return `
       <div class="detail-empty">
         <b>相册为空</b>
-        <span>${escapeHtml(status.selected_date || "这一天")} 还没有每日穿搭图。</span>
+        <span>${escapeHtml(status.selected_date || "这一天")} 还没有照片。</span>
       </div>
     `;
   }
-  const title = item.title || "每日穿搭";
+  const title = item.title || "照片";
   const meta = [item.generated_at, item.backend].filter(Boolean).join(" · ");
-  const image = item.exists && item.url
-    ? `<img src="${escapeHtml(item.url)}" alt="${escapeHtml(title)}" loading="lazy">`
+  const image = item.exists && (item.image_data_url || item.url)
+    ? albumImageTag(item, title)
     : `<div class="album-missing">${escapeHtml(item.error || "图片文件不可用")}</div>`;
   return `
     <article class="album-detail">
@@ -2873,16 +3094,37 @@ async function runSearch() {
 }
 
 async function loadArchive() {
+  const section = activeSecondaryNav("archive");
+  setArchiveSection(section);
+  if (section.startsWith("config:")) {
+    const module = section.slice("config:".length);
+    $("#selfMemoryList").innerHTML = loadingState("正在读取模块配置...");
+    const data = await apiGet("/config/schema");
+    $("#selfMemoryList").innerHTML = renderSchemaConfigModule(data, module);
+    bindSchemaConfigForm($("#selfMemoryList"), data);
+    return;
+  }
+  if (section === "topology") {
+    await loadAclTopology();
+    return;
+  }
+  if (section !== "retrieval") return;
   $("#selfMemoryList").innerHTML = loadingState("正在读取检索配置...");
   const config = await apiGet("/context/config");
   $("#selfMemoryList").innerHTML = renderArchiveConfig(config);
   bindRetrievalConfigForm($("#selfMemoryList"));
-  setArchiveSection(activeSecondaryNav("archive"));
+}
+
+function bindArchiveJumpButtons(root = document) {
+  root.querySelectorAll("[data-archive-jump]").forEach((button) => {
+    button.addEventListener("click", () => selectSecondaryNav(button.dataset.archiveJump));
+  });
 }
 
 function setArchiveSection(section) {
+  const visibleSection = section.startsWith("config:") ? "retrieval" : section;
   $$("#view-archive [data-archive-section]").forEach((item) => {
-    item.classList.toggle("is-active", item.dataset.archiveSection === section);
+    item.classList.toggle("is-active", item.dataset.archiveSection === visibleSection);
   });
   const result = $("#importResult");
   if (result) {
@@ -2896,6 +3138,148 @@ function renderArchiveConfig(config) {
   const rerankOptions = Array.isArray(config.rerank_provider_options) ? config.rerank_provider_options : [];
   const embeddingOptions = Array.isArray(config.embedding_provider_options) ? config.embedding_provider_options : [];
   return renderRetrievalConfigForm(retrieval, rerankOptions, embeddingOptions);
+}
+
+function renderSchemaConfigModule(data = {}, module = "") {
+  const schema = data.schema?.[module];
+  const values = data.values?.[module] || {};
+  if (!schema?.items) {
+    return `<div class="empty-state error-state"><b>配置模块不存在</b><span>${escapeHtml(module || "unknown")}</span></div>`;
+  }
+  const advancedModule = CONFIG_ADVANCED_MODULES[module] || "";
+  const advancedSchema = advancedModule ? data.schema?.[advancedModule] : null;
+  const advancedValues = advancedModule ? (data.values?.[advancedModule] || {}) : {};
+  const fields = Object.entries(schema.items)
+    .map(([key, item]) => renderSchemaConfigField(module, key, item || {}, values[key], data))
+    .join("");
+  const advancedFields = advancedSchema?.items
+    ? Object.entries(advancedSchema.items)
+      .map(([key, item]) => renderSchemaConfigField(advancedModule, key, item || {}, advancedValues[key], data))
+      .join("")
+    : "";
+  return `
+    <form class="context-form schema-config-form" data-config-module="${escapeHtml(module)}" data-config-advanced-module="${escapeHtml(advancedFields ? advancedModule : "")}" autocomplete="off">
+      <section class="context-form-section">
+        <div class="context-form-section-head">
+          <b>${escapeHtml(schema.description || module)}</b>
+          <span>${escapeHtml(schema.hint || "按官方配置 schema 渲染，保存后写入插件配置文件。")}</span>
+        </div>
+        ${renderConfigInlineGuide(module)}
+        ${fields}
+      </section>
+      ${advancedFields ? `
+        <details class="context-advanced">
+          <summary>${escapeHtml(advancedSchema.description || "高级参数")}</summary>
+          <div class="context-advanced-note">${escapeHtml(advancedSchema.hint || "日常使用可保持默认。")}</div>
+          ${advancedFields}
+        </details>
+      ` : ""}
+      <div class="context-form-actions">
+        <span>${advancedFields ? "保存当前模块及其折叠高级参数；其他模块不会被改动。" : "只保存当前模块；其他模块不会被改动。"}</span>
+        <button type="submit">保存${escapeHtml(schema.description || "配置")}</button>
+      </div>
+    </form>
+  `;
+}
+
+function renderConfigInlineGuide(module) {
+  const guide = CONFIG_MODULE_GUIDES[module];
+  if (!guide) return "";
+  return `
+    <div class="config-inline-guide">
+      <dl>
+        <div><dt>作用</dt><dd>${escapeHtml(guide.purpose)}</dd></div>
+        <div><dt>什么时候调</dt><dd>${escapeHtml(guide.tune)}</dd></div>
+        <div><dt>注意点</dt><dd>${escapeHtml(guide.avoid)}</dd></div>
+      </dl>
+    </div>
+  `;
+}
+
+function renderSchemaConfigField(module, key, item = {}, value, data = {}) {
+  const type = item.type || "string";
+  const label = item.description || key;
+  const hint = item.hint || `${module}.${key}`;
+  const current = value ?? item.default ?? "";
+  let control = "";
+  if (type === "bool") {
+    control = contextSwitch(key, Boolean(current));
+  } else if (type === "int") {
+    control = `<input name="${escapeHtml(key)}" type="number" step="1" value="${escapeHtml(current)}" />`;
+  } else if (type === "float") {
+    control = `<input name="${escapeHtml(key)}" type="number" step="0.01" value="${escapeHtml(current)}" />`;
+  } else if (Array.isArray(item.options) && item.options.length) {
+    control = `
+      <select name="${escapeHtml(key)}">
+        ${item.options.map((option) => `<option value="${escapeHtml(option)}"${String(option) === String(current) ? " selected" : ""}>${escapeHtml(option)}</option>`).join("")}
+      </select>
+    `;
+  } else if (item._special === "select_provider") {
+    const options = Array.isArray(data.provider_options) ? [...data.provider_options] : [];
+    if (current && !options.some((option) => option.id === current)) {
+      options.push({ id: current, label: `${current}（当前配置）` });
+    }
+    control = `
+      <div class="provider-inline retrieval-provider-picker">
+        <select data-config-provider-select="${escapeHtml(key)}">
+          ${options.map((option) => `<option value="${escapeHtml(option.id || "")}"${String(option.id || "") === String(current || "") ? " selected" : ""}>${escapeHtml(option.label || option.id || "不指定")}</option>`).join("")}
+        </select>
+        <input name="${escapeHtml(key)}" type="text" value="${escapeHtml(current)}" placeholder="留空使用当前会话模型" />
+      </div>
+    `;
+  } else {
+    control = `<input name="${escapeHtml(key)}" type="text" value="${escapeHtml(current)}" />`;
+  }
+  return contextField({ label, hint, control, wide: type === "string" && !Array.isArray(item.options) });
+}
+
+function bindSchemaConfigForm(root, schemaData = {}) {
+  const form = root.querySelector(".schema-config-form");
+  if (!form) return;
+  form.querySelectorAll("[data-config-provider-select]").forEach((select) => {
+    const input = form.querySelector(`[name='${select.dataset.configProviderSelect}']`);
+    bindProviderPicker(select, input);
+  });
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    withButton(form.querySelector("button[type='submit']"), "保存中", () => saveSchemaConfigModule(form, schemaData));
+  });
+}
+
+async function saveSchemaConfigModule(form, schemaData = {}) {
+  const module = form.dataset.configModule || "";
+  const advancedModule = form.dataset.configAdvancedModule || "";
+  const data = new FormData(form);
+  const values = schemaValuesFromForm(data, schemaData.schema?.[module]?.items || {});
+  await apiPost("/config/module/update", { module, values });
+  if (advancedModule) {
+    const advancedValues = schemaValuesFromForm(data, schemaData.schema?.[advancedModule]?.items || {});
+    await apiPost("/config/module/update", { module: advancedModule, values: advancedValues });
+  }
+  if (module === "appearance") {
+    applyTheme(values.theme);
+  }
+  showToast("配置模块已保存");
+  await loadArchive();
+}
+
+function schemaValuesFromForm(data, schema = {}) {
+  const values = {};
+  for (const [key, item] of Object.entries(schema)) {
+    const type = item?.type || "string";
+    if (type === "bool") {
+      values[key] = data.get(key) === "on";
+    } else if (type === "int") {
+      const value = Number(data.get(key));
+      values[key] = Number.isFinite(value) ? Math.round(value) : Number(item.default || 0);
+    } else if (type === "float") {
+      const value = Number(data.get(key));
+      values[key] = Number.isFinite(value) ? value : Number(item.default || 0);
+    } else {
+      values[key] = String(data.get(key) ?? "");
+    }
+  }
+  return values;
 }
 
 function renderRetrievalConfigForm(retrieval = {}, rerankOptions = [], embeddingOptions = []) {
@@ -2916,10 +3300,24 @@ function renderRetrievalConfigForm(retrieval = {}, rerankOptions = [], embedding
   const embeddingState = providerStateLabel(currentEmbeddingProvider, hasEmbeddingProvider, Boolean(retrieval.embedding_enabled));
   return `
     <form id="retrievalConfigForm" class="context-form retrieval-config-form" autocomplete="off">
+      <nav class="config-module-switcher" aria-label="配置模块">
+        <button type="button" class="is-active">
+          <b>检索召回</b>
+          <span>候选、Embedding、Rerank</span>
+        </button>
+        <button type="button" data-archive-jump="topology">
+          <b>权限边界</b>
+          <span>窗口读取关系</span>
+        </button>
+        <button type="button" data-archive-jump="maintenance">
+          <b>维护迁移</b>
+          <span>修复、导入、清理</span>
+        </button>
+      </nav>
       <div class="retrieval-hero">
         <div class="retrieval-hero-copy">
           <b>检索配置</b>
-          <p>控制记忆候选、向量补召回和二阶段重排。权限与黑白名单始终先于模型生效。</p>
+          <p>控制记忆候选、向量补召回和二阶段重排。窗口间读取权限请在权限拓扑中调整。</p>
         </div>
         <div class="retrieval-status-grid">
           <span><em>路径</em><strong data-retrieval-status="mode">${escapeHtml(retrievalModeLabel(mode))}</strong></span>
@@ -2934,6 +3332,7 @@ function renderRetrievalConfigForm(retrieval = {}, rerankOptions = [], embedding
           <span>注入组织</span>
         </div>
       </div>
+      ${renderConfigInlineGuide("retrieval")}
       <section class="retrieval-quick-panel">
         <div class="context-form-section-head">
           <b>推荐档位</b>
@@ -3084,6 +3483,7 @@ function renderRetrievalConfigForm(retrieval = {}, rerankOptions = [], embedding
 function bindRetrievalConfigForm(root) {
   const form = root.querySelector("#retrievalConfigForm");
   if (!form) return;
+  bindArchiveJumpButtons(form);
   const select = form.querySelector("[name='rerank_provider_select']");
   const input = form.querySelector("[name='rerank_provider_id']");
   bindProviderPicker(select, input);
@@ -3222,216 +3622,6 @@ async function saveRetrievalConfig(form) {
   await apiPost("/retrieval/config/update", payload);
   showToast("检索配置已保存");
   await loadArchive();
-}
-
-async function openBucketPermissions(bucketId) {
-  const bucket = state.buckets.find((item) => item.id === bucketId);
-  if (!isWindowBucket(bucket)) {
-    showToast("只有私聊/群聊卡片可以配置权限", "error");
-    return;
-  }
-  $("#detailDrawer").className = "detail-drawer";
-  $("#detailDrawer").innerHTML = loadingState("正在读取权限...");
-  try {
-    if (state.activeBucketId !== bucket.id) {
-      state.activeBucketId = bucket.id;
-      const scope = currentRailScope();
-      if (scope) {
-        renderScopedBucketRail(scope);
-      } else {
-        renderBuckets();
-      }
-      await loadActiveView();
-    }
-    await showBucketPermissions(bucket.id);
-  } catch (error) {
-    $("#detailDrawer").innerHTML = panelError(error, "重新读取权限");
-    const retry = $("#detailDrawer [data-retry-active]");
-    if (retry) retry.addEventListener("click", () => openBucketPermissions(bucketId));
-    showToast(error.message || "权限读取失败", "error");
-  }
-}
-
-async function showBucketPermissions(bucketId, targetSelector = "#detailDrawer") {
-  const bucket = state.buckets.find((item) => item.id === bucketId);
-  if (!isWindowBucket(bucket)) return;
-  const detail = $(targetSelector);
-  if (!detail) return;
-  const inDrawer = targetSelector === "#detailDrawer";
-  if (inDrawer) {
-    detail.className = "detail-drawer permission-drawer";
-  } else {
-    detail.className = "row-list permission-page";
-  }
-  detail.innerHTML = loadingState("正在读取权限...");
-  const params = new URLSearchParams({ scope: bucket.scope, id: bucket.target_id });
-  const data = await apiGet(`/acl?${params.toString()}`);
-  detail.classList.remove("empty");
-  detail.innerHTML = renderBucketPermissionPanel(bucket, data);
-  bindBucketPermissionPanel(bucket, targetSelector);
-}
-
-function renderBucketPermissionPanel(bucket, data) {
-  const canRead = data.can_read || [];
-  const canBeReadBy = data.can_be_read_by || [];
-  const policy = data.policy || {};
-  const readMode = normalizeAclMode(policy.read_mode);
-  const shareMode = normalizeAclMode(policy.share_mode);
-  const targets = permissionTargets(bucket);
-  return `
-    <div class="permission-drawer-head">
-      <h3>${escapeHtml(bucket.label)} · 记忆权限</h3>
-      ${isScopedSettingsMode() ? `<button class="mini" type="button" data-scope-mode-toggle="${escapeHtml(state.activeView)}">返回记忆</button>` : ""}
-    </div>
-    <div class="badges">
-      <span class="badge blue">${escapeHtml(windowKindLabel(bucket.scope))}</span>
-      <span class="badge teal">${escapeHtml(bucket.target_id)}</span>
-      <span class="badge gold">读取 ${escapeHtml(aclModeLabel(readMode))}</span>
-      <span class="badge violet">被读 ${escapeHtml(aclModeLabel(shareMode))}</span>
-    </div>
-    <div class="privacy-note ${bucket.scope === "group" ? "neutral" : ""}">${escapeHtml(scopedSettingsHint(bucket.scope))}</div>
-    ${bucket.scope === "private" ? `<div class="privacy-note">隐私保护：私聊记忆流向群聊必须显式加入白名单，黑名单默认放行不会自动开放给群聊。</div>` : ""}
-    <section class="permission-panel">
-      ${renderAclSection("can_read", "当前窗口可读", canRead, targets, readMode)}
-      ${renderAclSection("can_be_read_by", "可读取当前窗口", canBeReadBy, targets, shareMode)}
-    </section>
-  `;
-}
-
-function normalizeAclMode(value) {
-  return value === "blacklist" ? "blacklist" : "whitelist";
-}
-
-function aclModeLabel(mode) {
-  return normalizeAclMode(mode) === "blacklist" ? "黑名单" : "白名单";
-}
-
-function aclEffectForMode(mode) {
-  return normalizeAclMode(mode) === "blacklist" ? "deny" : "allow";
-}
-
-function aclPolicyField(sectionMode) {
-  return sectionMode === "can_read" ? "read_mode" : "share_mode";
-}
-
-function aclSectionNote(sectionMode, listMode) {
-  if (sectionMode === "can_read") {
-    return listMode === "blacklist" ? "名单内不可读" : "只读名单内";
-  }
-  return listMode === "blacklist" ? "名单内不可读当前" : "名单内可读当前";
-}
-
-function renderAclModeSwitch(sectionMode, listMode) {
-  const field = aclPolicyField(sectionMode);
-  return `
-    <div class="permission-mode" role="group" aria-label="${escapeHtml(aclModeLabel(listMode))}">
-      <button class="${listMode === "whitelist" ? "is-active" : ""}" data-acl-policy="${escapeHtml(field)}" data-acl-policy-value="whitelist" type="button">白名单</button>
-      <button class="${listMode === "blacklist" ? "is-active" : ""}" data-acl-policy="${escapeHtml(field)}" data-acl-policy-value="blacklist" type="button">黑名单</button>
-    </div>
-  `;
-}
-
-function renderAclSection(mode, title, rules, targets, listMode = "whitelist") {
-  const normalizedMode = normalizeAclMode(listMode);
-  const effect = aclEffectForMode(normalizedMode);
-  const visibleRules = rules.filter((rule) => (rule.effect || "allow") === effect);
-  const disabled = targets.length ? "" : " disabled";
-  const rows = visibleRules.length ? visibleRules.map((rule) => renderAclRuleRow(rule, mode)).join("") : `
-    <div class="empty-state compact">${normalizedMode === "blacklist" ? "暂无阻止项。" : "暂无允许项。"}</div>
-  `;
-  return `
-    <section class="permission-section">
-      <div class="personal-zone-head">
-        <h4>${escapeHtml(title)}</h4>
-        <span>${escapeHtml(aclSectionNote(mode, normalizedMode))}</span>
-      </div>
-      ${renderAclModeSwitch(mode, normalizedMode)}
-      <div class="permission-add">
-        <select data-acl-select="${escapeHtml(mode)}"${disabled}>
-          ${targets.map((target) => `
-            <option value="${escapeHtml(windowOptionValue(target.scope, target.target_id))}">
-              ${escapeHtml(windowKindLabel(target.scope))} · ${escapeHtml(target.label)}
-            </option>
-          `).join("")}
-        </select>
-        <button data-acl-add="${escapeHtml(mode)}" data-acl-effect="${escapeHtml(effect)}" type="button"${disabled}>${normalizedMode === "blacklist" ? "加入黑名单" : "加入白名单"}</button>
-      </div>
-      <div class="permission-list">${rows}</div>
-    </section>
-  `;
-}
-
-function renderAclRuleRow(rule, mode) {
-  const scope = mode === "can_read" ? rule.owner_scope : rule.reader_scope;
-  const id = mode === "can_read" ? rule.owner_id : rule.reader_id;
-  return `
-    <article class="permission-row">
-      <div>
-        <b>${escapeHtml(windowLabel(scope, id))}</b>
-        <small>${escapeHtml(windowKindLabel(scope))} · ${escapeHtml(id)}</small>
-      </div>
-      <button class="ghost mini" data-acl-delete="${escapeHtml(rule.id)}" type="button">移除</button>
-    </article>
-  `;
-}
-
-function bindBucketPermissionPanel(bucket, rootSelector = "#detailDrawer") {
-  bindScopedModeToggleButtons(rootSelector);
-  $$(`${rootSelector} [data-acl-add]`).forEach((button) => {
-    button.addEventListener("click", () => addBucketAclRule(bucket, button.dataset.aclAdd, button, rootSelector));
-  });
-  $$(`${rootSelector} [data-acl-delete]`).forEach((button) => {
-    button.addEventListener("click", () => deleteBucketAclRule(bucket, button.dataset.aclDelete, button, rootSelector));
-  });
-  $$(`${rootSelector} [data-acl-policy]`).forEach((button) => {
-    button.addEventListener("click", () => updateBucketAclPolicy(bucket, button.dataset.aclPolicy, button.dataset.aclPolicyValue, button, rootSelector));
-  });
-}
-
-function bindScopedModeToggleButtons(rootSelector = document) {
-  const root = typeof rootSelector === "string" ? $(rootSelector) : rootSelector;
-  if (!root) return;
-  root.querySelectorAll("[data-scope-mode-toggle]").forEach((button) => {
-    if (button.dataset.scopeModeBound === "1") return;
-    button.dataset.scopeModeBound = "1";
-    button.addEventListener("click", () => withBusy("正在切换页面模式...", () => toggleScopedMode(button.dataset.scopeModeToggle)));
-  });
-}
-
-async function addBucketAclRule(bucket, mode, button, rootSelector = "#detailDrawer") {
-  const select = $(`${rootSelector} [data-acl-select="${mode}"]`);
-  const target = parseWindowOption(select?.value || "");
-  if (!target.scope || !target.id) {
-    showToast("没有可添加的目标窗口", "error");
-    return;
-  }
-  const current = { scope: bucket.scope, id: bucket.target_id };
-  const payload = mode === "can_read"
-    ? { owner_scope: target.scope, owner_id: target.id, reader_scope: current.scope, reader_id: current.id }
-    : { owner_scope: current.scope, owner_id: current.id, reader_scope: target.scope, reader_id: target.id };
-  await withButton(button, "保存中", async () => {
-    await apiPost("/acl/upsert", { ...payload, effect: button.dataset.aclEffect || "allow", enabled: true });
-    showToast(button.dataset.aclEffect === "deny" ? "黑名单已更新" : "白名单已更新");
-    await showBucketPermissions(bucket.id, rootSelector);
-  });
-}
-
-async function updateBucketAclPolicy(bucket, field, value, button, rootSelector = "#detailDrawer") {
-  const payload = { scope: bucket.scope, id: bucket.target_id };
-  payload[field] = value;
-  await withButton(button, "切换中", async () => {
-    await apiPost("/acl/policy", payload);
-    showToast("名单模式已更新");
-    await showBucketPermissions(bucket.id, rootSelector);
-  });
-}
-
-async function deleteBucketAclRule(bucket, ruleId, button, rootSelector = "#detailDrawer") {
-  await withButton(button, "移除中", async () => {
-    await apiPost("/acl/delete", { id: ruleId });
-    showToast("权限已移除");
-    await showBucketPermissions(bucket.id, rootSelector);
-  });
 }
 
 async function showMemory(id) {
@@ -3698,20 +3888,21 @@ function showGenericDetail(title, payload) {
 }
 
 function clearDetail() {
-  const settingsMode = isScopedSettingsMode();
   $("#detailDrawer").className = "detail-drawer empty";
   $("#detailDrawer").innerHTML = `
     <div class="detail-empty">
-      <b>${settingsMode ? "权限设置模式" : "等待选片"}</b>
-      <span>${settingsMode ? "点击左侧具体对象后，在右侧上方面板配置记忆黑名单/白名单。" : "选择左侧对象，再点一条记忆或记录查看详情。"}</span>
+      <b>等待选片</b>
+      <span>选择左侧对象，再点一条记忆或记录查看详情。</span>
     </div>
   `;
 }
 
 function livingMemoryPathValue() {
-  const activeInput = $("#view-archive .archive-section.is-active .livingmemory-path");
-  const fallbackInput = $("#view-archive .livingmemory-path");
-  return (activeInput || fallbackInput)?.value.trim() || "";
+  const activeInputs = Array.from(document.querySelectorAll("#view-archive .archive-section.is-active .livingmemory-path"));
+  const filled = activeInputs.find((input) => input.value.trim());
+  if (filled) return filled.value.trim();
+  const fallbackInput = activeInputs[0] || $("#view-archive .livingmemory-path");
+  return fallbackInput?.value.trim() || "";
 }
 
 function sumLivingMemoryRows(tables = [], importable = true) {
@@ -3941,6 +4132,82 @@ async function executeClearAllMemoryData() {
   showToast("全部记忆已清空");
 }
 
+function scopedClearPayload(scope) {
+  const bucket = activeBucket();
+  const requiredScope = scope === "group_member" ? "group" : scope;
+  if (!bucket || bucket.id === "all" || bucket.scope !== requiredScope || !bucket.target_id) return null;
+  if (scope === "group" || scope === "group_member") {
+    const groupId = bucket.group_id || bucket.target_id;
+    if (scope === "group_member") {
+      const userId = String($("#clearGroupMemberUserId")?.value || "").trim();
+      if (!userId) return null;
+      return {
+        target_type: "group_member",
+        group_id: groupId,
+        user_id: userId,
+        label: `${bucket.label} 中的用户 ${userId}`,
+      };
+    }
+    return {
+      target_type: "group",
+      group_id: groupId,
+      label: bucket.label,
+    };
+  }
+  return {
+    target_type: "private",
+    user_id: bucket.target_id,
+    label: bucket.label,
+  };
+}
+
+function clearScopeCountsText(counts = {}) {
+  const labels = {
+    memories: "长期记忆",
+    timeline: "时间线",
+    relationship_edges: "关系边",
+    knowledge_nodes: "图谱节点",
+    knowledge_edges: "图谱边",
+    injection_logs: "注入日志",
+    summary_failures: "总结失败记录",
+    cross_window_threads: "跨窗口线程",
+  };
+  return Object.entries(labels)
+    .map(([key, label]) => `${label} ${Number(counts[key] || 0)}`)
+    .join(" / ");
+}
+
+async function clearCurrentScopedMemory(scope) {
+  const payload = scopedClearPayload(scope);
+  if (!payload) {
+    const message = scope === "group_member" ? "请先选择具体群聊并填写群成员 QQ" : `请先选择具体${scope === "group" ? "群聊" : "私聊用户"}`;
+    showToast(message, "error");
+    return;
+  }
+  const preview = await apiPost("/maintenance/clear_scope", { ...payload, preview: true });
+  const counts = preview.result?.counts || {};
+  const total = Object.values(counts).reduce((sum, value) => sum + Number(value || 0), 0);
+  if (total <= 0) {
+    showToast("这个范围内没有可清理的数据");
+    return;
+  }
+  const message = [
+    `将清空：${payload.label}`,
+    clearScopeCountsText(counts),
+    "请输入“清空”确认。",
+  ].join("\n");
+  if (prompt(message, "") !== "清空") {
+    showToast("已取消清空操作");
+    return;
+  }
+  const data = await apiPost("/maintenance/clear_scope", { ...payload, confirm: "清空" });
+  state.activeBucketId = "all";
+  clearDetail();
+  await refreshAll();
+  showArchiveResult(data.result);
+  showToast("范围记忆已清空");
+}
+
 async function previewImport() {
   const path = livingMemoryPathValue();
   const params = new URLSearchParams();
@@ -4025,15 +4292,582 @@ function bindActions() {
   $("#maintenanceBtn").addEventListener("click", () => withBusy("正在运行维护...", runMaintenance));
   $("#repairLivingMemoryBtn").addEventListener("click", () => withBusy("正在修复 LivingMemory 内容...", repairLivingMemoryContent));
   $("#clearAllMemoryBtn").addEventListener("click", clearAllMemoryData);
+  $("#clearCurrentGroupMemoryBtn")?.addEventListener("click", () => withBusy("正在预览范围清理...", () => clearCurrentScopedMemory("group")));
+  $("#clearGroupMemberMemoryBtn")?.addEventListener("click", () => withBusy("正在预览群成员记忆清理...", () => clearCurrentScopedMemory("group_member")));
+  $("#clearCurrentPrivateMemoryBtn")?.addEventListener("click", () => withBusy("正在预览范围清理...", () => clearCurrentScopedMemory("private")));
   $("#previewImportBtn").addEventListener("click", () => withBusy("正在扫描 LivingMemory...", previewImport));
   $("#runImportBtn").addEventListener("click", () => withBusy("正在导入 LivingMemory...", runImport));
-  bindScopedModeToggleButtons(document);
   $("#globalSearch").addEventListener("keydown", (event) => {
     if (event.key === "Enter") loadActiveView();
   });
   $("#bucketList").addEventListener("scroll", requestRailCoverflow, { passive: true });
   $("#bucketList").addEventListener("pointermove", requestRailCoverflow, { passive: true });
   window.addEventListener("resize", requestRailCoverflow);
+}
+
+async function loadPersonaState() {
+  const panel = $("#personaStatePanel");
+  if (!panel) return;
+  panel.innerHTML = `<div class="persona-loading">正在读取拟人维度数据...</div>`;
+  let data;
+  try {
+    data = await apiGet("/persona-state");
+  } catch (err) {
+    panel.innerHTML = `<div class="persona-error">读取失败：${escapeHtml(err?.message || "未知错误")}</div>`;
+    return;
+  }
+  panel.innerHTML = renderPersonaState(data || {});
+}
+
+function renderPersonaState(d) {
+  const phases = d.phases || [];
+  const events = d.pending_emotional_events || [];
+  const crossState = d.cross_window_emotional_state || {};
+  const timeOfDay = d.time_of_day || "";
+  const phaseLabels = d.phase_labels || {};
+  const addressLabels = d.address_phase_labels || {};
+  const timeLabels = d.time_of_day_labels || {};
+  const botAddress = d.bot_address_suggestions || {};
+  const phaseDefs = d.phase_definitions || {};
+  const allPhases = phaseDefs.phases || ["acquaintance", "familiar", "close", "intimate", "deeply_bonded"];
+  const thresholds = phaseDefs.thresholds || [0.0, 0.20, 0.45, 0.65, 0.85];
+
+  const timeLabel = timeLabels[timeOfDay] || timeOfDay || "未知";
+  const crossTotal = crossState.total || 0;
+  const crossScar = crossState.scar_count || 0;
+  const crossWarm = crossState.warm_count || 0;
+  const crossVuln = crossState.vulnerable_count || 0;
+
+  let html = '<div class="persona-grid">';
+
+  // 1. Time-of-day and cross-window summary card
+  html += `
+    <div class="persona-card persona-card-wide">
+      <div class="persona-card-head">
+        <b>当前时段</b>
+        <span class="persona-badge persona-badge-time">${escapeHtml(timeLabel)}</span>
+      </div>
+      <div class="persona-card-body">
+        <div class="persona-cross-window">
+          <span class="persona-cw-label">跨窗口情绪余波</span>
+          <div class="persona-cw-stats">
+            <span class="persona-cw-stat ${crossTotal > 0 ? 'is-active' : ''}">总计 ${crossTotal}</span>
+            ${crossScar > 0 ? `<span class="persona-cw-stat persona-cw-scar">伤痕 ${crossScar}</span>` : ''}
+            ${crossWarm > 0 ? `<span class="persona-cw-stat persona-cw-warm">温暖 ${crossWarm}</span>` : ''}
+            ${crossVuln > 0 ? `<span class="persona-cw-stat persona-cw-vuln">脆弱 ${crossVuln}</span>` : ''}
+          </div>
+          ${crossTotal === 0 ? '<small class="persona-cw-empty">近 30 分钟内无跨窗口情绪残留</small>' : '<small class="persona-cw-active">情绪正在跨窗口传递中</small>'}
+        </div>
+      </div>
+    </div>
+  `;
+
+  // 2. Relationship phases
+  if (phases.length === 0) {
+    html += `
+      <div class="persona-card persona-card-wide">
+        <div class="persona-card-head"><b>关系阶段</b></div>
+        <div class="persona-card-body">
+          <p class="persona-empty">还没有足够的关系互动数据。随着对话积累，关系阶段会自然演进。</p>
+        </div>
+      </div>
+    `;
+  } else {
+    html += `
+      <div class="persona-card persona-card-wide">
+        <div class="persona-card-head"><b>关系阶段演进</b><span class="persona-badge">${phases.length} 个会话</span></div>
+        <div class="persona-card-body">
+          <div class="persona-phase-list">
+            ${phases.map(p => renderPersonaPhaseItem(p, allPhases, thresholds, phaseLabels, addressLabels, botAddress)).join('')}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 3. Pending emotional events
+  if (events.length > 0) {
+    html += `
+      <div class="persona-card persona-card-wide">
+        <div class="persona-card-head"><b>情绪事件队列</b><span class="persona-badge">${events.length} 条待处理</span></div>
+        <div class="persona-card-body">
+          <div class="persona-event-list">
+            ${events.map(e => renderPersonaEventItem(e)).join('')}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  html += '</div>';
+  return html;
+}
+
+function renderPersonaPhaseItem(p, allPhases, thresholds, phaseLabels, addressLabels, botAddress) {
+  const phase = p.phase || 'acquaintance';
+  const momentum = p.momentum || 0;
+  const phaseLabel = phaseLabels[phase] || phase;
+  const touchCount = p.touch_count || 0;
+  const addressPhase = p.current_address_phase || '';
+  const addressLabel = addressLabels[addressPhase] || '';
+  const updatedAt = p.updated_at || '';
+  const sessionKey = p.session_key || '';
+  const shortSession = sessionKey.length > 40 ? sessionKey.slice(0, 37) + '...' : sessionKey;
+
+  // Find current phase index for progress bar
+  const phaseIdx = allPhases.indexOf(phase);
+  const phasePercent = phaseIdx >= 0 ? ((phaseIdx + 1) / allPhases.length) * 100 : 20;
+
+  // Momentum bar: map [-0.3, 1.0] to [0%, 100%]
+  const momentumPercent = Math.max(0, Math.min(100, ((momentum + 0.3) / 1.3) * 100));
+  const momentumClass = momentum >= 0.45 ? 'is-high' : momentum >= 0.15 ? 'is-mid' : momentum < 0 ? 'is-low' : '';
+
+  // Bot address suggestion
+  const botSuggestion = botAddress[phase] || {};
+  const botTone = botSuggestion.tone || '';
+  const botHint = botSuggestion.hint || '';
+
+  // Address log
+  const addressLog = p.address_log || [];
+  const hasAddressLog = addressLog.length > 0;
+
+  return `
+    <div class="persona-phase-item">
+      <div class="persona-phase-header">
+        <div class="persona-phase-info">
+          <span class="persona-phase-name">${escapeHtml(phaseLabel)}</span>
+          <small class="persona-phase-session">${escapeHtml(shortSession)}</small>
+        </div>
+        <div class="persona-phase-meta">
+          <span class="persona-phase-touch">${touchCount} 次触动</span>
+          ${addressLabel ? `<span class="persona-phase-address">称呼：${escapeHtml(addressLabel)}</span>` : ''}
+        </div>
+      </div>
+      <div class="persona-phase-progress">
+        <div class="persona-phase-bar">
+          <div class="persona-phase-bar-fill" style="width:${phasePercent}%"></div>
+        </div>
+        <div class="persona-phase-steps">
+          ${allPhases.map((ph, i) => `<span class="persona-phase-step ${i <= phaseIdx ? 'is-active' : ''}">${escapeHtml(phaseLabels[ph] || ph)}</span>`).join('')}
+        </div>
+      </div>
+      <div class="persona-momentum">
+        <span class="persona-momentum-label">动量</span>
+        <div class="persona-momentum-bar">
+          <div class="persona-momentum-fill ${momentumClass}" style="width:${momentumPercent}%"></div>
+        </div>
+        <span class="persona-momentum-value">${momentum.toFixed(3)}</span>
+      </div>
+      ${botTone ? `
+        <div class="persona-bot-address">
+          <span class="persona-bot-tone">${escapeHtml(botTone)}</span>
+          ${botHint ? `<small class="persona-bot-hint">${escapeHtml(botHint)}</small>` : ''}
+        </div>
+      ` : ''}
+      ${hasAddressLog ? `
+        <details class="persona-address-log">
+          <summary>称呼演变记录 (${addressLog.length})</summary>
+          <div class="persona-address-timeline">
+            ${addressLog.map(log => `
+              <div class="persona-address-entry">
+                <span class="persona-address-time">${escapeHtml((log.ts || '').slice(0, 16))}</span>
+                <span class="persona-address-change">${escapeHtml(addressLabels[log.previous] || log.previous || '—')} → ${escapeHtml(addressLabels[log.phase] || log.phase || '')}</span>
+              </div>
+            `).join('')}
+          </div>
+        </details>
+      ` : ''}
+      ${updatedAt ? `<small class="persona-phase-updated">更新于 ${escapeHtml(updatedAt.slice(0, 16))}</small>` : ''}
+    </div>
+  `;
+}
+
+function renderPersonaEventItem(e) {
+  const type = e.event_type || '';
+  const delta = Number(e.energy_delta) || 0;
+  const hint = e.mood_hint || '';
+  const preview = e.content_preview || '';
+  const sessionId = e.session_id || '';
+  const shortSession = sessionId.length > 30 ? sessionId.slice(0, 27) + '...' : sessionId;
+  const typeLabels = {
+    'scar_touched': { label: '伤痕触动', class: 'is-scar' },
+    'warm_memory': { label: '温暖记忆', class: 'is-warm' },
+    'vulnerable_resonance': { label: '脆弱共鸣', class: 'is-vuln' },
+  };
+  const typeInfo = typeLabels[type] || { label: type, class: '' };
+  const deltaSign = delta >= 0 ? '+' : '';
+  const deltaClass = delta >= 0 ? 'is-positive' : 'is-negative';
+
+  return `
+    <div class="persona-event-item ${typeInfo.class}">
+      <div class="persona-event-head">
+        <span class="persona-event-type">${escapeHtml(typeInfo.label)}</span>
+        <span class="persona-event-delta ${deltaClass}">${deltaSign}${delta.toFixed(1)}</span>
+      </div>
+      <div class="persona-event-body">
+        ${hint ? `<span class="persona-event-hint">${escapeHtml(hint)}</span>` : ''}
+        ${preview ? `<small class="persona-event-preview">${escapeHtml(preview)}</small>` : ''}
+        <small class="persona-event-session">${escapeHtml(shortSession)}</small>
+      </div>
+    </div>
+  `;
+}
+
+/* ====== 权限拓扑可视化 ====== */
+
+let _topologyState = { data: null, selectedNode: null, selectedPair: null, busy: false };
+
+async function loadAclTopology() {
+  const container = $("#aclTopologyContainer");
+  if (!container) return;
+  container.innerHTML = loadingState("正在读取权限矩阵...");
+  try {
+    const data = await apiGet("/acl/matrix");
+    _topologyState.data = data;
+    _topologyState.selectedNode = null;
+    _topologyState.selectedPair = null;
+    _topologyState.busy = false;
+    container.innerHTML = renderAclTopology(data);
+    bindAclTopologyInteractions(container);
+  } catch (err) {
+    container.innerHTML = `<div class="persona-error">权限矩阵读取失败：${escapeHtml(err?.message || "未知错误")}</div>`;
+  }
+}
+
+function _policyFor(policies, scope, id) {
+  const found = policies.find(p => p.window_scope === scope && p.window_id === id);
+  if (found) return { read_mode: found.read_mode, share_mode: found.share_mode };
+  const defaultMode = scope === "group" ? "blacklist" : "whitelist";
+  return { read_mode: defaultMode, share_mode: defaultMode };
+}
+
+function _findRule(rules, ownerScope, ownerId, readerScope, readerId) {
+  return rules.find(r =>
+    r.owner_scope === ownerScope && r.owner_id === ownerId &&
+    r.reader_scope === readerScope && r.reader_id === readerId && r.enabled
+  );
+}
+
+function _permissionState(owner, reader, rules, policies) {
+  const rule = _findRule(rules, owner.scope, owner.id, reader.scope, reader.id);
+  if (rule) return rule.effect === "deny" ? "deny" : "allow";
+  return "default";
+}
+
+function _defaultEffect(owner, reader, policies) {
+  const ownerPolicy = _policyFor(policies, owner.scope, owner.id);
+  const readerPolicy = _policyFor(policies, reader.scope, reader.id);
+  const requiresExplicit = owner.scope === "private" && reader.scope === "group";
+  if (requiresExplicit) return "deny";
+  if (ownerPolicy.share_mode === "blacklist" && readerPolicy.read_mode === "blacklist") return "allow";
+  return "deny";
+}
+
+function _permStateInfo(state, defaultEffect) {
+  if (state === "allow") return { color: "var(--acl-allow, #4a9)", label: "手动允许", solid: true };
+  if (state === "deny") return { color: "var(--acl-deny, #c43)", label: "手动屏蔽", solid: true };
+  // default
+  if (defaultEffect === "allow") return { color: "var(--acl-default-allow, #7ba)", label: "默认放行", solid: false };
+  return { color: "var(--acl-default-deny, #e95)", label: "默认禁止", solid: false };
+}
+
+function _topologyNodeKey(w) { return `${w.scope}:${w.id}`; }
+
+function _shortId(id, max) {
+  if (!id) return "";
+  const s = String(id);
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1) + "…";
+}
+
+function _topologyNodeLabels(node) {
+  const bucketTitle = splitWindowBucketTitle({
+    scope: node.scope,
+    target_id: node.id,
+    group_id: node.scope === "group" ? node.id : "",
+    label: node.label || "",
+    sublabel: node.identifier_label || "",
+    target_name: node.target_name || node.display_name || "",
+  });
+  const missingName = node.scope === "group" ? "未记录群名" : "未记录昵称";
+  const name = bucketTitle.secondary && bucketTitle.secondary !== bucketTitle.primary
+    ? bucketTitle.secondary
+    : missingName;
+  return {
+    name,
+    id: bucketTitle.primary || windowIdentifierLabel(node.scope, node.id),
+  };
+}
+
+function _topologyMidArrow(pathPoint, fromPoint, toPoint, ownerKey, readerKey, info, extraClass = "") {
+  const angle = Math.atan2(toPoint.y - fromPoint.y, toPoint.x - fromPoint.x) * 180 / Math.PI;
+  return `<text class="topo-mid-arrow ${extraClass}" x="${pathPoint.x}" y="${pathPoint.y}" transform="rotate(${angle} ${pathPoint.x} ${pathPoint.y})" fill="${info.color}" data-owner="${escapeHtml(ownerKey)}" data-reader="${escapeHtml(readerKey)}">➤</text>`;
+}
+
+function _topologyNodeBadgeClass(node) {
+  return node?.scope === "group" ? "topo-node-group-badge" : "topo-node-private-badge";
+}
+
+function _layoutNodes(windows) {
+  const groups = windows.filter(w => w.scope === "group");
+  const privates = windows.filter(w => w.scope === "private");
+  const colGap = 500;
+  const rowGap = 108;
+  const startY = 74;
+  const groupX = 120;
+  const privateX = groupX + colGap;
+  const nodes = [];
+  groups.forEach((w, i) => {
+    nodes.push({ ...w, key: _topologyNodeKey(w), x: groupX, y: startY + i * rowGap });
+  });
+  privates.forEach((w, i) => {
+    nodes.push({ ...w, key: _topologyNodeKey(w), x: privateX, y: startY + i * rowGap });
+  });
+  const maxCount = Math.max(groups.length, privates.length);
+  const width = Math.max(760, privateX + 160);
+  const height = Math.max(360, startY + maxCount * rowGap + 86);
+  return { nodes, width, height, groupCount: groups.length, privateCount: privates.length };
+}
+
+function renderAclTopology(data) {
+  const windows = data.windows || [];
+  const rules = data.rules || [];
+  const policies = data.policies || [];
+
+  if (windows.length < 2) {
+    return `<div class="empty-state">至少需要 2 个窗口才能配置权限。当前有 ${windows.length} 个窗口。</div>`;
+  }
+
+  const { nodes, width, height } = _layoutNodes(windows);
+  const nodeMap = new Map(nodes.map(n => [n.key, n]));
+
+  const pairs = [];
+  for (let i = 0; i < nodes.length; i++) {
+    for (let j = i + 1; j < nodes.length; j++) {
+      const a = nodes[i], b = nodes[j];
+      const ab = _permissionState(a, b, rules, policies);
+      const ba = _permissionState(b, a, rules, policies);
+      const abDefault = ab === "default" ? _defaultEffect(a, b, policies) : "";
+      const baDefault = ba === "default" ? _defaultEffect(b, a, policies) : "";
+      pairs.push({ a, b, ab, ba, abDefault, baDefault });
+    }
+  }
+
+  const selectedKey = _topologyState.selectedNode;
+  const selectedPair = _topologyState.selectedPair;
+
+  let arrowsHtml = "";
+  let arrowHitsHtml = "";
+  let nodesHtml = "";
+
+  for (const pair of pairs) {
+    const { a, b, ab, ba, abDefault, baDefault } = pair;
+    const isPairSelected = selectedPair && (
+      (selectedPair[0] === a.key && selectedPair[1] === b.key) ||
+      (selectedPair[0] === b.key && selectedPair[1] === a.key)
+    );
+    const involvesSelected = selectedKey && (a.key === selectedKey || b.key === selectedKey);
+    const dim = !isPairSelected && !involvesSelected ? " is-dim" : "";
+    const highlight = isPairSelected ? " is-highlighted" : "";
+    const hitDisabled = selectedPair && !isPairSelected ? " is-disabled" : "";
+    const arrowDisabled = selectedPair && !isPairSelected ? " is-locked" : "";
+
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+    const ox = -dy / dist * 18;
+    const oy = dx / dist * 18;
+    const ox2 = -dy / dist * 34;
+    const oy2 = dx / dist * 34;
+
+    const abInfo = _permStateInfo(ab, abDefault);
+    const baInfo = _permStateInfo(ba, baDefault);
+
+    // a -> b curve (upper)
+    const ax1 = a.x + ox, ay1 = a.y + oy;
+    const bx1 = b.x + ox, by1 = b.y + oy;
+    const mx1 = (a.x + b.x) / 2 + ox2, my1 = (a.y + b.y) / 2 + oy2;
+    const pathAb = `M ${ax1} ${ay1} Q ${mx1} ${my1} ${bx1} ${by1}`;
+    const midAb = { x: 0.25 * ax1 + 0.5 * mx1 + 0.25 * bx1, y: 0.25 * ay1 + 0.5 * my1 + 0.25 * by1 };
+    const abDashAttr = abInfo.solid ? "" : 'stroke-dasharray="5 4"';
+    const abMarkerId = ab === "default" ? `topo-m-default-${abDefault}` : `topo-m-${ab}`;
+    arrowsHtml += `<path class="topo-arrow${dim}${highlight}${arrowDisabled}" d="${pathAb}" data-owner="${escapeHtml(a.key)}" data-reader="${escapeHtml(b.key)}" data-state="${ab}" stroke="${abInfo.color}" fill="none" stroke-width="${abInfo.solid ? 2.5 : 1.8}" marker-end="url(#${abMarkerId})" ${abDashAttr}><title>${escapeHtml(a.label)} → ${escapeHtml(b.label)}: ${abInfo.label}</title></path>`;
+    arrowsHtml += _topologyMidArrow(midAb, { x: ax1, y: ay1 }, { x: bx1, y: by1 }, a.key, b.key, abInfo, `${dim}${highlight}${hitDisabled}`);
+    arrowHitsHtml += `<path class="topo-arrow-hit${hitDisabled}" d="${pathAb}" data-owner="${escapeHtml(a.key)}" data-reader="${escapeHtml(b.key)}" fill="none"><title>${escapeHtml(a.label)} → ${escapeHtml(b.label)}: 点击切换权限</title></path>`;
+
+    // b -> a curve (lower)
+    const ax2 = a.x - ox, ay2 = a.y - oy;
+    const bx2 = b.x - ox, by2 = b.y - oy;
+    const mx2 = (a.x + b.x) / 2 - ox2, my2 = (a.y + b.y) / 2 - oy2;
+    const pathBa = `M ${bx2} ${by2} Q ${mx2} ${my2} ${ax2} ${ay2}`;
+    const midBa = { x: 0.25 * bx2 + 0.5 * mx2 + 0.25 * ax2, y: 0.25 * by2 + 0.5 * my2 + 0.25 * ay2 };
+    const baDashAttr = baInfo.solid ? "" : 'stroke-dasharray="5 4"';
+    const baMarkerId = ba === "default" ? `topo-m-default-${baDefault}` : `topo-m-${ba}`;
+    arrowsHtml += `<path class="topo-arrow${dim}${highlight}${arrowDisabled}" d="${pathBa}" data-owner="${escapeHtml(b.key)}" data-reader="${escapeHtml(a.key)}" data-state="${ba}" stroke="${baInfo.color}" fill="none" stroke-width="${baInfo.solid ? 2.5 : 1.8}" marker-end="url(#${baMarkerId})" ${baDashAttr}><title>${escapeHtml(b.label)} → ${escapeHtml(a.label)}: ${baInfo.label}</title></path>`;
+    arrowsHtml += _topologyMidArrow(midBa, { x: bx2, y: by2 }, { x: ax2, y: ay2 }, b.key, a.key, baInfo, `${dim}${highlight}${hitDisabled}`);
+    arrowHitsHtml += `<path class="topo-arrow-hit${hitDisabled}" d="${pathBa}" data-owner="${escapeHtml(b.key)}" data-reader="${escapeHtml(a.key)}" fill="none"><title>${escapeHtml(b.label)} → ${escapeHtml(a.label)}: 点击切换权限</title></path>`;
+  }
+
+  // Column headers
+  nodesHtml += `
+    <text class="topo-col-header" x="120" y="30" text-anchor="middle">群聊</text>
+    <text class="topo-col-header" x="620" y="30" text-anchor="middle">私聊</text>`;
+
+  // Nodes
+  for (const n of nodes) {
+    const isSelected = n.key === selectedKey;
+    const isInPair = selectedPair && (selectedPair[0] === n.key || selectedPair[1] === n.key);
+    const cls = `topo-node topo-node-${n.scope}${isSelected ? " is-selected" : ""}${isInPair ? " is-paired" : ""}`;
+    const r = 24;
+    const icon = n.scope === "group" ? "#" : "♡";
+    const label = _topologyNodeLabels(n);
+    const textX = n.scope === "group" ? 42 : -42;
+    const anchor = n.scope === "group" ? "start" : "end";
+    nodesHtml += `
+      <g class="${cls}" data-node-key="${escapeHtml(n.key)}" transform="translate(${n.x},${n.y})">
+        <circle r="${r}" />
+        <text class="topo-node-icon" y="3">${escapeHtml(icon)}</text>
+        <text class="topo-node-label" x="${textX}" y="-8" text-anchor="${anchor}">${escapeHtml(compact(label.name, 18))}</text>
+        <text class="topo-node-id" x="${textX}" y="10" text-anchor="${anchor}">${escapeHtml(compact(label.id, 24))}</text>
+        <text class="topo-node-count" x="${textX}" y="27" text-anchor="${anchor}">${n.memory_count || 0} 条记忆</text>
+      </g>`;
+  }
+
+  return `
+    <div class="topo-wrapper">
+      <div class="topo-legend">
+        <span class="topo-legend-item"><span class="topo-legend-line topo-allow"></span>手动允许</span>
+        <span class="topo-legend-item"><span class="topo-legend-line topo-deny"></span>手动屏蔽</span>
+        <span class="topo-legend-item"><span class="topo-legend-line topo-default-allow"></span>默认放行</span>
+        <span class="topo-legend-item"><span class="topo-legend-line topo-default-deny"></span>默认禁止</span>
+        <span class="topo-legend-hint">点击两个节点选中，再点击箭头切换</span>
+      </div>
+      <div class="topo-canvas-wrap">
+        <svg class="topo-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMin meet">
+          <defs>
+            <marker id="topo-m-allow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--acl-allow, #4a9)" /></marker>
+            <marker id="topo-m-deny" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--acl-deny, #c43)" /></marker>
+            <marker id="topo-m-default-allow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--acl-default-allow, #7ba)" /></marker>
+            <marker id="topo-m-default-deny" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--acl-default-deny, #e95)" /></marker>
+          </defs>
+          <g class="topo-arrows">${arrowsHtml}</g>
+          <g class="topo-arrow-hits">${arrowHitsHtml}</g>
+          <g class="topo-nodes">${nodesHtml}</g>
+        </svg>
+      </div>
+    </div>`;
+}
+
+function bindAclTopologyInteractions(container) {
+  // Node click
+  container.querySelectorAll("[data-node-key]").forEach(el => {
+    el.addEventListener("click", () => {
+      const key = el.dataset.nodeKey;
+      if (_topologyState.selectedNode === key) {
+        _topologyState.selectedNode = null;
+        _topologyState.selectedPair = null;
+      } else if (_topologyState.selectedNode && _topologyState.selectedNode !== key) {
+        _topologyState.selectedPair = [_topologyState.selectedNode, key];
+        _topologyState.selectedNode = null;
+      } else {
+        _topologyState.selectedNode = key;
+        _topologyState.selectedPair = null;
+      }
+      _rerenderTopology();
+    });
+  });
+
+  // Arrow click
+  container.querySelectorAll(".topo-arrow[data-owner][data-reader], .topo-arrow-hit[data-owner][data-reader], .topo-mid-arrow[data-owner][data-reader]").forEach(el => {
+    el.addEventListener("click", (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      if (_topologyState.busy) return;
+      const ownerKey = el.dataset.owner;
+      const readerKey = el.dataset.reader;
+      if (
+        _topologyState.selectedPair
+        && !(
+          (_topologyState.selectedPair[0] === ownerKey && _topologyState.selectedPair[1] === readerKey)
+          || (_topologyState.selectedPair[0] === readerKey && _topologyState.selectedPair[1] === ownerKey)
+        )
+      ) {
+        return;
+      }
+      if (!_topologyState.selectedPair) {
+        _topologyState.selectedPair = [ownerKey, readerKey];
+      }
+      _toggleTopologyPermission(ownerKey, readerKey);
+    });
+  });
+
+}
+
+function _rerenderTopology() {
+  const container = $("#aclTopologyContainer");
+  if (!container || !_topologyState.data) return;
+  container.innerHTML = renderAclTopology(_topologyState.data);
+  bindAclTopologyInteractions(container);
+}
+
+async function _toggleTopologyPermission(ownerKey, readerKey) {
+  const data = _topologyState.data;
+  if (!data) return;
+  if (_topologyState.busy) return;
+  _topologyState.busy = true;
+  _rerenderTopology();
+  const ownerIdx = ownerKey.indexOf(":");
+  const ownerScope = ownerIdx >= 0 ? ownerKey.slice(0, ownerIdx) : ownerKey;
+  const ownerId = ownerIdx >= 0 ? ownerKey.slice(ownerIdx + 1) : "";
+  const readerIdx = readerKey.indexOf(":");
+  const readerScope = readerIdx >= 0 ? readerKey.slice(0, readerIdx) : readerKey;
+  const readerId = readerIdx >= 0 ? readerKey.slice(readerIdx + 1) : "";
+  const rules = data.rules || [];
+  const policies = data.policies || [];
+  const existing = _findRule(rules, ownerScope, ownerId, readerScope, readerId);
+  const owner = { scope: ownerScope, id: ownerId };
+  const reader = { scope: readerScope, id: readerId };
+  const currentState = _permissionState(owner, reader, rules, policies);
+
+  // Three-state cycle: allow → deny → default → allow → ...
+  let action;
+  if (currentState === "allow") {
+    action = "to_deny";
+  } else if (currentState === "deny") {
+    action = "to_default";
+  } else {
+    // default → allow
+    action = "to_allow";
+  }
+
+  try {
+    if (action === "to_default" && existing) {
+      await apiPost("/acl/delete", { id: existing.id });
+      showToast("已恢复默认策略");
+    } else if (action === "to_allow") {
+      await apiPost("/acl/upsert", {
+        owner_scope: ownerScope, owner_id: ownerId,
+        reader_scope: readerScope, reader_id: readerId,
+        effect: "allow", enabled: true,
+      });
+      showToast("已手动允许");
+    } else if (action === "to_deny") {
+      await apiPost("/acl/upsert", {
+        owner_scope: ownerScope, owner_id: ownerId,
+        reader_scope: readerScope, reader_id: readerId,
+        effect: "deny", enabled: true,
+      });
+      showToast("已手动屏蔽");
+    }
+    const fresh = await apiGet("/acl/matrix");
+    _topologyState.data = fresh;
+    _topologyState.busy = false;
+    _rerenderTopology();
+  } catch (err) {
+    _topologyState.busy = false;
+    _rerenderTopology();
+    showToast(err?.message || "权限切换失败", "error");
+  }
 }
 
 async function init() {

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 import hashlib
 import inspect
+import mimetypes
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from quart import jsonify, request, send_file
@@ -67,15 +71,21 @@ class PluginPageApi:
             ("/thread/status", self.thread_status, ["POST"], "MemoryCompanion Page thread status"),
             ("/logs", self.logs, ["GET"], "MemoryCompanion Page injection logs"),
             ("/context/config", self.context_config, ["GET"], "MemoryCompanion Page context config"),
+            ("/config/schema", self.config_schema, ["GET"], "MemoryCompanion Page config schema"),
+            ("/config/module/update", self.config_module_update, ["POST"], "MemoryCompanion Page config module update"),
             ("/retrieval/config/update", self.retrieval_config_update, ["POST"], "MemoryCompanion Page retrieval config update"),
             ("/companion/personal-memory", self.companion_personal_memory, ["GET"], "MemoryCompanion Page companion personal memory"),
             ("/companion/personal-photo", self.companion_personal_photo, ["GET"], "MemoryCompanion Page companion personal photo"),
+            ("/companion/personal-photo-data", self.companion_personal_photo_data, ["GET"], "MemoryCompanion Page companion personal photo data"),
             ("/maintenance", self.maintenance, ["POST"], "MemoryCompanion Page maintenance"),
             ("/maintenance/sleep", self.sleep_maintenance, ["GET", "POST"], "MemoryCompanion Page sleep maintenance"),
             ("/maintenance/repair_livingmemory_content", self.repair_livingmemory_content, ["POST"], "MemoryCompanion Page repair LivingMemory content"),
             ("/maintenance/clear_all", self.clear_all, ["POST"], "MemoryCompanion Page clear all memory data"),
+            ("/maintenance/clear_scope", self.clear_scope, ["POST"], "MemoryCompanion Page clear scoped memory data"),
             ("/import/livingmemory/preview", self.import_preview, ["GET"], "MemoryCompanion Page import preview"),
             ("/import/livingmemory/run", self.import_run, ["POST"], "MemoryCompanion Page import run"),
+            ("/persona-state", self.persona_state, ["GET"], "MemoryCompanion Page persona state"),
+            ("/acl/matrix", self.acl_matrix, ["GET"], "MemoryCompanion Page ACL matrix"),
         ]
         for prefix in PAGE_API_PREFIXES:
             for route, handler, methods, desc in routes:
@@ -85,6 +95,136 @@ class PluginPageApi:
         stats = await self.plugin.service.store.stats()
         stats.pop("pending_review", None)
         return self._ok({"stats": stats})
+
+    async def persona_state(self):
+        """Return persona state: relationship phases, emotional events, address evolution, cross-window state."""
+        try:
+            service = self.plugin.service
+            phases: list[dict[str, Any]] = []
+            phase_state = getattr(service, "_relationship_phase_state", None)
+            if isinstance(phase_state, dict):
+                for key, state in phase_state.items():
+                    if not isinstance(state, dict):
+                        continue
+                    phases.append({
+                        "session_key": key,
+                        "phase": state.get("phase", "acquaintance"),
+                        "momentum": round(state.get("momentum", 0.0), 3),
+                        "touch_count": state.get("touch_count", 0),
+                        "last_transition_at": state.get("last_transition_at", ""),
+                        "updated_at": state.get("updated_at", ""),
+                        "current_address_phase": state.get("current_address_phase", ""),
+                        "address_log": (state.get("address_log") or [])[-5:],
+                    })
+            phases.sort(key=lambda p: p.get("updated_at", ""), reverse=True)
+            pending_emotional_events: list[dict[str, Any]] = []
+            event_queue = getattr(service, "_emotional_event_queue", None)
+            if isinstance(event_queue, dict):
+                for session_id, queue in event_queue.items():
+                    if not isinstance(queue, list):
+                        continue
+                    for event in queue[-3:]:
+                        if not isinstance(event, dict):
+                            continue
+                        pending_emotional_events.append({
+                            "session_id": session_id,
+                            "event_type": event.get("event_type"),
+                            "energy_delta": event.get("energy_delta"),
+                            "mood_hint": event.get("mood_hint"),
+                            "content_preview": str(event.get("content_preview", ""))[:80],
+                            "ts": event.get("ts"),
+                        })
+            time_of_day = ""
+            if hasattr(service, "_compute_time_of_day"):
+                time_of_day = service._compute_time_of_day()
+            cross_window_state: dict[str, Any] = {"total": 0, "scar_count": 0, "warm_count": 0, "vulnerable_count": 0}
+            if hasattr(service, "_get_cross_window_emotional_state"):
+                cross_window_state = service._get_cross_window_emotional_state()
+            phases_list = getattr(service, "_PHASES", ["acquaintance", "familiar", "close", "intimate", "deeply_bonded"])
+            thresholds = getattr(service, "_PHASE_THRESHOLDS", [0.0, 0.20, 0.45, 0.65, 0.85])
+            bot_suggestions = getattr(service, "_BOT_ADDRESS_SUGGESTIONS", {})
+            return self._ok({
+                "phases": phases[:20],
+                "pending_emotional_events": pending_emotional_events[:15],
+                "time_of_day": time_of_day,
+                "phase_definitions": {
+                    "phases": phases_list,
+                    "thresholds": thresholds,
+                },
+                "cross_window_emotional_state": cross_window_state,
+                "address_phase_labels": {
+                    "formal": "正式",
+                    "casual": "随意",
+                    "intimate": "亲密",
+                    "playful": "玩笑",
+                },
+                "time_of_day_labels": {
+                    "late_night": "深夜",
+                    "dawn": "凌晨",
+                    "early_morning": "清晨",
+                    "afternoon": "下午",
+                    "evening": "傍晚",
+                    "night": "夜间",
+                },
+                "bot_address_suggestions": bot_suggestions,
+                "phase_labels": {
+                    "acquaintance": "初识",
+                    "familiar": "熟悉",
+                    "close": "亲近",
+                    "intimate": "亲密",
+                    "deeply_bonded": "深伴",
+                },
+            })
+        except Exception as exc:
+            return self._err(f"拟人维度数据读取失败: {exc}", 500)
+
+    async def acl_matrix(self):
+        """Return all windows, ACL rules and policies in one shot for topology visualization."""
+        try:
+            store = self.plugin.service.store
+            buckets = await store.list_memory_buckets(limit=200)
+            windows: list[dict[str, Any]] = []
+            for b in buckets:
+                scope = clean_text(b.get("scope"), 40)
+                tid = clean_text(b.get("target_id"), 160)
+                if scope in ("group", "private") and tid:
+                    windows.append({
+                        "scope": scope,
+                        "id": tid,
+                        "label": clean_text(b.get("label"), 120),
+                        "target_name": clean_text(b.get("target_name"), 120),
+                        "sample_session_id": clean_text(b.get("sample_session_id"), 200),
+                        "sample_group_id": clean_text(b.get("sample_group_id"), 120),
+                        "memory_count": b.get("memory_count", 0),
+                    })
+            rules = await store.list_acl_rules(enabled_only=False)
+            policies = await store.list_acl_policies()
+            return self._ok({
+                "windows": windows,
+                "rules": [
+                    {
+                        "id": clean_text(r.get("id"), 120),
+                        "owner_scope": clean_text(r.get("owner_scope"), 40),
+                        "owner_id": clean_text(r.get("owner_id"), 160),
+                        "reader_scope": clean_text(r.get("reader_scope"), 40),
+                        "reader_id": clean_text(r.get("reader_id"), 160),
+                        "effect": r.get("effect") or "allow",
+                        "enabled": bool(r.get("enabled", True)),
+                    }
+                    for r in rules
+                ],
+                "policies": [
+                    {
+                        "window_scope": clean_text(p.get("window_scope"), 40),
+                        "window_id": clean_text(p.get("window_id"), 160),
+                        "read_mode": p.get("read_mode") or ("blacklist" if clean_text(p.get("window_scope"), 40) == "group" else "whitelist"),
+                        "share_mode": p.get("share_mode") or ("blacklist" if clean_text(p.get("window_scope"), 40) == "group" else "whitelist"),
+                    }
+                    for p in policies
+                ],
+            })
+        except Exception as exc:
+            return self._err(f"权限矩阵读取失败: {exc}", 500)
 
     async def buckets(self):
         buckets = await self.plugin.service.store.list_memory_buckets(limit=self._query_int("limit", 160))
@@ -320,10 +460,14 @@ class PluginPageApi:
             scope=clean_text(request.args.get("scope", ""), 40),
             session_id=clean_text(request.args.get("session_id", ""), 200),
         )
+        all_ids: list[str] = []
+        for row in rows:
+            all_ids.extend(clean_text(mid, 120) for mid in (row.get("selected_memory_ids") or [])[:12])
+        records_map = await self.plugin.service.store.get_memories_by_ids(all_ids) if all_ids else {}
         for row in rows:
             selected = []
             for memory_id in (row.get("selected_memory_ids") or [])[:12]:
-                record = await self.plugin.service.store.get_memory(clean_text(memory_id, 120))
+                record = records_map.get(clean_text(memory_id, 120))
                 if record:
                     selected.append(serialize_memory(record))
             row["selected_memories"] = selected
@@ -437,7 +581,7 @@ class PluginPageApi:
                     "dedupe_prompt_context": config.bool("private_companion_bridge.dedupe_prompt_context", True),
                     "prefer_memory_companion_memory": config.bool(
                         "private_companion_bridge.prefer_memory_companion_memory",
-                        False,
+                        True,
                     ),
                     "preserve_external_prompt_context": config.bool(
                         "private_companion_bridge.preserve_external_prompt_context",
@@ -497,14 +641,16 @@ class PluginPageApi:
         mode = clean_text(payload.get("mode"), 40).lower()
         if mode not in {"auto", "basic", "rerank"}:
             mode = "auto"
-        values = {
+        core_values = {
             "mode": mode,
             "rerank_provider_id": clean_text(payload.get("rerank_provider_id"), 160),
             "rerank_candidate_multiplier": max(1, self._int(payload.get("rerank_candidate_multiplier"), 4)),
             "rerank_candidate_limit": max(1, self._int(payload.get("rerank_candidate_limit"), 32)),
-            "rerank_timeout_ms": max(0, self._int(payload.get("rerank_timeout_ms"), 1200)),
             "embedding_enabled": bool(payload.get("embedding_enabled")),
             "embedding_provider_id": clean_text(payload.get("embedding_provider_id"), 160),
+        }
+        advanced_values = {
+            "rerank_timeout_ms": max(0, self._int(payload.get("rerank_timeout_ms"), 1200)),
             "embedding_candidate_limit": max(1, self._int(payload.get("embedding_candidate_limit"), 1200)),
             "embedding_top_k": max(1, self._int(payload.get("embedding_top_k"), 32)),
             "embedding_score_threshold": max(0.0, min(1.0, self._float(payload.get("embedding_score_threshold"), 0.34))),
@@ -517,71 +663,123 @@ class PluginPageApi:
         raw.setdefault("retrieval", {})
         if not isinstance(raw["retrieval"], dict):
             raw["retrieval"] = {}
-        raw["retrieval"].update(values)
+        raw["retrieval"].update(core_values)
+        raw.setdefault("retrieval_advanced", {})
+        if not isinstance(raw["retrieval_advanced"], dict):
+            raw["retrieval_advanced"] = {}
+        raw["retrieval_advanced"].update(advanced_values)
         self._write_plugin_config(raw)
         return self._ok(
             {
                 "retrieval": {
-                    "mode": str(self.plugin.service.config.get("retrieval.mode", values["mode"]) or values["mode"]),
+                    "mode": str(self.plugin.service.config.get("retrieval.mode", core_values["mode"]) or core_values["mode"]),
                     "rerank_provider_id": str(
-                        self.plugin.service.config.get("retrieval.rerank_provider_id", values["rerank_provider_id"])
-                        or values["rerank_provider_id"]
+                        self.plugin.service.config.get("retrieval.rerank_provider_id", core_values["rerank_provider_id"])
+                        or core_values["rerank_provider_id"]
                     ),
                     "rerank_candidate_multiplier": self.plugin.service.config.int(
                         "retrieval.rerank_candidate_multiplier",
-                        values["rerank_candidate_multiplier"],
+                        core_values["rerank_candidate_multiplier"],
                     ),
                     "rerank_candidate_limit": self.plugin.service.config.int(
                         "retrieval.rerank_candidate_limit",
-                        values["rerank_candidate_limit"],
+                        core_values["rerank_candidate_limit"],
                     ),
                     "rerank_timeout_ms": self.plugin.service.config.int(
                         "retrieval.rerank_timeout_ms",
-                        values["rerank_timeout_ms"],
+                        advanced_values["rerank_timeout_ms"],
                     ),
                     "embedding_enabled": self.plugin.service.config.bool(
                         "retrieval.embedding_enabled",
-                        values["embedding_enabled"],
+                        core_values["embedding_enabled"],
                     ),
                     "embedding_provider_id": str(
-                        self.plugin.service.config.get("retrieval.embedding_provider_id", values["embedding_provider_id"])
-                        or values["embedding_provider_id"]
+                        self.plugin.service.config.get("retrieval.embedding_provider_id", core_values["embedding_provider_id"])
+                        or core_values["embedding_provider_id"]
                     ),
                     "embedding_candidate_limit": self.plugin.service.config.int(
                         "retrieval.embedding_candidate_limit",
-                        values["embedding_candidate_limit"],
+                        advanced_values["embedding_candidate_limit"],
                     ),
                     "embedding_top_k": self.plugin.service.config.int(
                         "retrieval.embedding_top_k",
-                        values["embedding_top_k"],
+                        advanced_values["embedding_top_k"],
                     ),
                     "embedding_score_threshold": self.plugin.service.config.float(
                         "retrieval.embedding_score_threshold",
-                        values["embedding_score_threshold"],
+                        advanced_values["embedding_score_threshold"],
                     ),
                     "embedding_weight": self.plugin.service.config.float(
                         "retrieval.embedding_weight",
-                        values["embedding_weight"],
+                        advanced_values["embedding_weight"],
                     ),
                     "embedding_timeout_ms": self.plugin.service.config.int(
                         "retrieval.embedding_timeout_ms",
-                        values["embedding_timeout_ms"],
+                        advanced_values["embedding_timeout_ms"],
                     ),
                     "embedding_max_text_chars": self.plugin.service.config.int(
                         "retrieval.embedding_max_text_chars",
-                        values["embedding_max_text_chars"],
+                        advanced_values["embedding_max_text_chars"],
                     ),
                     "embedding_backfill_enabled": self.plugin.service.config.bool(
                         "retrieval.embedding_backfill_enabled",
-                        values["embedding_backfill_enabled"],
+                        advanced_values["embedding_backfill_enabled"],
                     ),
                     "embedding_backfill_batch_size": self.plugin.service.config.int(
                         "retrieval.embedding_backfill_batch_size",
-                        values["embedding_backfill_batch_size"],
+                        advanced_values["embedding_backfill_batch_size"],
                     ),
                 },
                 "rerank_provider_options": await self._rerank_provider_options(),
                 "embedding_provider_options": await self._embedding_provider_options(),
+            }
+        )
+
+    async def config_schema(self):
+        try:
+            schema = self._load_config_schema()
+            return self._ok(
+                {
+                    "schema": schema,
+                    "values": self._schema_config_values(schema),
+                    "provider_options": self._provider_options(),
+                    "rerank_provider_options": await self._rerank_provider_options(),
+                    "embedding_provider_options": await self._embedding_provider_options(),
+                }
+            )
+        except Exception as exc:
+            return self._err(f"配置 schema 读取失败: {exc}", 500)
+
+    async def config_module_update(self):
+        payload = await self._json()
+        module = clean_text(payload.get("module"), 80)
+        values = payload.get("values")
+        if not isinstance(values, dict):
+            return self._err("values must be an object", 400)
+        raw = self.plugin.service.config.raw
+        if not isinstance(raw, dict):
+            return self._err("runtime config is not writable", 500)
+        schema = self._load_config_schema()
+        module_schema = schema.get(module)
+        if not isinstance(module_schema, dict):
+            return self._err("unknown config module", 400)
+        items = module_schema.get("items")
+        if not isinstance(items, dict):
+            return self._err("invalid config module", 400)
+
+        target = raw.setdefault(module, {})
+        if not isinstance(target, dict):
+            target = {}
+            raw[module] = target
+        for key, item_schema in items.items():
+            if key not in values or not isinstance(item_schema, dict):
+                continue
+            target[key] = self._coerce_config_value(values.get(key), item_schema)
+        self._write_plugin_config(raw)
+        return self._ok(
+            {
+                "module": module,
+                "values": self._schema_config_values(schema).get(module, {}),
             }
         )
 
@@ -631,22 +829,50 @@ class PluginPageApi:
         return self._ok(payload)
 
     async def companion_personal_photo(self):
+        resolved = self._resolve_companion_personal_photo_path_from_request()
+        if isinstance(resolved, dict):
+            return self._err(str(resolved.get("error") or "photo_not_found"), int(resolved.get("status") or 404))
+        return await send_file(resolved)
+
+    async def companion_personal_photo_data(self):
+        resolved = self._resolve_companion_personal_photo_path_from_request()
+        if isinstance(resolved, dict):
+            return self._err(str(resolved.get("error") or "photo_not_found"), int(resolved.get("status") or 404))
+        try:
+            mime = mimetypes.guess_type(str(resolved))[0] or "image/jpeg"
+            raw = await asyncio.to_thread(resolved.read_bytes)
+            return self._ok(
+                {
+                    "mime": mime,
+                    "size": len(raw),
+                    "data_url": f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}",
+                }
+            )
+        except Exception:
+            return self._err("photo_read_failed", 500)
+
+    def _resolve_companion_personal_photo_path_from_request(self) -> Path | dict[str, Any]:
         status = self._private_companion_status()
         if not status["available"]:
-            return self._err(status.get("reason") or "private companion unavailable", 404)
+            return {"error": status.get("reason") or "private companion unavailable", "status": 404}
         plugin = status.get("plugin")
         data = getattr(plugin, "data", {}) if plugin is not None else {}
         if not isinstance(data, dict):
             data = {}
         selected_date = clean_text(request.args.get("date", ""), 16)
-        photo_id = clean_text(request.args.get("id", ""), 120)
-        for item in self._private_companion_album(data, selected_date):
+        photo_id = clean_text(request.args.get("id"), 120)
+        # When looking up by photo_id, skip date filtering so photos from any date can be served
+        lookup_date = "" if photo_id else selected_date
+        for item in self._private_companion_album(data, lookup_date):
             if photo_id and clean_text(item.get("id"), 120) != photo_id:
                 continue
-            path = Path(clean_text(item.get("path"), 500))
-            if path.is_file():
-                return await send_file(path)
-        return self._err("photo_not_found", 404)
+            raw_path = clean_text(item.get("path"), 500)
+            if not raw_path:
+                continue
+            resolved = Path(raw_path).resolve()
+            if resolved.is_file():
+                return resolved
+        return {"error": "photo_not_found", "status": 404}
 
     def _private_companion_status(self) -> dict[str, Any]:
         for module_name in (
@@ -768,14 +994,20 @@ class PluginPageApi:
                 return
             seen.add(item_id)
             exists = bool(path and Path(path).is_file())
+            query = f"date={quote(date, safe='')}&id={quote(item_id, safe='')}"
             rows.append(
                 {
                     "id": item_id,
                     "date": date,
                     "kind": clean_text(raw.get("kind"), 40) or ("daily_outfit" if source == "daily_outfit_photo" else source),
-                    "title": "每日穿搭图" if source == "daily_outfit_photo" else "近期照片",
+                    "title": {
+                        "daily_outfit_photo": "每日穿搭图",
+                        "recent_photo": "近期自拍",
+                        "life_photo": "生活分享图",
+                    }.get(source, "近期照片"),
                     "path": path,
-                    "url": f"{PAGE_API_PREFIXES[0]}/companion/personal-photo?date={date}&id={item_id}",
+                    "url": f"{PAGE_API_PREFIXES[0]}/companion/personal-photo?{query}",
+                    "image_data_url": f"/companion/personal-photo-data?{query}",
                     "exists": exists,
                     "backend": clean_text(raw.get("backend"), 80),
                     "prompt": clean_text(raw.get("prompt"), 360),
@@ -789,8 +1021,18 @@ class PluginPageApi:
         recent = data.get("recent_photo_generations", [])
         if isinstance(recent, list):
             for item in recent[:12]:
-                if isinstance(item, dict) and (item.get("session") == "daily_outfit" or item.get("kind") == "selfie"):
+                if not isinstance(item, dict):
+                    continue
+                ok = bool(item.get("ok"))
+                path = clean_text(item.get("path"), 500)
+                if not ok or not path:
+                    continue
+                session = clean_text(item.get("session"), 100)
+                kind = clean_text(item.get("kind"), 30)
+                if session == "daily_outfit" or kind == "selfie":
                     add(item, "recent_photo")
+                elif session.startswith("natural_photo") or kind == "text2img":
+                    add(item, "life_photo")
         return rows[:8]
 
     def _private_companion_subjective_memories(self, data: dict[str, Any], selected_date: str) -> list[dict[str, Any]]:
@@ -1319,6 +1561,31 @@ class PluginPageApi:
         result = await self.plugin.service.store.clear_all_memory_data()
         return self._ok({"result": result})
 
+    async def clear_scope(self):
+        payload = await self._json()
+        target_type = clean_text(payload.get("target_type") or payload.get("type"), 40)
+        group_id = clean_text(payload.get("group_id"), 120)
+        user_id = clean_text(payload.get("user_id"), 120)
+        preview = self._bool(payload.get("preview"), False)
+        try:
+            if preview:
+                result = await self.plugin.service.store.preview_scoped_memory_clear(
+                    target_type=target_type,
+                    group_id=group_id,
+                    user_id=user_id,
+                )
+            else:
+                if clean_text(payload.get("confirm"), 20) != "清空":
+                    return self._err("confirmation mismatch", 400)
+                result = await self.plugin.service.store.clear_scoped_memory(
+                    target_type=target_type,
+                    group_id=group_id,
+                    user_id=user_id,
+                )
+        except ValueError as exc:
+            return self._err(str(exc), 400)
+        return self._ok({"result": result})
+
     async def import_preview(self):
         configured = clean_text(request.args.get("path", ""), 1000)
         report = self.plugin.service.migrator.preview(configured)
@@ -1351,12 +1618,82 @@ class PluginPageApi:
     def _write_plugin_config(self, raw: dict[str, Any]) -> None:
         path = self._plugin_config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+        import os
+        import tempfile
+        fd, tmp_path = tempfile.mkstemp(
+            suffix=".tmp",
+            prefix=path.stem,
+            dir=str(path.parent),
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(raw, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, str(path))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def _plugin_config_path(self) -> Path:
         data_dir = Path(getattr(self.plugin.service, "data_dir", ""))
         root = data_dir.parent.parent if data_dir.parent.name == "plugin_data" else data_dir.parent
         return root / "config" / f"{PLUGIN_NAME}_config.json"
+
+    def _load_config_schema(self) -> dict[str, Any]:
+        path = Path(__file__).with_name("_conf_schema.json")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+
+    def _schema_config_values(self, schema: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        for module, module_schema in schema.items():
+            if not isinstance(module_schema, dict):
+                continue
+            items = module_schema.get("items")
+            if not isinstance(items, dict):
+                continue
+            result[module] = {}
+            for key, item_schema in items.items():
+                if not isinstance(item_schema, dict):
+                    continue
+                dotted = f"{module}.{key}"
+                default = item_schema.get("default")
+                value = self._config_value_with_reverse_alias(dotted, default)
+                result[module][key] = value
+        return result
+
+    def _config_value_with_reverse_alias(self, dotted: str, default: Any = None) -> Any:
+        config = self.plugin.service.config
+        marker = object()
+        exact = getattr(config, "_get_exact", None)
+        aliases = getattr(config, "ALIASES", {}) or {}
+        if callable(exact):
+            value = exact(dotted, marker)
+            if value is not marker:
+                return value
+            for canonical, alias_list in aliases.items():
+                if dotted in alias_list:
+                    value = exact(canonical, marker)
+                    if value is not marker:
+                        return value
+        return config.get(dotted, default)
+
+    def _coerce_config_value(self, value: Any, item_schema: dict[str, Any]) -> Any:
+        value_type = clean_text(item_schema.get("type"), 40)
+        if value_type == "bool":
+            return self._bool(value, bool(item_schema.get("default", False)))
+        if value_type == "int":
+            return self._int(value, int(item_schema.get("default", 0) or 0))
+        if value_type == "float":
+            return self._float(value, float(item_schema.get("default", 0.0) or 0.0))
+        text = clean_text(value, 2000)
+        options = item_schema.get("options")
+        if isinstance(options, list) and options and text not in {str(option) for option in options}:
+            default = item_schema.get("default", "")
+            return clean_text(default, 2000)
+        return text
 
     def _provider_options(self) -> list[dict[str, str]]:
         options = [{"id": "", "label": "不使用 LLM 压缩"}]

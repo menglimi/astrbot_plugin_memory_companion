@@ -16,7 +16,7 @@ from .core.models import json_dumps
 from .core.service import MemoryCompanionService
 
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.4.0"
 
 _ACTIVE_BRIDGE: MemoryCompanionBridge | None = None
 
@@ -206,6 +206,18 @@ class MemoryCompanionPlugin(Star):
         self, event: AstrMessageEvent, memory_id: str = ""
     ) -> AsyncGenerator[MessageEventResult, None]:
         yield event.plain_result(await self.commands.delete(memory_id))
+
+    @permission_type(PermissionType.ADMIN)
+    @mcomp.command("clear_scope", priority=10)
+    async def cmd_mcomp_clear_scope(
+        self,
+        event: AstrMessageEvent,
+        target_type: str = "",
+        first_id: str = "",
+        second_id: str = "",
+        confirm: str = "",
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        yield event.plain_result(await self.commands.clear_scope(target_type, first_id, second_id, confirm))
 
     @permission_type(PermissionType.ADMIN)
     @mcomp.command("visibility", priority=10)
