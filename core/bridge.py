@@ -157,12 +157,16 @@ class MemoryCompanionBridge:
         session_context: SessionContext | dict[str, Any] | None = None,
         top_k: int | None = None,
         max_chars: int | None = None,
+        companion_bot_mood: str = "",
+        companion_bot_energy: float = 0.0,
     ) -> str:
         return await self._plugin.bridge_compose_injection(
             query,
             session_context=session_context,
             top_k=top_k,
             max_chars=max_chars,
+            companion_bot_mood=companion_bot_mood,
+            companion_bot_energy=companion_bot_energy,
         )
 
     async def compose_context(
@@ -172,12 +176,16 @@ class MemoryCompanionBridge:
         session_context: SessionContext | dict[str, Any] | None = None,
         top_k: int | None = None,
         max_chars: int | None = None,
+        companion_bot_mood: str = "",
+        companion_bot_energy: float = 0.0,
     ) -> str:
         return await self._plugin.bridge_compose_context(
             query=query,
             session_context=session_context,
             top_k=top_k,
             max_chars=max_chars,
+            companion_bot_mood=companion_bot_mood,
+            companion_bot_energy=companion_bot_energy,
         )
 
     async def remember(self, *, event: Any, content: str, note_type: str = "memory") -> dict[str, Any]:
@@ -197,6 +205,13 @@ class MemoryCompanionBridge:
         if callable(getter):
             return getter()
         return {"available": True}
+
+    def get_token_usage_summary(self) -> dict[str, Any]:
+        getter = getattr(self._plugin, "token_usage_summary", None)
+        if callable(getter):
+            result = getter()
+            return result if isinstance(result, dict) else {}
+        return {}
 
     def should_defer_private_companion_section(self, section: str) -> bool:
         checker = getattr(self._plugin, "should_private_companion_defer_section", None)
@@ -226,6 +241,34 @@ class MemoryCompanionBridge:
     async def mark_visibility(self, memory_id: str, visibility: str) -> bool:
         return await self._plugin.store.update_memory_visibility(memory_id, visibility)
 
+    def get_emotional_events(self, *, session_id: str = "", limit: int = 5) -> list[dict[str, Any]]:
+        """Retrieve pending emotional drift events for the companion plugin."""
+        return self._plugin.bridge_get_emotional_events(session_id=session_id, limit=limit)
+
+    async def search_open_loops(self, *, session_id: str = "", limit: int = 3) -> list[dict[str, Any]]:
+        """Search for unresolved open-loop / promise memories for proactive companionship."""
+        return await self._plugin.bridge_search_open_loops(session_id=session_id, limit=limit)
+
+    def get_relationship_phase(self, *, session_id: str = "", scope: str = "private") -> dict[str, Any]:
+        """Return current relationship phase state for a session."""
+        getter = getattr(self._plugin, "_get_relationship_phase", None)
+        if not callable(getter):
+            return {"phase": "unknown", "momentum": 0.0}
+        ctx = SessionContext(session_id=session_id, scope=scope)
+        return getter(ctx)
+
+    def get_recent_emotional_state(self) -> dict[str, Any]:
+        """Return a summary of recent emotional events across ALL sessions.
+
+        This provides cross-window emotional continuity for the companion plugin:
+        if the bot recently touched scar or warm memories in any session, the
+        companion plugin can factor this into its daily state calibration.
+        """
+        getter = getattr(self._plugin, "_get_cross_window_emotional_state", None)
+        if not callable(getter):
+            return {"total": 0, "scar_count": 0, "warm_count": 0, "vulnerable_count": 0}
+        return getter()
+
     def _entity(self, payload: dict[str, Any]) -> EntityRef:
         return EntityRef(
             kind=str(payload.get("kind") or "user"),
@@ -251,6 +294,8 @@ def serialize_memory(record: MemoryRecord, score: float | None = None, reason: s
         "freshness_weight",
         "scar_weight",
         "emotional_debt_weight",
+        "intimacy_weight",
+        "vulnerability_weight",
     ]
     persona_weights = {
         key: metadata.get(key)

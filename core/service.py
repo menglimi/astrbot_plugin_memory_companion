@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 import json
@@ -75,6 +76,9 @@ class MemoryCompanionService:
         )
         self.importance = ImportanceEvaluator()
         self._summary_locks: dict[str, asyncio.Lock] = {}
+        self._summary_lock_ts: dict[str, float] = {}
+        self._summary_lock_last_cleanup: float = time.monotonic()
+        self._SUMMARY_LOCK_TTL: float = 600.0  # 10 minutes
         self._decay_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._embedding_backfill_inflight: set[str] = set()
@@ -82,6 +86,15 @@ class MemoryCompanionService:
         self._last_retrieval_path_info: dict[str, Any] = {}
         self.migrator = LivingMemoryMigrator(self.store, self.plugin_root, self.data_dir)
         self.sleep_state_path = self.data_dir / "memory_companion_sleep_state.json"
+        self.token_usage_path = self.data_dir / "memory_companion_token_usage.json"
+        self._token_usage_last_save_at: float = 0.0
+        self._token_usage: dict[str, Any] = self._load_token_usage()
+        self._emotional_event_queue: dict[str, list[dict[str, Any]]] = {}
+        self._EMOTIONAL_EVENT_MAX_PER_SESSION = 10
+        self._EMOTIONAL_EVENT_TTL = 3600.0
+        self._relationship_phase_state: dict[str, dict[str, Any]] = {}
+        self._RELATIONSHIP_PHASE_FILE = self.data_dir / "memory_companion_relationship_phase.json"
+        self._load_relationship_phase_state()
 
     async def handle_llm_request(self, event: Any, req: Any) -> None:
         ctx = await self.identity.resolve_event_context(event)
@@ -91,6 +104,7 @@ class MemoryCompanionService:
             return
 
         await self._apply_user_reaction_feedback(ctx)
+        self._update_address_evolution(ctx, ctx.message_text or "")
 
         try:
             await self.inject_memories(ctx, req, event=event)
@@ -440,6 +454,8 @@ class MemoryCompanionService:
         session_context: SessionContext | dict[str, Any] | None = None,
         top_k: int | None = None,
         max_chars: int | None = None,
+        companion_bot_mood: str = "",
+        companion_bot_energy: float = 0.0,
     ) -> str:
         ctx = self.session_context_from_bridge(session_context)
         query_text = clean_text(query or ctx.message_text, 1400)
@@ -452,6 +468,8 @@ class MemoryCompanionService:
             max_chars=max_chars or self.config.int("memory_injection.max_chars", 1800),
             note="bridge_injection",
             write_log=False,
+            companion_bot_mood=companion_bot_mood,
+            companion_bot_energy=companion_bot_energy,
         )
 
     async def bridge_compose_context(
@@ -461,13 +479,222 @@ class MemoryCompanionService:
         session_context: SessionContext | dict[str, Any] | None = None,
         top_k: int | None = None,
         max_chars: int | None = None,
+        companion_bot_mood: str = "",
+        companion_bot_energy: float = 0.0,
     ) -> str:
         return await self.bridge_compose_injection(
             query,
             session_context=session_context,
             top_k=top_k,
             max_chars=max_chars,
+            companion_bot_mood=companion_bot_mood,
+            companion_bot_energy=companion_bot_energy,
         )
+
+    def bridge_get_emotional_events(self, *, session_id: str = "", limit: int = 5) -> list[dict[str, Any]]:
+        """Return pending emotional drift events for the companion plugin to consume."""
+        now = time.time()
+        events: list[dict[str, Any]] = []
+        if session_id:
+            keys = [session_id]
+        else:
+            keys = list(self._emotional_event_queue.keys())
+        for key in keys:
+            queue = self._emotional_event_queue.get(key, [])
+            fresh = [e for e in queue if (now - e.get("ts", 0)) < self._EMOTIONAL_EVENT_TTL]
+            if len(fresh) != len(queue):
+                self._emotional_event_queue[key] = fresh
+            events.extend(fresh)
+        events.sort(key=lambda e: e.get("ts", 0), reverse=True)
+        result = events[:max(1, min(limit, 20))]
+        for key in keys:
+            queue = self._emotional_event_queue.get(key, [])
+            consumed_ids = {e.get("id", "") for e in result if e.get("session_id") == key}
+            if consumed_ids:
+                self._emotional_event_queue[key] = [e for e in queue if e.get("id", "") not in consumed_ids]
+        return result
+
+    async def bridge_search_open_loops(self, *, session_id: str = "", limit: int = 3) -> list[dict[str, Any]]:
+        """Search for unresolved open-loop / promise memories for proactive companionship."""
+        ctx = SessionContext(session_id=session_id or "", scope="private")
+        try:
+            results = await self.search(
+                "约定 承诺 下次 继续 没完成 待续 还没 回头",
+                ctx,
+                top_k=max(limit * 3, 6),
+            )
+        except Exception:
+            return []
+        open_loops: list[dict[str, Any]] = []
+        now = time.time()
+        for item in results:
+            memory = item.memory
+            metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+            try:
+                open_loop_w = float(metadata.get("open_loop_weight") or 0.0)
+                promise_w = float(metadata.get("promise_weight") or 0.0)
+            except Exception:
+                open_loop_w = promise_w = 0.0
+            if max(open_loop_w, promise_w) < 0.30:
+                continue
+            if metadata.get("resolved_at"):
+                continue
+            occurred = clean_text(memory.occurred_at or memory.created_at, 40)
+            age_days = None
+            if occurred:
+                try:
+                    dt = datetime.fromisoformat(occurred.replace("Z", "+00:00"))
+                    age_days = (now - dt.timestamp()) / 86400.0
+                except Exception:
+                    pass
+            if age_days is not None and age_days < 0.5:
+                continue
+            open_loops.append({
+                "memory_id": memory.id,
+                "content": clean_text(memory.content, 300),
+                "session_id": memory.session_id,
+                "occurred_at": occurred,
+                "age_days": round(age_days, 1) if age_days is not None else None,
+                "open_loop_weight": round(open_loop_w, 3),
+                "promise_weight": round(promise_w, 3),
+                "memory_reason": clean_text(metadata.get("memory_reason"), 200),
+            })
+            if len(open_loops) >= limit:
+                break
+        return open_loops
+
+    def _detect_and_queue_emotional_events(
+        self,
+        ctx: SessionContext,
+        results: list[Any],
+        *,
+        companion_bot_mood: str = "",
+        companion_bot_energy: float = 0.0,
+        emotional_tone: str = "neutral",
+    ) -> None:
+        """Detect emotional signals from recalled memories and queue drift events for the companion plugin."""
+        if not results:
+            return
+        now = time.time()
+        events: list[dict[str, Any]] = []
+        for item in results:
+            memory = getattr(item, "memory", None)
+            if memory is None:
+                continue
+            metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+            try:
+                scar_w = float(metadata.get("scar_weight") or 0.0)
+                emotional_w = float(metadata.get("emotional_weight") or 0.0)
+                relationship_w = float(metadata.get("relationship_weight") or 0.0)
+                vulnerability_w = float(metadata.get("vulnerability_weight") or 0.0)
+            except Exception:
+                scar_w = emotional_w = relationship_w = vulnerability_w = 0.0
+            event_type = ""
+            energy_delta = 0.0
+            mood_hint = ""
+            if scar_w >= 0.55:
+                event_type = "scar_touched"
+                energy_delta = -min(8.0, scar_w * 10.0)
+                mood_hint = "低落"
+            elif emotional_w >= 0.50 and relationship_w >= 0.40:
+                event_type = "warm_memory"
+                energy_delta = min(5.0, emotional_w * 6.0)
+                mood_hint = "微暖"
+            elif vulnerability_w >= 0.50 and emotional_tone in ("vulnerable", "warm", "nostalgic"):
+                event_type = "vulnerable_resonance"
+                energy_delta = -min(4.0, vulnerability_w * 5.0)
+                mood_hint = "柔软"
+            if not event_type:
+                continue
+            # Mood resonance check: if Bot is already in a contrasting mood, dampen the drift
+            if companion_bot_mood:
+                mood_lower = companion_bot_mood.strip().lower()
+                if event_type == "warm_memory" and any(kw in mood_lower for kw in ("难过", "伤心", "累", "疲惫")):
+                    energy_delta *= 0.5
+                if event_type == "scar_touched" and any(kw in mood_lower for kw in ("开心", "愉快", "兴奋")):
+                    energy_delta *= 0.6
+            events.append({
+                "id": f"emo_{memory.id}_{int(now)}",
+                "ts": now,
+                "session_id": ctx.session_id,
+                "event_type": event_type,
+                "memory_id": memory.id,
+                "energy_delta": round(energy_delta, 2),
+                "mood_hint": mood_hint,
+                "scar_weight": round(scar_w, 3),
+                "emotional_weight": round(emotional_w, 3),
+                "content_preview": clean_text(memory.content, 120),
+            })
+        if not events:
+            return
+        queue = self._emotional_event_queue.setdefault(ctx.session_id, [])
+        queue.extend(events)
+        # Trim old events
+        queue[:] = [e for e in queue if (now - e.get("ts", 0)) < self._EMOTIONAL_EVENT_TTL]
+        if len(queue) > self._EMOTIONAL_EVENT_MAX_PER_SESSION:
+            queue[:] = queue[-self._EMOTIONAL_EVENT_MAX_PER_SESSION:]
+
+    def _get_cross_window_emotional_hint(self, ctx: SessionContext) -> str:
+        """Generate a subtle hint about emotional residue from other chat windows.
+
+        This creates cross-window emotional continuity: if the bot recently touched
+        scar or warm memories in another session, a faint residue influences the
+        current session's atmosphere without leaking private content.
+        """
+        now = time.time()
+        current_session = ctx.session_id
+        # Collect recent events from OTHER sessions (within last 30 minutes)
+        recent_window = 1800.0  # 30 minutes
+        other_events: list[dict[str, Any]] = []
+        for session_id, queue in self._emotional_event_queue.items():
+            if session_id == current_session:
+                continue
+            for event in queue:
+                age = now - event.get("ts", 0)
+                if age < recent_window:
+                    other_events.append(event)
+        if not other_events:
+            return ""
+        # Categorize
+        scar_count = sum(1 for e in other_events if e.get("event_type") == "scar_touched")
+        warm_count = sum(1 for e in other_events if e.get("event_type") == "warm_memory")
+        vulnerable_count = sum(1 for e in other_events if e.get("event_type") == "vulnerable_resonance")
+        # Build hint without leaking content
+        hints: list[str] = []
+        if scar_count >= 2:
+            hints.append("你刚刚在别处想起了一些沉重的事，此刻心里还有点闷；这不会影响你对当前对话的回应，但语气可能会不自觉柔和一些。")
+        elif scar_count == 1:
+            hints.append("你刚才在另一个对话里触碰到了一点旧事，心里还有一丝余波；自然回应就好，不需要刻意掩饰。")
+        if warm_count >= 2:
+            hints.append("你最近在别的对话里感受到了不少温暖，此刻心情底色偏暖；可以更自然地用这份温度回应当前的人。")
+        elif warm_count == 1:
+            hints.append("你刚才在别处想起了一些温暖的事，心里还带着一点柔软；这会让你的回应更自然地带着温度。")
+        if vulnerable_count >= 1:
+            hints.append("你刚刚在另一个窗口感受到了一些脆弱共鸣，此刻对对方的情绪可能更敏感一些。")
+        if not hints:
+            return ""
+        return " ".join(hints)
+
+    def _get_cross_window_emotional_state(self) -> dict[str, Any]:
+        """Return a summary of recent emotional events across all sessions for the companion plugin."""
+        now = time.time()
+        recent_window = 1800.0
+        all_events: list[dict[str, Any]] = []
+        for session_id, queue in self._emotional_event_queue.items():
+            for event in queue:
+                age = now - event.get("ts", 0)
+                if age < recent_window:
+                    all_events.append({**event, "age_seconds": round(age, 0)})
+        if not all_events:
+            return {"total": 0, "scar_count": 0, "warm_count": 0, "vulnerable_count": 0}
+        all_events.sort(key=lambda e: e.get("ts", 0), reverse=True)
+        return {
+            "total": len(all_events),
+            "scar_count": sum(1 for e in all_events if e.get("event_type") == "scar_touched"),
+            "warm_count": sum(1 for e in all_events if e.get("event_type") == "warm_memory"),
+            "vulnerable_count": sum(1 for e in all_events if e.get("event_type") == "vulnerable_resonance"),
+            "recent": all_events[:5],
+        }
 
     async def search(
         self,
@@ -559,6 +786,7 @@ class MemoryCompanionService:
             embedding_max_text_chars=self.config.int("retrieval.embedding_max_text_chars", 1200),
             knowledge_graph_enabled=self.config.bool("knowledge_graph.retrieval_expansion_enabled", True),
             knowledge_graph_expansion_limit=self.config.int("knowledge_graph.expansion_limit", 12),
+            usage_recorder=self._record_token_usage,
         )
 
     async def _resolve_rerank_provider(self, ctx: SessionContext, *, mode: str) -> tuple[Any, str]:
@@ -709,6 +937,249 @@ class MemoryCompanionService:
                 return value
         return clean_text(type(provider).__name__, 160)
 
+    def _load_token_usage(self) -> dict[str, Any]:
+        try:
+            if not self.token_usage_path.exists():
+                return {}
+            payload = json.loads(self.token_usage_path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except Exception as exc:
+            logger.warning("[MemoryCompanion] Token 统计读取失败，已从空统计开始: %s", exc)
+            return {}
+
+    def _save_token_usage(self, *, force: bool = False) -> None:
+        now_ts = time.time()
+        if not force and now_ts - self._token_usage_last_save_at < 30:
+            return
+        self._token_usage_last_save_at = now_ts
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            tmp_path = self.token_usage_path.with_suffix(self.token_usage_path.suffix + ".tmp")
+            tmp_path.write_text(
+                json.dumps(self._token_usage if isinstance(self._token_usage, dict) else {}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp_path.replace(self.token_usage_path)
+        except Exception as exc:
+            logger.debug("[MemoryCompanion] Token 统计保存失败: %s", exc)
+
+    def token_usage_summary(self) -> dict[str, Any]:
+        usage = self._token_usage if isinstance(self._token_usage, dict) else {}
+        payload = json_loads(json_dumps(usage), {})
+        if not isinstance(payload, dict):
+            payload = {}
+        payload.update(
+            {
+                "available": True,
+                "display_name": "我会牢牢记住你",
+                "plugin_name": "astrbot_plugin_memory_companion",
+                "counted_in_private_companion_budget": False,
+                "note": "仅展示记忆插件自身模型消耗，不计入陪伴插件每日 Token 限额。",
+            }
+        )
+        return payload
+
+    @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _estimate_token_count(text: str) -> int:
+        raw = str(text or "")
+        if not raw:
+            return 0
+        ascii_chars = sum(1 for ch in raw if ord(ch) < 128)
+        non_ascii_chars = max(0, len(raw) - ascii_chars)
+        return max(1, int(ascii_chars / 4.0 + non_ascii_chars / 1.6))
+
+    @staticmethod
+    def _usage_raw_value(usage: Any, key: str) -> Any:
+        current = usage
+        if not current:
+            return None
+        for part in str(key or "").split("."):
+            if not part:
+                return None
+            if isinstance(current, dict):
+                current = current.get(part)
+            else:
+                current = getattr(current, part, None)
+            if current is None:
+                return None
+        return current
+
+    @classmethod
+    def _usage_value(cls, usage: Any, *keys: str) -> int:
+        if not usage:
+            return 0
+        for key in keys:
+            try:
+                parsed = int(cls._usage_raw_value(usage, key))
+            except (TypeError, ValueError):
+                parsed = 0
+            if parsed > 0:
+                return parsed
+        return 0
+
+    def _extract_token_usage(self, resp: Any, prompt: str, completion: str) -> dict[str, Any]:
+        candidates = [
+            getattr(resp, "usage", None),
+            getattr(resp, "token_usage", None),
+            getattr(resp, "raw_usage", None),
+        ]
+        raw_completion = getattr(resp, "raw_completion", None)
+        if raw_completion is not None:
+            candidates.append(getattr(raw_completion, "usage", None))
+        raw_response = getattr(resp, "raw_response", None)
+        if isinstance(raw_response, dict):
+            candidates.extend([raw_response.get("usage"), raw_response.get("token_usage")])
+        usage = next((item for item in candidates if item), None)
+        prompt_tokens = self._usage_value(usage, "prompt_tokens", "input_tokens", "prompt", "input")
+        completion_tokens = self._usage_value(usage, "completion_tokens", "output_tokens", "completion", "output")
+        total_tokens = self._usage_value(usage, "total_tokens", "total")
+        cache_read_tokens = self._usage_value(
+            usage,
+            "input_cached",
+            "prompt_tokens_details.cached_tokens",
+            "input_tokens_details.cached_tokens",
+            "input_token_details.cached_tokens",
+            "input_token_details.cache_read",
+            "cache_read_input_tokens",
+            "cache_read_tokens",
+            "prompt_cache_hit_tokens",
+        )
+        cache_write_tokens = self._usage_value(
+            usage,
+            "cache_creation_input_tokens",
+            "cache_creation_tokens",
+            "cache_write_input_tokens",
+            "cache_write_tokens",
+            "prompt_cache_creation_tokens",
+        )
+        cached_tokens = self._usage_value(
+            usage,
+            "input_cached",
+            "cached_tokens",
+            "prompt_cached_tokens",
+            "input_cached_tokens",
+            "prompt_tokens_details.cached_tokens",
+            "input_tokens_details.cached_tokens",
+            "input_token_details.cached_tokens",
+        )
+        if cached_tokens <= 0:
+            cached_tokens = cache_read_tokens
+        if total_tokens <= 0:
+            prompt_estimated = prompt_tokens <= 0
+            completion_estimated = completion_tokens <= 0
+            if prompt_estimated:
+                prompt_tokens = self._estimate_token_count(prompt)
+            if completion_estimated:
+                completion_tokens = self._estimate_token_count(completion)
+            total_tokens = prompt_tokens + completion_tokens
+            estimated = (not usage) or prompt_estimated or completion_estimated
+        else:
+            estimated = not usage
+            if prompt_tokens <= 0 and completion_tokens <= 0:
+                prompt_tokens = self._estimate_token_count(prompt)
+                completion_tokens = max(0, total_tokens - prompt_tokens)
+        return {
+            "prompt_tokens": max(0, prompt_tokens),
+            "completion_tokens": max(0, completion_tokens),
+            "total_tokens": max(0, total_tokens),
+            "cached_tokens": max(0, cached_tokens),
+            "cache_read_tokens": max(0, cache_read_tokens),
+            "cache_write_tokens": max(0, cache_write_tokens),
+            "estimated": bool(estimated),
+        }
+
+    def _record_token_usage(
+        self,
+        *,
+        task: str,
+        provider_id: str,
+        prompt: str = "",
+        completion: str = "",
+        resp: Any = None,
+        success: bool = True,
+        elapsed_ms: int = 0,
+        error: str = "",
+    ) -> None:
+        usage = self._extract_token_usage(resp, prompt, completion)
+        now_dt = datetime.now()
+        now_ts = time.time()
+        day = now_dt.strftime("%Y-%m-%d")
+        hour = now_dt.strftime("%Y-%m-%dT%H:00")
+        store = self._token_usage if isinstance(self._token_usage, dict) else {}
+        self._token_usage = store
+        totals = store.setdefault("totals", {})
+        by_provider = store.setdefault("by_provider", {})
+        by_task = store.setdefault("by_task", {})
+        by_day = store.setdefault("by_day", {})
+        by_day_provider = store.setdefault("by_day_provider", {})
+        by_day_task = store.setdefault("by_day_task", {})
+        by_hour = store.setdefault("by_hour", {})
+        recent = store.setdefault("recent", [])
+        if not isinstance(recent, list):
+            recent = []
+            store["recent"] = recent
+        provider_key = clean_text(provider_id, 160) or "(default)"
+        task_key = clean_text(task, 60) or "other"
+
+        def bump(bucket: dict[str, Any]) -> None:
+            bucket["calls"] = self._safe_int(bucket.get("calls")) + 1
+            bucket["success"] = self._safe_int(bucket.get("success")) + (1 if success else 0)
+            bucket["errors"] = self._safe_int(bucket.get("errors")) + (0 if success else 1)
+            bucket["prompt_tokens"] = self._safe_int(bucket.get("prompt_tokens")) + usage["prompt_tokens"]
+            bucket["completion_tokens"] = self._safe_int(bucket.get("completion_tokens")) + usage["completion_tokens"]
+            bucket["total_tokens"] = self._safe_int(bucket.get("total_tokens")) + usage["total_tokens"]
+            bucket["cached_tokens"] = self._safe_int(bucket.get("cached_tokens")) + usage["cached_tokens"]
+            bucket["cache_read_tokens"] = self._safe_int(bucket.get("cache_read_tokens")) + usage["cache_read_tokens"]
+            bucket["cache_write_tokens"] = self._safe_int(bucket.get("cache_write_tokens")) + usage["cache_write_tokens"]
+            bucket["estimated_tokens"] = self._safe_int(bucket.get("estimated_tokens")) + (
+                usage["total_tokens"] if usage["estimated"] else 0
+            )
+            bucket["elapsed_ms"] = self._safe_int(bucket.get("elapsed_ms")) + max(0, int(elapsed_ms or 0))
+            bucket["last_ts"] = now_ts
+
+        for target in (
+            totals,
+            by_provider.setdefault(provider_key, {}),
+            by_task.setdefault(task_key, {}),
+            by_day.setdefault(day, {}),
+            by_day_provider.setdefault(day, {}).setdefault(provider_key, {}),
+            by_day_task.setdefault(day, {}).setdefault(task_key, {}),
+            by_hour.setdefault(hour, {}),
+        ):
+            if isinstance(target, dict):
+                bump(target)
+
+        recent.append(
+            {
+                "ts": now_ts,
+                "time": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "provider": provider_key,
+                "task": task_key,
+                "success": bool(success),
+                "prompt_tokens": usage["prompt_tokens"],
+                "completion_tokens": usage["completion_tokens"],
+                "total_tokens": usage["total_tokens"],
+                "cached_tokens": usage["cached_tokens"],
+                "cache_read_tokens": usage["cache_read_tokens"],
+                "cache_write_tokens": usage["cache_write_tokens"],
+                "estimated": usage["estimated"],
+                "elapsed_ms": max(0, int(elapsed_ms or 0)),
+                "prompt_chars": len(str(prompt or "")),
+                "completion_chars": len(str(completion or "")),
+                "error": clean_text(error, 160),
+            }
+        )
+        del recent[:-240]
+        store["updated_at"] = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        self._save_token_usage()
+
     def _spawn_background(self, coro: Any, *, label: str) -> None:
         try:
             task = asyncio.create_task(coro, name=f"memory_companion:{label}")
@@ -808,7 +1279,7 @@ class MemoryCompanionService:
         if not text or not text_hash:
             return False
         try:
-            vector = await self._embed_text_with_provider(provider, text)
+            vector = await self._embed_text_with_provider(provider, text, provider_id=provider_id)
             vector = self._normalize_embedding_vector(vector)
             if not vector:
                 return False
@@ -828,7 +1299,7 @@ class MemoryCompanionService:
             )
             return False
 
-    async def _embed_text_with_provider(self, provider: Any, text: str) -> list[float]:
+    async def _embed_text_with_provider(self, provider: Any, text: str, *, provider_id: str = "") -> list[float]:
         text = clean_text(text, max(200, self.config.int("retrieval.embedding_max_text_chars", 1200)))
 
         async def wait_result(value: Any) -> Any:
@@ -840,24 +1311,52 @@ class MemoryCompanionService:
             return value
 
         get_embedding = getattr(provider, "get_embedding", None)
-        if callable(get_embedding):
-            return self._coerce_embedding_vector(await wait_result(get_embedding(text)))
-
         get_embeddings = getattr(provider, "get_embeddings", None)
-        if callable(get_embeddings):
-            payload = await wait_result(get_embeddings([text]))
-            return self._first_embedding_vector(payload)
-
         get_embeddings_batch = getattr(provider, "get_embeddings_batch", None)
-        if callable(get_embeddings_batch):
-            try:
-                payload = await wait_result(
-                    get_embeddings_batch([text], batch_size=1, tasks_limit=1, max_retries=1)
+        started = time.monotonic()
+        payload: Any = None
+        success = False
+        error = ""
+        called_provider = False
+        try:
+            if callable(get_embedding):
+                called_provider = True
+                payload = await wait_result(get_embedding(text))
+                success = True
+                return self._coerce_embedding_vector(payload)
+
+            if callable(get_embeddings):
+                called_provider = True
+                payload = await wait_result(get_embeddings([text]))
+                success = True
+                return self._first_embedding_vector(payload)
+
+            if callable(get_embeddings_batch):
+                called_provider = True
+                try:
+                    payload = await wait_result(
+                        get_embeddings_batch([text], batch_size=1, tasks_limit=1, max_retries=1)
+                    )
+                except TypeError:
+                    payload = await wait_result(get_embeddings_batch([text]))
+                success = True
+                return self._first_embedding_vector(payload)
+            return []
+        except Exception as exc:
+            error = str(exc)
+            raise
+        finally:
+            if called_provider:
+                self._record_token_usage(
+                    task="memory_embedding",
+                    provider_id=provider_id or self._provider_runtime_id(provider) or "<auto>",
+                    prompt=text,
+                    completion="",
+                    resp=payload,
+                    success=success,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    error=error,
                 )
-            except TypeError:
-                payload = await wait_result(get_embeddings_batch([text]))
-            return self._first_embedding_vector(payload)
-        return []
 
     @staticmethod
     def _coerce_embedding_vector(value: Any) -> list[float]:
@@ -950,6 +1449,21 @@ class MemoryCompanionService:
         if memory_id:
             logger.info("[MemoryCompanion] 后台阶段性总结完成: session=%s reason=%s memory=%s", ctx.session_id, reason, memory_id)
 
+    def _cleanup_stale_summary_locks(self) -> None:
+        """Remove summary locks that haven't been used in TTL seconds and aren't currently held."""
+        now = time.monotonic()
+        if (now - self._summary_lock_last_cleanup) < 60.0:
+            return
+        self._summary_lock_last_cleanup = now
+        stale = [
+            sid for sid, ts in self._summary_lock_ts.items()
+            if (now - ts) > self._SUMMARY_LOCK_TTL
+            and not self._summary_locks.get(sid, asyncio.Lock()).locked()
+        ]
+        for sid in stale:
+            self._summary_locks.pop(sid, None)
+            self._summary_lock_ts.pop(sid, None)
+
     async def maybe_summarize_session(self, ctx: SessionContext, *, force: bool = False) -> str:
         if not force and not self.config.bool("memory_summary.enabled", True):
             return ""
@@ -957,6 +1471,8 @@ class MemoryCompanionService:
             return ""
 
         lock = self._summary_locks.setdefault(ctx.session_id, asyncio.Lock())
+        self._summary_lock_ts[ctx.session_id] = time.monotonic()
+        self._cleanup_stale_summary_locks()
         if lock.locked():
             return ""
         async with lock:
@@ -1010,6 +1526,9 @@ class MemoryCompanionService:
                             attempt["provider"],
                             rows=rows,
                             session_label=ctx.label,
+                            provider_id=attempt["provider_id"] or attempt["source"],
+                            usage_recorder=self._record_token_usage,
+                            usage_task="memory_summary",
                         )
                         content = self.summarizer.compose_memory_content(payload or {})
                         if content:
@@ -2087,8 +2606,32 @@ class MemoryCompanionService:
             ),
             "request_max_retries": 1,
         }
-        resp = await provider.text_chat(**kwargs)
+        started = time.monotonic()
+        try:
+            resp = await provider.text_chat(**kwargs)
+        except Exception as exc:
+            self._record_token_usage(
+                task="memory_decay_summary",
+                provider_id=self._provider_runtime_id(provider),
+                prompt=prompt,
+                completion="",
+                resp=None,
+                success=False,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                error=str(exc),
+            )
+            raise
         text = clean_text(getattr(resp, "completion_text", "") or "", max(120, max_chars * 2))
+        self._record_token_usage(
+            task="memory_decay_summary",
+            provider_id=self._provider_runtime_id(provider),
+            prompt=prompt,
+            completion=text,
+            resp=resp,
+            success=True,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            error="",
+        )
         summary = clean_text(self._plain_decay_summary(text), max_chars)
         return self.summarizer._sanitize_generated_memory_text(summary, max_chars)
 
@@ -2167,6 +2710,8 @@ class MemoryCompanionService:
         max_chars: int | None = None,
         note: str = "composed",
         write_log: bool = True,
+        companion_bot_mood: str = "",
+        companion_bot_energy: float = 0.0,
     ) -> str:
         ctx = self._normalized_session_context(ctx)
         turn_signal = analyze_turn_signal(explicit_query or ctx.message_text)
@@ -2261,19 +2806,10 @@ class MemoryCompanionService:
         companion_state = detect_private_companion_request(req) if req is not None else {}
         companion_deferred = self._companion_deferred_sections(event, req)
         companion_memory_present = self._companion_memory_context_present(companion_state, companion_deferred)
-        slot_map, companion_current_reasons = self._filter_companion_current_state_overlap(slot_map, companion_state, companion_memory_present)
-        if companion_current_reasons:
-            blocked.extend({"id": "", "reason": reason, "content": ""} for reason in companion_current_reasons)
-            results = self._flatten_slot_map(slot_map)
-        slot_map, slot_dedupe_reasons = self._dedupe_slots_for_companion(
-            slot_map,
-            companion_state,
-            companion_memory_present,
-            companion_deferred,
+        slot_map, _ = self._apply_companion_dedupe(
+            slot_map, companion_state, companion_memory_present, companion_deferred, blocked,
         )
-        if slot_dedupe_reasons:
-            blocked.extend({"id": "", "reason": reason, "content": ""} for reason in slot_dedupe_reasons)
-            results = self._flatten_slot_map(slot_map)
+        results = self._flatten_slot_map(slot_map)
 
         await self._add_time_window_timeline_slot(ctx, slot_map, time_intent)
         slot_map = self._apply_memory_expression_policy(
@@ -2289,6 +2825,9 @@ class MemoryCompanionService:
         if decision.guard_lines:
             guard_text = "\n".join(decision.guard_lines)
             intent_context = f"{guard_text}\n{intent_context}" if intent_context else guard_text
+        # Merge companion emotional state: explicit params take priority, fall back to intent-extracted values
+        merged_bot_mood = companion_bot_mood or getattr(intent, "companion_bot_mood", "") or ""
+        merged_bot_energy = companion_bot_energy or getattr(intent, "companion_bot_energy", 0.0) or 0.0
         injection = self.injection.compose(
             ctx,
             results,
@@ -2297,7 +2836,21 @@ class MemoryCompanionService:
             slot_sections=self._slot_sections(slot_map),
             compact_memory=time_intent.active or self._message_requests_temporal_aggregate(ctx.message_text or intent.query),
             time_context=time_intent.display_range if time_intent.active else "",
+            emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"),
+            intimacy_level=getattr(turn_signal, "intimacy_level", 0.0),
+            companion_bot_mood=merged_bot_mood,
+            companion_bot_energy=merged_bot_energy,
+            time_of_day=self._compute_time_of_day(),
+            cross_window_emotional_hint=self._get_cross_window_emotional_hint(ctx),
+            address_hint=self._address_hint_for_injection(ctx),
         )
+        self._detect_and_queue_emotional_events(
+            ctx, results,
+            companion_bot_mood=merged_bot_mood,
+            companion_bot_energy=merged_bot_energy,
+            emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"),
+        )
+        self._maybe_record_persona_touch(ctx, results, emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"))
         self._log_injection_debug(
             ctx=ctx,
             intent=intent,
@@ -2359,11 +2912,10 @@ class MemoryCompanionService:
         if isolate_request_context:
             managed = manage_request_contexts(
                 req,
-                "clear",
-                0,
-                preserve_external_temp=(
-                    self.config.bool("private_companion_bridge.preserve_external_prompt_context", True)
-                    and not isolate_request_context
+                "trim",
+                4,
+                preserve_external_temp=self.config.bool(
+                    "private_companion_bridge.preserve_external_prompt_context", True
                 ),
             )
             if int(managed.get("removed", 0) or 0) > 0:
@@ -2498,19 +3050,10 @@ class MemoryCompanionService:
         if current_state_reasons:
             blocked.extend({"id": "", "reason": reason, "content": clean_text(ctx.message_text, 180)} for reason in current_state_reasons)
             results = self._flatten_slot_map(slot_map)
-        slot_map, companion_current_reasons = self._filter_companion_current_state_overlap(slot_map, companion_state, companion_memory_present)
-        if companion_current_reasons:
-            blocked.extend({"id": "", "reason": reason, "content": ""} for reason in companion_current_reasons)
-            results = self._flatten_slot_map(slot_map)
-        slot_map, slot_dedupe_reasons = self._dedupe_slots_for_companion(
-            slot_map,
-            companion_state,
-            companion_memory_present,
-            companion_deferred,
+        slot_map, _ = self._apply_companion_dedupe(
+            slot_map, companion_state, companion_memory_present, companion_deferred, blocked,
         )
-        if slot_dedupe_reasons:
-            blocked.extend({"id": "", "reason": reason, "content": ""} for reason in slot_dedupe_reasons)
-            results = self._flatten_slot_map(slot_map)
+        results = self._flatten_slot_map(slot_map)
 
         await self._add_time_window_timeline_slot(ctx, slot_map, time_intent)
         slot_map = self._apply_memory_expression_policy(
@@ -2527,6 +3070,8 @@ class MemoryCompanionService:
             guard_text = "\n".join(decision.guard_lines)
             intent_context = f"{guard_text}\n{intent_context}" if intent_context else guard_text
 
+        _bot_mood = getattr(intent, "companion_bot_mood", "") or ""
+        _bot_energy = getattr(intent, "companion_bot_energy", 0.0) or 0.0
         injection = self.injection.compose(
             ctx,
             results,
@@ -2535,7 +3080,21 @@ class MemoryCompanionService:
             slot_sections=self._slot_sections(slot_map),
             compact_memory=time_intent.active or self._message_requests_temporal_aggregate(ctx.message_text or intent.query),
             time_context=time_intent.display_range if time_intent.active else "",
+            emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"),
+            intimacy_level=getattr(turn_signal, "intimacy_level", 0.0),
+            companion_bot_mood=_bot_mood,
+            companion_bot_energy=_bot_energy,
+            time_of_day=self._compute_time_of_day(),
+            cross_window_emotional_hint=self._get_cross_window_emotional_hint(ctx),
+            address_hint=self._address_hint_for_injection(ctx),
         )
+        self._detect_and_queue_emotional_events(
+            ctx, results,
+            companion_bot_mood=_bot_mood,
+            companion_bot_energy=_bot_energy,
+            emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"),
+        )
+        self._maybe_record_persona_touch(ctx, results, emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"))
         self._log_injection_debug(
             ctx=ctx,
             intent=intent,
@@ -3581,7 +4140,7 @@ class MemoryCompanionService:
             "bridge_enabled": self.config.bool("private_companion_bridge.enabled", True),
             "memory_injection_enabled": self.config.bool("memory_injection.enabled", True),
             "dedupe_prompt_context": self.config.bool("private_companion_bridge.dedupe_prompt_context", True),
-            "prefer_memory_companion_memory": self.config.bool("private_companion_bridge.prefer_memory_companion_memory", False),
+            "prefer_memory_companion_memory": self.config.bool("private_companion_bridge.prefer_memory_companion_memory", True),
             "clean_proactive_history": self.config.bool("private_companion_bridge.clean_proactive_history", True),
             "suppress_self_timeline_when_companion_seen": self.config.bool("private_companion_bridge.suppress_self_timeline_when_companion_seen", True),
             "suppress_user_context_when_companion_seen": self.config.bool("private_companion_bridge.suppress_user_context_when_companion_seen", True),
@@ -3594,9 +4153,9 @@ class MemoryCompanionService:
             return False
         normalized = clean_text(section, 80)
         if normalized in {"self_timeline", "private_context", "livingmemory_guidance"}:
-            return self.config.bool("private_companion_bridge.prefer_memory_companion_memory", False)
+            return self.config.bool("private_companion_bridge.prefer_memory_companion_memory", True)
         if normalized in {"companion_memory", "dialogue_history"}:
-            return self.config.bool("private_companion_bridge.prefer_memory_companion_memory", False)
+            return self.config.bool("private_companion_bridge.prefer_memory_companion_memory", True)
         return False
 
     def _companion_deferred_sections(self, event: Any, req: Any) -> set[str]:
@@ -3628,6 +4187,33 @@ class MemoryCompanionService:
             or (state.get("has_self_timeline") and not self_timeline_deferred)
             or state.get("has_recall_query")
         )
+
+    def _apply_companion_dedupe(
+        self,
+        slot_map: dict[str, list[Any]],
+        companion_state: dict[str, Any],
+        companion_memory_present: bool,
+        companion_deferred: set[str],
+        blocked: list[dict[str, str]],
+    ) -> tuple[dict[str, list[Any]], list[Any]]:
+        """Apply companion-context dedup in one step, returning updated slot_map and flattened results."""
+        results: list[Any] = []
+        slot_map, companion_current_reasons = self._filter_companion_current_state_overlap(
+            slot_map, companion_state, companion_memory_present,
+        )
+        if companion_current_reasons:
+            blocked.extend({"id": "", "reason": reason, "content": ""} for reason in companion_current_reasons)
+            results = self._flatten_slot_map(slot_map)
+        slot_map, slot_dedupe_reasons = self._dedupe_slots_for_companion(
+            slot_map,
+            companion_state,
+            companion_memory_present,
+            companion_deferred,
+        )
+        if slot_dedupe_reasons:
+            blocked.extend({"id": "", "reason": reason, "content": ""} for reason in slot_dedupe_reasons)
+            results = self._flatten_slot_map(slot_map)
+        return slot_map, results
 
     def _dedupe_slots_for_companion(
         self,
@@ -3837,17 +4423,51 @@ class MemoryCompanionService:
         compact = re.sub(r"\s+", "", clean_text(text, 800)).lower()
         if not compact:
             return ""
-        correction_markers = ("不是", "不对", "错了", "记错", "不是这样", "应该是", "其实是", "我说的是")
-        denied_markers = ("没有这回事", "我没说过", "别乱记", "你记错了", "不是这个", "不要这么说")
-        awkward_markers = ("别提", "别说了", "尴尬", "不想提", "算了", "别翻", "别回忆", "有点怪")
-        comforted_markers = ("被安慰到", "安心了", "好多了", "谢谢你记得", "你还记得", "有被接住", "舒服多了")
-        accepted_markers = ("对", "是的", "没错", "嗯嗯", "就是这个", "你记得", "你还记得", "确实")
+        correction_markers = (
+            "不是", "不对", "错了", "记错", "不是这样", "应该是", "其实是", "我说的是",
+            "你搞错了", "你理解错", "弄错了", "搞混了", "说反了", "正好相反",
+        )
+        denied_markers = (
+            "没有这回事", "我没说过", "别乱记", "你记错了", "不是这个", "不要这么说",
+            "没发生过", "不存在", "瞎说", "乱讲", "怎么可能", "才没有", "根本没有",
+            "别瞎编", "别乱说", "你听谁说的",
+        )
+        awkward_markers = (
+            "别提", "别说了", "尴尬", "不想提", "算了", "别翻", "别回忆", "有点怪",
+            "别聊这个", "换个话题", "不想聊", "别问了", "过去了", "别提了",
+            "别旧事重提", "好尴尬", "太尴尬", "脚趾抠地", "社死",
+        )
+        comforted_markers = (
+            "被安慰到", "安心了", "好多了", "谢谢你记得", "你还记得", "有被接住", "舒服多了",
+            "暖到了", "好暖心", "心里暖暖", "谢谢你", "有你在真好", "被治愈",
+            "好感动", "谢谢你懂我", "被理解了", "安心了好多", "没那么难过了",
+        )
+        touched_markers = (
+            "感动", "好感动", "泪目", "哭了", "暖到了", "戳中", "破防了",
+            "眼眶湿了", "好想哭", "太感人了", "心化了", "你真的", "好珍惜",
+            "谢谢你一直记得", "没想到你还记得", "你居然记得", "好幸福",
+            "被在乎的感觉", "被惦记", "心里好暖",
+        )
+        nostalgic_markers = (
+            "怀念", "好怀念", "想念", "好想念", "那时候", "从前", "以前真好",
+            "回忆好美", "好回忆", "想起来就", "忆当年", "好想回到",
+            "那时候的", "曾经的", "好感慨", "时光啊", "好感慨",
+        )
+        accepted_markers = (
+            "对", "是的", "没错", "嗯嗯", "就是这个", "你记得", "你还记得", "确实",
+            "对的", "是呀", "是哦", "没错呀", "对啊", "嗯对", "是的呢",
+            "就是这样", "你说得对", "可不是嘛", "确实如此", "真的是",
+        )
         if any(marker in compact for marker in correction_markers):
             return "corrected"
         if any(marker in compact for marker in denied_markers):
             return "denied"
         if any(marker in compact for marker in awkward_markers):
             return "awkward"
+        if any(marker in compact for marker in touched_markers):
+            return "touched"
+        if any(marker in compact for marker in nostalgic_markers):
+            return "nostalgic"
         if any(marker in compact for marker in comforted_markers):
             return "comforted"
         if any(marker in compact for marker in accepted_markers) and len(compact) <= 40:
@@ -3860,6 +4480,10 @@ class MemoryCompanionService:
             return {"mention": 0.08, "confidence": 0.03, "emotional": 0.02}
         if reaction == "comforted":
             return {"mention": 0.11, "confidence": 0.02, "emotional": 0.08}
+        if reaction == "touched":
+            return {"mention": 0.14, "confidence": 0.04, "emotional": 0.12}
+        if reaction == "nostalgic":
+            return {"mention": 0.10, "confidence": 0.03, "emotional": 0.06}
         if reaction == "awkward":
             return {"mention": -0.12, "confidence": 0.0, "emotional": 0.02}
         if reaction == "denied":
@@ -4318,10 +4942,293 @@ class MemoryCompanionService:
         digest = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:20]
         return f"mem_{digest}"
 
+    def _compute_time_of_day(self) -> str:
+        """Compute time-of-day category for atmosphere hints."""
+        try:
+            hour = datetime.now().hour
+        except Exception:
+            return ""
+        if 23 <= hour or hour < 4:
+            return "late_night"
+        if 4 <= hour < 7:
+            return "dawn"
+        if 7 <= hour < 11:
+            return "early_morning"
+        if 11 <= hour < 17:
+            return "afternoon"
+        if 17 <= hour < 20:
+            return "evening"
+        return "night"
+
+    def _maybe_record_persona_touch(
+        self,
+        ctx: SessionContext,
+        results: list[Any],
+        *,
+        emotional_tone: str = "neutral",
+    ) -> None:
+        """Record a lightweight persona touch log when emotional resonance is high."""
+        if not results:
+            return
+        now = time.time()
+        for item in results:
+            memory = getattr(item, "memory", None)
+            if memory is None:
+                continue
+            metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+            try:
+                emotional_w = float(metadata.get("emotional_weight") or 0.0)
+                relationship_w = float(metadata.get("relationship_weight") or 0.0)
+                scar_w = float(metadata.get("scar_weight") or 0.0)
+            except Exception:
+                emotional_w = relationship_w = scar_w = 0.0
+            resonance = max(emotional_w * 0.5 + relationship_w * 0.3, scar_w * 0.7)
+            if resonance < 0.45:
+                continue
+            touch_type = "scar" if scar_w >= 0.55 else "warm" if emotional_w >= 0.50 else "resonance"
+            self._update_relationship_phase_momentum(
+                ctx, touch_type=touch_type,
+                emotional_w=emotional_w, relationship_w=relationship_w,
+                scar_w=scar_w, emotional_tone=emotional_tone,
+            )
+
+    _PHASES = ["acquaintance", "familiar", "close", "intimate", "deeply_bonded"]
+    _PHASE_THRESHOLDS = [0.0, 0.20, 0.45, 0.65, 0.85]
+    _PHASE_MOMENTUM_MAX = 1.0
+    _PHASE_MOMENTUM_MIN = -0.3
+
+    def _phase_key(self, ctx: SessionContext) -> str:
+        return clean_text(f"{ctx.scope}:{ctx.current_target_id or ctx.session_id}", 120)
+
+    def _load_relationship_phase_state(self) -> None:
+        try:
+            if self._RELATIONSHIP_PHASE_FILE.exists():
+                data = json_loads(self._RELATIONSHIP_PHASE_FILE.read_text(encoding="utf-8"), {})
+                if isinstance(data, dict):
+                    self._relationship_phase_state = data
+        except Exception:
+            pass
+
+    def _save_relationship_phase_state(self) -> None:
+        try:
+            self._RELATIONSHIP_PHASE_FILE.write_text(
+                json_dumps(self._relationship_phase_state), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+    def _get_relationship_phase(self, ctx: SessionContext) -> dict[str, Any]:
+        key = self._phase_key(ctx)
+        if key not in self._relationship_phase_state:
+            self._relationship_phase_state[key] = {
+                "phase": "acquaintance",
+                "momentum": 0.0,
+                "last_transition_at": "",
+                "touch_count": 0,
+                "updated_at": utc_now(),
+            }
+        return self._relationship_phase_state[key]
+
+    def _update_relationship_phase_momentum(
+        self,
+        ctx: SessionContext,
+        *,
+        touch_type: str = "",
+        emotional_w: float = 0.0,
+        relationship_w: float = 0.0,
+        scar_w: float = 0.0,
+        emotional_tone: str = "neutral",
+    ) -> None:
+        state = self._get_relationship_phase(ctx)
+        delta = 0.0
+        if touch_type == "warm":
+            delta = 0.02 + emotional_w * 0.01
+        elif touch_type == "resonance":
+            delta = 0.015 + relationship_w * 0.008
+        elif touch_type == "scar":
+            delta = -0.05
+            if emotional_tone == "vulnerable":
+                delta *= 0.5
+        state["momentum"] = max(
+            self._PHASE_MOMENTUM_MIN,
+            min(self._PHASE_MOMENTUM_MAX, state.get("momentum", 0.0) + delta),
+        )
+        state["touch_count"] = state.get("touch_count", 0) + 1
+        state["updated_at"] = utc_now()
+        self._maybe_transition_phase(ctx, state)
+        self._save_relationship_phase_state()
+
+    def _maybe_transition_phase(self, ctx: SessionContext, state: dict[str, Any]) -> None:
+        current = state.get("phase", "acquaintance")
+        momentum = state.get("momentum", 0.0)
+        try:
+            idx = self._PHASES.index(current)
+        except ValueError:
+            idx = 0
+        # Check upgrade
+        if idx < len(self._PHASES) - 1:
+            threshold = self._PHASE_THRESHOLDS[min(idx + 1, len(self._PHASE_THRESHOLDS) - 1)]
+            if momentum >= threshold and state.get("touch_count", 0) >= 5:
+                state["phase"] = self._PHASES[idx + 1]
+                state["last_transition_at"] = utc_now()
+                state["momentum"] = max(0.0, momentum - threshold * 0.5)
+                logger.info(
+                    "[MemoryCompanion] 关系阶段晋升: session=%s phase=%s->%s momentum=%.3f",
+                    ctx.session_id, current, state["phase"], state["momentum"],
+                )
+        # Check downgrade (only if momentum very negative)
+        elif idx > 0 and momentum < self._PHASE_MOMENTUM_MIN * 0.8:
+            state["phase"] = self._PHASES[idx - 1] if idx > 0 else current
+            state["last_transition_at"] = utc_now()
+            logger.info(
+                "[MemoryCompanion] 关系阶段回退: session=%s phase=%s->%s momentum=%.3f",
+                ctx.session_id, current, state["phase"], state["momentum"],
+            )
+
+    _ADDRESS_TERMS = {
+        "formal": ["你好", "请问", "麻烦", "您好"],
+        "casual": ["嘿", "哈喽", "hi", "hello", "喂"],
+        "intimate": ["亲爱的", "宝贝", "宝宝", "老公", "老婆", "哥哥", "姐姐", "笨蛋", "傻瓜", "猪猪"],
+        "playful": ["小子", "丫头", "笨蛋", "大笨蛋", "小可爱"],
+    }
+
+    # Bot-side address suggestions based on relationship phase
+    _BOT_ADDRESS_SUGGESTIONS = {
+        "acquaintance": {
+            "tone": "礼貌自然",
+            "hint": "你们还不太熟，用自然的语气称呼对方名字或“你”就好，不要太亲昵也不要太疏远。",
+        },
+        "familiar": {
+            "tone": "轻松友好",
+            "hint": "你们已经比较熟了，可以用更轻松的方式称呼对方，偶尔用昵称或缩写名字。",
+        },
+        "close": {
+            "tone": "温暖亲近",
+            "hint": "你们关系很近了，可以用温暖的方式称呼对方，比如“你呀”、“笨蛋”这种带着善意的词，自然地用名字缩写或昵称。",
+        },
+        "intimate": {
+            "tone": "亲密柔软",
+            "hint": "你们关系很亲密，可以用柔软的方式称呼对方，像“宝贝”、“亲爱的”这种词在自然的时候可以用，但不要刻意。",
+        },
+        "deeply_bonded": {
+            "tone": "默契无间",
+            "hint": "你们之间已经不需要刻意称呼了，用只有你们才懂的称呼或昵称，语气里带着只有彼此才理解的默契。",
+        },
+    }
+
+    def _detect_address_phase(self, text: str) -> str:
+        """Detect the address phase from user message text."""
+        if not text:
+            return ""
+        lower = text.lower()
+        for phase, terms in self._ADDRESS_TERMS.items():
+            for term in terms:
+                if term in lower:
+                    return phase
+        return ""
+
+    def _update_address_evolution(self, ctx: SessionContext, text: str) -> None:
+        """Track address evolution in the relationship phase state."""
+        phase = self._detect_address_phase(text)
+        if not phase:
+            return
+        state = self._get_relationship_phase(ctx)
+        address_log = state.get("address_log")
+        if not isinstance(address_log, list):
+            address_log = []
+            state["address_log"] = address_log
+        current_phase = state.get("current_address_phase", "")
+        if phase != current_phase:
+            address_log.append({
+                "ts": utc_now(),
+                "phase": phase,
+                "previous": current_phase,
+            })
+            if len(address_log) > 10:
+                address_log[:] = address_log[-10:]
+            state["current_address_phase"] = phase
+            self._save_relationship_phase_state()
+
+    def _address_hint_for_injection(self, ctx: SessionContext) -> str:
+        """Generate address hint for injection context.
+
+        Combines user-side address phase detection with bot-side address suggestions
+        based on the current relationship phase, creating a bidirectional address
+        evolution system.
+        """
+        state = self._get_relationship_phase(ctx)
+        user_address_phase = state.get("current_address_phase", "")
+        relationship_phase = state.get("phase", "acquaintance")
+        parts: list[str] = []
+        # User-side address hint
+        user_hints = {
+            "casual": "对方用比较随意的语气称呼你，可以更放松地回应。",
+            "intimate": "对方用了亲密称呼，记忆中如果有共同经历可以更自然地融入，用'我也记得'的语气。",
+            "playful": "对方在开玩笑，可以用轻松的方式提起有趣的旧事。",
+        }
+        if user_address_phase and user_address_phase != "formal":
+            user_hint = user_hints.get(user_address_phase, "")
+            if user_hint:
+                parts.append(user_hint)
+        # Bot-side address suggestion based on relationship phase
+        bot_suggestion = self._BOT_ADDRESS_SUGGESTIONS.get(relationship_phase, {})
+        bot_hint = bot_suggestion.get("hint", "")
+        if bot_hint:
+            parts.append(bot_hint)
+        # Address mismatch awareness: if user is more intimate than relationship phase suggests
+        if user_address_phase == "intimate" and relationship_phase in ("acquaintance", "familiar"):
+            parts.append("对方比你预期的更亲密，自然接受但不要急着跟进太多，让关系自然发展。")
+        elif user_address_phase == "formal" and relationship_phase in ("close", "intimate", "deeply_bonded"):
+            parts.append("对方突然变正式了，可能心情有变化或在外面不方便太亲密，自然配合对方的节奏。")
+        return " ".join(parts) if parts else ""
+
+    def _apply_scar_scene_gate(
+        self,
+        ctx: SessionContext,
+        slot_map: dict[str, list[Any]],
+        *,
+        companion_bot_energy: float = 0.0,
+        time_of_day: str = "",
+    ) -> dict[str, list[Any]]:
+        """Gate scar memories based on time-of-day and bot energy."""
+        if not slot_map:
+            return slot_map
+        is_late_night = time_of_day in ("late_night", "dawn")
+        low_energy = 0 < companion_bot_energy < 40
+        if not is_late_night and not low_energy:
+            return slot_map
+        result: dict[str, list[Any]] = {}
+        for slot, items in slot_map.items():
+            gated: list[Any] = []
+            for item in items or []:
+                memory = getattr(item, "memory", None)
+                if memory is None:
+                    gated.append(item)
+                    continue
+                metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+                try:
+                    scar_w = float(metadata.get("scar_weight") or 0.0)
+                except Exception:
+                    scar_w = 0.0
+                if scar_w >= 0.55 and (is_late_night or low_energy):
+                    policy = clean_text(metadata.get("mention_policy"), 60)
+                    if policy != "avoid_unless_asked":
+                        metadata = dict(metadata)
+                        metadata["mention_policy"] = "tone_only"
+                        metadata["_scene_gated"] = True
+                        try:
+                            memory.metadata = metadata
+                        except Exception:
+                            pass
+                gated.append(item)
+            result[slot] = gated
+        return result
+
     def close(self) -> None:
         for task in list(self._background_tasks):
             task.cancel()
         self._background_tasks.clear()
+        self._save_token_usage(force=True)
         try:
             self.store.close()
         except Exception as exc:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import closing
+import re
 import sqlite3
 import threading
 from pathlib import Path
@@ -18,6 +19,7 @@ class MemoryStore:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self._closed = False
+        self._fts_enabled = False
 
     def initialize(self) -> None:
         with self._lock:
@@ -265,6 +267,7 @@ class MemoryStore:
             self._ensure_memory_columns_sync()
             self._ensure_timeline_columns_sync()
             self._ensure_acl_columns_sync()
+            self._ensure_memory_fts_sync()
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_fingerprint ON memories(content_fingerprint)"
             )
@@ -287,6 +290,113 @@ class MemoryStore:
                 "CREATE INDEX IF NOT EXISTS idx_memory_embeddings_provider ON memory_embeddings(provider_id, updated_at)"
             )
             self._conn.commit()
+
+    def _ensure_memory_fts_sync(self) -> None:
+        try:
+            self._conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
+                USING fts5(search_text, memory_id UNINDEXED, tokenize='unicode61')
+                """
+            )
+            self._fts_enabled = True
+            memory_count = int(self._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] or 0)
+            fts_count = int(self._conn.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0] or 0)
+            if memory_count != fts_count:
+                self._rebuild_memory_fts_sync()
+        except sqlite3.Error:
+            self._fts_enabled = False
+
+    def _rebuild_memory_fts_sync(self) -> int:
+        if not self._fts_enabled:
+            return 0
+        self._conn.execute("DELETE FROM memory_fts")
+        rows = self._conn.execute("SELECT * FROM memories").fetchall()
+        count = 0
+        for row in rows:
+            self._upsert_memory_fts_row(row)
+            count += 1
+        return count
+
+    def _upsert_memory_fts_row(self, row: sqlite3.Row | None) -> None:
+        if not self._fts_enabled or row is None:
+            return
+        memory_id = clean_text(row["id"], 120)
+        if not memory_id:
+            return
+        search_text = self._memory_fts_text(row)
+        self._conn.execute("DELETE FROM memory_fts WHERE memory_id=?", (memory_id,))
+        if search_text:
+            self._conn.execute(
+                "INSERT INTO memory_fts(memory_id, search_text) VALUES(?, ?)",
+                (memory_id, search_text),
+            )
+
+    def _delete_memory_fts_row(self, memory_id: str) -> None:
+        if not self._fts_enabled:
+            return
+        memory_id = clean_text(memory_id, 120)
+        if memory_id:
+            self._conn.execute("DELETE FROM memory_fts WHERE memory_id=?", (memory_id,))
+
+    def _memory_fts_text(self, row: sqlite3.Row) -> str:
+        metadata = json_loads(row["metadata"], {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        tags = json_loads(row["tags"], [])
+        if not isinstance(tags, list):
+            tags = []
+        metadata_parts: list[str] = []
+        for key in (
+            "canonical_summary",
+            "persona_summary",
+            "memory_reason",
+            "title",
+            "topic",
+            "fact_key",
+            "user_correction",
+        ):
+            value = metadata.get(key)
+            if isinstance(value, dict):
+                value = json_dumps(value)
+            if value:
+                metadata_parts.append(clean_text(value, 800))
+        for key in ("key_facts", "topics", "participants", "aliases", "query_anchors"):
+            value = metadata.get(key)
+            if isinstance(value, list):
+                metadata_parts.extend(clean_text(item, 160) for item in value if clean_text(item, 160))
+        parts = [
+            row["memory_type"],
+            row["subject_id"],
+            row["subject_name"],
+            row["object_id"],
+            row["object_name"],
+            row["session_id"],
+            row["group_id"],
+            row["content"],
+            row["evidence"],
+            " ".join(clean_text(tag, 80) for tag in tags if clean_text(tag, 80)),
+            " ".join(metadata_parts),
+        ]
+        text = clean_text(" ".join(part for part in parts if part), 8000)
+        bigrams = self._cjk_bigrams(text)
+        return clean_text(f"{text} {' '.join(bigrams)}", 12000)
+
+    @staticmethod
+    def _cjk_bigrams(text: str) -> list[str]:
+        compact = re.sub(r"\s+", "", clean_text(text, 8000))
+        chunks = re.findall(r"[\u4e00-\u9fff]{2,}", compact)
+        result: list[str] = []
+        seen: set[str] = set()
+        for chunk in chunks:
+            for index in range(0, len(chunk) - 1):
+                gram = chunk[index : index + 2]
+                if gram not in seen:
+                    seen.add(gram)
+                    result.append(gram)
+                if len(result) >= 512:
+                    return result
+        return result
 
     def _ensure_memory_columns_sync(self) -> None:
         existing = {
@@ -371,6 +481,7 @@ class MemoryStore:
     def _clear_all_memory_data_sync(self) -> dict[str, Any]:
         backup = self.backup(".before_clear_all")
         tables = [
+            "memory_fts",
             "review_queue",
             "injection_logs",
             "summary_failures",
@@ -389,10 +500,288 @@ class MemoryStore:
         deleted: dict[str, int] = {}
         with self._lock:
             for table in tables:
-                cur = self._conn.execute(f"DELETE FROM {table}")
+                try:
+                    cur = self._conn.execute(f"DELETE FROM {table}")
+                except sqlite3.Error:
+                    if table == "memory_fts":
+                        continue
+                    raise
                 deleted[table] = int(cur.rowcount or 0)
             self._conn.commit()
         return {"backup": str(backup), "deleted": deleted}
+
+    async def preview_scoped_memory_clear(
+        self,
+        *,
+        target_type: str,
+        group_id: str = "",
+        user_id: str = "",
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._scoped_memory_clear_sync,
+            target_type,
+            group_id,
+            user_id,
+            False,
+        )
+
+    async def clear_scoped_memory(
+        self,
+        *,
+        target_type: str,
+        group_id: str = "",
+        user_id: str = "",
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._scoped_memory_clear_sync,
+            target_type,
+            group_id,
+            user_id,
+            True,
+        )
+
+    def _scoped_memory_clear_sync(
+        self,
+        target_type: str,
+        group_id: str,
+        user_id: str,
+        execute: bool,
+    ) -> dict[str, Any]:
+        target_type = clean_text(target_type, 40).lower()
+        group_id = clean_text(group_id, 120)
+        user_id = clean_text(user_id, 120)
+        if target_type not in {"group", "private", "group_member"}:
+            raise ValueError("target_type must be group, private or group_member")
+        if target_type == "group" and not group_id:
+            raise ValueError("group_id is required")
+        if target_type == "private" and not user_id:
+            raise ValueError("user_id is required")
+        if target_type == "group_member" and (not group_id or not user_id):
+            raise ValueError("group_id and user_id are required")
+
+        memory_where, memory_params = self._scoped_memory_where(target_type, group_id, user_id)
+        timeline_where, timeline_params = self._scoped_timeline_where(target_type, group_id, user_id)
+        relation_where, relation_params = self._scoped_relation_where(target_type, group_id, user_id)
+        knowledge_node_where, knowledge_node_params = self._scoped_knowledge_node_where(target_type, group_id, user_id)
+        knowledge_edge_where, knowledge_edge_params = self._scoped_knowledge_edge_where(target_type, group_id, user_id)
+        injection_where, injection_params = self._scoped_session_log_where(target_type, group_id, user_id)
+        thread_where, thread_params = self._scoped_thread_where(target_type, group_id, user_id)
+
+        with self._lock:
+            memory_ids = [
+                row["id"]
+                for row in self._conn.execute(
+                    f"SELECT id FROM memories WHERE {memory_where}",
+                    memory_params,
+                ).fetchall()
+            ]
+            counts = {
+                "memories": len(memory_ids),
+                "timeline": self._count_where("timeline", timeline_where, timeline_params),
+                "relationship_edges": self._count_where("relationship_edges", relation_where, relation_params),
+                "knowledge_nodes": self._count_where("knowledge_nodes", knowledge_node_where, knowledge_node_params),
+                "knowledge_edges": self._count_knowledge_edges_for_scope_or_memory_ids(
+                    knowledge_edge_where,
+                    knowledge_edge_params,
+                    memory_ids,
+                ),
+                "injection_logs": self._count_where("injection_logs", injection_where, injection_params),
+                "summary_failures": self._count_where("summary_failures", injection_where, injection_params),
+                "cross_window_threads": self._count_where("cross_window_threads", thread_where, thread_params),
+            }
+            if not execute:
+                return {
+                    "target_type": target_type,
+                    "group_id": group_id,
+                    "user_id": user_id,
+                    "preview": True,
+                    "counts": counts,
+                }
+
+            backup = self.backup(f".before_clear_{target_type}")
+            deleted: dict[str, int] = {}
+            if memory_ids:
+                self._delete_many_by_ids("review_queue", "memory_id", memory_ids, deleted)
+                self._delete_many_by_ids("memory_embeddings", "memory_id", memory_ids, deleted)
+                self._delete_many_by_ids("knowledge_edges", "source_memory_id", memory_ids, deleted)
+                for memory_id in memory_ids:
+                    self._delete_memory_fts_row(memory_id)
+            deleted["memories"] = self._delete_where("memories", memory_where, memory_params)
+            deleted["timeline"] = self._delete_where("timeline", timeline_where, timeline_params)
+            deleted["relationship_edges"] = self._delete_where("relationship_edges", relation_where, relation_params)
+            deleted["knowledge_edges"] = deleted.get("knowledge_edges", 0) + self._delete_where(
+                "knowledge_edges",
+                knowledge_edge_where,
+                knowledge_edge_params,
+            )
+            deleted["knowledge_nodes"] = self._delete_where("knowledge_nodes", knowledge_node_where, knowledge_node_params)
+            deleted["injection_logs"] = self._delete_where("injection_logs", injection_where, injection_params)
+            deleted["summary_failures"] = self._delete_where("summary_failures", injection_where, injection_params)
+            deleted["cross_window_threads"] = self._delete_where("cross_window_threads", thread_where, thread_params)
+            self._conn.commit()
+        return {
+            "target_type": target_type,
+            "group_id": group_id,
+            "user_id": user_id,
+            "preview": False,
+            "backup": str(backup),
+            "counts": counts,
+            "deleted": deleted,
+        }
+
+    def _count_where(self, table: str, where: str, params: list[Any]) -> int:
+        row = self._conn.execute(f"SELECT COUNT(*) AS c FROM {table} WHERE {where}", params).fetchone()
+        return int(row["c"] if row else 0)
+
+    def _delete_where(self, table: str, where: str, params: list[Any]) -> int:
+        cur = self._conn.execute(f"DELETE FROM {table} WHERE {where}", params)
+        return int(cur.rowcount or 0)
+
+    def _delete_many_by_ids(self, table: str, column: str, ids: list[str], deleted: dict[str, int]) -> None:
+        total = 0
+        for index in range(0, len(ids), 500):
+            chunk = ids[index:index + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            cur = self._conn.execute(f"DELETE FROM {table} WHERE {column} IN ({placeholders})", chunk)
+            total += int(cur.rowcount or 0)
+        deleted[table] = deleted.get(table, 0) + total
+
+    @staticmethod
+    def _like_id(value: str) -> str:
+        escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return f"%{escaped}"
+
+    def _session_target_where(self, column: str, scope: str, target_id: str) -> tuple[str, list[Any]]:
+        target_id = clean_text(target_id, 120)
+        lowered = target_id.lower()
+        if scope == "group":
+            tokens = (":groupmessage:", ":group:")
+        else:
+            tokens = (":friendmessage:", ":privatemessage:", ":friend:", ":private:")
+        clauses = [f"{column}=?"]
+        params: list[Any] = [target_id]
+        for token in tokens:
+            clauses.append(f"LOWER({column}) LIKE ? ESCAPE '\\'")
+            params.append(self._like_id(f"{token}{lowered}"))
+        return f"({' OR '.join(clauses)})", params
+
+    def _count_knowledge_edges_for_scope_or_memory_ids(
+        self,
+        where: str,
+        params: list[Any],
+        memory_ids: list[str],
+    ) -> int:
+        edge_ids = {
+            row["id"]
+            for row in self._conn.execute(f"SELECT id FROM knowledge_edges WHERE {where}", params).fetchall()
+        }
+        for index in range(0, len(memory_ids), 500):
+            chunk = memory_ids[index:index + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._conn.execute(
+                f"SELECT id FROM knowledge_edges WHERE source_memory_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            edge_ids.update(row["id"] for row in rows)
+        return len(edge_ids)
+
+    def _scoped_memory_where(self, target_type: str, group_id: str, user_id: str) -> tuple[str, list[Any]]:
+        if target_type == "group":
+            session_where, session_params = self._session_target_where("session_id", "group", group_id)
+            return (
+                f"scope='group' AND (group_id=? OR object_id=? OR {session_where})",
+                [group_id, group_id, *session_params],
+            )
+        if target_type == "private":
+            session_where, session_params = self._session_target_where("session_id", "private", user_id)
+            return (
+                f"scope='private' AND (subject_id=? OR object_id=? OR {session_where})",
+                [user_id, user_id, *session_params],
+            )
+        session_where, session_params = self._session_target_where("session_id", "group", group_id)
+        return (
+            f"scope='group' AND (group_id=? OR {session_where}) AND (subject_id=? OR object_id=?)",
+            [group_id, *session_params, user_id, user_id],
+        )
+
+    def _scoped_timeline_where(self, target_type: str, group_id: str, user_id: str) -> tuple[str, list[Any]]:
+        if target_type == "group":
+            session_where, session_params = self._session_target_where("session_id", "group", group_id)
+            return (f"scope='group' AND ({session_where} OR object_id=?)", [*session_params, group_id])
+        if target_type == "private":
+            session_where, session_params = self._session_target_where("session_id", "private", user_id)
+            return (
+                f"scope='private' AND (subject_id=? OR object_id=? OR {session_where})",
+                [user_id, user_id, *session_params],
+            )
+        session_where, session_params = self._session_target_where("session_id", "group", group_id)
+        return (
+            f"scope='group' AND {session_where} AND (subject_id=? OR object_id=?)",
+            [*session_params, user_id, user_id],
+        )
+
+    def _scoped_relation_where(self, target_type: str, group_id: str, user_id: str) -> tuple[str, list[Any]]:
+        if target_type == "group":
+            session_where, session_params = self._session_target_where("session_id", "group", group_id)
+            return (f"scope='group' AND (group_id=? OR {session_where})", [group_id, *session_params])
+        if target_type == "private":
+            session_where, session_params = self._session_target_where("session_id", "private", user_id)
+            return (
+                f"scope='private' AND (subject_id=? OR object_id=? OR {session_where})",
+                [user_id, user_id, *session_params],
+            )
+        session_where, session_params = self._session_target_where("session_id", "group", group_id)
+        return (
+            f"scope='group' AND (group_id=? OR {session_where}) AND (subject_id=? OR object_id=?)",
+            [group_id, *session_params, user_id, user_id],
+        )
+
+    def _scoped_knowledge_node_where(self, target_type: str, group_id: str, user_id: str) -> tuple[str, list[Any]]:
+        if target_type == "group":
+            session_where, session_params = self._session_target_where("session_id", "group", group_id)
+            return (f"scope='group' AND (group_id=? OR {session_where})", [group_id, *session_params])
+        if target_type == "private":
+            session_where, session_params = self._session_target_where("session_id", "private", user_id)
+            return (f"scope='private' AND {session_where}", session_params)
+        session_where, session_params = self._session_target_where("session_id", "group", group_id)
+        return (
+            f"scope='group' AND (group_id=? OR {session_where}) AND node_type='user' AND node_key=?",
+            [group_id, *session_params, user_id.lower()],
+        )
+
+    def _scoped_knowledge_edge_where(self, target_type: str, group_id: str, user_id: str) -> tuple[str, list[Any]]:
+        if target_type == "group":
+            session_where, session_params = self._session_target_where("session_id", "group", group_id)
+            return (f"scope='group' AND (group_id=? OR {session_where})", [group_id, *session_params])
+        if target_type == "private":
+            session_where, session_params = self._session_target_where("session_id", "private", user_id)
+            return (f"scope='private' AND {session_where}", session_params)
+        session_where, session_params = self._session_target_where("session_id", "group", group_id)
+        return (
+            f"""scope='group' AND (group_id=? OR {session_where}) AND (
+                source_node_id IN (SELECT id FROM knowledge_nodes WHERE node_type='user' AND node_key=?)
+                OR target_node_id IN (SELECT id FROM knowledge_nodes WHERE node_type='user' AND node_key=?)
+            )""",
+            [group_id, *session_params, user_id.lower(), user_id.lower()],
+        )
+
+    def _scoped_session_log_where(self, target_type: str, group_id: str, user_id: str) -> tuple[str, list[Any]]:
+        if target_type == "group":
+            session_where, session_params = self._session_target_where("session_id", "group", group_id)
+            return (f"scope='group' AND {session_where}", session_params)
+        if target_type == "private":
+            session_where, session_params = self._session_target_where("session_id", "private", user_id)
+            return (f"scope='private' AND {session_where}", session_params)
+        return ("1=0", [])
+
+    def _scoped_thread_where(self, target_type: str, group_id: str, user_id: str) -> tuple[str, list[Any]]:
+        if target_type == "group_member":
+            return ("1=0", [])
+        value = group_id if target_type in {"group", "group_member"} else user_id
+        scope = "group" if target_type == "group" else "private"
+        from_where, from_params = self._session_target_where("from_session", scope, value)
+        to_where, to_params = self._session_target_where("to_session", scope, value)
+        return (f"{from_where} OR {to_where}", [*from_params, *to_params])
 
     async def insert_memory(self, record: MemoryRecord, review_reason: str = "") -> str:
         return await asyncio.to_thread(self._insert_memory_sync, record, review_reason)
@@ -500,6 +889,8 @@ class MemoryStore:
                         duplicate["id"],
                     ),
                 )
+                row = self._conn.execute("SELECT * FROM memories WHERE id=?", (duplicate["id"],)).fetchone()
+                self._upsert_memory_fts_row(row)
                 self._conn.commit()
                 return str(duplicate["id"])
             self._conn.execute(
@@ -509,6 +900,8 @@ class MemoryStore:
             )
             if record.review_status == "pending" or review_reason:
                 self._upsert_review_sync(record.id, review_reason or "待人工确认")
+            row = self._conn.execute("SELECT * FROM memories WHERE id=?", (record.id,)).fetchone()
+            self._upsert_memory_fts_row(row)
             self._conn.commit()
         return record.id
 
@@ -1661,6 +2054,78 @@ class MemoryStore:
             ).fetchall()
         return [MemoryRecord.from_row(row) for row in rows]
 
+    async def list_fts_candidate_memories(
+        self,
+        terms: list[str],
+        limit: int = 800,
+        include_pending: bool = False,
+    ) -> list[MemoryRecord]:
+        return await asyncio.to_thread(
+            self._list_fts_candidate_memories_sync,
+            terms,
+            limit,
+            include_pending,
+        )
+
+    def _list_fts_candidate_memories_sync(
+        self,
+        terms: list[str],
+        limit: int,
+        include_pending: bool,
+    ) -> list[MemoryRecord]:
+        if not self._fts_enabled:
+            return []
+        query = self._fts_match_query(terms)
+        if not query:
+            return []
+        where = "m.lifecycle != 'archived'"
+        params: list[Any] = [query]
+        if not include_pending:
+            where += " AND m.review_status != 'pending'"
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    f"""
+                    SELECT m.*
+                    FROM memory_fts
+                    JOIN memories m ON m.id = memory_fts.memory_id
+                    WHERE memory_fts MATCH ?
+                      AND {where}
+                    ORDER BY bm25(memory_fts), m.importance DESC,
+                             COALESCE(NULLIF(m.occurred_at, ''), m.created_at) DESC
+                    LIMIT ?
+                    """,
+                    params + [max(1, int(limit or 1))],
+                ).fetchall()
+        except sqlite3.Error:
+            return []
+        return [MemoryRecord.from_row(row) for row in rows]
+
+    def _fts_match_query(self, terms: list[str]) -> str:
+        variants: list[str] = []
+        for term in terms or []:
+            text = clean_text(term, 80).lower()
+            if not text:
+                continue
+            for variant in self._fts_term_variants(text):
+                if variant and variant not in variants:
+                    variants.append(variant)
+            if len(variants) >= 48:
+                break
+        return " OR ".join(self._quote_fts_term(term) for term in variants[:48])
+
+    @staticmethod
+    def _fts_term_variants(term: str) -> list[str]:
+        variants = [term]
+        compact = re.sub(r"\s+", "", term)
+        if re.fullmatch(r"[\u4e00-\u9fff]{3,}", compact):
+            variants.extend(compact[index : index + 2] for index in range(0, len(compact) - 1))
+        return variants
+
+    @staticmethod
+    def _quote_fts_term(term: str) -> str:
+        return '"' + clean_text(term, 80).replace('"', '""') + '"'
+
     async def list_keyword_candidate_memories(
         self,
         terms: list[str],
@@ -1917,7 +2382,7 @@ class MemoryStore:
         return buckets
 
     def _resolve_bucket_target_name_sync(self, scope: str, target_id: str, fallback: str = "") -> str:
-        fallback = clean_text(fallback, 120)
+        fallback = self._clean_window_display_name(fallback)
         target_id = clean_text(target_id, 160)
         if fallback and fallback != target_id:
             return fallback
@@ -1934,8 +2399,10 @@ class MemoryStore:
             """,
             (entity_kind, target_id),
         ).fetchone()
-        if row and clean_text(row["display_name"], 120):
-            return clean_text(row["display_name"], 120)
+        if row:
+            name = self._clean_window_display_name(row["display_name"])
+            if name:
+                return name
 
         if scope == "group":
             row = self._conn.execute(
@@ -1947,8 +2414,10 @@ class MemoryStore:
                 """,
                 (target_id,),
             ).fetchone()
-            if row and clean_text(row["name"], 120):
-                return clean_text(row["name"], 120)
+            if row:
+                name = self._clean_window_display_name(row["name"])
+                if name:
+                    return name
         elif scope == "private":
             row = self._conn.execute(
                 """
@@ -1964,9 +2433,30 @@ class MemoryStore:
                 """,
                 (target_id, target_id),
             ).fetchone()
-            if row and clean_text(row["name"], 120):
-                return clean_text(row["name"], 120)
+            if row:
+                name = self._clean_window_display_name(row["name"])
+                if name:
+                    return name
         return fallback
+
+    @staticmethod
+    def _clean_window_display_name(value: Any) -> str:
+        text = clean_text(value, 120)
+        if not text:
+            return ""
+        text = re.sub(
+            r"\s+(?:Avatar|Owner\s*ID|Admin\s*IDs?|Member\s*Count|Max\s*Member\s*Count|Description)\s*[:：].*$",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            r"^(?:Group\s*ID|Group\s*Name|Name|User\s*ID|User\s*Name|Nick(?:name)?|QQ)\s*[:：]\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        return clean_text(text, 80)
 
     async def list_acl_rules(
         self,
@@ -2239,6 +2729,21 @@ class MemoryStore:
             row = self._conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
         return MemoryRecord.from_row(row) if row else None
 
+    async def get_memories_by_ids(self, memory_ids: list[str]) -> dict[str, MemoryRecord]:
+        return await asyncio.to_thread(self._get_memories_by_ids_sync, memory_ids)
+
+    def _get_memories_by_ids_sync(self, memory_ids: list[str]) -> dict[str, MemoryRecord]:
+        ids = [clean_text(mid, 120) for mid in memory_ids if clean_text(mid, 120)]
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM memories WHERE id IN ({placeholders})",
+                ids,
+            ).fetchall()
+        return {row["id"]: MemoryRecord.from_row(row) for row in rows}
+
     async def update_memory_payload(
         self,
         memory_id: str,
@@ -2320,6 +2825,8 @@ class MemoryStore:
                     memory_id,
                 ),
             )
+            row = self._conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
+            self._upsert_memory_fts_row(row)
             self._conn.commit()
             return cur.rowcount > 0
 
@@ -2396,7 +2903,7 @@ class MemoryStore:
             metadata["mentionability_score"] = round(mentionability, 3)
             if reaction in {"awkward", "denied"} and mentionability <= 0.35:
                 metadata["mention_policy"] = "avoid_unless_asked"
-            elif reaction in {"accepted", "comforted"} and mentionability >= 0.62:
+            elif reaction in {"accepted", "comforted", "touched", "nostalgic"} and mentionability >= 0.62:
                 metadata["mention_policy"] = "soft_echo"
             if reaction == "corrected" and evidence:
                 metadata["user_correction"] = {
@@ -2424,6 +2931,8 @@ class MemoryStore:
                 """,
                 (json_dumps(metadata), confidence, now, memory_id),
             )
+            row = self._conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
+            self._upsert_memory_fts_row(row)
             self._conn.commit()
             return cur.rowcount > 0
 
@@ -2435,6 +2944,7 @@ class MemoryStore:
             cur = self._conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
             self._conn.execute("DELETE FROM review_queue WHERE memory_id=?", (memory_id,))
             self._conn.execute("DELETE FROM memory_embeddings WHERE memory_id=?", (memory_id,))
+            self._delete_memory_fts_row(memory_id)
             self._conn.commit()
             return cur.rowcount > 0
 
@@ -2660,12 +3170,14 @@ class MemoryStore:
                         ),
                     )
                     merged += 1
+            fts_rebuilt = self._rebuild_memory_fts_sync() if self._fts_enabled else 0
             self._conn.commit()
         return {
             "manual_visibility_fixed": manual_fixed,
             "utterance_reality_fixed": int(utterance_fixed_cur.rowcount or 0),
             "fingerprint_fixed": fingerprint_fixed,
             "duplicates_archived": merged,
+            "fts_rebuilt": fts_rebuilt,
         }
 
     async def list_decay_candidate_pool(self, limit: int = 2000) -> list[MemoryRecord]:

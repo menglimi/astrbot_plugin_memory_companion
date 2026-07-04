@@ -37,6 +37,7 @@ class RetrievalEngine:
         embedding_max_text_chars: int = 1200,
         knowledge_graph_enabled: bool = True,
         knowledge_graph_expansion_limit: int = 12,
+        usage_recorder: Any | None = None,
     ):
         self.store = store
         self.policy = policy
@@ -59,6 +60,7 @@ class RetrievalEngine:
         self.embedding_max_text_chars = max(200, int(embedding_max_text_chars or 1200))
         self.knowledge_graph_enabled = bool(knowledge_graph_enabled)
         self.knowledge_graph_expansion_limit = max(0, int(knowledge_graph_expansion_limit or 0))
+        self.usage_recorder = usage_recorder if callable(usage_recorder) else None
         self._rank_path_info: dict[str, Any] = {}
         self.last_path_info: dict[str, Any] = {
             "mode": self.retrieval_mode,
@@ -302,12 +304,37 @@ class RetrievalEngine:
             accepts_top_n = True
         if accepts_top_n:
             kwargs["top_n"] = len(documents)
-        result = method(**kwargs)
-        if inspect.isawaitable(result):
-            if self.rerank_timeout_ms > 0:
-                return await asyncio.wait_for(result, timeout=self.rerank_timeout_ms / 1000.0)
-            return await result
-        return result
+        prompt = self._usage_prompt_for_rerank(query, documents)
+        started = datetime.now(timezone.utc)
+        resp: Any = None
+        success = False
+        error = ""
+        try:
+            result = method(**kwargs)
+            if inspect.isawaitable(result):
+                if self.rerank_timeout_ms > 0:
+                    resp = await asyncio.wait_for(result, timeout=self.rerank_timeout_ms / 1000.0)
+                else:
+                    resp = await result
+            else:
+                resp = result
+            success = True
+            return resp
+        except Exception as exc:
+            error = str(exc)
+            raise
+        finally:
+            elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+            self._record_usage(
+                task="memory_rerank",
+                provider_id=self.rerank_provider_id or "<auto>",
+                prompt=prompt,
+                completion="",
+                resp=resp,
+                success=success,
+                elapsed_ms=elapsed_ms,
+                error=error,
+            )
 
     def _apply_rerank_response(
         self,
@@ -754,8 +781,14 @@ class RetrievalEngine:
                 limit=1600,
                 include_pending=include_pending,
             )
+        keyword_terms = self._keyword_candidate_terms(query, expanded_terms)
+        fts_candidates = await self.store.list_fts_candidate_memories(
+            keyword_terms,
+            limit=1200,
+            include_pending=include_pending,
+        )
         keyword_candidates = await self.store.list_keyword_candidate_memories(
-            self._keyword_candidate_terms(query, expanded_terms),
+            keyword_terms,
             limit=1200,
             include_pending=include_pending,
         )
@@ -766,6 +799,7 @@ class RetrievalEngine:
         self._rank_path_info = embedding_info
         candidates, candidate_sources = self._merge_candidate_memories(
             ranked_candidates,
+            fts_candidates,
             keyword_candidates,
             vector_candidates,
             time_window_candidates,
@@ -933,24 +967,94 @@ class RetrievalEngine:
             return value
 
         get_embedding = getattr(provider, "get_embedding", None)
-        if callable(get_embedding):
-            return self._coerce_vector(await maybe_wait(get_embedding(text)))
-
         get_embeddings = getattr(provider, "get_embeddings", None)
-        if callable(get_embeddings):
-            payload = await maybe_wait(get_embeddings([text]))
-            return self._first_vector(payload)
-
         get_embeddings_batch = getattr(provider, "get_embeddings_batch", None)
-        if callable(get_embeddings_batch):
-            try:
-                payload = await maybe_wait(
-                    get_embeddings_batch([text], batch_size=1, tasks_limit=1, max_retries=1)
+        started = datetime.now(timezone.utc)
+        payload: Any = None
+        success = False
+        error = ""
+        called_provider = False
+        try:
+            if callable(get_embedding):
+                called_provider = True
+                payload = await maybe_wait(get_embedding(text))
+                success = True
+                return self._coerce_vector(payload)
+
+            if callable(get_embeddings):
+                called_provider = True
+                payload = await maybe_wait(get_embeddings([text]))
+                success = True
+                return self._first_vector(payload)
+
+            if callable(get_embeddings_batch):
+                called_provider = True
+                try:
+                    payload = await maybe_wait(
+                        get_embeddings_batch([text], batch_size=1, tasks_limit=1, max_retries=1)
+                    )
+                except TypeError:
+                    payload = await maybe_wait(get_embeddings_batch([text]))
+                success = True
+                return self._first_vector(payload)
+            return []
+        except Exception as exc:
+            error = str(exc)
+            raise
+        finally:
+            if called_provider:
+                elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+                self._record_usage(
+                    task="memory_embedding_query",
+                    provider_id=self.embedding_provider_id or "<auto>",
+                    prompt=text,
+                    completion="",
+                    resp=payload,
+                    success=success,
+                    elapsed_ms=elapsed_ms,
+                    error=error,
                 )
-            except TypeError:
-                payload = await maybe_wait(get_embeddings_batch([text]))
-            return self._first_vector(payload)
-        return []
+
+    @staticmethod
+    def _usage_prompt_for_rerank(query: str, documents: list[str]) -> str:
+        doc_lines = [
+            f"{index + 1}. {clean_text(document, 700)}"
+            for index, document in enumerate(documents[:80])
+            if clean_text(document, 700)
+        ]
+        return clean_text(
+            f"query: {clean_text(query, 1000)}\n\ndocuments:\n" + "\n".join(doc_lines),
+            12000,
+        )
+
+    def _record_usage(
+        self,
+        *,
+        task: str,
+        provider_id: str,
+        prompt: str,
+        completion: str,
+        resp: Any,
+        success: bool,
+        elapsed_ms: int,
+        error: str = "",
+    ) -> None:
+        recorder = self.usage_recorder
+        if not callable(recorder):
+            return
+        try:
+            recorder(
+                task=task,
+                provider_id=provider_id,
+                prompt=prompt,
+                completion=completion,
+                resp=resp,
+                success=success,
+                elapsed_ms=elapsed_ms,
+                error=error,
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _coerce_vector(value: Any) -> list[float]:
@@ -1292,6 +1396,7 @@ class RetrievalEngine:
     @staticmethod
     def _merge_candidate_memories(
         ranked_candidates: list[MemoryRecord],
+        fts_candidates: list[MemoryRecord],
         keyword_candidates: list[MemoryRecord],
         vector_candidates: list[MemoryRecord] | None = None,
         time_window_candidates: list[MemoryRecord] | None = None,
@@ -1309,6 +1414,8 @@ class RetrievalEngine:
                 if memory_id:
                     seen_ids.add(memory_id)
 
+        for memory in fts_candidates:
+            add(memory, "fts")
         for memory in keyword_candidates:
             add(memory, "keyword")
         for memory in time_window_candidates or []:

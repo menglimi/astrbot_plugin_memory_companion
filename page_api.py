@@ -5,6 +5,7 @@ import base64
 import json
 import hashlib
 import inspect
+import logging
 import mimetypes
 import re
 import sys
@@ -22,6 +23,8 @@ from .core.models import SessionContext, clean_text
 
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
 PAGE_API_PREFIXES = (f"/{PLUGIN_NAME}/page",)
+
+logger = logging.getLogger("MemoryCompanion.PageAPI")
 
 THEME_NAME_TO_KEY = {
     "黄白游": "huangbaiyou",
@@ -410,41 +413,57 @@ class PluginPageApi:
         )
 
     async def timeline(self):
-        rows = await self.plugin.service.store.recent_timeline(
-            limit=self._query_int("limit", 30),
-            scope=clean_text(request.args.get("scope", ""), 40),
-            session_id=clean_text(request.args.get("session_id", ""), 200),
-            entity_id=clean_text(request.args.get("entity_id", ""), 120),
-        )
-        return self._ok({"items": rows})
+        try:
+            rows = await self.plugin.service.store.recent_timeline(
+                limit=self._query_int("limit", 30),
+                scope=clean_text(request.args.get("scope", ""), 40),
+                session_id=clean_text(request.args.get("session_id", ""), 200),
+                entity_id=clean_text(request.args.get("entity_id", ""), 120),
+            )
+            return self._ok({"items": rows})
+        except Exception as exc:
+            logger.warning("[MemoryCompanion] timeline 端点异常: %s", exc, exc_info=True)
+            return self._ok({"items": []})
 
     async def relations(self):
-        rows = await self.plugin.service.store.list_relationships(
-            limit=self._query_int("limit", 50),
-            entity_id=clean_text(request.args.get("entity_id", ""), 120),
-            scope=clean_text(request.args.get("scope", ""), 40),
-            session_id=clean_text(request.args.get("session_id", ""), 200),
-            group_id=clean_text(request.args.get("group_id", ""), 120),
-        )
-        return self._ok({"items": rows})
+        try:
+            rows = await self.plugin.service.store.list_relationships(
+                limit=self._query_int("limit", 50),
+                entity_id=clean_text(request.args.get("entity_id", ""), 120),
+                scope=clean_text(request.args.get("scope", ""), 40),
+                session_id=clean_text(request.args.get("session_id", ""), 200),
+                group_id=clean_text(request.args.get("group_id", ""), 120),
+            )
+            return self._ok({"items": rows})
+        except Exception as exc:
+            logger.warning("[MemoryCompanion] relations 端点异常: %s", exc, exc_info=True)
+            return self._ok({"items": []})
 
     async def graph(self):
-        rows = await self.plugin.service.store.list_knowledge_edges(
-            limit=self._query_int("limit", 50),
-            scope=clean_text(request.args.get("scope", ""), 40),
-            session_id=clean_text(request.args.get("session_id", ""), 200),
-            group_id=clean_text(request.args.get("group_id", ""), 120),
-            node=clean_text(request.args.get("node") or request.args.get("q"), 160),
-        )
-        return self._ok({"items": rows})
+        try:
+            rows = await self.plugin.service.store.list_knowledge_edges(
+                limit=self._query_int("limit", 50),
+                scope=clean_text(request.args.get("scope", ""), 40),
+                session_id=clean_text(request.args.get("session_id", ""), 200),
+                group_id=clean_text(request.args.get("group_id", ""), 120),
+                node=clean_text(request.args.get("node") or request.args.get("q"), 160),
+            )
+            return self._ok({"items": rows})
+        except Exception as exc:
+            logger.warning("[MemoryCompanion] graph 端点异常: %s", exc, exc_info=True)
+            return self._ok({"items": []})
 
     async def threads(self):
-        rows = await self.plugin.service.store.list_cross_window_threads(
-            status=clean_text(request.args.get("status", "open"), 40) or "open",
-            limit=self._query_int("limit", 30),
-            session_id=clean_text(request.args.get("session_id", ""), 200),
-        )
-        return self._ok({"items": rows})
+        try:
+            rows = await self.plugin.service.store.list_cross_window_threads(
+                status=clean_text(request.args.get("status", "open"), 40) or "open",
+                limit=self._query_int("limit", 30),
+                session_id=clean_text(request.args.get("session_id", ""), 200),
+            )
+            return self._ok({"items": rows})
+        except Exception as exc:
+            logger.warning("[MemoryCompanion] threads 端点异常: %s", exc, exc_info=True)
+            return self._ok({"items": []})
 
     async def thread_status(self):
         payload = await self._json()
@@ -455,23 +474,27 @@ class PluginPageApi:
         return self._ok({"updated": ok})
 
     async def logs(self):
-        rows = await self.plugin.service.store.recent_injection_logs(
-            limit=self._query_int("limit", 20),
-            scope=clean_text(request.args.get("scope", ""), 40),
-            session_id=clean_text(request.args.get("session_id", ""), 200),
-        )
-        all_ids: list[str] = []
-        for row in rows:
-            all_ids.extend(clean_text(mid, 120) for mid in (row.get("selected_memory_ids") or [])[:12])
-        records_map = await self.plugin.service.store.get_memories_by_ids(all_ids) if all_ids else {}
-        for row in rows:
-            selected = []
-            for memory_id in (row.get("selected_memory_ids") or [])[:12]:
-                record = records_map.get(clean_text(memory_id, 120))
-                if record:
-                    selected.append(serialize_memory(record))
-            row["selected_memories"] = selected
-        return self._ok({"items": rows})
+        try:
+            rows = await self.plugin.service.store.recent_injection_logs(
+                limit=self._query_int("limit", 20),
+                scope=clean_text(request.args.get("scope", ""), 40),
+                session_id=clean_text(request.args.get("session_id", ""), 200),
+            )
+            all_ids: list[str] = []
+            for row in rows:
+                all_ids.extend(clean_text(mid, 120) for mid in (row.get("selected_memory_ids") or [])[:12])
+            records_map = await self.plugin.service.store.get_memories_by_ids(all_ids) if all_ids else {}
+            for row in rows:
+                selected = []
+                for memory_id in (row.get("selected_memory_ids") or [])[:12]:
+                    record = records_map.get(clean_text(memory_id, 120))
+                    if record:
+                        selected.append(serialize_memory(record))
+                row["selected_memories"] = selected
+            return self._ok({"items": rows})
+        except Exception as exc:
+            logger.warning("[MemoryCompanion] logs 端点异常: %s", exc, exc_info=True)
+            return self._ok({"items": []})
 
     async def context_config(self):
         config = self.plugin.service.config

@@ -10,7 +10,7 @@ from .models import MemoryRecord, clean_text
 class ImportanceEvaluator:
     """Calibrate memory importance around long-term conversational value."""
 
-    version = "persona_dimensions_v4"
+    version = "persona_dimensions_v5"
 
     def calibrate(self, record: MemoryRecord, *, source: str = "") -> MemoryRecord:
         base = self._base_importance(record.importance)
@@ -39,6 +39,8 @@ class ImportanceEvaluator:
         metadata.setdefault("mention_policy_source", self.version)
         metadata["memory_reason"] = dimensions["memory_reason"]
         metadata["persona_dimensions"] = dimensions["active_dimensions"]
+        metadata["intimacy_weight"] = dimensions["intimacy_weight"]
+        metadata["vulnerability_weight"] = dimensions["vulnerability_weight"]
         if source:
             metadata["importance_source"] = clean_text(source, 80)
         record.metadata = metadata
@@ -64,6 +66,8 @@ class ImportanceEvaluator:
         semantic += float(dimensions.get("persona_importance", 0.0) or 0.0) * 0.18
         semantic += float(dimensions.get("freshness_weight", 0.0) or 0.0) * 0.05
         semantic += float(dimensions.get("scar_weight", 0.0) or 0.0) * 0.06
+        semantic += float(dimensions.get("intimacy_weight", 0.0) or 0.0) * 0.04
+        semantic += float(dimensions.get("vulnerability_weight", 0.0) or 0.0) * 0.05
         semantic += self._length_bonus(text)
         semantic += self._confidence_bonus(record)
         semantic -= self._low_value_penalty(compact, record)
@@ -155,6 +159,64 @@ class ImportanceEvaluator:
             compact,
             ("日程", "计划", "自主", "主动", "我做了", "我想", "我记得", "睡眠", "休息", "状态"),
         )
+        intimacy = self._dimension_score(
+            compact,
+            (
+                "想你",
+                "喜欢你",
+                "爱你",
+                "舍不得",
+                "依赖",
+                "离不开",
+                "信任",
+                "在意",
+                "在乎",
+                "珍惜",
+                "特别",
+                "唯一",
+                "最重要",
+                "心里话",
+                "秘密",
+                "只跟你",
+                "没跟别人说过",
+                "依靠",
+                "倾诉",
+                "贴贴",
+                "抱抱",
+                "依靠你",
+                "不想分开",
+                "你是我的",
+            ),
+        )
+        vulnerability = self._dimension_score(
+            compact,
+            (
+                "累",
+                "难过",
+                "哭",
+                "害怕",
+                "孤独",
+                "委屈",
+                "崩溃",
+                "焦虑",
+                "压力",
+                "不安",
+                "迷茫",
+                "无助",
+                "压抑",
+                "绝望",
+                "没安全感",
+                "睡不着",
+                "噩梦",
+                "撑不住",
+                "想消失",
+                "没意义",
+                "没人懂",
+                "好寂寞",
+                "好孤单",
+                "心疼",
+            ),
+        )
 
         if memory_type in {"user_profile", "user_preference", "user_habit"}:
             preference = max(preference, 0.72)
@@ -197,12 +259,16 @@ class ImportanceEvaluator:
             "creative_weight": creative,
             "emotional_weight": emotional,
             "self_continuity_weight": self_continuity,
+            "intimacy_weight": intimacy,
+            "vulnerability_weight": vulnerability,
         }
         persona_importance = max(weights.values())
         if relationship >= 0.45 and emotional >= 0.35:
             persona_importance = max(persona_importance, min(0.95, (relationship + emotional) / 2 + 0.12))
         if promise >= 0.45 and open_loop >= 0.45:
             persona_importance = max(persona_importance, min(0.95, (promise + open_loop) / 2 + 0.14))
+        if intimacy >= 0.45 and vulnerability >= 0.35:
+            persona_importance = max(persona_importance, min(0.95, (intimacy + vulnerability) / 2 + 0.10))
         phase = self._relationship_phase(compact, relationship, emotional, promise)
         scar = self._scar_weight(compact, relationship, emotional, promise, open_loop, creative, phase)
         emotional_debt = self._emotional_debt_weight(compact, emotional, relationship, open_loop, promise, phase)
@@ -222,6 +288,8 @@ class ImportanceEvaluator:
         rounded["freshness_weight"] = round(max(0.0, min(1.0, freshness)), 3)
         rounded["scar_weight"] = round(max(0.0, min(1.0, scar)), 3)
         rounded["emotional_debt_weight"] = round(max(0.0, min(1.0, emotional_debt)), 3)
+        rounded["intimacy_weight"] = round(max(0.0, min(1.0, intimacy)), 3)
+        rounded["vulnerability_weight"] = round(max(0.0, min(1.0, vulnerability)), 3)
         rounded["last_emotional_touch_at"] = occurred_at if max(emotional, relationship, promise, open_loop, scar, emotional_debt) >= 0.35 else ""
         rounded["relationship_phase"] = phase
         rounded["decay_mode"] = decay_mode
@@ -264,7 +332,11 @@ class ImportanceEvaluator:
             return "tone_only", 0.34
         if max(scar, emotional_debt, emotional) >= 0.66:
             return "tone_only", 0.36
-        if max(open_loop, promise, relationship, creative) >= 0.45 or decay_mode in {"no_decay", "scar_slow_decay", "creative_milestone"}:
+        vulnerability = weight("vulnerability_weight")
+        intimacy = weight("intimacy_weight")
+        if vulnerability >= 0.58 and scar < 0.35:
+            return "soft_echo", 0.48
+        if max(open_loop, promise, relationship, creative, intimacy) >= 0.45 or decay_mode in {"no_decay", "scar_slow_decay", "creative_milestone"}:
             return "soft_echo", 0.58
         if memory_type in {"manual_memory", "explicit_memory", "user_profile", "user_preference", "user_habit"} or preference >= 0.58:
             return "direct", 0.72
@@ -289,6 +361,8 @@ class ImportanceEvaluator:
             "creative": "创作连续性",
             "emotional": "情绪转折",
             "self_continuity": "Bot自我连续性",
+            "intimacy": "亲密信任",
+            "vulnerability": "脆弱时刻",
         }
         chosen = [labels.get(item, item) for item in active[:3]]
         phase = clean_text(weights.get("relationship_phase"), 40)
@@ -427,7 +501,7 @@ class ImportanceEvaluator:
             return "scar_slow_decay"
         if memory_type == "creative_work" or weight("creative_weight") >= 0.66 or "creative_work" in tags:
             return "creative_milestone"
-        if max(weight("relationship_weight"), weight("emotional_weight"), weight("preference_weight")) >= 0.52:
+        if max(weight("relationship_weight"), weight("emotional_weight"), weight("preference_weight"), weight("intimacy_weight")) >= 0.52:
             return "slow_decay"
         if memory_type in {"conversation_summary", "memory_decay_summary"}:
             return "summary_decay"

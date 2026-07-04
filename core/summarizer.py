@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -33,6 +34,9 @@ class MemorySummarizer:
         *,
         rows: list[dict[str, Any]],
         session_label: str,
+        provider_id: str = "",
+        usage_recorder: Any | None = None,
+        usage_task: str = "memory_summary",
     ) -> dict[str, Any] | None:
         if not rows:
             return None
@@ -44,8 +48,40 @@ class MemorySummarizer:
             "system_prompt": self._system_prompt(),
             "request_max_retries": 1,
         }
-        resp = await provider.text_chat(**kwargs)
+        started = time.monotonic()
+        try:
+            resp = await provider.text_chat(**kwargs)
+        except Exception as exc:
+            if callable(usage_recorder):
+                try:
+                    usage_recorder(
+                        task=usage_task,
+                        provider_id=provider_id,
+                        prompt=prompt,
+                        completion="",
+                        resp=None,
+                        success=False,
+                        elapsed_ms=int((time.monotonic() - started) * 1000),
+                        error=str(exc),
+                    )
+                except Exception:
+                    pass
+            raise
         text = clean_text(getattr(resp, "completion_text", "") or "", self.max_summary_chars * 2)
+        if callable(usage_recorder):
+            try:
+                usage_recorder(
+                    task=usage_task,
+                    provider_id=provider_id,
+                    prompt=prompt,
+                    completion=text,
+                    resp=resp,
+                    success=True,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    error="",
+                )
+            except Exception:
+                pass
         return self._normalize_payload(self._parse_response(text) or {}, rows)
 
     def compose_memory_content(self, payload: dict[str, Any]) -> str:

@@ -21,6 +21,8 @@ class RetrievalIntent:
     notes: list[str] = field(default_factory=list)
     query_mode: str = "current_message"
     companion_hint_status: str = ""
+    companion_bot_mood: str = ""
+    companion_bot_energy: float = 0.0
 
     def terms(self) -> list[str]:
         values: list[str] = []
@@ -48,6 +50,10 @@ class RetrievalIntent:
             lines.append("- 检索关键词：" + "、".join(self.keywords[:8]))
         if self.notes:
             lines.append("- 陪伴线索：" + " / ".join(self.notes[:3]))
+        if self.companion_bot_mood:
+            lines.append(f"- Bot当前情绪底色：{self.companion_bot_mood}")
+        if self.companion_bot_energy > 0:
+            lines.append(f"- Bot心理能量：{self.companion_bot_energy:.0f}/100")
         text = "\n".join(lines)
         return clean_text(text, max_chars)
 
@@ -101,6 +107,18 @@ class RetrievalIntentBuilder:
             ),
         )
 
+        companion_bot_mood = self._first_text(
+            merged,
+            ("mood_bias", "mood", "bot_mood", "emotion", "bot_emotion", "emotional_state"),
+        )
+        try:
+            companion_bot_energy = float(
+                self._first_text(merged, ("energy", "bot_energy", "psychological_energy"))
+                or 0.0
+            )
+        except Exception:
+            companion_bot_energy = 0.0
+
         companion_terms = [topic, *entities, *facts[:4], *keywords[:8]]
         companion_used = False
         companion_status = "none"
@@ -137,6 +155,8 @@ class RetrievalIntentBuilder:
             notes=notes,
             query_mode=normalized_mode,
             companion_hint_status=companion_status,
+            companion_bot_mood=companion_bot_mood,
+            companion_bot_energy=companion_bot_energy,
         )
 
     def _normalize_query_mode(self, query_mode: str) -> str:

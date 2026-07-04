@@ -97,6 +97,69 @@ class MemoryCompanionCommandHandler:
         ok = await self.service.store.delete_memory(memory_id)
         return "已删除。" if ok else "没有找到这条记忆。"
 
+    async def clear_scope(
+        self,
+        target_type: str = "",
+        first_id: str = "",
+        second_id: str = "",
+        confirm: str = "",
+    ) -> str:
+        target_type = clean_text(target_type, 40).lower()
+        first_id = clean_text(first_id, 120)
+        second_id = clean_text(second_id, 120)
+        confirm = clean_text(confirm, 20)
+        if target_type in {"group", "private"} and second_id == "清空" and not confirm:
+            confirm = second_id
+            second_id = ""
+        if target_type not in {"group", "private", "group_member"}:
+            return (
+                "用法：\n"
+                "/mcomp clear_scope group <群号> [清空]\n"
+                "/mcomp clear_scope private <QQ> [清空]\n"
+                "/mcomp clear_scope group_member <群号> <QQ> [清空]\n"
+                "不带“清空”只预览数量，带“清空”才执行。"
+            )
+        group_id = first_id if target_type in {"group", "group_member"} else ""
+        user_id = first_id if target_type == "private" else second_id
+        try:
+            if confirm == "清空":
+                result = await self.service.store.clear_scoped_memory(
+                    target_type=target_type,
+                    group_id=group_id,
+                    user_id=user_id,
+                )
+                action = "已清空"
+            else:
+                result = await self.service.store.preview_scoped_memory_clear(
+                    target_type=target_type,
+                    group_id=group_id,
+                    user_id=user_id,
+                )
+                action = "预览"
+        except ValueError as exc:
+            return f"参数错误：{exc}"
+        counts = result.get("deleted") if confirm == "清空" else result.get("counts")
+        counts = counts or {}
+        lines = [
+            f"{action}范围：{self._clear_scope_label(target_type, group_id, user_id)}",
+            "影响数量："
+        ]
+        for key in ["memories", "timeline", "relationship_edges", "knowledge_nodes", "knowledge_edges", "injection_logs", "summary_failures", "cross_window_threads"]:
+            lines.append(f"- {key}: {counts.get(key, 0)}")
+        if confirm != "清空":
+            lines.append("确认执行请在命令末尾加：清空")
+        elif result.get("backup"):
+            lines.append(f"备份：{result.get('backup')}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _clear_scope_label(target_type: str, group_id: str, user_id: str) -> str:
+        if target_type == "group":
+            return f"群聊 {group_id}"
+        if target_type == "private":
+            return f"私聊 {user_id}"
+        return f"群聊 {group_id} 中的用户 {user_id}"
+
     async def visibility(self, memory_id: str = "", visibility: str = "") -> str:
         if not memory_id or not visibility:
             return "用法：/mcomp visibility <memory_id> private_pair|group_public|bot_self|shareable|internal"
@@ -181,7 +244,8 @@ class MemoryCompanionCommandHandler:
             f"可见性修正 {result.get('manual_visibility_fixed', 0)}，"
             f"原始话语修正 {result.get('utterance_reality_fixed', 0)}，"
             f"指纹补齐 {result.get('fingerprint_fixed', 0)}，"
-            f"重复归档 {result.get('duplicates_archived', 0)}；"
+            f"重复归档 {result.get('duplicates_archived', 0)}，"
+            f"全文索引 {result.get('fts_rebuilt', 0)}；"
             f"原始事件归档 {raw.get('archived', 0)}；"
             f"衰减总结 {decay.get('summaries', 0)}，衰减归档 {decay.get('archived', 0)}；"
             f"睡眠维护时间 {state.get('ran_at', '-')}"
@@ -199,6 +263,7 @@ class MemoryCompanionCommandHandler:
                 f"{state.get('ran_at', '-')}｜"
                 f"指纹补齐 {repair.get('fingerprint_fixed', 0)}｜"
                 f"重复归档 {repair.get('duplicates_archived', 0)}｜"
+                f"全文索引 {repair.get('fts_rebuilt', 0)}｜"
                 f"原始事件归档 {raw.get('archived', 0)}｜"
                 f"衰减总结 {decay.get('summaries', 0)}｜"
                 f"衰减归档 {decay.get('archived', 0)}"

@@ -164,6 +164,7 @@ const state = {
   secondaryNavSwitching: false,
   animatePersonalViewportRail: false,
   personalSnapshot: null,
+  personalData: null,
   animatePersonalDateRail: false,
   pendingPersonalFilmReveal: false,
   personalEntranceRevealRequested: false,
@@ -1080,7 +1081,9 @@ function renderPersonalDateRail(dates, selectedDate) {
 
 async function selectPersonalDate(date) {
   const nextDate = date || "";
-  if (nextDate && nextDate !== state.selectedPersonalDate) {
+  const changed = nextDate && nextDate !== state.selectedPersonalDate;
+  if (!changed) return;
+  if (changed && state.personalViewport !== "album") {
     await retractScheduleFilmBeforeDateMove();
   }
   state.selectedPersonalDate = nextDate;
@@ -1088,6 +1091,11 @@ async function selectPersonalDate(date) {
   state.selectedPersonalAlbumIndex = "";
   state.selectedSubjectiveMemoryIndex = "";
   state.animatePersonalDateRail = true;
+  if (state.personalViewport === "album" && changed) {
+    await switchPersonalAlbumDate();
+    resetRailCoverflow();
+    return;
+  }
   clearDetail();
   await loadPersonalMemory();
   resetRailCoverflow();
@@ -1711,20 +1719,29 @@ async function loadContextPanel() {
     target.innerHTML = `<div id="personaStatePanel" class="persona-state-panel"></div>`;
     await loadPersonaState();
   } else {
-    const [graph, relations, threads, timeline, logs] = await Promise.all([
+    const results = await Promise.allSettled([
       apiGet(`/graph?${params.toString()}`),
       apiGet(`/relations?${params.toString()}`),
       apiGet(`/threads?${new URLSearchParams({ ...Object.fromEntries(params), status: "all" }).toString()}`),
       apiGet(`/timeline?${params.toString()}`),
       apiGet(`/logs?${params.toString()}`),
     ]);
+    const settled = (idx) => results[idx].status === "fulfilled" ? (results[idx].value?.items || []) : [];
+    const failures = results.filter(r => r.status === "rejected");
+    if (failures.length === results.length) {
+      throw results[0].reason || new Error("所有知识图谱 API 请求失败");
+    }
     target.innerHTML = renderKnowledgeOverview({
-      graph: graph.items || [],
-      relations: relations.items || [],
-      threads: threads.items || [],
-      timeline: timeline.items || [],
-      logs: logs.items || [],
+      graph: settled(0),
+      relations: settled(1),
+      threads: settled(2),
+      timeline: settled(3),
+      logs: settled(4),
     });
+    if (failures.length > 0) {
+      const failedNames = ["图谱边", "身份关系", "跨窗口线程", "时间线", "注入日志"].filter((_, i) => results[i].status === "rejected");
+      showToast(`${failedNames.join("、")}加载失败，已显示可用数据`, "error");
+    }
   }
   bindKnowledgeGraphRows(target);
 }
@@ -2045,11 +2062,7 @@ async function loadPersonalMemory() {
     return;
   }
   target.innerHTML = loadingState("正在读取个人记忆...");
-  const query = $("#globalSearch").value.trim();
-  const params = new URLSearchParams({ limit: "80" });
-  if (query) params.set("q", query);
-  if (state.selectedPersonalDate) params.set("date", state.selectedPersonalDate);
-  const data = await apiGet(`/companion/personal-memory?${params.toString()}`);
+  const data = await fetchPersonalMemoryData();
   updatePersonalMemoryAvailability(Boolean(data.available));
   if (!data.available) {
     target.innerHTML = renderPersonalMemoryUnavailable(data.reason || "未检测到已加载的主动陪伴插件");
@@ -2057,6 +2070,7 @@ async function loadPersonalMemory() {
   }
   state.selectedPersonalDate = data.selected_date || state.selectedPersonalDate || "";
   state.personalSnapshot = data.snapshot || {};
+  state.personalData = data;
   if (shouldAnimateEntrance) state.animatePersonalDateRail = true;
   renderPersonalDateRail(data.dates || [], state.selectedPersonalDate);
   target.innerHTML = renderPersonalMemoryWorkspace(data.snapshot || {}, data);
@@ -2064,34 +2078,31 @@ async function loadPersonalMemory() {
   hydratePersonalAlbumImages(target);
 }
 
+function personalMemoryQueryParams() {
+  const query = $("#globalSearch")?.value.trim() || "";
+  const params = new URLSearchParams({ limit: "80" });
+  if (query) params.set("q", query);
+  if (state.selectedPersonalDate) params.set("date", state.selectedPersonalDate);
+  return params;
+}
+
+async function fetchPersonalMemoryData() {
+  return apiGet(`/companion/personal-memory?${personalMemoryQueryParams().toString()}`);
+}
+
 function bindPersonalMemoryWorkspace(target, snapshot, data) {
   target.querySelectorAll("[data-personal-viewport]").forEach((button) => {
     button.addEventListener("click", async () => {
       const next = button.dataset.personalViewport || "schedule";
       if (next === state.personalViewport) return;
-      await switchPersonalViewport(next, target, snapshot, data);
+      await switchPersonalViewport(next, target, state.personalSnapshot || snapshot, state.personalData || data);
     });
   });
 
   target.querySelectorAll("[data-memory-id]").forEach((row) => {
     row.addEventListener("click", () => showMemory(row.dataset.memoryId));
   });
-  target.querySelectorAll("[data-album-index]").forEach((card) => {
-    const selectAlbum = () => {
-      state.selectedPersonalAlbumIndex = card.dataset.albumIndex || "";
-      target.querySelectorAll("[data-album-index]").forEach((item) => {
-        item.classList.toggle("is-active", item.dataset.albumIndex === state.selectedPersonalAlbumIndex);
-      });
-      showPersonalAlbumDetail(snapshot, data, { animate: true });
-    };
-    card.addEventListener("click", selectAlbum);
-    card.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") {
-        event.preventDefault();
-        selectAlbum();
-      }
-    });
-  });
+  bindPersonalAlbumCards(target, snapshot, data);
   target.querySelectorAll("[data-subjective-index]").forEach((card) => {
     const selectSubjective = () => {
       state.selectedSubjectiveMemoryIndex = card.dataset.subjectiveIndex || "";
@@ -2148,6 +2159,58 @@ function bindPersonalMemoryWorkspace(target, snapshot, data) {
   }
   updateScheduleSummary(target, snapshot);
   showPersonalScheduleDetail(snapshot, data);
+}
+
+function bindPersonalAlbumCards(target, snapshot, data) {
+  target.querySelectorAll("[data-album-index]").forEach((card) => {
+    const selectAlbum = () => {
+      state.selectedPersonalAlbumIndex = card.dataset.albumIndex || "";
+      target.querySelectorAll("[data-album-index]").forEach((item) => {
+        item.classList.toggle("is-active", item.dataset.albumIndex === state.selectedPersonalAlbumIndex);
+      });
+      showPersonalAlbumDetail(snapshot, data, { animate: true });
+    };
+    card.addEventListener("click", selectAlbum);
+    card.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectAlbum();
+      }
+    });
+  });
+}
+
+async function switchPersonalAlbumDate() {
+  const target = $("#personalMemoryList");
+  const viewport = target?.querySelector(".personal-viewport[data-personal-viewport-panel='album']");
+  if (!target || !viewport) {
+    await loadPersonalMemory();
+    return;
+  }
+  const currentPanel = viewport.querySelector(".companion-album");
+  if (currentPanel && !prefersReducedMotion()) {
+    currentPanel.classList.add("is-album-date-leaving");
+    await waitForMotion(180);
+  }
+  const data = await fetchPersonalMemoryData();
+  updatePersonalMemoryAvailability(Boolean(data.available));
+  if (!data.available) {
+    target.innerHTML = renderPersonalMemoryUnavailable(data.reason || "未检测到已加载的主动陪伴插件");
+    return;
+  }
+  state.selectedPersonalDate = data.selected_date || state.selectedPersonalDate || "";
+  state.selectedPersonalAlbumIndex = "";
+  state.personalSnapshot = data.snapshot || {};
+  state.personalData = data;
+  state.animatePersonalDateRail = true;
+  renderPersonalDateRail(data.dates || [], state.selectedPersonalDate);
+  viewport.innerHTML = renderPersonalViewportPanel("album", data.snapshot || {}, data);
+  const nextPanel = viewport.querySelector(".companion-album");
+  nextPanel?.classList.add("is-album-date-entering");
+  bindPersonalAlbumCards(target, data.snapshot || {}, data);
+  showPersonalAlbumDetail(data.snapshot || {}, data, { animate: true });
+  hydratePersonalAlbumImages(viewport);
+  requestAnimationFrame(() => nextPanel?.classList.remove("is-album-date-entering"));
 }
 
 async function switchPersonalViewport(next, target, snapshot, data) {
@@ -2630,7 +2693,7 @@ function renderAlbumCard(item, index = 0, active = false) {
     ? albumImageTag(item, title)
     : `<div class="album-missing">${escapeHtml(item.error || "图片文件不可用")}</div>`;
   return `
-    <article class="album-card${active ? " is-active" : ""}" data-album-index="${escapeHtml(index)}" role="button" tabindex="0">
+    <article class="album-card${active ? " is-active" : ""}" style="--album-i:${escapeHtml(index)}" data-album-index="${escapeHtml(index)}" role="button" tabindex="0">
       <div class="album-image">${image}</div>
       <div class="album-caption">
         <b>${escapeHtml(title)}</b>
@@ -2812,12 +2875,51 @@ function activeScheduleIndex(items) {
   return state.selectedScheduleIndex;
 }
 
-function detailForSchedule(details, item, selectedIndex) {
-  if (!item || !selectedIndex) return null;
-  return details.find((detail) => String(detail.index) === String(selectedIndex))
+function firstMinute(value) {
+  const match = String(value || "").match(/(\d{1,2}):(\d{2})/);
+  if (!match) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+  return hour * 60 + minute;
+}
+
+function scheduleWindowForIndex(items, selectedIndex) {
+  const index = items.findIndex((candidate, fallback) => scheduleIndex(candidate, fallback) === String(selectedIndex));
+  const item = index >= 0 ? items[index] : null;
+  const start = firstMinute(item?.time);
+  const end = firstMinute(items[index + 1]?.time);
+  return { start, end };
+}
+
+function detailMatchesSchedule(detail, item, selectedIndex, window = {}) {
+  if (!detail || !item || !selectedIndex) return false;
+  const index = String(selectedIndex);
+  const key = String(detail.key || "");
+  const time = String(item.time || "");
+  const detailStart = firstMinute(detail.time || key);
+  return String(detail.index) === index
+    || (
+      window.start !== null
+      && detailStart !== null
+      && detailStart >= window.start
+      && (window.end === null || detailStart < window.end)
+    )
+    || key.includes(`:${index}:`)
+    || Boolean(time && (key.includes(`:${time}`) || String(detail.time || "").startsWith(time)));
+}
+
+function detailsForSchedule(details, item, selectedIndex, items = []) {
+  if (!item || !selectedIndex || !Array.isArray(details)) return [];
+  const window = scheduleWindowForIndex(items, selectedIndex);
+  const matched = details
+    .filter((detail) => detailMatchesSchedule(detail, item, selectedIndex, window))
+    .sort((a, b) => (firstMinute(a?.time || a?.key) ?? 99999) - (firstMinute(b?.time || b?.key) ?? 99999));
+  if (matched.length) return matched;
+  const fallback = details.find((detail) => String(detail.index) === String(selectedIndex))
     || details.find((detail) => String(detail.key || "").includes(`:${selectedIndex}:`))
-    || details.find((detail) => item.time && String(detail.key || "").includes(`:${item.time}`))
-    || null;
+    || details.find((detail) => item.time && String(detail.key || "").includes(`:${item.time}`));
+  return fallback ? [fallback] : [];
 }
 
 function scheduleRange(items, index) {
@@ -2834,11 +2936,11 @@ function showPersonalScheduleDetail(snapshot, status, options = {}) {
   const details = Array.isArray(snapshot.details) ? snapshot.details : [];
   const selectedIndex = activeScheduleIndex(items);
   const selectedItem = items.find((item, index) => scheduleIndex(item, index) === selectedIndex) || null;
-  const selectedDetail = detailForSchedule(details, selectedItem, selectedIndex);
+  const selectedDetails = detailsForSchedule(details, selectedItem, selectedIndex, items);
   const drawer = $("#detailDrawer");
   const render = () => {
-    drawer.className = selectedItem ? "detail-drawer" : "detail-drawer empty";
-    drawer.innerHTML = `<div class="personal-detail-content">${renderSelectedDetail(selectedItem, selectedDetail, items)}</div>`;
+    drawer.className = selectedItem ? "detail-drawer is-schedule-detail" : "detail-drawer empty";
+    drawer.innerHTML = `<div class="personal-detail-content">${renderSelectedDetail(selectedItem, selectedDetails, items)}</div>`;
   };
   if (options.animate) {
     swapPanelContent(drawer, render);
@@ -2847,7 +2949,7 @@ function showPersonalScheduleDetail(snapshot, status, options = {}) {
   }
 }
 
-function renderSelectedDetail(item, detail, items) {
+function renderSelectedDetail(item, details, items) {
   if (!item) {
     return `
       <div class="detail-empty">
@@ -2856,20 +2958,30 @@ function renderSelectedDetail(item, detail, items) {
       </div>
     `;
   }
-  const index = items.findIndex((candidate, fallback) => scheduleIndex(candidate, fallback) === String(state.selectedScheduleIndex));
-  const range = index >= 0 ? scheduleRange(items, index) : (item.time || "");
-  const detailTime = detail?.time ? detail.time : "";
-  if (!detail) {
+  const selectedDetails = Array.isArray(details) ? details.filter(Boolean) : (details ? [details] : []);
+  if (!selectedDetails.length) {
     return `
       <div class="empty-state">这个时间段还没有细化。</div>
     `;
   }
   return `
     <article class="selected-detail">
+      ${selectedDetails.length > 1 ? `<span class="detail-count">${escapeHtml(selectedDetails.length)} 条细化</span>` : ""}
+      <div class="detail-segment-list">
+        ${selectedDetails.map((detail) => renderDetailSegment(detail)).join("")}
+      </div>
+    </article>
+  `;
+}
+
+function renderDetailSegment(detail) {
+  const detailTime = detail?.time ? detail.time : "";
+  return `
+    <section class="detail-segment">
       ${detailTime ? `<span class="detail-time">${escapeHtml(detailTime)}</span>` : ""}
       ${detail.summary ? `<b class="detail-summary">${escapeHtml(detail.summary)}</b>` : ""}
       ${renderDetailLines(detail)}
-    </article>
+    </section>
   `;
 }
 
@@ -2934,7 +3046,7 @@ function showPersonalAlbumDetail(snapshot, status, options = {}) {
   const selected = album[Number(selectedIndex)] || null;
   const drawer = $("#detailDrawer");
   const render = () => {
-    drawer.className = selected ? "detail-drawer" : "detail-drawer empty";
+    drawer.className = selected ? "detail-drawer is-album-detail" : "detail-drawer empty";
     drawer.innerHTML = `<div class="personal-detail-content">${renderAlbumDetail(selected, status)}</div>`;
     requestAnimationFrame(() => hydratePersonalAlbumImages(drawer));
   };
@@ -3029,7 +3141,7 @@ function renderDetailLines(item) {
     ...(item.today_events || []),
     ...(item.proactive_events || []),
     ...(item.state_variables || []),
-  ].slice(0, 4);
+  ];
   if (!lines.length) return "";
   return `<ul class="detail-lines">${lines.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul>`;
 }
