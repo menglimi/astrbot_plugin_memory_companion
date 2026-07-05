@@ -33,6 +33,7 @@ from .injection import (
 )
 from .migration_livingmemory import LivingMemoryMigrator
 from .models import EntityRef, MemoryRecord, SearchResult, SessionContext, clean_text, json_dumps, json_loads, utc_now
+from .reply_chain import ReplyChainResolver
 from .retrieval import RetrievalEngine
 from .store import MemoryStore
 from .summarizer import MemorySummarizer
@@ -65,6 +66,7 @@ class MemoryCompanionService:
             logger.info("[MemoryCompanion] 已收回早期过宽的手动记忆可见性: count=%s", normalized)
 
         self.identity = IdentityResolver()
+        self.reply_chain = ReplyChainResolver()
         self.intent_builder = RetrievalIntentBuilder()
         self.classifier = MemoryClassifier(
             capture_min_chars=self.config.int("memory_capture.capture_min_chars", 2)
@@ -99,6 +101,7 @@ class MemoryCompanionService:
     async def handle_llm_request(self, event: Any, req: Any) -> None:
         ctx = await self.identity.resolve_event_context(event)
         await self.note_identity(ctx)
+        reply_chain = await self._reply_chain_for_event(event)
 
         if self._private_companion_internal_generation_event(event):
             return
@@ -128,9 +131,11 @@ class MemoryCompanionService:
             event_metadata = {
                 "memory_id": memory_id,
                 "sender_name": ctx.user_name,
+                "message_id": ctx.message_id,
                 "source": "llm_request",
                 "conversation_memory": ctx.scope == "group",
             }
+            event_metadata.update(self._reply_chain_metadata(reply_chain))
             if ctx.scope == "group":
                 event_metadata.update(await self._conversation_memory_metadata(ctx, source="llm_request"))
             await self.store.add_timeline_event(
@@ -139,7 +144,7 @@ class MemoryCompanionService:
                 scope=ctx.scope,
                 subject_id=ctx.user_id,
                 object_id=ctx.current_target_id,
-                content=ctx.message_text,
+                content=self._timeline_content_with_reply_chain(ctx.message_text, reply_chain),
                 metadata=event_metadata,
             )
         if self.config.bool("memory_capture.record_relationship_edges", True):
@@ -184,6 +189,7 @@ class MemoryCompanionService:
         if ctx.bot_id and ctx.user_id and ctx.bot_id == ctx.user_id:
             return
         await self.note_identity(ctx)
+        reply_chain = await self._reply_chain_for_event(event)
         record = self.classifier.from_user_message(ctx)
         if not record:
             return
@@ -197,13 +203,14 @@ class MemoryCompanionService:
                 "message_id": ctx.message_id,
             }
         )
+        event_metadata.update(self._reply_chain_metadata(reply_chain))
         await self.store.add_timeline_event(
             event_type="user_message",
             session_id=ctx.session_id,
             scope=ctx.scope,
             subject_id=ctx.user_id,
             object_id=ctx.current_target_id,
-            content=ctx.message_text,
+            content=self._timeline_content_with_reply_chain(ctx.message_text, reply_chain),
             metadata=event_metadata,
         )
         if self.config.bool("memory_capture.record_relationship_edges", True):
@@ -310,6 +317,28 @@ class MemoryCompanionService:
         metadata["conversation_segment_id"] = segment_id
         metadata["conversation_segment_start"] = bool(starts_new_segment)
         return metadata
+
+    async def _reply_chain_for_event(self, event: Any) -> list[dict[str, Any]]:
+        if event is None:
+            return []
+        try:
+            chain = await self.reply_chain.resolve(event, max_depth=3)
+        except Exception as exc:
+            logger.warning("[MemoryCompanion] 引用链解析失败，已跳过: error=%s", exc, exc_info=True)
+            return []
+        return chain
+
+    def _reply_chain_metadata(self, chain: list[dict[str, Any]]) -> dict[str, Any]:
+        return self.reply_chain.metadata(chain)
+
+    def _timeline_content_with_reply_chain(self, message_text: str, chain: list[dict[str, Any]]) -> str:
+        text = clean_text(message_text, 1600)
+        reply_context = self.reply_chain.format_for_query(chain, max_chars=520)
+        if not reply_context:
+            return text
+        if text:
+            return clean_text(f"{text}\n[引用链上下文] {reply_context}", 2000)
+        return clean_text(f"[引用链上下文] {reply_context}", 2000)
 
     def _private_companion_internal_generation_event(self, event: Any) -> bool:
         if event is None:

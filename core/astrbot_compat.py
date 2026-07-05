@@ -35,6 +35,7 @@ PRIVATE_COMPANION_MARKERS = (
     "<!-- private_companion_self_timeline_v1 -->",
     "<!-- private_companion_recall_query_v1 -->",
     "<!-- private_companion_reply_image_anchor_v1 -->",
+    "<!-- private_companion_reply_chain_v1 -->",
 )
 
 PRIVATE_COMPANION_PROACTIVE_BLOCK_HEADINGS = (

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .models import SessionContext, clean_text, json_loads
+from .reply_chain import ReplyChainResolver
 
 
 @dataclass(slots=True)
@@ -70,6 +71,9 @@ class RetrievalIntentBuilder:
         "private_companion_context",
     )
 
+    def __init__(self) -> None:
+        self.reply_chain = ReplyChainResolver()
+
     def build(
         self,
         ctx: SessionContext,
@@ -85,6 +89,9 @@ class RetrievalIntentBuilder:
             or clean_text(getattr(req, "prompt", "") if req is not None else "", 1200),
             1200,
         )
+        reply_chain_context = self.reply_chain.cached_context_for_event(event, max_chars=520)
+        if reply_chain_context:
+            message_query = clean_text(f"{message_query} {reply_chain_context}", 1400)
         normalized_mode = self._normalize_query_mode(query_mode)
         parse_companion = normalized_mode in {"guarded_companion", "companion_augmented"}
         payloads = self._context_payloads(event) if parse_companion else []
