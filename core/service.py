@@ -159,7 +159,7 @@ class MemoryCompanionService:
                 if relation_type and self.config.bool("memory_capture.record_relationship_edges", True):
                     await self.store.upsert_relationship(
                         subject=derived.subject,
-                        object=EntityRef.bot_self(),
+                        object=self._bot_entity(ctx),
                         relation_type=relation_type,
                         scope=ctx.scope,
                         session_id=ctx.session_id,
@@ -244,12 +244,13 @@ class MemoryCompanionService:
             event_type="bot_response",
             session_id=ctx.session_id,
             scope=ctx.scope,
-            subject_id="self",
+            subject_id=self._bot_subject_id(ctx),
             object_id=ctx.current_target_id,
             content=text,
             metadata={
                 "memory_id": memory_id,
                 "memory_companion_injection_state": injection_state,
+                "owner_bot_id": self._bot_subject_id(ctx),
             },
         )
         self._schedule_session_summary(ctx, reason="after_bot_response")
@@ -263,7 +264,7 @@ class MemoryCompanionService:
             entity_id=ctx.current_target_id,
         )
         text = clean_text(ctx.message_text, 1000)
-        subject_id = clean_text("self" if event_type == "bot_response" else ctx.user_id, 120)
+        subject_id = clean_text(self._bot_subject_id(ctx) if event_type == "bot_response" else ctx.user_id, 120)
         for row in rows:
             if clean_text(row.get("event_type"), 80) != event_type:
                 continue
@@ -402,7 +403,8 @@ class MemoryCompanionService:
         normalized_role = clean_text(role, 40).lower()
         if normalized_role in {"assistant", "bot", "self"}:
             event_type = "bot_response"
-            subject_id = "self"
+            bridge_ctx = SessionContext(bot_id=clean_text((metadata or {}).get("bot_id"), 120))
+            subject_id = self._bot_subject_id(bridge_ctx)
             object_id = clean_text(group_id or user_id or session_id, 120)
         else:
             event_type = "user_message"
@@ -411,6 +413,8 @@ class MemoryCompanionService:
         event_metadata = dict(metadata or {})
         if source:
             event_metadata.setdefault("source", clean_text(source, 80))
+        if event_type == "bot_response":
+            event_metadata.setdefault("owner_bot_id", subject_id)
         if user_name:
             event_metadata.setdefault("sender_name", clean_text(user_name, 120))
         if message_id:
@@ -1467,6 +1471,13 @@ class MemoryCompanionService:
             message_text=ctx.message_text,
         )
 
+    def _bot_entity(self, ctx: SessionContext | None = None) -> EntityRef:
+        bot_id = clean_text(getattr(ctx, "bot_id", "") if ctx else "", 120)
+        return EntityRef.bot_self(bot_id=bot_id)
+
+    def _bot_subject_id(self, ctx: SessionContext | None = None) -> str:
+        return self._bot_entity(ctx).id
+
     def _schedule_session_summary(self, ctx: SessionContext, *, reason: str) -> None:
         if not self.config.bool("memory_summary.enabled", True):
             return
@@ -1604,8 +1615,8 @@ class MemoryCompanionService:
             record = MemoryRecord(
                 id=self.stable_id("summary", ctx.session_id, start_at, end_at, content),
                 memory_type="conversation_summary",
-                subject=EntityRef(kind="user", id=ctx.user_id, name=ctx.user_name, role="conversation_partner"),
-                object=EntityRef.bot_self() if ctx.scope != "group" else EntityRef(kind="group", id=ctx.group_id, role="group"),
+                subject=self._bot_entity(ctx) if ctx.scope == "group" else EntityRef(kind="user", id=ctx.user_id, name=ctx.user_name, role="conversation_partner"),
+                object=EntityRef(kind="group", id=ctx.group_id, name=ctx.group_name, role="group") if ctx.scope == "group" else self._bot_entity(ctx),
                 scope=ctx.scope,
                 session_id=ctx.session_id,
                 platform=ctx.platform,
@@ -1627,6 +1638,7 @@ class MemoryCompanionService:
                     "end_at": end_at,
                     "summarizer": "companion_memory_schema_v1",
                     "summary_schema_version": "companion_memory_v1",
+                    "owner_bot_id": self._bot_subject_id(ctx),
                     "summary_quality": self.summarizer.summary_quality(payload or {}),
                     "canonical_summary": clean_text((payload or {}).get("canonical_summary"), 2000),
                     "persona_summary": clean_text((payload or {}).get("persona_summary") or (payload or {}).get("summary"), 2000),
@@ -2024,7 +2036,7 @@ class MemoryCompanionService:
         record = MemoryRecord(
             memory_type="manual_memory",
             subject=EntityRef(kind="user", id=ctx.user_id, name=ctx.user_name, role="admin"),
-            object=EntityRef.bot_self(),
+            object=self._bot_entity(ctx),
             scope=ctx.scope,
             session_id=ctx.session_id,
             platform=ctx.platform,
@@ -2039,6 +2051,7 @@ class MemoryCompanionService:
             importance=0.75,
             review_status="auto",
             tags=["manual"],
+            metadata={"owner_bot_id": self._bot_subject_id(ctx)},
         )
         self.importance.calibrate(record, source="manual_memory")
         memory_id = await self.store.insert_memory(record)
@@ -2059,7 +2072,7 @@ class MemoryCompanionService:
         record = MemoryRecord(
             id=self.stable_id("tool", note_type, ctx.session_id, content),
             memory_type="tool_memory",
-            subject=EntityRef.bot_self(),
+            subject=self._bot_entity(ctx),
             object=EntityRef(kind="user", id=ctx.user_id, name=ctx.user_name, role="conversation_partner"),
             scope=ctx.scope,
             session_id=ctx.session_id,
@@ -2076,7 +2089,7 @@ class MemoryCompanionService:
             importance=0.66,
             review_status="auto",
             tags=["llm_tool", note_type, ctx.scope],
-            metadata={"tool": "memory_companion_remember", "note_type": note_type},
+            metadata={"tool": "memory_companion_remember", "note_type": note_type, "owner_bot_id": self._bot_subject_id(ctx)},
         )
         self.importance.calibrate(record, source="tool_memory")
         memory_id = await self.store.insert_memory(record)
@@ -2103,7 +2116,7 @@ class MemoryCompanionService:
         record = MemoryRecord(
             id=self.stable_id("companion_note", ctx.session_id, title, content),
             memory_type="companion_note",
-            subject=EntityRef.bot_self(),
+            subject=self._bot_entity(ctx),
             object=EntityRef(kind="session", id=ctx.session_id, role="companion_context"),
             scope="unknown",
             session_id=ctx.session_id,
@@ -2118,7 +2131,7 @@ class MemoryCompanionService:
             importance=0.6,
             review_status="auto",
             tags=["companion_note", "bot_self", title] if title else ["companion_note", "bot_self"],
-            metadata={"title": title, "tool": "memory_companion_note_create"},
+            metadata={"title": title, "tool": "memory_companion_note_create", "owner_bot_id": self._bot_subject_id(ctx)},
             source_plugin="memory_companion_tool",
         )
         self.importance.calibrate(record, source="companion_note")
@@ -2564,6 +2577,10 @@ class MemoryCompanionService:
                 if entity.kind == "user" and entity.id and entity.id != "self":
                     return entity
         if sample.scope == "group":
+            if sample.subject.kind == "bot":
+                return sample.subject
+            if sample.object.kind == "bot":
+                return sample.object
             return EntityRef.bot_self()
         return sample.subject
 
@@ -2572,6 +2589,10 @@ class MemoryCompanionService:
             group_id = sample.group_id or sample.object.id or sample.session_id
             return EntityRef(kind="group", id=group_id, name=sample.object.name, role="group")
         if sample.scope == "private":
+            if sample.subject.kind == "bot":
+                return sample.subject
+            if sample.object.kind == "bot":
+                return sample.object
             return EntityRef.bot_self()
         return sample.object
 
@@ -4805,7 +4826,7 @@ class MemoryCompanionService:
         metadata = json_loads(row.get("metadata"), {})
         sender_name = clean_text(metadata.get("sender_name"), 120)
         if event_type == "bot_response" or subject_id == "self":
-            subject = EntityRef.bot_self()
+            subject = self._bot_entity(ctx)
             prefix = "Bot"
         else:
             subject = EntityRef(kind="user", id=subject_id, name=sender_name, role="timeline_speaker")

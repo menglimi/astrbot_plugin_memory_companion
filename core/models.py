@@ -59,8 +59,8 @@ class EntityRef:
     role: str = "unknown"
 
     @classmethod
-    def bot_self(cls) -> "EntityRef":
-        return cls(kind="bot", id="self", name="Bot", role="bot_self")
+    def bot_self(cls, bot_id: str = "", bot_name: str = "") -> "EntityRef":
+        return cls(kind="bot", id=clean_text(bot_id, 120) or "self", name=clean_text(bot_name, 80) or "Bot", role="bot_self")
 
 
 @dataclass(slots=True)

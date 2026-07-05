@@ -3,6 +3,10 @@ from __future__ import annotations
 from .models import MemoryRecord, SessionContext
 
 
+def _clean_id(value: str | None) -> str:
+    return (value or "").strip()
+
+
 class VisibilityPolicy:
     def __init__(
         self,
@@ -47,8 +51,48 @@ class VisibilityPolicy:
             return False, "other_private_pair"
         if memory.visibility == "group_public":
             if ctx.scope == "group" and memory.group_id and memory.group_id == ctx.group_id:
+                owner_ok, owner_reason = self._bot_owner_visible(memory, ctx)
+                if not owner_ok:
+                    return False, owner_reason
                 return True, "same_group"
             if ctx.scope == "private" and self.allow_group_public_in_private:
+                owner_ok, owner_reason = self._bot_owner_visible(memory, ctx)
+                if not owner_ok:
+                    return False, owner_reason
                 return True, "group_public_allowed_in_private"
             return False, "other_group_public"
         return False, f"unknown_visibility:{memory.visibility}"
+
+    def _bot_owner_visible(self, memory: MemoryRecord, ctx: SessionContext) -> tuple[bool, str]:
+        """Keep bot-perspective group memories tied to the bot that produced them."""
+        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+        owner_bot_id = _clean_id(metadata.get("owner_bot_id"))
+        bot_entity_ids = {
+            _clean_id(entity.id)
+            for entity in (memory.subject, memory.object)
+            if getattr(entity, "kind", "") == "bot" and _clean_id(getattr(entity, "id", ""))
+        }
+        specific_bot_ids = {bot_id for bot_id in bot_entity_ids if bot_id != "self"}
+        if owner_bot_id and owner_bot_id != "self":
+            specific_bot_ids.add(owner_bot_id)
+        if not specific_bot_ids:
+            if self._is_legacy_group_conversation_summary(memory) and _clean_id(ctx.bot_id):
+                return False, "ambiguous_bot_owner"
+            return True, "no_specific_bot_owner"
+        current_bot_id = _clean_id(ctx.bot_id)
+        if current_bot_id and current_bot_id in specific_bot_ids:
+            return True, "same_bot_owner"
+        return False, "other_bot_owner"
+
+    @staticmethod
+    def _is_legacy_group_conversation_summary(memory: MemoryRecord) -> bool:
+        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+        if memory.memory_type != "conversation_summary":
+            return False
+        if memory.scope != "group" and memory.visibility != "group_public":
+            return False
+        if _clean_id(metadata.get("owner_bot_id")):
+            return False
+        return _clean_id(metadata.get("summarizer")) == "companion_memory_schema_v1" or _clean_id(
+            metadata.get("summary_schema_version")
+        ) == "companion_memory_v1"

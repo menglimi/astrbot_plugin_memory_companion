@@ -50,7 +50,7 @@ class MemoryClassifier:
         content = self._format_bot_content(ctx, text)
         return MemoryRecord(
             memory_type="self_action",
-            subject=EntityRef.bot_self(),
+            subject=EntityRef.bot_self(bot_id=ctx.bot_id),
             object=target,
             scope=ctx.scope,
             session_id=ctx.session_id,
@@ -67,7 +67,7 @@ class MemoryClassifier:
             importance=self._importance_for_text(text),
             review_status="auto",
             tags=["bot_response", ctx.scope],
-            metadata={"response_text": text},
+            metadata={"response_text": text, "owner_bot_id": clean_text(ctx.bot_id, 120) or "self"},
         )
 
     def derived_user_memories(self, ctx: SessionContext, source_memory_id: str = "") -> list[MemoryRecord]:
