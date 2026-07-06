@@ -852,13 +852,13 @@ class PluginPageApi:
         return self._ok(payload)
 
     async def companion_personal_photo(self):
-        resolved = self._resolve_companion_personal_photo_path_from_request()
+        resolved = await self._resolve_companion_personal_photo_path_from_request()
         if isinstance(resolved, dict):
             return self._err(str(resolved.get("error") or "photo_not_found"), int(resolved.get("status") or 404))
         return await send_file(resolved)
 
     async def companion_personal_photo_data(self):
-        resolved = self._resolve_companion_personal_photo_path_from_request()
+        resolved = await self._resolve_companion_personal_photo_path_from_request()
         if isinstance(resolved, dict):
             return self._err(str(resolved.get("error") or "photo_not_found"), int(resolved.get("status") or 404))
         try:
@@ -874,7 +874,7 @@ class PluginPageApi:
         except Exception:
             return self._err("photo_read_failed", 500)
 
-    def _resolve_companion_personal_photo_path_from_request(self) -> Path | dict[str, Any]:
+    async def _resolve_companion_personal_photo_path_from_request(self) -> Path | dict[str, Any]:
         status = self._private_companion_status()
         if not status["available"]:
             return {"error": status.get("reason") or "private companion unavailable", "status": 404}
@@ -886,7 +886,17 @@ class PluginPageApi:
         photo_id = clean_text(request.args.get("id"), 120)
         # When looking up by photo_id, skip date filtering so photos from any date can be served
         lookup_date = "" if photo_id else selected_date
-        for item in self._private_companion_album(data, lookup_date):
+        records: list[Any] = []
+        try:
+            records = await self.plugin.service.store.list_memories(
+                limit=1200,
+                include_pending=False,
+                query=selected_date if selected_date and not photo_id else "",
+                visibility="bot_self",
+            )
+        except Exception:
+            records = []
+        for item in self._private_companion_album(data, lookup_date, records, limit=1200 if photo_id else 80):
             if photo_id and clean_text(item.get("id"), 120) != photo_id:
                 continue
             raw_path = clean_text(item.get("path"), 500)
@@ -989,11 +999,17 @@ class PluginPageApi:
                 "note": clean_text(state.get("note"), 240),
             },
             "details": details,
-            "album": self._private_companion_album(data, selected_date),
-            "subjective_memories": self._private_companion_subjective_memories(data, selected_date),
+            "album": self._private_companion_album(data, selected_date, records or []),
+            "subjective_memories": self._private_companion_subjective_memories(data, selected_date, records or []),
         }
 
-    def _private_companion_album(self, data: dict[str, Any], selected_date: str) -> list[dict[str, Any]]:
+    def _private_companion_album(
+        self,
+        data: dict[str, Any],
+        selected_date: str,
+        records: list[Any] | None = None,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         seen: set[str] = set()
 
@@ -1056,35 +1072,122 @@ class PluginPageApi:
                     add(item, "recent_photo")
                 elif session.startswith("natural_photo") or kind == "text2img":
                     add(item, "life_photo")
-        return rows[:8]
 
-    def _private_companion_subjective_memories(self, data: dict[str, Any], selected_date: str) -> list[dict[str, Any]]:
-        diaries = data.get("bot_diaries", [])
-        if not isinstance(diaries, list):
-            return []
-        rows: list[dict[str, Any]] = []
-        for diary in reversed(diaries):
-            if not isinstance(diary, dict):
+        for record in records or []:
+            if not self._is_personal_album_memory(record):
                 continue
-            date = clean_text(diary.get("date"), 16)
+            metadata = getattr(record, "metadata", {}) or {}
+            if not isinstance(metadata, dict):
+                continue
+            tags = {clean_text(tag, 80) for tag in (getattr(record, "tags", []) or []) if clean_text(tag, 80)}
+            memory_type = clean_text(getattr(record, "memory_type", ""), 80)
+            path = clean_text(metadata.get("image_path") or metadata.get("path"), 500)
+            if not path:
+                continue
+            date = clean_text(metadata.get("date"), 16) or self._memory_date_key(record)
+            if selected_date and date and date != selected_date:
+                continue
+            source = "memory_photo"
+            if "daily_outfit" in tags or "outfit" in tags:
+                source = "daily_outfit_photo"
+            elif memory_type == "image_action" or "life_photo" in tags:
+                source = "life_photo"
+            item_id = clean_text(getattr(record, "id", ""), 120)
+            if not item_id:
+                item_id = hashlib.sha1(f"memory:{date}:{path}".encode("utf-8", errors="ignore")).hexdigest()[:16]
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+            exists = bool(path and Path(path).is_file())
+            query = f"date={quote(date, safe='')}&id={quote(item_id, safe='')}"
+            rows.append(
+                {
+                    "id": item_id,
+                    "date": date,
+                    "kind": "daily_outfit" if source == "daily_outfit_photo" else source,
+                    "title": {
+                        "daily_outfit_photo": "每日穿搭图",
+                        "life_photo": "生活分享图",
+                    }.get(source, "记忆照片"),
+                    "path": path,
+                    "url": f"{PAGE_API_PREFIXES[0]}/companion/personal-photo?{query}",
+                    "image_data_url": f"/companion/personal-photo-data?{query}",
+                    "exists": exists,
+                    "backend": clean_text(metadata.get("backend"), 80),
+                    "prompt": clean_text(metadata.get("prompt_preview") or metadata.get("prompt"), 360),
+                    "note": clean_text(metadata.get("note") or getattr(record, "content", ""), 220),
+                    "error": "" if exists else "图片文件不可用",
+                    "generated_at": self._timestamp_label(getattr(record, "occurred_at", "") or getattr(record, "created_at", "")),
+                }
+            )
+        safe_limit = max(1, min(2000, int(limit or 8)))
+        return rows[:safe_limit]
+
+    def _private_companion_subjective_memories(
+        self,
+        data: dict[str, Any],
+        selected_date: str,
+        records: list[Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        diaries = data.get("bot_diaries", [])
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        if isinstance(diaries, list):
+            for diary in reversed(diaries):
+                if not isinstance(diary, dict):
+                    continue
+                date = clean_text(diary.get("date"), 16)
+                if selected_date and date != selected_date:
+                    continue
+                story_plan = diary.get("story_plan") if isinstance(diary.get("story_plan"), dict) else {}
+                row_key = f"diary:{date}:{clean_text(diary.get('summary'), 120)}"
+                seen.add(row_key)
+                rows.append(
+                    {
+                        "date": date,
+                        "summary": clean_text(diary.get("summary"), 220),
+                        "body": clean_text(diary.get("body"), 520),
+                        "share_seed": clean_text(diary.get("share_seed"), 180),
+                        "tags": [clean_text(tag, 40) for tag in (diary.get("tags") or []) if clean_text(tag, 40)][:8]
+                        if isinstance(diary.get("tags"), list)
+                        else [],
+                        "today_events": self._compact_detail_events(story_plan.get("today_events")) if story_plan else [],
+                        "proactive_events": self._compact_detail_events(story_plan.get("proactive_events")) if story_plan else [],
+                        "long_term_events": self._compact_detail_events(story_plan.get("long_term_events")) if story_plan else [],
+                    }
+                )
+                if len(rows) >= 4:
+                    break
+        for record in records or []:
+            if not self._is_personal_subjective_memory(record):
+                continue
+            date = self._memory_date_key(record)
             if selected_date and date != selected_date:
                 continue
-            story_plan = diary.get("story_plan") if isinstance(diary.get("story_plan"), dict) else {}
+            record_id = clean_text(getattr(record, "id", ""), 120)
+            if record_id in seen:
+                continue
+            seen.add(record_id)
+            metadata = getattr(record, "metadata", {}) or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
             rows.append(
                 {
                     "date": date,
-                    "summary": clean_text(diary.get("summary"), 220),
-                    "body": clean_text(diary.get("body"), 520),
-                    "share_seed": clean_text(diary.get("share_seed"), 180),
-                    "tags": [clean_text(tag, 40) for tag in (diary.get("tags") or []) if clean_text(tag, 40)][:8]
-                    if isinstance(diary.get("tags"), list)
-                    else [],
-                    "today_events": self._compact_detail_events(story_plan.get("today_events")) if story_plan else [],
-                    "proactive_events": self._compact_detail_events(story_plan.get("proactive_events")) if story_plan else [],
-                    "long_term_events": self._compact_detail_events(story_plan.get("long_term_events")) if story_plan else [],
+                    "summary": "梦境碎片",
+                    "body": clean_text(getattr(record, "content", ""), 520),
+                    "share_seed": "",
+                    "tags": [
+                        tag
+                        for tag in ["梦境碎片", clean_text(metadata.get("dream_type"), 40), clean_text(metadata.get("dream_mood"), 40)]
+                        if tag
+                    ],
+                    "today_events": [],
+                    "proactive_events": [],
+                    "long_term_events": [],
                 }
             )
-            if len(rows) >= 4:
+            if len(rows) >= 6:
                 break
         return rows
 
@@ -1184,12 +1287,19 @@ class PluginPageApi:
                 metadata = {}
             key = clean_text(metadata.get("date"), 16) if self._is_personal_schedule_memory(record) else ""
             key = key or self._memory_date_key(record)
-            if key and (self._is_personal_action(record) or self._is_personal_schedule_memory(record)):
+            if key and (
+                self._is_personal_action(record)
+                or self._is_personal_schedule_memory(record)
+                or self._is_personal_album_memory(record)
+                or self._is_personal_subjective_memory(record)
+            ):
                 dates.add(key)
         return sorted(dates, reverse=True)
 
     def _memory_date_key(self, record: Any) -> str:
-        return self._date_key(getattr(record, "occurred_at", "") or getattr(record, "created_at", ""))
+        metadata = getattr(record, "metadata", {}) or {}
+        date = clean_text(metadata.get("date"), 16) if isinstance(metadata, dict) else ""
+        return date or self._date_key(getattr(record, "occurred_at", "") or getattr(record, "created_at", ""))
 
     def _date_key(self, value: Any) -> str:
         text = clean_text(value, 80)
@@ -1223,6 +1333,8 @@ class PluginPageApi:
         return datetime.fromtimestamp(ts, ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
 
     def _is_personal_action(self, record: Any) -> bool:
+        tags = getattr(record, "tags", []) or []
+        tag_set = {clean_text(tag, 80) for tag in tags if clean_text(tag, 80)}
         action_types = {
             "self_action",
             "proactive_message",
@@ -1231,27 +1343,82 @@ class PluginPageApi:
             "image_action",
             "qzone_action",
             "reading_memory",
-            "persona_life",
         }
+        non_action_tags = {
+            "schedule",
+            "daily_plan",
+            "daily_detail",
+            "daily_outfit",
+            "outfit",
+            "dream",
+            "dream_fragment",
+        }
+        positive_action_tags = {
+            "bot_action",
+            "qzone",
+            "qzone_publish",
+            "proactive",
+            "proactive_message",
+            "search",
+            "creative_work",
+            "image_action",
+            "reading",
+            "self_meal",
+        }
+        memory_type = getattr(record, "memory_type", "")
         return (
             getattr(record, "visibility", "") == "bot_self"
             and (
-                getattr(record, "memory_type", "") in action_types
-                or getattr(record, "source_plugin", "") == "private_companion"
-                and getattr(record, "memory_type", "") != "schedule_fragment"
+                memory_type in action_types
+                or bool(tag_set & positive_action_tags)
+                or (
+                    getattr(record, "source_plugin", "") == "private_companion"
+                    and memory_type != "schedule_fragment"
+                    and not bool(tag_set & non_action_tags)
+                )
             )
         )
 
     def _is_personal_schedule_memory(self, record: Any) -> bool:
         tags = getattr(record, "tags", []) or []
+        tag_set = {clean_text(tag, 80) for tag in tags if clean_text(tag, 80)}
+        metadata = getattr(record, "metadata", {}) or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        content = clean_text(getattr(record, "content", ""), 360)
         return (
             getattr(record, "visibility", "") == "bot_self"
             and (
-                getattr(record, "memory_type", "") in {"schedule_fragment", "persona_life"}
-                or "schedule" in tags
-                or "persona_life" in tags
+                getattr(record, "memory_type", "") == "schedule_fragment"
+                or "schedule" in tag_set
+                or "daily_plan" in tag_set
+                or "daily_detail" in tag_set
+                or bool(clean_text(metadata.get("start"), 20) or clean_text(metadata.get("end"), 20))
+                or "当日生活日程" in content
+                or "日程细化" in content
             )
         )
+
+    def _is_personal_album_memory(self, record: Any) -> bool:
+        if getattr(record, "visibility", "") != "bot_self":
+            return False
+        metadata = getattr(record, "metadata", {}) or {}
+        if not isinstance(metadata, dict):
+            return False
+        if not clean_text(metadata.get("image_path") or metadata.get("path"), 500):
+            return False
+        tags = {clean_text(tag, 80) for tag in (getattr(record, "tags", []) or []) if clean_text(tag, 80)}
+        return (
+            getattr(record, "memory_type", "") in {"image_action", "persona_life"}
+            or bool(tags & {"daily_outfit", "outfit", "life_photo", "image", "current_state"})
+            or getattr(record, "source_plugin", "") == "private_companion"
+        )
+
+    def _is_personal_subjective_memory(self, record: Any) -> bool:
+        if getattr(record, "visibility", "") != "bot_self":
+            return False
+        tags = {clean_text(tag, 80) for tag in (getattr(record, "tags", []) or []) if clean_text(tag, 80)}
+        return bool(tags & {"dream", "dream_fragment", "subjective_memory", "bot_diary"})
 
     def _compact_plan(self, plan: dict[str, Any]) -> dict[str, Any]:
         items = plan.get("items", [])

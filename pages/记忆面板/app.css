@@ -2017,7 +2017,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
 .personal-memory-workspace{display:grid;gap:14px}
 .personal-view-switch{
   display:grid;
-  grid-template-columns:repeat(3,minmax(0,1fr));
+  grid-template-columns:repeat(4,minmax(0,1fr));
   gap:6px;
   align-items:center;
   border:1px solid rgba(var(--edge-rgb),.18);
@@ -2122,6 +2122,29 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
   overflow:hidden;
   text-overflow:ellipsis;
   white-space:nowrap;
+}
+.personal-actions-panel{
+  display:grid;
+  gap:12px;
+}
+.personal-action-list{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(260px,1fr));
+  gap:10px;
+}
+.personal-action-card{
+  min-height:116px;
+  align-items:start;
+}
+.personal-action-card .memory-frame-time span{
+  white-space:normal;
+  line-height:1.25;
+}
+.personal-action-card .item-title{
+  display:-webkit-box;
+  -webkit-line-clamp:3;
+  -webkit-box-orient:vertical;
+  overflow:hidden;
 }
 .action-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;max-height:270px;overflow:auto}
 .action-card{min-height:104px}
@@ -3031,6 +3054,13 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
 }
 .clear-confirm b{color:var(--red)}
 .clear-confirm p{margin:0;color:var(--muted);line-height:1.6}
+.scoped-clear-confirm strong{color:var(--accent-strong)}
+.scoped-clear-counts{
+  border:1px solid var(--line-soft);
+  border-radius:8px;
+  background:rgba(var(--light-rgb),.66);
+  padding:10px;
+}
 .detail-drawer{
   grid-area:detail;
   position:static;

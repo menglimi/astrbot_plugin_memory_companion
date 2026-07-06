@@ -1691,10 +1691,22 @@ function isUserMemory(memory) {
 function isPersonalMemory(memory) {
   return memory.visibility === "bot_self"
     && (
-      hasMemoryType(memory, ["schedule_fragment", "persona_life"])
+      hasMemoryType(memory, [
+        "schedule_fragment",
+        "persona_life",
+        "self_action",
+        "proactive_message",
+        "search_action",
+        "creative_work",
+        "image_action",
+        "qzone_action",
+        "reading_memory",
+      ])
       || memory.source_plugin === "private_companion"
       || (memory.tags || []).includes("schedule")
       || (memory.tags || []).includes("persona_life")
+      || (memory.tags || []).includes("qzone")
+      || (memory.tags || []).includes("qzone_publish")
     );
 }
 
@@ -2128,6 +2140,7 @@ function bindPersonalMemoryWorkspace(target, snapshot, data) {
       hydratePersonalAlbumImages(target);
     }
     if (state.personalViewport === "subjective") showPersonalSubjectiveDetail(snapshot, data);
+    if (state.personalViewport === "actions") showPersonalActionsDetail(data);
     return;
   }
   const film = target.querySelector("[data-schedule-film]");
@@ -2628,7 +2641,7 @@ function renderPersonalMemoryWorkspace(snapshot, status) {
 }
 
 function personalViewport() {
-  const views = ["schedule", "album", "subjective"];
+  const views = ["schedule", "album", "subjective", "actions"];
   if (!views.includes(state.personalViewport)) state.personalViewport = "schedule";
   return state.personalViewport;
 }
@@ -2638,6 +2651,7 @@ function renderPersonalViewportSwitch(active) {
     { id: "schedule", label: "日程" },
     { id: "album", label: "相册" },
     { id: "subjective", label: "主观记忆" },
+    { id: "actions", label: "行动" },
   ];
   return `
     <div class="personal-view-switch" role="tablist" aria-label="个人记忆视窗">
@@ -2653,7 +2667,75 @@ function renderPersonalViewportSwitch(active) {
 function renderPersonalViewportPanel(active, snapshot, status) {
   if (active === "album") return renderCompanionAlbumPanel(snapshot, status);
   if (active === "subjective") return renderSubjectiveMemoryPanel(snapshot, status);
+  if (active === "actions") return renderPersonalActionsPanel(status);
   return renderCompanionSchedulePanel(snapshot, status);
+}
+
+function renderPersonalActionsPanel(status) {
+  const actions = Array.isArray(status.actions) ? status.actions : [];
+  const date = status.selected_date || "";
+  return `
+    <section class="personal-zone personal-actions-panel">
+      <div class="personal-zone-head">
+        <h4>行动</h4>
+        <span>${escapeHtml(date || "全部日期")} · ${escapeHtml(actions.length)} 条</span>
+      </div>
+      ${actions.length ? `
+        <div class="personal-action-list">
+          ${actions.map((item) => renderPersonalActionCard(item)).join("")}
+        </div>
+      ` : `
+        <div class="album-empty">
+          <b>这一天还没有行动记忆</b>
+          <span>发说说、搜索、创作、生图、阅读和主动消息等 Bot 行动会出现在这里。</span>
+        </div>
+      `}
+    </section>
+  `;
+}
+
+function renderPersonalActionCard(memory) {
+  const metadata = memory.metadata || {};
+  const tags = Array.isArray(memory.tags) ? memory.tags.filter(Boolean).slice(0, 5) : [];
+  const metaParts = [
+    metadata.action_label || personalActionTypeLabel(memory.memory_type),
+    formatTime(memory.occurred_at || memory.created_at),
+    metadata.tid ? `tid ${metadata.tid}` : "",
+    Number(metadata.image_count || 0) > 0 ? `${metadata.image_count} 张图` : "",
+  ].filter(Boolean);
+  return `
+    <article class="row-item memory-frame personal-action-card" data-memory-id="${escapeHtml(memory.id)}">
+      <div class="memory-frame-time">
+        <b>${escapeHtml(metaParts[0] || "行动")}</b>
+        <span>${escapeHtml(metaParts.slice(1).join(" · ") || shortId(memory.id))}</span>
+      </div>
+      <div class="memory-frame-main">
+        <div class="memory-frame-text">
+          <span class="item-title">${escapeHtml(compact(memory.content, "(空内容)"))}</span>
+          ${metadata.text && metadata.text !== memory.content ? `<p class="memory-preview">${escapeHtml(metadata.text)}</p>` : ""}
+        </div>
+        <div class="badges">
+          <span class="badge teal">${escapeHtml(memory.memory_type || "action")}</span>
+          <span class="badge blue">${escapeHtml(memory.reality_level || "bot_action")}</span>
+          ${tags.map((tag) => `<span class="badge gold">${escapeHtml(tag)}</span>`).join("")}
+        </div>
+      </div>
+    </article>
+  `;
+}
+
+function personalActionTypeLabel(type) {
+  const labels = {
+    self_action: "自我行动",
+    proactive_message: "主动消息",
+    search_action: "搜索",
+    creative_work: "创作",
+    image_action: "生图",
+    qzone_action: "QQ 空间",
+    reading_memory: "阅读",
+    persona_life: "生活片段",
+  };
+  return labels[type] || type || "行动";
 }
 
 function renderCompanionAlbumPanel(snapshot, status) {
@@ -3098,6 +3180,19 @@ function showPersonalSubjectiveDetail(snapshot, status, options = {}) {
   } else {
     render();
   }
+}
+
+function showPersonalActionsDetail(status) {
+  if (state.activeView !== "review") return;
+  const actions = Array.isArray(status.actions) ? status.actions : [];
+  const drawer = $("#detailDrawer");
+  drawer.className = "detail-drawer empty";
+  drawer.innerHTML = `
+    <div class="detail-empty">
+      <b>${actions.length ? "选择一条行动" : "行动记忆为空"}</b>
+      <span>${actions.length ? "点击左侧行动卡片查看完整记录、标签和元数据。" : `${status.selected_date || "这一天"} 还没有 Bot 行动记忆。`}</span>
+    </div>
+  `;
 }
 
 function renderSubjectiveDetail(item, status) {
@@ -4289,6 +4384,56 @@ function clearScopeCountsText(counts = {}) {
     .join(" / ");
 }
 
+function showScopedClearConfirm(payload, counts = {}) {
+  const drawer = $("#detailDrawer");
+  if (!drawer) return;
+  drawer.className = "detail-drawer";
+  drawer.innerHTML = `
+    <div class="clear-confirm scoped-clear-confirm">
+      <b>确认清空范围记忆</b>
+      <p>将清空：<strong>${escapeHtml(payload.label || "当前范围")}</strong></p>
+      <p class="scoped-clear-counts">${escapeHtml(clearScopeCountsText(counts))}</p>
+      <input id="clearScopeConfirmText" type="text" placeholder="输入 清空 后执行" autocomplete="off" />
+      <div class="inline-actions">
+        <button id="executeClearScopeMemoryBtn" class="danger" type="button" disabled>执行清空</button>
+        <button id="cancelClearScopeMemoryBtn" type="button">取消</button>
+      </div>
+    </div>
+  `;
+  const input = $("#clearScopeConfirmText");
+  const execute = $("#executeClearScopeMemoryBtn");
+  const cancel = $("#cancelClearScopeMemoryBtn");
+  const update = () => {
+    execute.disabled = input.value.trim() !== "清空";
+  };
+  input.addEventListener("input", update);
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !execute.disabled) {
+      withBusy("正在清空范围记忆...", () => executeScopedClearMemory(payload));
+    }
+  });
+  execute.addEventListener("click", () => withBusy("正在清空范围记忆...", () => executeScopedClearMemory(payload)));
+  cancel.addEventListener("click", () => {
+    clearDetail();
+    showToast("已取消清空操作");
+  });
+  input.focus();
+  showToast("请在右侧输入“清空”确认");
+}
+
+async function executeScopedClearMemory(payload) {
+  const confirmText = $("#clearScopeConfirmText")?.value.trim();
+  if (confirmText !== "清空") {
+    showToast("请输入“清空”后再执行", "error");
+    return;
+  }
+  const data = await apiPost("/maintenance/clear_scope", { ...payload, confirm: "清空" });
+  state.activeBucketId = "all";
+  await refreshAll();
+  showGenericDetail("范围清理结果", data.result);
+  showToast("范围记忆已清空");
+}
+
 async function clearCurrentScopedMemory(scope) {
   const payload = scopedClearPayload(scope);
   if (!payload) {
@@ -4303,21 +4448,7 @@ async function clearCurrentScopedMemory(scope) {
     showToast("这个范围内没有可清理的数据");
     return;
   }
-  const message = [
-    `将清空：${payload.label}`,
-    clearScopeCountsText(counts),
-    "请输入“清空”确认。",
-  ].join("\n");
-  if (prompt(message, "") !== "清空") {
-    showToast("已取消清空操作");
-    return;
-  }
-  const data = await apiPost("/maintenance/clear_scope", { ...payload, confirm: "清空" });
-  state.activeBucketId = "all";
-  clearDetail();
-  await refreshAll();
-  showArchiveResult(data.result);
-  showToast("范围记忆已清空");
+  showScopedClearConfirm(payload, counts);
 }
 
 async function previewImport() {
