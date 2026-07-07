@@ -52,6 +52,9 @@ class InjectionComposer:
         ]
         if atmosphere_hint:
             lines.append(atmosphere_hint)
+        rest_check_hint = self._short_rest_check_hint(ctx.message_text, time_of_day, companion_bot_mood)
+        if rest_check_hint:
+            lines.append(rest_check_hint)
         if cross_window_emotional_hint:
             lines.append(cross_window_emotional_hint)
         if address_hint:
@@ -371,6 +374,32 @@ class InjectionComposer:
         elif 0 < companion_bot_energy < 50:
             hints.append("你此刻心理能量偏低；记忆可以参与但以轻量提及为主，避免一次引入太多线索。")
         return " ".join(hints) if hints else ""
+
+    @staticmethod
+    def _short_rest_check_hint(message_text: str, time_of_day: str = "", companion_bot_mood: str = "") -> str:
+        text = clean_text(message_text, 80)
+        if not text or len(text) > 20:
+            return ""
+        compact = re.sub(r"[\s，。！？!?,.、~～…]+", "", text)
+        if not compact:
+            return ""
+        check_like = (
+            compact in {"例行检查", "查岗", "查岗了", "在吗", "在不在", "还在吗", "睡了吗", "睡没", "醒着吗"}
+            or any(word in compact for word in ("例行检查", "查岗", "在不在", "还在吗", "醒着吗"))
+        )
+        if not check_like:
+            return ""
+        mood = clean_text(companion_bot_mood, 80).lower()
+        rest_like = time_of_day in {"late_night", "dawn"} or any(
+            word in mood for word in ("睡", "困", "倦", "疲", "累", "迷糊", "休息")
+        )
+        if not rest_like:
+            return ""
+        return (
+            "当前像是睡眠/休息中的短检查或查岗；先简短回应人在、不必展开。"
+            "召回到的旧“例行检查/查岗/梦境/穿着”等记忆只能影响亲近感和语气，"
+            "不要复述旧细节，不要把旧记录当作此刻正在发生，也不要新编具体梦境或继续追问。"
+        )
 
     @staticmethod
     def _persona_hint(metadata: dict[str, Any]) -> str:

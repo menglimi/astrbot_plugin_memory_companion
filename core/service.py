@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import Counter, defaultdict
+from copy import deepcopy
 from dataclasses import dataclass, field
 import json
 import hashlib
@@ -11,6 +12,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .astrbot_compat import (
     append_temp_text,
@@ -86,6 +88,10 @@ class MemoryCompanionService:
         self._embedding_backfill_inflight: set[str] = set()
         self._embedding_provider_warned: set[str] = set()
         self._last_retrieval_path_info: dict[str, Any] = {}
+        self._retrieval_result_cache: dict[str, dict[str, Any]] = {}
+        self._retrieval_result_cache_stats: dict[str, int] = {"hits": 0, "misses": 0, "evictions": 0}
+        self._RETRIEVAL_RESULT_CACHE_TTL: float = 45.0
+        self._RETRIEVAL_RESULT_CACHE_MAX: int = 128
         self.migrator = LivingMemoryMigrator(self.store, self.plugin_root, self.data_dir)
         self.sleep_state_path = self.data_dir / "memory_companion_sleep_state.json"
         self.token_usage_path = self.data_dir / "memory_companion_token_usage.json"
@@ -729,6 +735,118 @@ class MemoryCompanionService:
             "recent": all_events[:5],
         }
 
+    async def _retrieval_cache_key(
+        self,
+        kind: str,
+        query: str,
+        ctx: SessionContext,
+        top_k: int,
+        *,
+        admin_read_all: bool = False,
+        time_intent: TimeIntent | None = None,
+        slot_limits: dict[str, int] | None = None,
+    ) -> str:
+        try:
+            revision = await self.store.memory_revision()
+        except Exception:
+            revision = ""
+        if not revision:
+            return ""
+        time_payload = {}
+        if time_intent is not None:
+            time_payload = {
+                "active": bool(time_intent.active),
+                "label": clean_text(time_intent.label, 80),
+                "start_at": clean_text(time_intent.start_at, 80),
+                "end_at": clean_text(time_intent.end_at, 80),
+                "summary_like": bool(time_intent.summary_like),
+                "source": clean_text(time_intent.source, 80),
+            }
+        config_payload = {
+            "retrieval_mode": clean_text(self.config.get("retrieval.mode", "auto"), 40),
+            "rerank_provider_id": clean_text(self.config.get("retrieval.rerank_provider_id", ""), 160),
+            "rerank_candidate_multiplier": self.config.int("retrieval.rerank_candidate_multiplier", 4),
+            "rerank_candidate_limit": self.config.int("retrieval.rerank_candidate_limit", 32),
+            "rerank_timeout_ms": self.config.int("retrieval.rerank_timeout_ms", 1200),
+            "embedding_enabled": self.config.bool("retrieval.embedding_enabled", False),
+            "embedding_provider_id": clean_text(self.config.get("retrieval.embedding_provider_id", ""), 160),
+            "embedding_candidate_limit": self.config.int("retrieval.embedding_candidate_limit", 1200),
+            "embedding_top_k": self.config.int("retrieval.embedding_top_k", 32),
+            "embedding_score_threshold": self.config.float("retrieval.embedding_score_threshold", 0.34),
+            "embedding_weight": self.config.float("retrieval.embedding_weight", 0.55),
+            "knowledge_graph_enabled": self.config.bool("knowledge_graph.retrieval_expansion_enabled", True),
+            "knowledge_graph_expansion_limit": self.config.int("knowledge_graph.expansion_limit", 12),
+            "context_orchestration_enabled": self.config.bool("context_orchestration.enabled", True),
+        }
+        payload = {
+            "kind": clean_text(kind, 40),
+            "query": clean_text(query, 1400).lower(),
+            "top_k": max(1, int(top_k or 1)),
+            "admin_read_all": bool(admin_read_all),
+            "ctx": {
+                "session_id": clean_text(ctx.session_id, 160),
+                "scope": clean_text(ctx.scope, 40),
+                "platform": clean_text(ctx.platform, 80),
+                "user_id": clean_text(ctx.user_id, 120),
+                "group_id": clean_text(ctx.group_id, 120),
+                "bot_id": clean_text(ctx.bot_id, 120),
+            },
+            "time": time_payload,
+            "slots": slot_limits or {},
+            "config": config_payload,
+            "revision": revision,
+        }
+        raw = json_dumps(payload)
+        return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+    def _get_retrieval_cache(self, cache_key: str) -> dict[str, Any] | None:
+        if not cache_key:
+            return None
+        cache = self._retrieval_result_cache
+        item = cache.get(cache_key)
+        now = time.monotonic()
+        if not isinstance(item, dict):
+            self._retrieval_result_cache_stats["misses"] = self._retrieval_result_cache_stats.get("misses", 0) + 1
+            return None
+        if now - float(item.get("ts") or 0.0) > self._RETRIEVAL_RESULT_CACHE_TTL:
+            cache.pop(cache_key, None)
+            self._retrieval_result_cache_stats["misses"] = self._retrieval_result_cache_stats.get("misses", 0) + 1
+            return None
+        item["last_hit"] = now
+        item["hits"] = int(item.get("hits") or 0) + 1
+        self._retrieval_result_cache_stats["hits"] = self._retrieval_result_cache_stats.get("hits", 0) + 1
+        return deepcopy(item.get("payload") or {})
+
+    def _set_retrieval_cache(self, cache_key: str, payload: dict[str, Any]) -> None:
+        if not cache_key or not isinstance(payload, dict):
+            return
+        cache = self._retrieval_result_cache
+        now = time.monotonic()
+        cache[cache_key] = {"ts": now, "last_hit": now, "hits": 0, "payload": deepcopy(payload)}
+        if len(cache) <= self._RETRIEVAL_RESULT_CACHE_MAX:
+            return
+        stale = sorted(
+            cache.items(),
+            key=lambda pair: (
+                int((pair[1] if isinstance(pair[1], dict) else {}).get("hits") or 0),
+                float((pair[1] if isinstance(pair[1], dict) else {}).get("last_hit") or 0.0),
+            ),
+        )
+        remove_count = max(1, len(cache) - self._RETRIEVAL_RESULT_CACHE_MAX)
+        for key, _item in stale[:remove_count]:
+            cache.pop(key, None)
+        self._retrieval_result_cache_stats["evictions"] = self._retrieval_result_cache_stats.get("evictions", 0) + remove_count
+
+    async def _mark_cached_results_accessed(self, results: list[Any]) -> None:
+        memory_ids: list[str] = []
+        for item in results or []:
+            memory = getattr(item, "memory", None)
+            memory_id = clean_text(getattr(memory, "id", ""), 120)
+            if memory_id and memory_id not in memory_ids:
+                memory_ids.append(memory_id)
+        if memory_ids:
+            await self.store.mark_accessed(memory_ids)
+
     async def search(
         self,
         query: str,
@@ -739,9 +857,26 @@ class MemoryCompanionService:
         time_intent: TimeIntent | None = None,
     ):
         ctx = self._normalized_session_context(ctx)
+        cache_key = await self._retrieval_cache_key(
+            "search",
+            query,
+            ctx,
+            top_k,
+            admin_read_all=admin_read_all,
+            time_intent=time_intent,
+        )
+        cached = self._get_retrieval_cache(cache_key)
+        if isinstance(cached, dict):
+            results = deepcopy(cached.get("results") or [])
+            self._last_retrieval_path_info = dict(cached.get("path_info") or {})
+            self._last_retrieval_path_info["cache"] = "hit"
+            await self._mark_cached_results_accessed(results)
+            return results
         engine = await self._retrieval_engine(ctx, admin_read_all=admin_read_all)
         results = await engine.search(query, ctx, top_k, time_intent=time_intent)
         self._last_retrieval_path_info = dict(engine.last_path_info or {})
+        self._last_retrieval_path_info["cache"] = "miss"
+        self._set_retrieval_cache(cache_key, {"results": deepcopy(results), "path_info": dict(self._last_retrieval_path_info)})
         return results
 
     async def search_with_diagnostics(
@@ -754,9 +889,34 @@ class MemoryCompanionService:
         time_intent: TimeIntent | None = None,
     ):
         ctx = self._normalized_session_context(ctx)
+        cache_key = await self._retrieval_cache_key(
+            "diagnostics",
+            query,
+            ctx,
+            top_k,
+            admin_read_all=admin_read_all,
+            time_intent=time_intent,
+        )
+        cached = self._get_retrieval_cache(cache_key)
+        if isinstance(cached, dict):
+            results = deepcopy(cached.get("results") or [])
+            blocked = deepcopy(cached.get("blocked") or [])
+            self._last_retrieval_path_info = dict(cached.get("path_info") or {})
+            self._last_retrieval_path_info["cache"] = "hit"
+            await self._mark_cached_results_accessed(results)
+            return results, blocked
         engine = await self._retrieval_engine(ctx, admin_read_all=admin_read_all)
         results, blocked = await engine.search_with_diagnostics(query, ctx, top_k, time_intent=time_intent)
         self._last_retrieval_path_info = dict(engine.last_path_info or {})
+        self._last_retrieval_path_info["cache"] = "miss"
+        self._set_retrieval_cache(
+            cache_key,
+            {
+                "results": deepcopy(results),
+                "blocked": deepcopy(blocked),
+                "path_info": dict(self._last_retrieval_path_info),
+            },
+        )
         return results, blocked
 
     async def search_context_slots(
@@ -769,19 +929,59 @@ class MemoryCompanionService:
         time_intent: TimeIntent | None = None,
     ):
         ctx = self._normalized_session_context(ctx)
+        slot_limits = self._slot_limits(top_k, query=query, time_intent=time_intent)
+        cache_key = await self._retrieval_cache_key(
+            "slots",
+            query,
+            ctx,
+            top_k,
+            admin_read_all=admin_read_all,
+            time_intent=time_intent,
+            slot_limits=slot_limits,
+        )
+        cached = self._get_retrieval_cache(cache_key)
+        if isinstance(cached, dict):
+            results = deepcopy(cached.get("results") or [])
+            blocked = deepcopy(cached.get("blocked") or [])
+            slot_map = deepcopy(cached.get("slot_map") or {})
+            self._last_retrieval_path_info = dict(cached.get("path_info") or {})
+            self._last_retrieval_path_info["cache"] = "hit"
+            await self._mark_cached_results_accessed(results)
+            return results, blocked, slot_map
         engine = await self._retrieval_engine(ctx, admin_read_all=admin_read_all)
         if not self.config.bool("context_orchestration.enabled", True):
             results, blocked = await engine.search_with_diagnostics(query, ctx, top_k, time_intent=time_intent)
             self._last_retrieval_path_info = dict(engine.last_path_info or {})
-            return results, blocked, {"stable_memory": results}
+            self._last_retrieval_path_info["cache"] = "miss"
+            slot_map = {"stable_memory": results}
+            self._set_retrieval_cache(
+                cache_key,
+                {
+                    "results": deepcopy(results),
+                    "blocked": deepcopy(blocked),
+                    "slot_map": deepcopy(slot_map),
+                    "path_info": dict(self._last_retrieval_path_info),
+                },
+            )
+            return results, blocked, slot_map
         results, blocked, slot_map = await engine.search_by_slots(
             query,
             ctx,
-            slot_limits=self._slot_limits(top_k, query=query, time_intent=time_intent),
+            slot_limits=slot_limits,
             total_limit=top_k,
             time_intent=time_intent,
         )
         self._last_retrieval_path_info = dict(engine.last_path_info or {})
+        self._last_retrieval_path_info["cache"] = "miss"
+        self._set_retrieval_cache(
+            cache_key,
+            {
+                "results": deepcopy(results),
+                "blocked": deepcopy(blocked),
+                "slot_map": deepcopy(slot_map),
+                "path_info": dict(self._last_retrieval_path_info),
+            },
+        )
         return results, blocked, slot_map
 
     async def _retrieval_engine(self, ctx: SessionContext, *, admin_read_all: bool = False) -> RetrievalEngine:
@@ -1426,7 +1626,7 @@ class MemoryCompanionService:
             f"标签: {' '.join(record.tags or [])}",
             f"内容: {record.content}",
         ]
-        for key in ("canonical_summary", "persona_summary", "key_facts", "topics"):
+        for key in ("canonical_summary", "persona_summary", "key_facts", "routine_check_notes", "topics"):
             value = metadata.get(key)
             if isinstance(value, list):
                 value = " ".join(str(item) for item in value if item)
@@ -1607,6 +1807,8 @@ class MemoryCompanionService:
             visibility = "group_public" if ctx.scope == "group" else "private_pair"
             start_at = clean_text(rows[0].get("occurred_at") if rows else "", 80)
             end_at = clean_text(rows[-1].get("occurred_at") if rows else "", 80)
+            start_at_local = self._local_time_label(start_at)
+            end_at_local = self._local_time_label(end_at)
             evidence = "\n".join(
                 clean_text(row.get("content"), 220)
                 for row in rows[: self.config.int("memory_summary.evidence_events", 12)]
@@ -1636,6 +1838,9 @@ class MemoryCompanionService:
                     "unsummarized_total": total,
                     "start_at": start_at,
                     "end_at": end_at,
+                    "start_at_local": start_at_local,
+                    "end_at_local": end_at_local,
+                    "timezone": "Asia/Shanghai",
                     "summarizer": "companion_memory_schema_v1",
                     "summary_schema_version": "companion_memory_v1",
                     "owner_bot_id": self._bot_subject_id(ctx),
@@ -1644,6 +1849,7 @@ class MemoryCompanionService:
                     "persona_summary": clean_text((payload or {}).get("persona_summary") or (payload or {}).get("summary"), 2000),
                     "topics": (payload or {}).get("topics", []),
                     "key_facts": (payload or {}).get("key_facts", []),
+                    "routine_check_notes": (payload or {}).get("routine_check_notes", []),
                     "participants": (payload or {}).get("participants", []),
                     "sentiment": clean_text((payload or {}).get("sentiment"), 20),
                     "summary_provider_id": clean_text(used_summary.get("provider_id"), 120),
@@ -3349,6 +3555,19 @@ class MemoryCompanionService:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
 
+    @staticmethod
+    def _local_time_label(value: Any) -> str:
+        text = clean_text(value, 80)
+        if not text:
+            return ""
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return text
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
+
     def _topic_shift_guard_reason(self, turn_signal: Any, rows: list[dict[str, Any]]) -> str:
         if turn_signal.low_information or turn_signal.context_dependent or not turn_signal.standalone_request:
             return ""
@@ -4447,6 +4666,15 @@ class MemoryCompanionService:
                 break
         if not target_ids:
             return
+        if reaction in {"corrected", "denied"}:
+            target_ids = await self._filter_reaction_feedback_targets(ctx.message_text, target_ids)
+            if not target_ids:
+                logger.info(
+                    "[MemoryCompanion] 用户纠正未命中具体记忆，跳过批量纠正反馈: session=%s reaction=%s",
+                    ctx.session_id,
+                    reaction,
+                )
+                return
         deltas = self._reaction_feedback_deltas(reaction)
         updated = 0
         for memory_id in target_ids[:8]:
@@ -4467,6 +4695,51 @@ class MemoryCompanionService:
                 reaction,
                 updated,
             )
+
+    async def _filter_reaction_feedback_targets(self, evidence: str, target_ids: list[str]) -> list[str]:
+        ids = [clean_text(memory_id, 120) for memory_id in target_ids if clean_text(memory_id, 120)]
+        if not ids:
+            return []
+        memories = await self.store.get_memories_by_ids(ids[:8])
+        evidence_terms = set(self._anchor_terms_for_text(evidence))
+        evidence_compact = re.sub(r"\s+", "", clean_text(evidence, 800)).lower()
+        filtered: list[str] = []
+        fallback: list[tuple[str, float]] = []
+        for memory_id in ids[:8]:
+            memory = memories.get(memory_id)
+            if memory is None:
+                continue
+            metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+            haystack = " ".join(
+                clean_text(part, 1000)
+                for part in (
+                    memory.content,
+                    memory.evidence,
+                    metadata.get("canonical_summary"),
+                    metadata.get("persona_summary"),
+                    " ".join(str(item) for item in metadata.get("key_facts", [])[:6]) if isinstance(metadata.get("key_facts"), list) else "",
+                )
+                if clean_text(part, 1000)
+            )
+            memory_terms = set(self._anchor_terms_for_text(haystack))
+            overlap = evidence_terms & memory_terms
+            score = 0.0
+            if overlap:
+                score += sum(max(1.0, len(term) / 2.0) for term in overlap)
+            compact_memory = re.sub(r"\s+", "", clean_text(haystack, 1800)).lower()
+            for term in evidence_terms:
+                if len(term) >= 3 and term in compact_memory:
+                    score += 1.5
+            if evidence_compact and len(evidence_compact) >= 6 and evidence_compact in compact_memory:
+                score += 4.0
+            if score >= 3.0:
+                filtered.append(memory_id)
+            elif score > 0:
+                fallback.append((memory_id, score))
+        if filtered:
+            return filtered[:3]
+        fallback.sort(key=lambda item: item[1], reverse=True)
+        return [memory_id for memory_id, score in fallback[:1] if score >= 1.5]
 
     @staticmethod
     def _classify_memory_reaction(text: str) -> str:
@@ -4615,6 +4888,7 @@ class MemoryCompanionService:
             return "uncertain", "low_confidence"
         text = clean_text(query_text or ctx.message_text, 800)
         explicit_memory = self._message_is_contextual_memory_request(text) or self._message_requests_temporal_aggregate(text)
+        short_rest_check = self._message_is_short_rest_check(text)
         metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
         mention_policy = clean_text(metadata.get("mention_policy"), 60)
         try:
@@ -4630,6 +4904,8 @@ class MemoryCompanionService:
         if not explicit_memory and mentionability <= 0.25:
             return "tone", "user_reaction_boundary:low_mentionability"
         if slot == "open_loop":
+            if short_rest_check and not explicit_memory:
+                return "tone", "short_rest_check:open_loop_tone_only"
             if confidence < 0.58:
                 return "uncertain", "open_loop_low_confidence"
             if mention_policy == "avoid_unless_asked" and not explicit_memory:
@@ -4651,6 +4927,8 @@ class MemoryCompanionService:
                 return "mention", "self_memory_with_long_term_explanation"
             return ("mention", "explicit_self_memory_requested") if explicit_memory else ("tone", "self_timeline_background")
         if memory_type in {"conversation_summary", "timeline_event"} or "summary" in tags:
+            if short_rest_check and not explicit_memory:
+                return "tone", "short_rest_check:summary_tone_only"
             if explicit_memory or slot == "time_window_timeline":
                 return "mention", "summary_requested"
             return "tone", "conversation_continuity_background"
@@ -4672,6 +4950,26 @@ class MemoryCompanionService:
         if parsed is None:
             return None
         return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds() / 86400)
+
+    @staticmethod
+    def _message_is_short_rest_check(text: str) -> bool:
+        text = clean_text(text, 80)
+        if not text or len(text) > 20:
+            return False
+        compact = re.sub(r"[\s，。！？!?,.、~～…]+", "", text)
+        if not compact:
+            return False
+        check_like = (
+            compact in {"例行检查", "查岗", "查岗了", "在吗", "在不在", "还在吗", "睡了吗", "睡没", "醒着吗"}
+            or any(word in compact for word in ("例行检查", "查岗", "在不在", "还在吗", "醒着吗"))
+        )
+        if not check_like:
+            return False
+        try:
+            hour = datetime.now().hour
+        except Exception:
+            return True
+        return hour >= 23 or hour < 7
 
     @staticmethod
     def _append_expression_reason(reason: Any, expression: str, expression_reason: str) -> str:

@@ -354,14 +354,13 @@ class MemoryStore:
             "title",
             "topic",
             "fact_key",
-            "user_correction",
         ):
             value = metadata.get(key)
             if isinstance(value, dict):
                 value = json_dumps(value)
             if value:
                 metadata_parts.append(clean_text(value, 800))
-        for key in ("key_facts", "topics", "participants", "aliases", "query_anchors"):
+        for key in ("key_facts", "routine_check_notes", "topics", "participants", "aliases", "query_anchors"):
             value = metadata.get(key)
             if isinstance(value, list):
                 metadata_parts.extend(clean_text(item, 160) for item in value if clean_text(item, 160))
@@ -3519,6 +3518,25 @@ class MemoryStore:
 
     async def stats(self) -> dict[str, Any]:
         return await asyncio.to_thread(self._stats_sync)
+
+    async def memory_revision(self) -> str:
+        return await asyncio.to_thread(self._memory_revision_sync)
+
+    def _memory_revision_sync(self) -> str:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS count,
+                    COALESCE(MAX(updated_at), '') AS updated_at,
+                    COALESCE(MAX(created_at), '') AS created_at
+                FROM memories
+                WHERE lifecycle!='archived'
+                """
+            ).fetchone()
+        if not row:
+            return "0::"
+        return f"{int(row['count'] or 0)}:{row['updated_at'] or ''}:{row['created_at'] or ''}"
 
     def _stats_sync(self) -> dict[str, Any]:
         with self._lock:

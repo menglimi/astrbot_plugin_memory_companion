@@ -2653,6 +2653,11 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
   line-height:1.72;
   overflow-wrap:anywhere;
 }
+.memory-structured-block p em{
+  color:var(--muted);
+  font-style:normal;
+  font-size:12px;
+}
 .memory-structured-block ul{
   margin:0;
   padding-left:18px;

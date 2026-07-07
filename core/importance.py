@@ -239,11 +239,14 @@ class ImportanceEvaluator:
             ("relationship_notes", "relationship"),
             ("emotional_turning_points", "emotional"),
             ("creative_threads", "creative"),
+            ("routine_check_notes", "open_loop"),
         ):
             value = metadata.get(key)
             if isinstance(value, list) and value:
                 if target == "open_loop":
-                    open_loop = max(open_loop, 0.70)
+                    open_loop = max(open_loop, 0.62 if key == "routine_check_notes" else 0.70)
+                    if key == "routine_check_notes":
+                        self_continuity = max(self_continuity, 0.42)
                 elif target == "relationship":
                     relationship = max(relationship, 0.62)
                 elif target == "emotional":

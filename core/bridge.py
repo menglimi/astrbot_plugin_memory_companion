@@ -1,8 +1,26 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .models import EntityRef, MemoryRecord, SessionContext, clean_text
+
+
+LOCAL_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _local_time_label(value: Any) -> str:
+    text = clean_text(value, 80)
+    if not text:
+        return ""
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return text
 
 
 class MemoryCompanionBridge:
@@ -280,6 +298,7 @@ class MemoryCompanionBridge:
 def serialize_memory(record: MemoryRecord, score: float | None = None, reason: str = "") -> dict[str, Any]:
     metadata = record.metadata if isinstance(record.metadata, dict) else {}
     key_facts = metadata.get("key_facts") if isinstance(metadata.get("key_facts"), list) else []
+    routine_check_notes = metadata.get("routine_check_notes") if isinstance(metadata.get("routine_check_notes"), list) else []
     topics = metadata.get("topics") if isinstance(metadata.get("topics"), list) else []
     participants = metadata.get("participants") if isinstance(metadata.get("participants"), list) else []
     persona_weight_keys = [
@@ -316,6 +335,7 @@ def serialize_memory(record: MemoryRecord, score: float | None = None, reason: s
         "evidence_preview": clean_text(record.evidence, 520),
         "canonical_summary": clean_text(metadata.get("canonical_summary"), 420),
         "key_facts": [clean_text(item, 180) for item in key_facts if clean_text(item, 180)][:4],
+        "routine_check_notes": [clean_text(item, 180) for item in routine_check_notes if clean_text(item, 180)][:4],
         "topics": [clean_text(item, 80) for item in topics if clean_text(item, 80)][:5],
         "participants": [clean_text(item, 80) for item in participants if clean_text(item, 80)][:5],
         "memory_reason": clean_text(metadata.get("memory_reason"), 260),
@@ -337,7 +357,18 @@ def serialize_memory(record: MemoryRecord, score: float | None = None, reason: s
         "source_plugin": record.source_plugin,
         "import_batch_id": record.import_batch_id,
         "created_at": record.created_at,
+        "created_at_local": _local_time_label(record.created_at),
+        "updated_at": record.updated_at,
+        "updated_at_local": _local_time_label(record.updated_at),
         "occurred_at": record.occurred_at,
+        "occurred_at_local": _local_time_label(record.occurred_at),
+        "time_range": {
+            "start_at": clean_text(metadata.get("start_at"), 80),
+            "end_at": clean_text(metadata.get("end_at"), 80),
+            "start_at_local": clean_text(metadata.get("start_at_local"), 80) or _local_time_label(metadata.get("start_at")),
+            "end_at_local": clean_text(metadata.get("end_at_local"), 80) or _local_time_label(metadata.get("end_at")),
+            "timezone": "Asia/Shanghai",
+        },
         "subject": {
             "kind": record.subject.kind,
             "id": record.subject.id,

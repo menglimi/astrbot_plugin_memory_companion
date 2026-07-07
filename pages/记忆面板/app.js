@@ -3912,7 +3912,7 @@ async function showMemory(id) {
       <h4>归属</h4>
       <pre>${escapeHtml(JSON.stringify({ subject: memory.subject, object: memory.object, scope: memory.scope, session_id: memory.session_id, group_id: memory.group_id }, null, 2))}</pre>
       <h4>元数据</h4>
-      <pre>${escapeHtml(JSON.stringify(memory.metadata || {}, null, 2))}</pre>
+      <pre>${escapeHtml(JSON.stringify(displayMemoryMetadata(memory), null, 2))}</pre>
     </details>
   `;
   const form = $("#memoryManageForm");
@@ -3928,9 +3928,29 @@ async function showMemory(id) {
   });
 }
 
+function displayMemoryMetadata(memory) {
+  const metadata = { ...(memory.metadata || {}) };
+  const timeRange = memory.time_range || {};
+  if (metadata.start_at && !metadata.start_at_local) {
+    metadata.start_at_local = timeRange.start_at_local || formatTime(metadata.start_at);
+  }
+  if (metadata.end_at && !metadata.end_at_local) {
+    metadata.end_at_local = timeRange.end_at_local || formatTime(metadata.end_at);
+  }
+  if ((metadata.start_at || metadata.end_at) && !metadata.timezone) {
+    metadata.timezone = timeRange.timezone || "Asia/Shanghai";
+  }
+  return metadata;
+}
+
 function renderMemoryStructuredMetadata(memory) {
   const metadata = memory.metadata || {};
+  const timeRange = memory.time_range || {};
+  const startLocal = compact(timeRange.start_at_local || metadata.start_at_local, "");
+  const endLocal = compact(timeRange.end_at_local || metadata.end_at_local, "");
+  const hasTimeRange = Boolean(startLocal || endLocal || metadata.start_at || metadata.end_at);
   const keyFacts = Array.isArray(metadata.key_facts) ? metadata.key_facts.filter(Boolean) : [];
+  const routineCheckNotes = Array.isArray(metadata.routine_check_notes) ? metadata.routine_check_notes.filter(Boolean) : [];
   const topics = Array.isArray(metadata.topics) ? metadata.topics.filter(Boolean) : [];
   const participants = Array.isArray(metadata.participants) ? metadata.participants.filter(Boolean) : [];
   const canonical = compact(metadata.canonical_summary, "");
@@ -3946,9 +3966,15 @@ function renderMemoryStructuredMetadata(memory) {
   const feedback = memory.mention_feedback || metadata.mention_feedback || {};
   const correction = metadata.user_correction || {};
   const hasPersona = policy || memoryReason || phase || decayMode || activeDimensions.length || weights.length || feedback.last_reaction || correction.text;
-  if (!keyFacts.length && !topics.length && !participants.length && !canonical && !hasPersona) return "";
+  if (!hasTimeRange && !keyFacts.length && !routineCheckNotes.length && !topics.length && !participants.length && !canonical && !hasPersona) return "";
   return `
     <section class="memory-structured-panel">
+      ${hasTimeRange ? `
+        <div class="memory-structured-block">
+          <b>总结范围</b>
+          <p>${escapeHtml(`${startLocal || formatTime(metadata.start_at)}${endLocal || metadata.end_at ? " 至 " : ""}${endLocal || formatTime(metadata.end_at)}`)} <em>${escapeHtml(timeRange.timezone || metadata.timezone || "Asia/Shanghai")}</em></p>
+        </div>
+      ` : ""}
       ${hasPersona ? `
         <div class="memory-structured-block">
           <b>提及策略</b>
@@ -3985,6 +4011,12 @@ function renderMemoryStructuredMetadata(memory) {
         <div class="memory-structured-block">
           <b>关键事实</b>
           <ul>${keyFacts.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+        </div>
+      ` : ""}
+      ${routineCheckNotes.length ? `
+        <div class="memory-structured-block">
+          <b>例行检查记录</b>
+          <ul>${routineCheckNotes.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
         </div>
       ` : ""}
       ${topics.length || participants.length ? `
