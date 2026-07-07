@@ -26,7 +26,7 @@ from .bridge import serialize_memory
 from .classifier import MemoryClassifier
 from .config import ConfigView
 from .context_orchestrator import RetrievalIntent, RetrievalIntentBuilder
-from .identity import IdentityResolver, maybe_await, normalize_session_context_fields
+from .identity import IdentityResolver, looks_like_command, maybe_await, normalize_session_context_fields
 from .importance import ImportanceEvaluator
 from .injection import (
     MEMORY_COMPANION_INJECTION_FOOTER,
@@ -106,11 +106,21 @@ class MemoryCompanionService:
 
     async def handle_llm_request(self, event: Any, req: Any) -> None:
         ctx = await self.identity.resolve_event_context(event)
-        await self.note_identity(ctx)
-        reply_chain = await self._reply_chain_for_event(event)
-
         if self._private_companion_internal_generation_event(event):
             return
+        if looks_like_command(ctx.message_text):
+            remove_temp_text(req, MEMORY_COMPANION_INJECTION_HEADER, MEMORY_COMPANION_INJECTION_FOOTER)
+            self._mark_memory_companion_injection_state(event, req, injected=False, conversation_memory=False, slot_map={})
+            if self.config.bool("memory_injection.debug_log_injection_enabled", True):
+                logger.info(
+                    "[MemoryCompanion] 当前消息为指令，跳过记忆注入和采集: session=%s message=%s",
+                    ctx.session_id,
+                    clean_text(ctx.message_text, 160),
+                )
+            return
+
+        await self.note_identity(ctx)
+        reply_chain = await self._reply_chain_for_event(event)
 
         await self._apply_user_reaction_feedback(ctx)
         self._update_address_evolution(ctx, ctx.message_text or "")
@@ -192,6 +202,8 @@ class MemoryCompanionService:
         ctx = await self.identity.resolve_event_context(event)
         if ctx.scope != "group":
             return
+        if looks_like_command(ctx.message_text):
+            return
         if ctx.bot_id and ctx.user_id and ctx.bot_id == ctx.user_id:
             return
         await self.note_identity(ctx)
@@ -240,6 +252,8 @@ class MemoryCompanionService:
             return
 
         ctx = await self.identity.resolve_event_context(event)
+        if looks_like_command(ctx.message_text):
+            return
         record = self.classifier.from_bot_response(ctx, text)
         if not record:
             return

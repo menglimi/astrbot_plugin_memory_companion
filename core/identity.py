@@ -180,7 +180,22 @@ def looks_like_command(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
         return True
-    if stripped.startswith(("/", "／", "!", "！", "#")):
+
+    def _strip_leading_message_decorations(value: str) -> str:
+        current = value.strip()
+        for _ in range(8):
+            previous = current
+            current = re.sub(r"^(?:\[CQ:at,[^\]]+\]|\[At:[^\]]+\]|\[at:[^\]]+\])\s*", "", current, flags=re.I)
+            current = re.sub(r"^(?:\[Reply:[^\]]+\]|\[reply:[^\]]+\]|\[引用消息[^\]]*\])\s*", "", current, flags=re.I)
+            current = re.sub(r"^(?:<at\b[^>]*>|<reply\b[^>]*>)\s*", "", current, flags=re.I)
+            current = re.sub(r"^@\S{1,64}\s+", "", current)
+            if current == previous:
+                break
+        return current.strip()
+
+    command_prefixes = ("/", "／", "!", "！", "#", "＃", "﹟")
+    candidates = (stripped, _strip_leading_message_decorations(stripped))
+    if any(candidate.startswith(command_prefixes) for candidate in candidates):
         return True
     if re.fullmatch(r"[\W_]+", stripped):
         return True
