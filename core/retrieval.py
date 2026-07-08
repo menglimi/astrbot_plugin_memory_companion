@@ -33,7 +33,7 @@ class RetrievalEngine:
         embedding_top_k: int = 32,
         embedding_score_threshold: float = 0.34,
         embedding_weight: float = 0.55,
-        embedding_timeout_ms: int = 1500,
+        embedding_timeout_ms: int = 5000,
         embedding_max_text_chars: int = 1200,
         knowledge_graph_enabled: bool = True,
         knowledge_graph_expansion_limit: int = 12,
@@ -900,7 +900,7 @@ class RetrievalEngine:
             query_vector = await self._call_embedding_provider(query)
             query_vector = self._normalize_vector(query_vector)
         except Exception as error:
-            info["embedding_reason"] = f"embedding_query_error:{clean_text(error, 120)}"
+            info["embedding_reason"] = f"embedding_query_error:{clean_text(self._describe_exception(error), 120)}"
             return [], {}, info
         if not query_vector:
             info["embedding_reason"] = "empty_query_vector"
@@ -999,7 +999,7 @@ class RetrievalEngine:
                 return self._first_vector(payload)
             return []
         except Exception as exc:
-            error = str(exc)
+            error = self._describe_exception(exc)
             raise
         finally:
             if called_provider:
@@ -1014,6 +1014,12 @@ class RetrievalEngine:
                     elapsed_ms=elapsed_ms,
                     error=error,
                 )
+
+    @staticmethod
+    def _describe_exception(error: BaseException) -> str:
+        message = str(error).strip()
+        name = type(error).__name__
+        return f"{name}: {message}" if message else name
 
     @staticmethod
     def _usage_prompt_for_rerank(query: str, documents: list[str]) -> str:
@@ -1058,6 +1064,25 @@ class RetrievalEngine:
 
     @staticmethod
     def _coerce_vector(value: Any) -> list[float]:
+        if value is None:
+            return []
+        if isinstance(value, dict):
+            for key in ("embedding", "vector"):
+                if key in value:
+                    vector = RetrievalEngine._coerce_vector(value.get(key))
+                    if vector:
+                        return vector
+            for key in ("data", "embeddings", "vectors"):
+                if key in value:
+                    vector = RetrievalEngine._coerce_vector(value.get(key))
+                    if vector:
+                        return vector
+            return []
+        for attr in ("embedding", "vector", "data", "embeddings", "vectors"):
+            if hasattr(value, attr):
+                vector = RetrievalEngine._coerce_vector(getattr(value, attr, None))
+                if vector:
+                    return vector
         if not isinstance(value, (list, tuple)):
             return []
         vector: list[float] = []
@@ -1065,13 +1090,11 @@ class RetrievalEngine:
             try:
                 vector.append(float(item))
             except Exception:
-                return []
+                return RetrievalEngine._coerce_vector(value[0]) if value else []
         return vector
 
     def _first_vector(self, payload: Any) -> list[float]:
-        if isinstance(payload, (list, tuple)) and payload:
-            return self._coerce_vector(payload[0])
-        return []
+        return self._coerce_vector(payload)
 
     @staticmethod
     def _normalize_vector(vector: Any) -> list[float]:

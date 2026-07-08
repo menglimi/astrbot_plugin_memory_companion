@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 from .astrbot_compat import (
     append_temp_text,
+    clean_private_companion_history_text,
     detect_private_companion_request,
     logger,
     manage_request_contexts,
@@ -106,6 +107,7 @@ class MemoryCompanionService:
 
     async def handle_llm_request(self, event: Any, req: Any) -> None:
         ctx = await self.identity.resolve_event_context(event)
+        self._sanitize_session_context_message_text(ctx)
         if self._private_companion_internal_generation_event(event):
             return
         if looks_like_command(ctx.message_text):
@@ -200,6 +202,7 @@ class MemoryCompanionService:
         if self._private_companion_internal_generation_event(event):
             return
         ctx = await self.identity.resolve_event_context(event)
+        self._sanitize_session_context_message_text(ctx)
         if ctx.scope != "group":
             return
         if looks_like_command(ctx.message_text):
@@ -370,6 +373,17 @@ class MemoryCompanionService:
         if not text:
             return False
         return "这不是用户消息" in text and "Private Companion" in text and "主动消息" in text
+
+    def _sanitize_session_context_message_text(self, ctx: SessionContext) -> None:
+        cleaned, changed, drop = clean_private_companion_history_text(ctx.message_text)
+        if not changed:
+            return
+        ctx.message_text = "" if drop else clean_text(cleaned, 2000)
+        logger.info(
+            "[MemoryCompanion] 已清理当前消息里的陪伴插件动态提示残留: session=%s drop=%s",
+            ctx.session_id,
+            drop,
+        )
 
     def _sanitize_visible_timeline_text(self, text: Any) -> str:
         cleaned = clean_text(text, 1200)
@@ -1029,7 +1043,7 @@ class MemoryCompanionService:
             embedding_top_k=self.config.int("retrieval.embedding_top_k", 32),
             embedding_score_threshold=self.config.float("retrieval.embedding_score_threshold", 0.34),
             embedding_weight=self.config.float("retrieval.embedding_weight", 0.55),
-            embedding_timeout_ms=self.config.int("retrieval.embedding_timeout_ms", 1500),
+            embedding_timeout_ms=self._embedding_timeout_ms(),
             embedding_max_text_chars=self.config.int("retrieval.embedding_max_text_chars", 1200),
             knowledge_graph_enabled=self.config.bool("knowledge_graph.retrieval_expansion_enabled", True),
             knowledge_graph_expansion_limit=self.config.int("knowledge_graph.expansion_limit", 12),
@@ -1542,7 +1556,7 @@ class MemoryCompanionService:
                 "[MemoryCompanion] 记忆向量索引失败: provider=%s memory=%s error=%s",
                 provider_id,
                 record.id,
-                error,
+                self._describe_exception(error),
             )
             return False
 
@@ -1551,7 +1565,7 @@ class MemoryCompanionService:
 
         async def wait_result(value: Any) -> Any:
             if inspect.isawaitable(value):
-                timeout_ms = self.config.int("retrieval.embedding_timeout_ms", 1500)
+                timeout_ms = self._embedding_timeout_ms()
                 if timeout_ms > 0:
                     return await asyncio.wait_for(value, timeout=timeout_ms / 1000.0)
                 return await value
@@ -1590,7 +1604,7 @@ class MemoryCompanionService:
                 return self._first_embedding_vector(payload)
             return []
         except Exception as exc:
-            error = str(exc)
+            error = self._describe_exception(exc)
             raise
         finally:
             if called_provider:
@@ -1605,8 +1619,42 @@ class MemoryCompanionService:
                     error=error,
                 )
 
+    def _embedding_timeout_ms(self) -> int:
+        timeout_ms = self.config.int("retrieval.embedding_timeout_ms", 5000)
+        if timeout_ms <= 0:
+            return 0
+        # 1.4.1 的默认 1500ms 对不少 OpenAI 兼容 embedding 公益站过紧，API 最终成功时插件已先超时。
+        if timeout_ms == 1500:
+            return 5000
+        return timeout_ms
+
+    @staticmethod
+    def _describe_exception(error: BaseException) -> str:
+        message = str(error).strip()
+        name = type(error).__name__
+        return f"{name}: {message}" if message else name
+
     @staticmethod
     def _coerce_embedding_vector(value: Any) -> list[float]:
+        if value is None:
+            return []
+        if isinstance(value, dict):
+            for key in ("embedding", "vector"):
+                if key in value:
+                    vector = MemoryCompanionService._coerce_embedding_vector(value.get(key))
+                    if vector:
+                        return vector
+            for key in ("data", "embeddings", "vectors"):
+                if key in value:
+                    vector = MemoryCompanionService._coerce_embedding_vector(value.get(key))
+                    if vector:
+                        return vector
+            return []
+        for attr in ("embedding", "vector", "data", "embeddings", "vectors"):
+            if hasattr(value, attr):
+                vector = MemoryCompanionService._coerce_embedding_vector(getattr(value, attr, None))
+                if vector:
+                    return vector
         if not isinstance(value, (list, tuple)):
             return []
         vector: list[float] = []
@@ -1614,13 +1662,11 @@ class MemoryCompanionService:
             try:
                 vector.append(float(item))
             except Exception:
-                return []
+                return MemoryCompanionService._coerce_embedding_vector(value[0]) if value else []
         return vector
 
     def _first_embedding_vector(self, payload: Any) -> list[float]:
-        if isinstance(payload, (list, tuple)) and payload:
-            return self._coerce_embedding_vector(payload[0])
-        return []
+        return self._coerce_embedding_vector(payload)
 
     @staticmethod
     def _normalize_embedding_vector(vector: Any) -> list[float]:

@@ -225,9 +225,9 @@
       },
       "embedding_timeout_ms": {
         "description": "嵌入超时毫秒",
-        "hint": "生成查询向量或记忆向量超过该时间会回退/跳过。0 表示不限制。",
+        "hint": "生成查询向量或记忆向量超过该时间会回退/跳过。0 表示不限制；OpenAI 兼容公益站建议 4000-8000。",
         "type": "int",
-        "default": 1500
+        "default": 5000
       },
       "rerank_timeout_ms": {
         "description": "重排超时毫秒",
@@ -500,7 +500,7 @@
       },
       "preserve_external_prompt_context": {
         "description": "保留外部临时片段",
-        "hint": "整理 AstrBot 原始历史时保留带 private_companion marker 或临时标记的上下文，避免误删陪伴插件当前轮提示。",
+        "hint": "整理 AstrBot 原始历史时只保留真正带临时/不保存标记的外部片段；历史里遗留的 private_companion HTML 动态块会被清理，避免状态、引用链或工具提示写入会话历史后反复污染主链。",
         "type": "bool",
         "default": true
       },

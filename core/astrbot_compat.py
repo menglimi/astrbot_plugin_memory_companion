@@ -31,11 +31,39 @@ def remove_marked_text(text: str, header: str, footer: str) -> str:
 PRIVATE_COMPANION_MARKERS = (
     "<!-- private_companion_turn_fragments_start -->",
     "<!-- private_companion_state_v1 -->",
+    "<!-- private_companion_static_v1 -->",
+    "<!-- private_companion_reply_style_v1 -->",
+    "<!-- private_companion_environment_v1 -->",
     "<!-- private_companion_group_context_v1 -->",
     "<!-- private_companion_self_timeline_v1 -->",
     "<!-- private_companion_recall_query_v1 -->",
     "<!-- private_companion_reply_image_anchor_v1 -->",
     "<!-- private_companion_reply_chain_v1 -->",
+    "<!-- private_companion_forward_message_v1 -->",
+    "<!-- private_companion_group_injection_guard_v1 -->",
+    "<!-- private_companion_relation_lookup_v1 -->",
+    "<!-- private_companion_atrelay_tools_v1 -->",
+    "<!-- private_companion_qzone_tools_v1 -->",
+    "<!-- private_companion_photo_generation_tool_v1 -->",
+    "<!-- private_companion_cross_user_memory_v1 -->",
+    "<!-- private_companion_group_persona_denoise_v1 -->",
+    "<!-- private_companion_group_high_intensity_reply_guard_v1 -->",
+    "<!-- private_companion_rest_backlog_v1 -->",
+    "<!-- private_companion_atrelay_target_summary_v1 -->",
+    "<!-- private_companion_worldbook_mentions_v1 -->",
+    "<!-- private_companion_non_target_private_guard_v1 -->",
+    "<!-- private_companion_capability_boundary_v1 -->",
+)
+
+_PRIVATE_COMPANION_BLOCK_RE = re.compile(
+    r"\n*\s*<!--\s*private_companion_[a-z0-9_]+_v1\s*-->.*?"
+    r"(?=\n\s*<!--\s*private_companion_[a-z0-9_]+_v1\s*-->|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+_PRIVATE_COMPANION_TURN_FRAGMENT_RE = re.compile(
+    r"\n*\s*<!--\s*private_companion_turn_fragments_start\s*-->.*?"
+    r"<!--\s*private_companion_turn_fragments_end\s*-->\s*",
+    re.IGNORECASE | re.DOTALL,
 )
 
 PRIVATE_COMPANION_PROACTIVE_BLOCK_HEADINGS = (
@@ -143,6 +171,15 @@ def _drop_private_companion_proactive_blocks(text: str) -> tuple[str, bool]:
     return "\n".join(kept), changed
 
 
+def _strip_private_companion_marked_blocks(text: str) -> tuple[str, bool]:
+    if not text or "private_companion_" not in text:
+        return text or "", False
+    cleaned = _PRIVATE_COMPANION_TURN_FRAGMENT_RE.sub("\n", text)
+    cleaned = _PRIVATE_COMPANION_BLOCK_RE.sub("\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, cleaned != text
+
+
 def clean_private_companion_history_text(text: Any) -> tuple[str, bool, bool]:
     raw = str(text or "")
     if not raw:
@@ -156,8 +193,9 @@ def clean_private_companion_history_text(text: Any) -> tuple[str, bool, bool]:
     cleaned = re.sub(r"<timer\b[^>]*>.*?</timer>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
     cleaned = re.sub(r"<tts\b[^>]*>.*?</tts>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
     cleaned = re.sub(r"【主动承接占位】[^\n]*(?:\n|$)", "", cleaned)
+    cleaned, removed_companion_block = _strip_private_companion_marked_blocks(cleaned)
     cleaned = re.sub(
-        r"<!--\s*private_companion_[^>]*(?:proactive|turn_fragments)[^>]*-->",
+        r"\s*<!--\s*private_companion_[^>]*-->\s*",
         "",
         cleaned,
         flags=re.IGNORECASE,
@@ -165,7 +203,7 @@ def clean_private_companion_history_text(text: Any) -> tuple[str, bool, bool]:
     cleaned, removed_block = _drop_private_companion_proactive_blocks(cleaned)
 
     kept_lines: list[str] = []
-    removed_line = removed_block
+    removed_line = removed_block or removed_companion_block
     for line in cleaned.replace("\r", "\n").splitlines():
         stripped = line.strip()
         if not stripped:
@@ -221,8 +259,9 @@ def _plain_request_text(value: Any, *, depth: int = 0) -> str:
 
 
 def _is_temp_or_plugin_context(item: Any) -> bool:
-    text = _plain_request_text(item)
-    if "private_companion_" in text or any(marker in text for marker in PRIVATE_COMPANION_MARKERS):
+    if bool(getattr(item, "_private_companion_turn_fragments", False)):
+        return True
+    if bool(getattr(item, "_no_save", False) or getattr(item, "no_save", False)):
         return True
     if not isinstance(item, dict):
         return False

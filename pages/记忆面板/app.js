@@ -3660,8 +3660,8 @@ function renderRetrievalConfigForm(retrieval = {}, rerankOptions = [], embedding
         })}
         ${contextField({
           label: "嵌入超时毫秒",
-          hint: "查询向量或记忆向量生成超时后会回退/跳过。0 表示不限制。",
-          control: `<input name="embedding_timeout_ms" type="number" min="0" step="100" value="${escapeHtml(retrieval.embedding_timeout_ms ?? 1500)}" />`,
+          hint: "查询向量或记忆向量生成超时后会回退/跳过。0 表示不限制；OpenAI 兼容公益站建议 4000-8000。",
+          control: `<input name="embedding_timeout_ms" type="number" min="0" step="100" value="${escapeHtml(retrieval.embedding_timeout_ms ?? 5000)}" />`,
         })}
         ${contextField({
           label: "单条记忆字符上限",
@@ -3736,7 +3736,7 @@ function applyRetrievalPreset(form, preset) {
       embedding_top_k: 24,
       embedding_score_threshold: 0.38,
       embedding_weight: 0.45,
-      embedding_timeout_ms: 1200,
+      embedding_timeout_ms: 4000,
       embedding_backfill_enabled: false,
       embedding_backfill_batch_size: 24,
     },
@@ -3750,7 +3750,7 @@ function applyRetrievalPreset(form, preset) {
       embedding_top_k: 32,
       embedding_score_threshold: 0.34,
       embedding_weight: 0.55,
-      embedding_timeout_ms: 1500,
+      embedding_timeout_ms: 5000,
       embedding_backfill_enabled: true,
       embedding_backfill_batch_size: 50,
     },
@@ -3764,7 +3764,7 @@ function applyRetrievalPreset(form, preset) {
       embedding_top_k: 48,
       embedding_score_threshold: 0.30,
       embedding_weight: 0.70,
-      embedding_timeout_ms: 2200,
+      embedding_timeout_ms: 8000,
       embedding_backfill_enabled: true,
       embedding_backfill_batch_size: 80,
     },
@@ -3821,7 +3821,7 @@ async function saveRetrievalConfig(form) {
     embedding_top_k: Math.max(1, Math.round(num("embedding_top_k", 32))),
     embedding_score_threshold: Math.min(1, Math.max(0, num("embedding_score_threshold", 0.34))),
     embedding_weight: Math.min(2, Math.max(0, num("embedding_weight", 0.55))),
-    embedding_timeout_ms: Math.max(0, Math.round(num("embedding_timeout_ms", 1500))),
+    embedding_timeout_ms: Math.max(0, Math.round(num("embedding_timeout_ms", 5000))),
     embedding_max_text_chars: Math.max(200, Math.round(num("embedding_max_text_chars", 1200))),
     embedding_backfill_enabled: data.get("embedding_backfill_enabled") === "on",
     embedding_backfill_batch_size: Math.max(1, Math.round(num("embedding_backfill_batch_size", 50))),
