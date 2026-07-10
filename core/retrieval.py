@@ -23,7 +23,7 @@ class RetrievalEngine:
         retrieval_mode: str = "auto",
         rerank_provider: Any = None,
         rerank_provider_id: str = "",
-        rerank_candidate_multiplier: int = 4,
+        rerank_candidate_multiplier: int = 5,
         rerank_candidate_limit: int = 32,
         rerank_timeout_ms: int = 1200,
         embedding_provider: Any = None,
@@ -35,6 +35,8 @@ class RetrievalEngine:
         embedding_weight: float = 0.55,
         embedding_timeout_ms: int = 5000,
         embedding_max_text_chars: int = 1200,
+        current_window_candidate_limit: int = 600,
+        keyword_fallback_min_fts_candidates: int = 80,
         knowledge_graph_enabled: bool = True,
         knowledge_graph_expansion_limit: int = 12,
         usage_recorder: Any | None = None,
@@ -46,7 +48,7 @@ class RetrievalEngine:
             self.retrieval_mode = "auto"
         self.rerank_provider = rerank_provider
         self.rerank_provider_id = clean_text(rerank_provider_id, 160)
-        self.rerank_candidate_multiplier = max(1, int(rerank_candidate_multiplier or 4))
+        self.rerank_candidate_multiplier = max(1, int(rerank_candidate_multiplier or 5))
         self.rerank_candidate_limit = max(1, int(rerank_candidate_limit or 32))
         self.rerank_timeout_ms = max(0, int(rerank_timeout_ms or 0))
         self.embedding_provider = embedding_provider
@@ -58,6 +60,11 @@ class RetrievalEngine:
         self.embedding_weight = max(0.0, min(2.0, float(embedding_weight or 0.0)))
         self.embedding_timeout_ms = max(0, int(embedding_timeout_ms or 0))
         self.embedding_max_text_chars = max(200, int(embedding_max_text_chars or 1200))
+        self.current_window_candidate_limit = max(1, int(current_window_candidate_limit or 600))
+        self.keyword_fallback_min_fts_candidates = max(
+            0,
+            int(keyword_fallback_min_fts_candidates or 0),
+        )
         self.knowledge_graph_enabled = bool(knowledge_graph_enabled)
         self.knowledge_graph_expansion_limit = max(0, int(knowledge_graph_expansion_limit or 0))
         self.usage_recorder = usage_recorder if callable(usage_recorder) else None
@@ -82,6 +89,56 @@ class RetrievalEngine:
     ) -> list[SearchResult]:
         results, _blocked = await self.search_with_diagnostics(query, ctx, top_k, time_intent=time_intent)
         return results
+
+    async def revalidate_cached_results(
+        self,
+        results: list[SearchResult],
+        ctx: SessionContext,
+    ) -> list[SearchResult]:
+        """Refresh cached rows and re-run current visibility and ACL checks."""
+        memory_ids = [
+            clean_text(getattr(getattr(item, "memory", None), "id", ""), 120)
+            for item in results or []
+        ]
+        current = await self.store.get_memories_by_ids([memory_id for memory_id in memory_ids if memory_id])
+        acl_state = await self._acl_state() if self.policy.enable_acl_rules else self._empty_acl_state()
+        validated: list[SearchResult] = []
+        for item, memory_id in zip(results or [], memory_ids):
+            memory = current.get(memory_id)
+            if memory is None:
+                continue
+            visible_reason, blocked_reason = self._search_visibility_reason(memory, ctx, acl_state)
+            if not visible_reason or blocked_reason:
+                continue
+            item.memory = memory
+            validated.append(item)
+        return validated
+
+    async def revalidate_cached_diagnostics(
+        self,
+        blocked: list[dict[str, str]],
+        ctx: SessionContext,
+    ) -> list[dict[str, str]]:
+        """Drop cached diagnostic snippets that are no longer readable."""
+        memory_ids = [clean_text(item.get("id"), 120) for item in blocked if isinstance(item, dict)]
+        current = await self.store.get_memories_by_ids([memory_id for memory_id in memory_ids if memory_id])
+        acl_state = await self._acl_state() if self.policy.enable_acl_rules else self._empty_acl_state()
+        validated: list[dict[str, str]] = []
+        for item in blocked or []:
+            if not isinstance(item, dict):
+                continue
+            memory_id = clean_text(item.get("id"), 120)
+            if not memory_id:
+                validated.append({**item, "content": ""})
+                continue
+            memory = current.get(memory_id)
+            if memory is None:
+                continue
+            visible_reason, blocked_reason = self._search_visibility_reason(memory, ctx, acl_state)
+            if not visible_reason or blocked_reason:
+                continue
+            validated.append({**item, "content": clean_text(memory.content, 120)})
+        return validated
 
     async def search_with_diagnostics(
         self,
@@ -773,6 +830,14 @@ class RetrievalEngine:
         expanded_terms = self._merge_terms(terms, graph_terms)
         include_pending = not self.policy.hide_pending_review
         ranked_candidates = await self.store.list_candidate_memories(limit=2000, include_pending=include_pending)
+        current_window_candidates = await self.store.list_current_window_candidate_memories(
+            scope=ctx.scope,
+            session_id=ctx.session_id,
+            user_id=ctx.user_id,
+            group_id=ctx.group_id,
+            limit=self.current_window_candidate_limit,
+            include_pending=include_pending,
+        )
         time_window_candidates: list[MemoryRecord] = []
         if time_intent is not None and time_intent.active:
             time_window_candidates = await self.store.list_time_window_candidate_memories(
@@ -787,18 +852,32 @@ class RetrievalEngine:
             limit=1200,
             include_pending=include_pending,
         )
-        keyword_candidates = await self.store.list_keyword_candidate_memories(
-            keyword_terms,
-            limit=1200,
-            include_pending=include_pending,
+        use_keyword_fallback = len(fts_candidates) < self.keyword_fallback_min_fts_candidates
+        keyword_candidates = (
+            await self.store.list_keyword_candidate_memories(
+                keyword_terms,
+                limit=1200,
+                include_pending=include_pending,
+            )
+            if use_keyword_fallback
+            else []
         )
         vector_candidates, vector_scores, embedding_info = await self._embedding_candidate_memories(
             query,
             include_pending=include_pending,
         )
         self._rank_path_info = embedding_info
+        self._rank_path_info.update(
+            {
+                "current_window_candidates": len(current_window_candidates),
+                "fts_candidates": len(fts_candidates),
+                "keyword_fallback_used": use_keyword_fallback,
+                "keyword_candidates": len(keyword_candidates),
+            }
+        )
         candidates, candidate_sources = self._merge_candidate_memories(
             ranked_candidates,
+            current_window_candidates,
             fts_candidates,
             keyword_candidates,
             vector_candidates,
@@ -1419,6 +1498,7 @@ class RetrievalEngine:
     @staticmethod
     def _merge_candidate_memories(
         ranked_candidates: list[MemoryRecord],
+        current_window_candidates: list[MemoryRecord],
         fts_candidates: list[MemoryRecord],
         keyword_candidates: list[MemoryRecord],
         vector_candidates: list[MemoryRecord] | None = None,
@@ -1439,6 +1519,8 @@ class RetrievalEngine:
 
         for memory in fts_candidates:
             add(memory, "fts")
+        for memory in current_window_candidates:
+            add(memory, "current_window")
         for memory in keyword_candidates:
             add(memory, "keyword")
         for memory in time_window_candidates or []:
@@ -1550,6 +1632,11 @@ class RetrievalEngine:
 
         tags = {clean_text(tag, 80).lower() for tag in (memory.tags or [])}
         memory_type = clean_text(memory.memory_type, 80).lower()
+        if (
+            memory_type == "conversation_summary"
+            and (memory.scope == "group" or memory.visibility == "group_public")
+        ):
+            return False
         phase = clean_text(metadata.get("relationship_phase"), 80).lower()
         if max(weight("open_loop_weight"), weight("promise_weight"), weight("emotional_debt_weight")) >= 0.35:
             return True

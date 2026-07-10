@@ -15,6 +15,12 @@ class ConfigView:
         "retrieval.embedding_max_text_chars": ("retrieval_advanced.embedding_max_text_chars",),
         "retrieval.embedding_backfill_enabled": ("retrieval_advanced.embedding_backfill_enabled",),
         "retrieval.embedding_backfill_batch_size": ("retrieval_advanced.embedding_backfill_batch_size",),
+        "retrieval.embedding_backfill_interval_seconds": ("retrieval_advanced.embedding_backfill_interval_seconds",),
+        "retrieval.embedding_background_concurrency": ("retrieval_advanced.embedding_background_concurrency",),
+        "retrieval.current_window_candidate_limit": ("retrieval_advanced.current_window_candidate_limit",),
+        "retrieval.keyword_fallback_min_fts_candidates": (
+            "retrieval_advanced.keyword_fallback_min_fts_candidates",
+        ),
         # conversation_memory → conversation_memory_advanced
         "conversation_memory.recent_events_for_followup": ("conversation_memory_advanced.recent_events_for_followup",),
         "conversation_memory.time_window_timeline_limit": ("conversation_memory_advanced.time_window_timeline_limit",),

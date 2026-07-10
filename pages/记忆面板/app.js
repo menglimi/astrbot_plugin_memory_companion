@@ -4686,7 +4686,7 @@ function renderPersonaPhaseItem(p, allPhases, thresholds, phaseLabels, addressLa
   const addressPhase = p.current_address_phase || '';
   const addressLabel = addressLabels[addressPhase] || '';
   const updatedAt = p.updated_at || '';
-  const sessionKey = p.session_key || '';
+  const sessionKey = p.session_label || p.session_key || '';
   const shortSession = sessionKey.length > 40 ? sessionKey.slice(0, 37) + '...' : sessionKey;
 
   // Find current phase index for progress bar

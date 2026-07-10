@@ -267,12 +267,30 @@ class MemoryCompanionBridge:
         """Search for unresolved open-loop / promise memories for proactive companionship."""
         return await self._plugin.bridge_search_open_loops(session_id=session_id, limit=limit)
 
-    def get_relationship_phase(self, *, session_id: str = "", scope: str = "private") -> dict[str, Any]:
+    def get_relationship_phase(
+        self,
+        *,
+        session_id: str = "",
+        scope: str = "private",
+        platform: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        bot_id: str = "",
+    ) -> dict[str, Any]:
         """Return current relationship phase state for a session."""
         getter = getattr(self._plugin, "_get_relationship_phase", None)
         if not callable(getter):
             return {"phase": "unknown", "momentum": 0.0}
-        ctx = SessionContext(session_id=session_id, scope=scope)
+        normalizer = getattr(self._plugin, "session_context_from_bridge", None)
+        payload = {
+            "session_id": session_id,
+            "scope": scope,
+            "platform": platform,
+            "user_id": user_id,
+            "group_id": group_id,
+            "bot_id": bot_id,
+        }
+        ctx = normalizer(payload) if callable(normalizer) else SessionContext(**payload)
         return getter(ctx)
 
     def get_recent_emotional_state(self) -> dict[str, Any]:

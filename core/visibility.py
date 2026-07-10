@@ -34,6 +34,11 @@ class VisibilityPolicy:
             return False, "raw_event_disabled"
         if memory.visibility == "internal":
             return False, "internal"
+        if ctx.strict_session_only:
+            if not ctx.session_id:
+                return False, "strict_session_missing"
+            if not memory.session_id or memory.session_id != ctx.session_id:
+                return False, "strict_session_mismatch"
         if self.admin_read_all:
             return True, "admin_search"
         if memory.visibility == "bot_self":

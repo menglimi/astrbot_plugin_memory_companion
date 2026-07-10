@@ -132,6 +132,12 @@
         "type": "int",
         "default": 1200
       },
+      "provider_timeout_seconds": {
+        "description": "总结模型超时秒数",
+        "hint": "单次调用总结模型的最长等待时间。超时会尝试备用模型并保留未总结时间线。0 表示不限制。",
+        "type": "int",
+        "default": 60
+      },
       "evidence_events": {
         "description": "证据事件条数",
         "hint": "长期总结记忆中最多保留多少条原始时间线事件作为 evidence，便于排查总结来源。",
@@ -140,7 +146,7 @@
       },
       "max_retries": {
         "description": "失败重试次数",
-        "hint": "同一会话阶段性总结连续失败达到该次数后，会跳过当前窗口，避免坏窗口无限阻塞后续记忆整理。",
+        "hint": "同一会话阶段性总结连续失败达到该次数后暂停自动重试，但保留原始时间线；可使用手动总结命令强制重试。",
         "type": "int",
         "default": 3
       }
@@ -252,6 +258,30 @@
         "hint": "每次后台最多补齐多少条旧记忆向量。值越大，首次开启后建索引越快，但会增加 Embedding Provider 调用量。",
         "type": "int",
         "default": 50
+      },
+      "embedding_backfill_interval_seconds": {
+        "description": "补向量最短间隔",
+        "hint": "同一 Embedding Provider 两次后台缺失扫描之间的最短秒数，避免每轮检索都重复扫描。0 表示不节流。",
+        "type": "int",
+        "default": 300
+      },
+      "embedding_background_concurrency": {
+        "description": "向量后台并发",
+        "hint": "后台新增记忆和批量补索引共用的最大并发数，建议 1-3。",
+        "type": "int",
+        "default": 2
+      },
+      "current_window_candidate_limit": {
+        "description": "当前窗口候选保底",
+        "hint": "无论全局记忆数量多少，额外读取当前私聊或群聊窗口的候选上限，防止高重要度全局记录挤掉当前上下文。",
+        "type": "int",
+        "default": 600
+      },
+      "keyword_fallback_min_fts_candidates": {
+        "description": "宽泛关键词回退阈值",
+        "hint": "FTS 候选少于该数量时才执行多列 LIKE 回退；设为 0 可完全关闭宽泛 LIKE 回退。",
+        "type": "int",
+        "default": 80
       }
     }
   },
@@ -298,9 +328,9 @@
       },
       "debug_log_injection_enabled": {
         "description": "日志打印注入内容",
-        "hint": "开启后会把检索 query、命中记忆、过滤原因、连续对话记忆状态和实际注入包打印到 AstrBot 日志，便于排障。",
+        "hint": "默认关闭。仅在排障时临时开启；开启后会把检索 query、命中记忆、过滤原因、连续对话记忆状态和实际注入包打印到 AstrBot 日志。",
         "type": "bool",
-        "default": true
+        "default": false
       },
       "debug_log_max_chars": {
         "description": "注入调试日志字数",
@@ -504,6 +534,12 @@
         "type": "bool",
         "default": true
       },
+      "cross_window_emotional_continuity_enabled": {
+        "description": "跨窗口情绪连续性",
+        "hint": "默认关闭。开启后其他会话中触发的情绪余波可影响当前窗口，但不会注入原始记忆内容。",
+        "type": "bool",
+        "default": false
+      },
       "clean_proactive_history": {
         "description": "清理主动消息历史提示",
         "hint": "注入前清理 AstrBot 原始上下文中残留的主动消息生成提示、send_message_to_user 工具说明、主动承接占位和 TTS/定时控制标签，只保留用户可见的干净聊天内容。",
@@ -652,6 +688,24 @@
         "hint": "每次睡眠维护最多归档多少条过期 raw_event 长期记录，避免一次维护写入过多。",
         "type": "int",
         "default": 1000
+      },
+      "retention_summarized_timeline_days": {
+        "description": "已总结时间线保留天数",
+        "hint": "只清理已经成功写入长期总结的时间线；未总结和总结失败的原始消息不会被删除。0 表示不自动清理。",
+        "type": "int",
+        "default": 30
+      },
+      "retention_injection_log_days": {
+        "description": "注入日志保留天数",
+        "hint": "超过该天数的注入诊断日志会在睡眠维护时删除。0 表示不自动清理。",
+        "type": "int",
+        "default": 14
+      },
+      "retention_cleanup_limit": {
+        "description": "保留清理单次上限",
+        "hint": "每次维护分别最多删除多少条已总结时间线和注入日志，避免长事务。",
+        "type": "int",
+        "default": 2000
       },
       "memory_decay_enabled": {
         "description": "启用自然衰减",

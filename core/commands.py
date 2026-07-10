@@ -123,7 +123,7 @@ class MemoryCompanionCommandHandler:
         user_id = first_id if target_type == "private" else second_id
         try:
             if confirm == "清空":
-                result = await self.service.store.clear_scoped_memory(
+                result = await self.service.clear_scoped_memory(
                     target_type=target_type,
                     group_id=group_id,
                     user_id=user_id,

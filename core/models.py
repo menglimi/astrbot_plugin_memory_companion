@@ -75,6 +75,7 @@ class SessionContext:
     bot_id: str = ""
     message_id: str = ""
     message_text: str = ""
+    strict_session_only: bool = False
 
     @property
     def current_target_id(self) -> str:

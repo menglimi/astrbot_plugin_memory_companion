@@ -254,6 +254,17 @@ class ImportanceEvaluator:
                 elif target == "creative":
                     creative = max(creative, 0.62)
 
+        # Group summaries may use a first-person observer voice while describing
+        # several members. They remain useful context but cannot become the Bot's
+        # personal plan or open loop; verified Bot facts are stored separately.
+        is_group_summary = memory_type == "conversation_summary" and (
+            record.scope == "group" or clean_text(record.visibility, 80).lower() == "group_public"
+        )
+        if is_group_summary:
+            promise = min(promise, 0.25)
+            open_loop = min(open_loop, 0.25)
+            self_continuity = min(self_continuity, 0.20)
+
         weights = {
             "preference_weight": preference,
             "relationship_weight": relationship,

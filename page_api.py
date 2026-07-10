@@ -109,8 +109,19 @@ class PluginPageApi:
                 for key, state in phase_state.items():
                     if not isinstance(state, dict):
                         continue
+                    identity = state.get("_identity") if isinstance(state.get("_identity"), dict) else {}
+                    identity_parts = [
+                        clean_text(identity.get("platform"), 80),
+                        clean_text(identity.get("bot_id"), 120),
+                        clean_text(identity.get("scope"), 40),
+                        clean_text(identity.get("target_id"), 200),
+                    ]
+                    member_id = clean_text(identity.get("member_id"), 120)
+                    if member_id:
+                        identity_parts.append(f"member={member_id}")
                     phases.append({
                         "session_key": key,
+                        "session_label": " / ".join(part for part in identity_parts if part) or key,
                         "phase": state.get("phase", "acquaintance"),
                         "momentum": round(state.get("momentum", 0.0), 3),
                         "touch_count": state.get("touch_count", 0),
@@ -531,7 +542,7 @@ class PluginPageApi:
                 "retrieval": {
                     "mode": str(config.get("retrieval.mode", "auto") or "auto"),
                     "rerank_provider_id": str(config.get("retrieval.rerank_provider_id", "") or ""),
-                    "rerank_candidate_multiplier": config.int("retrieval.rerank_candidate_multiplier", 4),
+                    "rerank_candidate_multiplier": config.int("retrieval.rerank_candidate_multiplier", 5),
                     "rerank_candidate_limit": config.int("retrieval.rerank_candidate_limit", 32),
                     "rerank_timeout_ms": config.int("retrieval.rerank_timeout_ms", 1200),
                     "embedding_enabled": config.bool("retrieval.embedding_enabled", False),
@@ -544,6 +555,18 @@ class PluginPageApi:
                     "embedding_max_text_chars": config.int("retrieval.embedding_max_text_chars", 1200),
                     "embedding_backfill_enabled": config.bool("retrieval.embedding_backfill_enabled", True),
                     "embedding_backfill_batch_size": config.int("retrieval.embedding_backfill_batch_size", 50),
+                    "embedding_backfill_interval_seconds": config.int(
+                        "retrieval.embedding_backfill_interval_seconds", 300
+                    ),
+                    "embedding_background_concurrency": config.int(
+                        "retrieval.embedding_background_concurrency", 2
+                    ),
+                    "current_window_candidate_limit": config.int(
+                        "retrieval.current_window_candidate_limit", 600
+                    ),
+                    "keyword_fallback_min_fts_candidates": config.int(
+                        "retrieval.keyword_fallback_min_fts_candidates", 80
+                    ),
                 },
                 "knowledge_graph": {
                     "enabled": config.bool("knowledge_graph.enabled", True),
@@ -567,7 +590,7 @@ class PluginPageApi:
                     "enable_injection_logs": config.bool("memory_injection.enable_injection_logs", True),
                     "debug_log_injection_enabled": config.bool(
                         "memory_injection.debug_log_injection_enabled",
-                        True,
+                        False,
                     ),
                     "debug_log_max_chars": config.int("memory_injection.debug_log_max_chars", 12000),
                 },
@@ -601,6 +624,10 @@ class PluginPageApi:
                 "private_companion_bridge": {
                     "enabled": config.bool("private_companion_bridge.enabled", True),
                     "accept_external_records": config.bool("private_companion_bridge.accept_external_records", True),
+                    "cross_window_emotional_continuity_enabled": config.bool(
+                        "private_companion_bridge.cross_window_emotional_continuity_enabled",
+                        False,
+                    ),
                     "dedupe_prompt_context": config.bool("private_companion_bridge.dedupe_prompt_context", True),
                     "prefer_memory_companion_memory": config.bool(
                         "private_companion_bridge.prefer_memory_companion_memory",
@@ -629,6 +656,13 @@ class PluginPageApi:
                 "maintenance": {
                     "retention_raw_event_days": config.int("maintenance.retention_raw_event_days", 7),
                     "retention_raw_event_limit": config.int("maintenance.retention_raw_event_limit", 1000),
+                    "retention_summarized_timeline_days": config.int(
+                        "maintenance.retention_summarized_timeline_days", 30
+                    ),
+                    "retention_injection_log_days": config.int(
+                        "maintenance.retention_injection_log_days", 14
+                    ),
+                    "retention_cleanup_limit": config.int("maintenance.retention_cleanup_limit", 2000),
                     "memory_decay_enabled": config.bool("maintenance.memory_decay_enabled", True),
                     "memory_decay_after_days": config.int("maintenance.memory_decay_after_days", 180),
                     "memory_decay_idle_days": config.int("maintenance.memory_decay_idle_days", 90),
@@ -667,7 +701,7 @@ class PluginPageApi:
         core_values = {
             "mode": mode,
             "rerank_provider_id": clean_text(payload.get("rerank_provider_id"), 160),
-            "rerank_candidate_multiplier": max(1, self._int(payload.get("rerank_candidate_multiplier"), 4)),
+            "rerank_candidate_multiplier": max(1, self._int(payload.get("rerank_candidate_multiplier"), 5)),
             "rerank_candidate_limit": max(1, self._int(payload.get("rerank_candidate_limit"), 32)),
             "embedding_enabled": bool(payload.get("embedding_enabled")),
             "embedding_provider_id": clean_text(payload.get("embedding_provider_id"), 160),
@@ -896,14 +930,21 @@ class PluginPageApi:
             )
         except Exception:
             records = []
-        for item in self._private_companion_album(data, lookup_date, records, limit=1200 if photo_id else 80):
+        for item in self._private_companion_album(
+            data,
+            lookup_date,
+            records,
+            limit=1200 if photo_id else 80,
+            plugin=plugin,
+            include_local_path=True,
+        ):
             if photo_id and clean_text(item.get("id"), 120) != photo_id:
                 continue
-            raw_path = clean_text(item.get("path"), 500)
+            raw_path = clean_text(item.get("_local_path"), 500)
             if not raw_path:
                 continue
-            resolved = Path(raw_path).resolve()
-            if resolved.is_file():
+            resolved = self._safe_companion_photo_path(raw_path, plugin)
+            if resolved is not None:
                 return resolved
         return {"error": "photo_not_found", "status": 404}
 
@@ -999,7 +1040,7 @@ class PluginPageApi:
                 "note": clean_text(state.get("note"), 240),
             },
             "details": details,
-            "album": self._private_companion_album(data, selected_date, records or []),
+            "album": self._private_companion_album(data, selected_date, records or [], plugin=plugin),
             "subjective_memories": self._private_companion_subjective_memories(data, selected_date, records or []),
         }
 
@@ -1009,6 +1050,9 @@ class PluginPageApi:
         selected_date: str,
         records: list[Any] | None = None,
         limit: int = 8,
+        *,
+        plugin: Any = None,
+        include_local_path: bool = False,
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -1032,10 +1076,10 @@ class PluginPageApi:
             if item_id in seen:
                 return
             seen.add(item_id)
-            exists = bool(path and Path(path).is_file())
+            safe_path = self._safe_companion_photo_path(path, plugin) if path else None
+            exists = safe_path is not None
             query = f"date={quote(date, safe='')}&id={quote(item_id, safe='')}"
-            rows.append(
-                {
+            row = {
                     "id": item_id,
                     "date": date,
                     "kind": clean_text(raw.get("kind"), 40) or ("daily_outfit" if source == "daily_outfit_photo" else source),
@@ -1044,7 +1088,6 @@ class PluginPageApi:
                         "recent_photo": "近期自拍",
                         "life_photo": "生活分享图",
                     }.get(source, "近期照片"),
-                    "path": path,
                     "url": f"{PAGE_API_PREFIXES[0]}/companion/personal-photo?{query}",
                     "image_data_url": f"/companion/personal-photo-data?{query}",
                     "exists": exists,
@@ -1054,7 +1097,9 @@ class PluginPageApi:
                     "error": error if not exists else "",
                     "generated_at": self._timestamp_label(generated_at),
                 }
-            )
+            if include_local_path and safe_path is not None:
+                row["_local_path"] = str(safe_path)
+            rows.append(row)
 
         add(data.get("daily_outfit_photo"), "daily_outfit_photo")
         recent = data.get("recent_photo_generations", [])
@@ -1098,10 +1143,10 @@ class PluginPageApi:
             if item_id in seen:
                 continue
             seen.add(item_id)
-            exists = bool(path and Path(path).is_file())
+            safe_path = self._safe_companion_photo_path(path, plugin) if path else None
+            exists = safe_path is not None
             query = f"date={quote(date, safe='')}&id={quote(item_id, safe='')}"
-            rows.append(
-                {
+            row = {
                     "id": item_id,
                     "date": date,
                     "kind": "daily_outfit" if source == "daily_outfit_photo" else source,
@@ -1109,7 +1154,6 @@ class PluginPageApi:
                         "daily_outfit_photo": "每日穿搭图",
                         "life_photo": "生活分享图",
                     }.get(source, "记忆照片"),
-                    "path": path,
                     "url": f"{PAGE_API_PREFIXES[0]}/companion/personal-photo?{query}",
                     "image_data_url": f"/companion/personal-photo-data?{query}",
                     "exists": exists,
@@ -1119,9 +1163,55 @@ class PluginPageApi:
                     "error": "" if exists else "图片文件不可用",
                     "generated_at": self._timestamp_label(getattr(record, "occurred_at", "") or getattr(record, "created_at", "")),
                 }
-            )
+            if include_local_path and safe_path is not None:
+                row["_local_path"] = str(safe_path)
+            rows.append(row)
         safe_limit = max(1, min(2000, int(limit or 8)))
         return rows[:safe_limit]
+
+    def _safe_companion_photo_path(self, raw_path: Any, plugin: Any = None) -> Path | None:
+        text = clean_text(raw_path, 1000)
+        if not text:
+            return None
+        roots: list[Path] = []
+        candidates = [
+            getattr(plugin, "data_dir", "") if plugin is not None else "",
+            getattr(plugin, "plugin_data_dir", "") if plugin is not None else "",
+            getattr(getattr(self.plugin, "service", None), "data_dir", ""),
+        ]
+        data_file = getattr(plugin, "data_file", "") if plugin is not None else ""
+        if data_file:
+            candidates.append(Path(str(data_file)).parent)
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                root = Path(str(candidate)).expanduser().resolve()
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if root not in roots:
+                roots.append(root)
+        if not roots:
+            return None
+        source = Path(text).expanduser()
+        paths = [source] if source.is_absolute() else [root / source for root in roots]
+        allowed_extensions = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif"}
+        max_bytes = 20 * 1024 * 1024
+        for candidate in paths:
+            try:
+                resolved = candidate.resolve()
+                if not any(resolved.is_relative_to(root) for root in roots):
+                    continue
+                mime = mimetypes.guess_type(str(resolved))[0] or ""
+                if resolved.suffix.lower() not in allowed_extensions or not mime.startswith("image/"):
+                    continue
+                stat = resolved.stat()
+                if not resolved.is_file() or stat.st_size <= 0 or stat.st_size > max_bytes:
+                    continue
+            except (OSError, RuntimeError, ValueError):
+                continue
+            return resolved
+        return None
 
     def _private_companion_subjective_memories(
         self,
@@ -1748,7 +1838,7 @@ class PluginPageApi:
         payload = await self._json()
         if clean_text(payload.get("confirm"), 20) != "清空":
             return self._err("confirmation mismatch", 400)
-        result = await self.plugin.service.store.clear_all_memory_data()
+        result = await self.plugin.service.clear_all_memory_data()
         return self._ok({"result": result})
 
     async def clear_scope(self):
@@ -1767,7 +1857,7 @@ class PluginPageApi:
             else:
                 if clean_text(payload.get("confirm"), 20) != "清空":
                     return self._err("confirmation mismatch", 400)
-                result = await self.plugin.service.store.clear_scoped_memory(
+                result = await self.plugin.service.clear_scoped_memory(
                     target_type=target_type,
                     group_id=group_id,
                     user_id=user_id,

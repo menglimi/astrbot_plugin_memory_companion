@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import closing
+from contextlib import closing, contextmanager
+from copy import deepcopy
 import re
 import sqlite3
 import threading
@@ -20,6 +21,37 @@ class MemoryStore:
         self._lock = threading.RLock()
         self._closed = False
         self._fts_enabled = False
+        self._savepoint_counter = 0
+        self._embedding_candidate_cache_revision = ""
+        self._embedding_candidate_cache: dict[
+            tuple[str, bool, int],
+            list[tuple[MemoryRecord, list[float], str]],
+        ] = {}
+
+    @contextmanager
+    def _transaction_sync(self):
+        """Run a write unit atomically; callers must hold ``self._lock``."""
+        if self._conn.in_transaction:
+            self._savepoint_counter += 1
+            savepoint = f"memory_companion_{self._savepoint_counter}"
+            self._conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                yield
+            except BaseException:
+                self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                raise
+            else:
+                self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            return
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self._conn.rollback()
+            raise
+        else:
+            self._conn.commit()
 
     def initialize(self) -> None:
         with self._lock:
@@ -99,6 +131,8 @@ class MemoryStore:
                     object_id TEXT NOT NULL DEFAULT '',
                     content TEXT NOT NULL DEFAULT '',
                     metadata TEXT NOT NULL DEFAULT '{}',
+                    message_id TEXT NOT NULL DEFAULT '',
+                    dedupe_key TEXT NOT NULL DEFAULT '',
                     occurred_at TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL DEFAULT '',
                     summarized_at TEXT NOT NULL DEFAULT ''
@@ -268,11 +302,21 @@ class MemoryStore:
             self._ensure_timeline_columns_sync()
             self._ensure_acl_columns_sync()
             self._ensure_memory_fts_sync()
+            self._ensure_retrieval_revision_sync()
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_fingerprint ON memories(content_fingerprint)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_timeline_summary ON timeline(session_id, summarized_at, occurred_at)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_timeline_retention ON timeline(occurred_at, created_at) WHERE summarized_at!=''"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_injection_logs_created ON injection_logs(created_at)"
+            )
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_timeline_dedupe_key ON timeline(dedupe_key) WHERE dedupe_key!=''"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_summary_failures_updated ON summary_failures(updated_at)"
@@ -290,6 +334,120 @@ class MemoryStore:
                 "CREATE INDEX IF NOT EXISTS idx_memory_embeddings_provider ON memory_embeddings(provider_id, updated_at)"
             )
             self._conn.commit()
+
+    def _ensure_retrieval_revision_sync(self) -> None:
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS retrieval_revision (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                revision INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT OR IGNORE INTO retrieval_revision(singleton, revision) VALUES(1, 0);
+
+            CREATE TRIGGER IF NOT EXISTS trg_memories_retrieval_revision_insert
+            AFTER INSERT ON memories
+            BEGIN
+                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_memories_retrieval_revision_delete
+            AFTER DELETE ON memories
+            BEGIN
+                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_memories_retrieval_revision_update
+            AFTER UPDATE OF
+                memory_type, subject_kind, subject_id, subject_name, subject_role,
+                object_kind, object_id, object_name, object_role, scope, session_id,
+                platform, message_id, group_id, visibility, sayability, reality_level,
+                lifecycle, content, evidence, confidence, importance, review_status,
+                tags, metadata, created_at, updated_at, occurred_at, source_plugin,
+                import_batch_id, content_fingerprint, merged_count, supersedes_id
+            ON memories
+            BEGIN
+                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_acl_rules_retrieval_revision_insert
+            AFTER INSERT ON memory_acl_rules
+            BEGIN
+                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_acl_rules_retrieval_revision_update
+            AFTER UPDATE ON memory_acl_rules
+            BEGIN
+                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_acl_rules_retrieval_revision_delete
+            AFTER DELETE ON memory_acl_rules
+            BEGIN
+                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_acl_policies_retrieval_revision_insert
+            AFTER INSERT ON memory_acl_policies
+            BEGIN
+                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_acl_policies_retrieval_revision_update
+            AFTER UPDATE ON memory_acl_policies
+            BEGIN
+                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_acl_policies_retrieval_revision_delete
+            AFTER DELETE ON memory_acl_policies
+            BEGIN
+                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_embeddings_retrieval_revision_insert
+            AFTER INSERT ON memory_embeddings
+            BEGIN
+                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_embeddings_retrieval_revision_update
+            AFTER UPDATE ON memory_embeddings
+            BEGIN
+                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_embeddings_retrieval_revision_delete
+            AFTER DELETE ON memory_embeddings
+            BEGIN
+                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_knowledge_nodes_retrieval_revision_insert
+            AFTER INSERT ON knowledge_nodes
+            BEGIN
+                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_knowledge_nodes_retrieval_revision_update
+            AFTER UPDATE ON knowledge_nodes
+            BEGIN
+                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_knowledge_nodes_retrieval_revision_delete
+            AFTER DELETE ON knowledge_nodes
+            BEGIN
+                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_knowledge_edges_retrieval_revision_insert
+            AFTER INSERT ON knowledge_edges
+            BEGIN
+                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_knowledge_edges_retrieval_revision_update
+            AFTER UPDATE ON knowledge_edges
+            BEGIN
+                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_knowledge_edges_retrieval_revision_delete
+            AFTER DELETE ON knowledge_edges
+            BEGIN
+                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            """
+        )
 
     def _ensure_memory_fts_sync(self) -> None:
         try:
@@ -416,8 +574,14 @@ class MemoryStore:
             row["name"]
             for row in self._conn.execute("PRAGMA table_info(timeline)").fetchall()
         }
-        if "summarized_at" not in existing:
-            self._conn.execute("ALTER TABLE timeline ADD COLUMN summarized_at TEXT NOT NULL DEFAULT ''")
+        additions = {
+            "summarized_at": "TEXT NOT NULL DEFAULT ''",
+            "message_id": "TEXT NOT NULL DEFAULT ''",
+            "dedupe_key": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, ddl in additions.items():
+            if name not in existing:
+                self._conn.execute(f"ALTER TABLE timeline ADD COLUMN {name} {ddl}")
 
     def _ensure_acl_columns_sync(self) -> None:
         existing = {
@@ -430,32 +594,35 @@ class MemoryStore:
     def normalize_legacy_manual_visibility(self) -> int:
         """收回早期版本中过宽的手动记忆默认可见性。"""
         with self._lock:
-            private_cur = self._conn.execute(
-                """
-                UPDATE memories
-                SET visibility='private_pair', updated_at=?
-                WHERE memory_type='manual_memory' AND visibility='shareable' AND scope='private'
-                """,
-                (utc_now(),),
-            )
-            group_cur = self._conn.execute(
-                """
-                UPDATE memories
-                SET visibility='group_public', updated_at=?
-                WHERE memory_type='manual_memory' AND visibility='shareable' AND scope='group'
-                """,
-                (utc_now(),),
-            )
-            unknown_cur = self._conn.execute(
-                """
-                UPDATE memories
-                SET visibility='internal', updated_at=?
-                WHERE memory_type='manual_memory' AND visibility='shareable' AND scope NOT IN ('private', 'group')
-                """,
-                (utc_now(),),
-            )
-            self._conn.commit()
-            return int(private_cur.rowcount or 0) + int(group_cur.rowcount or 0) + int(unknown_cur.rowcount or 0)
+            with self._transaction_sync():
+                return self._normalize_legacy_manual_visibility_sync()
+
+    def _normalize_legacy_manual_visibility_sync(self) -> int:
+        private_cur = self._conn.execute(
+            """
+            UPDATE memories
+            SET visibility='private_pair', updated_at=?
+            WHERE memory_type='manual_memory' AND visibility='shareable' AND scope='private'
+            """,
+            (utc_now(),),
+        )
+        group_cur = self._conn.execute(
+            """
+            UPDATE memories
+            SET visibility='group_public', updated_at=?
+            WHERE memory_type='manual_memory' AND visibility='shareable' AND scope='group'
+            """,
+            (utc_now(),),
+        )
+        unknown_cur = self._conn.execute(
+            """
+            UPDATE memories
+            SET visibility='internal', updated_at=?
+            WHERE memory_type='manual_memory' AND visibility='shareable' AND scope NOT IN ('private', 'group')
+            """,
+            (utc_now(),),
+        )
+        return int(private_cur.rowcount or 0) + int(group_cur.rowcount or 0) + int(unknown_cur.rowcount or 0)
 
     def close(self) -> None:
         with self._lock:
@@ -498,15 +665,15 @@ class MemoryStore:
         ]
         deleted: dict[str, int] = {}
         with self._lock:
-            for table in tables:
-                try:
-                    cur = self._conn.execute(f"DELETE FROM {table}")
-                except sqlite3.Error:
-                    if table == "memory_fts":
-                        continue
-                    raise
-                deleted[table] = int(cur.rowcount or 0)
-            self._conn.commit()
+            with self._transaction_sync():
+                for table in tables:
+                    try:
+                        cur = self._conn.execute(f"DELETE FROM {table}")
+                    except sqlite3.Error:
+                        if table == "memory_fts":
+                            continue
+                        raise
+                    deleted[table] = int(cur.rowcount or 0)
         return {"backup": str(backup), "deleted": deleted}
 
     async def preview_scoped_memory_clear(
@@ -599,25 +766,28 @@ class MemoryStore:
 
             backup = self.backup(f".before_clear_{target_type}")
             deleted: dict[str, int] = {}
-            if memory_ids:
-                self._delete_many_by_ids("review_queue", "memory_id", memory_ids, deleted)
-                self._delete_many_by_ids("memory_embeddings", "memory_id", memory_ids, deleted)
-                self._delete_many_by_ids("knowledge_edges", "source_memory_id", memory_ids, deleted)
-                for memory_id in memory_ids:
-                    self._delete_memory_fts_row(memory_id)
-            deleted["memories"] = self._delete_where("memories", memory_where, memory_params)
-            deleted["timeline"] = self._delete_where("timeline", timeline_where, timeline_params)
-            deleted["relationship_edges"] = self._delete_where("relationship_edges", relation_where, relation_params)
-            deleted["knowledge_edges"] = deleted.get("knowledge_edges", 0) + self._delete_where(
-                "knowledge_edges",
-                knowledge_edge_where,
-                knowledge_edge_params,
-            )
-            deleted["knowledge_nodes"] = self._delete_where("knowledge_nodes", knowledge_node_where, knowledge_node_params)
-            deleted["injection_logs"] = self._delete_where("injection_logs", injection_where, injection_params)
-            deleted["summary_failures"] = self._delete_where("summary_failures", injection_where, injection_params)
-            deleted["cross_window_threads"] = self._delete_where("cross_window_threads", thread_where, thread_params)
-            self._conn.commit()
+            with self._transaction_sync():
+                if memory_ids:
+                    self._delete_many_by_ids("review_queue", "memory_id", memory_ids, deleted)
+                    self._delete_many_by_ids("memory_embeddings", "memory_id", memory_ids, deleted)
+                    self._delete_many_by_ids("knowledge_edges", "source_memory_id", memory_ids, deleted)
+                    self._delete_many_by_ids("relationship_edges", "source_memory_id", memory_ids, deleted)
+                    for memory_id in memory_ids:
+                        self._delete_memory_fts_row(memory_id)
+                deleted["memories"] = self._delete_where("memories", memory_where, memory_params)
+                deleted["timeline"] = self._delete_where("timeline", timeline_where, timeline_params)
+                deleted["relationship_edges"] = deleted.get("relationship_edges", 0) + self._delete_where(
+                    "relationship_edges", relation_where, relation_params
+                )
+                deleted["knowledge_edges"] = deleted.get("knowledge_edges", 0) + self._delete_where(
+                    "knowledge_edges",
+                    knowledge_edge_where,
+                    knowledge_edge_params,
+                )
+                deleted["knowledge_nodes"] = self._delete_where("knowledge_nodes", knowledge_node_where, knowledge_node_params)
+                deleted["injection_logs"] = self._delete_where("injection_logs", injection_where, injection_params)
+                deleted["summary_failures"] = self._delete_where("summary_failures", injection_where, injection_params)
+                deleted["cross_window_threads"] = self._delete_where("cross_window_threads", thread_where, thread_params)
         return {
             "target_type": target_type,
             "group_id": group_id,
@@ -1522,29 +1692,48 @@ class MemoryStore:
     ) -> str:
         now = utc_now()
         row_id = new_id("tl")
+        event_type = clean_text(event_type, 80)
+        session_id = clean_text(session_id, 200)
+        subject_id = clean_text(subject_id, 120)
+        message_id = clean_text(metadata.get("message_id"), 120)
+        dedupe_key = (
+            stable_fingerprint("timeline", event_type, session_id, subject_id, message_id)
+            if message_id
+            else ""
+        )
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO timeline(
-                    id, event_type, session_id, scope, subject_id, object_id,
-                    content, metadata, occurred_at, created_at, summarized_at
+            with self._transaction_sync():
+                cur = self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO timeline(
+                        id, event_type, session_id, scope, subject_id, object_id,
+                        content, metadata, message_id, dedupe_key,
+                        occurred_at, created_at, summarized_at
+                    )
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?, '')
+                    """,
+                    (
+                        row_id,
+                        event_type,
+                        session_id,
+                        clean_text(scope, 40),
+                        subject_id,
+                        clean_text(object_id, 120),
+                        clean_text(content, 4000),
+                        json_dumps(metadata),
+                        message_id,
+                        dedupe_key,
+                        occurred_at or now,
+                        now,
+                    ),
                 )
-                VALUES(?,?,?,?,?,?,?,?,?,?,'')
-                """,
-                (
-                    row_id,
-                    clean_text(event_type, 80),
-                    clean_text(session_id, 200),
-                    clean_text(scope, 40),
-                    clean_text(subject_id, 120),
-                    clean_text(object_id, 120),
-                    clean_text(content, 4000),
-                    json_dumps(metadata),
-                    occurred_at or now,
-                    now,
-                ),
-            )
-            self._conn.commit()
+                if cur.rowcount == 0 and dedupe_key:
+                    existing = self._conn.execute(
+                        "SELECT id FROM timeline WHERE dedupe_key=?",
+                        (dedupe_key,),
+                    ).fetchone()
+                    if existing:
+                        return clean_text(existing["id"], 120)
         return row_id
 
     async def recent_timeline(
@@ -1784,6 +1973,39 @@ class MemoryStore:
     async def clear_summary_failure(self, session_id: str) -> bool:
         return await asyncio.to_thread(self._clear_summary_failure_sync, session_id)
 
+    async def mark_summary_failure_dead_letter(self, session_id: str, max_retries: int) -> bool:
+        return await asyncio.to_thread(
+            self._mark_summary_failure_dead_letter_sync,
+            session_id,
+            max_retries,
+        )
+
+    def _mark_summary_failure_dead_letter_sync(self, session_id: str, max_retries: int) -> bool:
+        session_id = clean_text(session_id, 200)
+        with self._lock:
+            with self._transaction_sync():
+                row = self._conn.execute(
+                    "SELECT metadata FROM summary_failures WHERE session_id=?",
+                    (session_id,),
+                ).fetchone()
+                if not row:
+                    return False
+                metadata = json_loads(row["metadata"], {})
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata.update(
+                    {
+                        "state": "dead_letter",
+                        "max_retries": max(1, int(max_retries or 1)),
+                        "dead_letter_at": utc_now(),
+                    }
+                )
+                cur = self._conn.execute(
+                    "UPDATE summary_failures SET metadata=?, updated_at=? WHERE session_id=?",
+                    (json_dumps(metadata), utc_now(), session_id),
+                )
+                return cur.rowcount > 0
+
     def _clear_summary_failure_sync(self, session_id: str) -> bool:
         with self._lock:
             cur = self._conn.execute(
@@ -2000,6 +2222,69 @@ class MemoryStore:
                 LIMIT ?
                 """,
                 params + [max(1, int(limit))],
+            ).fetchall()
+        return [MemoryRecord.from_row(row) for row in rows]
+
+    async def list_current_window_candidate_memories(
+        self,
+        *,
+        scope: str,
+        session_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        limit: int = 600,
+        include_pending: bool = False,
+    ) -> list[MemoryRecord]:
+        return await asyncio.to_thread(
+            self._list_current_window_candidate_memories_sync,
+            scope,
+            session_id,
+            user_id,
+            group_id,
+            limit,
+            include_pending,
+        )
+
+    def _list_current_window_candidate_memories_sync(
+        self,
+        scope: str,
+        session_id: str,
+        user_id: str,
+        group_id: str,
+        limit: int,
+        include_pending: bool,
+    ) -> list[MemoryRecord]:
+        scope = clean_text(scope, 40).lower()
+        session_id = clean_text(session_id, 200)
+        user_id = clean_text(user_id, 120)
+        group_id = clean_text(group_id, 120)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if session_id:
+            clauses.append("session_id=?")
+            params.append(session_id)
+        if scope == "group" and group_id:
+            clauses.append("(scope='group' AND group_id=?)")
+            params.append(group_id)
+        elif scope == "private" and user_id:
+            clauses.append("(scope='private' AND (subject_id=? OR object_id=?))")
+            params.extend([user_id, user_id])
+        if not clauses:
+            return []
+        where = "lifecycle != 'archived' AND (" + " OR ".join(clauses) + ")"
+        if not include_pending:
+            where += " AND review_status != 'pending'"
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT *
+                FROM memories
+                WHERE {where}
+                ORDER BY importance DESC,
+                         COALESCE(NULLIF(occurred_at, ''), NULLIF(updated_at, ''), created_at) DESC
+                LIMIT ?
+                """,
+                params + [max(1, int(limit or 1))],
             ).fetchall()
         return [MemoryRecord.from_row(row) for row in rows]
 
@@ -2939,13 +3224,16 @@ class MemoryStore:
         return await asyncio.to_thread(self._delete_memory_sync, memory_id)
 
     def _delete_memory_sync(self, memory_id: str) -> bool:
+        memory_id = clean_text(memory_id, 120)
         with self._lock:
-            cur = self._conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
-            self._conn.execute("DELETE FROM review_queue WHERE memory_id=?", (memory_id,))
-            self._conn.execute("DELETE FROM memory_embeddings WHERE memory_id=?", (memory_id,))
-            self._delete_memory_fts_row(memory_id)
-            self._conn.commit()
-            return cur.rowcount > 0
+            with self._transaction_sync():
+                self._conn.execute("DELETE FROM review_queue WHERE memory_id=?", (memory_id,))
+                self._conn.execute("DELETE FROM memory_embeddings WHERE memory_id=?", (memory_id,))
+                self._conn.execute("DELETE FROM relationship_edges WHERE source_memory_id=?", (memory_id,))
+                self._conn.execute("DELETE FROM knowledge_edges WHERE source_memory_id=?", (memory_id,))
+                self._delete_memory_fts_row(memory_id)
+                cur = self._conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+                return cur.rowcount > 0
 
     async def update_review_status(self, memory_id: str, status: str) -> bool:
         return await asyncio.to_thread(self._update_review_status_sync, memory_id, status)
@@ -3098,79 +3386,79 @@ class MemoryStore:
 
     def _maintenance_repair_sync(self) -> dict[str, Any]:
         with self._lock:
-            manual_fixed = self.normalize_legacy_manual_visibility()
-            utterance_fixed_cur = self._conn.execute(
-                """
-                UPDATE memories
-                SET reality_level='observed_utterance', updated_at=?
-                WHERE memory_type='conversation_event' AND reality_level='real_user_fact'
-                """,
-                (utc_now(),),
-            )
-            all_rows = self._conn.execute("SELECT * FROM memories").fetchall()
-            fingerprint_fixed = 0
-            for row in all_rows:
-                record = MemoryRecord.from_row(row)
-                old_fingerprint = record.content_fingerprint
-                record.content_fingerprint = ""
-                record.ensure_defaults()
-                if record.content_fingerprint != old_fingerprint or int(row["merged_count"] or 0) < 1:
-                    self._conn.execute(
-                        "UPDATE memories SET content_fingerprint=?, merged_count=max(merged_count, 1), updated_at=? WHERE id=?",
-                        (record.content_fingerprint, utc_now(), record.id),
-                    )
-                    fingerprint_fixed += 1
-
-            duplicates = self._conn.execute(
-                """
-                SELECT content_fingerprint, COUNT(*) AS count
-                FROM memories
-                WHERE content_fingerprint!='' AND lifecycle!='archived'
-                GROUP BY content_fingerprint
-                HAVING count > 1
-                """
-            ).fetchall()
-            merged = 0
-            for dup in duplicates:
-                rows = self._conn.execute(
+            with self._transaction_sync():
+                manual_fixed = self._normalize_legacy_manual_visibility_sync()
+                utterance_fixed_cur = self._conn.execute(
                     """
-                    SELECT id, importance, confidence, merged_count, created_at
-                    FROM memories
-                    WHERE content_fingerprint=? AND lifecycle!='archived'
-                    ORDER BY merged_count DESC, importance DESC, created_at ASC
+                    UPDATE memories
+                    SET reality_level='observed_utterance', updated_at=?
+                    WHERE memory_type='conversation_event' AND reality_level='real_user_fact'
                     """,
-                    (dup["content_fingerprint"],),
+                    (utc_now(),),
+                )
+                all_rows = self._conn.execute("SELECT * FROM memories").fetchall()
+                fingerprint_fixed = 0
+                for row in all_rows:
+                    record = MemoryRecord.from_row(row)
+                    old_fingerprint = record.content_fingerprint
+                    record.content_fingerprint = ""
+                    record.ensure_defaults()
+                    if record.content_fingerprint != old_fingerprint or int(row["merged_count"] or 0) < 1:
+                        self._conn.execute(
+                            "UPDATE memories SET content_fingerprint=?, merged_count=max(merged_count, 1), updated_at=? WHERE id=?",
+                            (record.content_fingerprint, utc_now(), record.id),
+                        )
+                        fingerprint_fixed += 1
+
+                duplicates = self._conn.execute(
+                    """
+                    SELECT content_fingerprint, COUNT(*) AS count
+                    FROM memories
+                    WHERE content_fingerprint!='' AND lifecycle!='archived'
+                    GROUP BY content_fingerprint
+                    HAVING count > 1
+                    """
                 ).fetchall()
-                keep = rows[0]
-                for row in rows[1:]:
-                    self._conn.execute(
+                merged = 0
+                for dup in duplicates:
+                    rows = self._conn.execute(
                         """
-                        UPDATE memories
-                        SET lifecycle='archived', supersedes_id=?, updated_at=?
-                        WHERE id=?
+                        SELECT id, importance, confidence, merged_count, created_at
+                        FROM memories
+                        WHERE content_fingerprint=? AND lifecycle!='archived'
+                        ORDER BY merged_count DESC, importance DESC, created_at ASC
                         """,
-                        (keep["id"], utc_now(), row["id"]),
-                    )
-                    self._conn.execute(
-                        """
-                        UPDATE memories
-                        SET importance=max(importance, ?),
-                            confidence=max(confidence, ?),
-                            merged_count=COALESCE(merged_count, 1) + COALESCE(?, 1),
-                            updated_at=?
-                        WHERE id=?
-                        """,
-                        (
-                            row["importance"],
-                            row["confidence"],
-                            row["merged_count"],
-                            utc_now(),
-                            keep["id"],
-                        ),
-                    )
-                    merged += 1
-            fts_rebuilt = self._rebuild_memory_fts_sync() if self._fts_enabled else 0
-            self._conn.commit()
+                        (dup["content_fingerprint"],),
+                    ).fetchall()
+                    keep = rows[0]
+                    for row in rows[1:]:
+                        self._conn.execute(
+                            """
+                            UPDATE memories
+                            SET lifecycle='archived', supersedes_id=?, updated_at=?
+                            WHERE id=?
+                            """,
+                            (keep["id"], utc_now(), row["id"]),
+                        )
+                        self._conn.execute(
+                            """
+                            UPDATE memories
+                            SET importance=max(importance, ?),
+                                confidence=max(confidence, ?),
+                                merged_count=COALESCE(merged_count, 1) + COALESCE(?, 1),
+                                updated_at=?
+                            WHERE id=?
+                            """,
+                            (
+                                row["importance"],
+                                row["confidence"],
+                                row["merged_count"],
+                                utc_now(),
+                                keep["id"],
+                            ),
+                        )
+                        merged += 1
+                fts_rebuilt = self._rebuild_memory_fts_sync() if self._fts_enabled else 0
         return {
             "manual_visibility_fixed": manual_fixed,
             "utterance_reality_fixed": int(utterance_fixed_cur.rowcount or 0),
@@ -3208,40 +3496,101 @@ class MemoryStore:
             return 0
         now = utc_now()
         with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT id, metadata
-                FROM memories
-                WHERE lifecycle='raw_event'
-                  AND COALESCE(NULLIF(occurred_at, ''), created_at) < ?
-                ORDER BY COALESCE(NULLIF(occurred_at, ''), created_at) ASC
-                LIMIT ?
-                """,
-                (cutoff_at, max(1, int(limit or 1))),
-            ).fetchall()
-            archived = 0
-            for row in rows:
-                metadata = json_loads(row["metadata"], {})
-                if not isinstance(metadata, dict):
-                    metadata = {}
-                metadata["retention_archived"] = {
-                    "reason": "raw_event_retention",
-                    "cutoff_at": cutoff_at,
-                    "archived_at": now,
-                }
-                cur = self._conn.execute(
+            with self._transaction_sync():
+                rows = self._conn.execute(
                     """
-                    UPDATE memories
-                    SET lifecycle='archived',
-                        metadata=?,
-                        updated_at=?
-                    WHERE id=? AND lifecycle='raw_event'
+                    SELECT id, metadata
+                    FROM memories
+                    WHERE lifecycle='raw_event'
+                      AND COALESCE(NULLIF(occurred_at, ''), created_at) < ?
+                    ORDER BY COALESCE(NULLIF(occurred_at, ''), created_at) ASC
+                    LIMIT ?
                     """,
-                    (json_dumps(metadata), now, row["id"]),
-                )
-                archived += int(cur.rowcount or 0)
-            self._conn.commit()
+                    (cutoff_at, max(1, int(limit or 1))),
+                ).fetchall()
+                archived = 0
+                for row in rows:
+                    metadata = json_loads(row["metadata"], {})
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                    metadata["retention_archived"] = {
+                        "reason": "raw_event_retention",
+                        "cutoff_at": cutoff_at,
+                        "archived_at": now,
+                    }
+                    cur = self._conn.execute(
+                        """
+                        UPDATE memories
+                        SET lifecycle='archived',
+                            metadata=?,
+                            updated_at=?
+                        WHERE id=? AND lifecycle='raw_event'
+                        """,
+                        (json_dumps(metadata), now, row["id"]),
+                    )
+                    archived += int(cur.rowcount or 0)
         return archived
+
+    async def prune_retained_rows(
+        self,
+        *,
+        summarized_timeline_cutoff: str = "",
+        injection_log_cutoff: str = "",
+        limit: int = 2000,
+    ) -> dict[str, int]:
+        return await asyncio.to_thread(
+            self._prune_retained_rows_sync,
+            summarized_timeline_cutoff,
+            injection_log_cutoff,
+            limit,
+        )
+
+    def _prune_retained_rows_sync(
+        self,
+        summarized_timeline_cutoff: str,
+        injection_log_cutoff: str,
+        limit: int,
+    ) -> dict[str, int]:
+        summarized_timeline_cutoff = clean_text(summarized_timeline_cutoff, 80)
+        injection_log_cutoff = clean_text(injection_log_cutoff, 80)
+        safe_limit = max(1, int(limit or 1))
+        deleted = {"timeline": 0, "injection_logs": 0}
+        with self._lock:
+            with self._transaction_sync():
+                if summarized_timeline_cutoff:
+                    rows = self._conn.execute(
+                        """
+                        SELECT id
+                        FROM timeline
+                        WHERE summarized_at!=''
+                          AND COALESCE(NULLIF(occurred_at, ''), created_at) < ?
+                        ORDER BY COALESCE(NULLIF(occurred_at, ''), created_at) ASC
+                        LIMIT ?
+                        """,
+                        (summarized_timeline_cutoff, safe_limit),
+                    ).fetchall()
+                    ids = [row["id"] for row in rows]
+                    if ids:
+                        result: dict[str, int] = {}
+                        self._delete_many_by_ids("timeline", "id", ids, result)
+                        deleted["timeline"] = result.get("timeline", 0)
+                if injection_log_cutoff:
+                    rows = self._conn.execute(
+                        """
+                        SELECT id
+                        FROM injection_logs
+                        WHERE created_at < ?
+                        ORDER BY created_at ASC
+                        LIMIT ?
+                        """,
+                        (injection_log_cutoff, safe_limit),
+                    ).fetchall()
+                    ids = [row["id"] for row in rows]
+                    if ids:
+                        result = {}
+                        self._delete_many_by_ids("injection_logs", "id", ids, result)
+                        deleted["injection_logs"] = result.get("injection_logs", 0)
+        return deleted
 
     async def archive_memories(
         self,
@@ -3375,7 +3724,8 @@ class MemoryStore:
                 INSERT INTO memory_embeddings(
                     memory_id, provider_id, text_hash, dimension, vector, created_at, updated_at
                 )
-                VALUES(?,?,?,?,?,?,?)
+                SELECT ?,?,?,?,?,?,?
+                WHERE EXISTS(SELECT 1 FROM memories WHERE id=?)
                 ON CONFLICT(memory_id, provider_id) DO UPDATE SET
                     text_hash=excluded.text_hash,
                     dimension=excluded.dimension,
@@ -3390,6 +3740,7 @@ class MemoryStore:
                     json_dumps(values),
                     now,
                     now,
+                    memory_id,
                 ),
             )
             self._conn.commit()
@@ -3417,6 +3768,16 @@ class MemoryStore:
         provider_id = clean_text(provider_id, 160)
         if not provider_id:
             return []
+        safe_limit = max(1, int(limit or 1))
+        with self._lock:
+            revision = self._memory_revision_sync()
+            if revision != self._embedding_candidate_cache_revision:
+                self._embedding_candidate_cache.clear()
+                self._embedding_candidate_cache_revision = revision
+            cache_key = (provider_id, bool(include_pending), safe_limit)
+            cached = self._embedding_candidate_cache.get(cache_key)
+            if cached is not None:
+                return deepcopy(cached)
         where = "m.lifecycle != 'archived' AND e.provider_id=?"
         params: list[Any] = [provider_id]
         if not include_pending:
@@ -3434,7 +3795,7 @@ class MemoryStore:
                 ORDER BY m.importance DESC, COALESCE(NULLIF(m.occurred_at, ''), m.created_at) DESC
                 LIMIT ?
                 """,
-                params + [max(1, int(limit or 1))],
+                params + [safe_limit],
             ).fetchall()
         result: list[tuple[MemoryRecord, list[float], str]] = []
         for row in rows:
@@ -3451,7 +3812,9 @@ class MemoryStore:
             if not vector:
                 continue
             result.append((MemoryRecord.from_row(row), vector, clean_text(row["embedding_text_hash"], 80)))
-        return result
+        with self._lock:
+            self._embedding_candidate_cache[cache_key] = result
+        return deepcopy(result)
 
     async def list_memories_missing_embeddings(
         self,
@@ -3525,18 +3888,11 @@ class MemoryStore:
     def _memory_revision_sync(self) -> str:
         with self._lock:
             row = self._conn.execute(
-                """
-                SELECT
-                    COUNT(*) AS count,
-                    COALESCE(MAX(updated_at), '') AS updated_at,
-                    COALESCE(MAX(created_at), '') AS created_at
-                FROM memories
-                WHERE lifecycle!='archived'
-                """
+                "SELECT revision FROM retrieval_revision WHERE singleton=1"
             ).fetchone()
         if not row:
-            return "0::"
-        return f"{int(row['count'] or 0)}:{row['updated_at'] or ''}:{row['created_at'] or ''}"
+            return "0"
+        return str(int(row["revision"] or 0))
 
     def _stats_sync(self) -> dict[str, Any]:
         with self._lock:
