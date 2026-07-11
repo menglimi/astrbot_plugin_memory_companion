@@ -1171,6 +1171,23 @@ class MemoryStore:
             self._conn.commit()
         return row_id
 
+    async def list_identities(self, limit: int = 1000) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_identities_sync, limit)
+
+    def _list_identities_sync(self, limit: int) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM identities ORDER BY updated_at DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["aliases"] = json_loads(item.get("aliases"), [])
+            item["profile"] = json_loads(item.get("profile"), {})
+            result.append(item)
+        return result
+
     async def upsert_relationship(
         self,
         *,
@@ -3037,6 +3054,8 @@ class MemoryStore:
         evidence: str | None = None,
         importance: Any | None = None,
         confidence: Any | None = None,
+        visibility: str | None = None,
+        lifecycle: str | None = None,
     ) -> bool:
         return await asyncio.to_thread(
             self._update_memory_payload_sync,
@@ -3046,6 +3065,8 @@ class MemoryStore:
             evidence,
             importance,
             confidence,
+            visibility,
+            lifecycle,
         )
 
     def _update_memory_payload_sync(
@@ -3056,63 +3077,71 @@ class MemoryStore:
         evidence: str | None,
         importance: Any | None,
         confidence: Any | None,
+        visibility: str | None,
+        lifecycle: str | None,
     ) -> bool:
         memory_id = clean_text(memory_id, 120)
         with self._lock:
-            row = self._conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
-            if not row:
-                return False
-            next_type = clean_text(memory_type if memory_type is not None else row["memory_type"], 80) or row["memory_type"]
-            next_content = clean_text(content if content is not None else row["content"], 4000)
-            next_evidence = clean_text(evidence if evidence is not None else row["evidence"], 4000)
-            try:
-                next_importance = max(0.0, min(1.0, float(importance if importance is not None else row["importance"])))
-            except Exception:
-                next_importance = float(row["importance"] or 0.3)
-            try:
-                next_confidence = max(0.0, min(1.0, float(confidence if confidence is not None else row["confidence"])))
-            except Exception:
-                next_confidence = float(row["confidence"] or 0.5)
-            fingerprint = stable_fingerprint(
-                next_type,
-                row["scope"],
-                row["session_id"],
-                row["group_id"],
-                row["subject_kind"],
-                row["subject_id"],
-                row["object_kind"],
-                row["object_id"],
-                row["visibility"],
-                row["reality_level"],
-                next_content,
-            )
-            cur = self._conn.execute(
-                """
-                UPDATE memories
-                SET memory_type=?,
-                    content=?,
-                    evidence=?,
-                    importance=?,
-                    confidence=?,
-                    content_fingerprint=?,
-                    updated_at=?
-                WHERE id=?
-                """,
-                (
+            with self._transaction_sync():
+                row = self._conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
+                if not row:
+                    return False
+                next_type = clean_text(memory_type if memory_type is not None else row["memory_type"], 80) or row["memory_type"]
+                next_content = clean_text(content if content is not None else row["content"], 4000)
+                next_evidence = clean_text(evidence if evidence is not None else row["evidence"], 4000)
+                next_visibility = clean_text(visibility if visibility is not None else row["visibility"], 40) or row["visibility"]
+                next_lifecycle = clean_text(lifecycle if lifecycle is not None else row["lifecycle"], 40) or row["lifecycle"]
+                try:
+                    next_importance = max(0.0, min(1.0, float(importance if importance is not None else row["importance"])))
+                except Exception:
+                    next_importance = float(row["importance"] or 0.3)
+                try:
+                    next_confidence = max(0.0, min(1.0, float(confidence if confidence is not None else row["confidence"])))
+                except Exception:
+                    next_confidence = float(row["confidence"] or 0.5)
+                fingerprint = stable_fingerprint(
                     next_type,
+                    row["scope"],
+                    row["session_id"],
+                    row["group_id"],
+                    row["subject_kind"],
+                    row["subject_id"],
+                    row["object_kind"],
+                    row["object_id"],
+                    next_visibility,
+                    row["reality_level"],
                     next_content,
-                    next_evidence,
-                    next_importance,
-                    next_confidence,
-                    fingerprint,
-                    utc_now(),
-                    memory_id,
-                ),
-            )
-            row = self._conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
-            self._upsert_memory_fts_row(row)
-            self._conn.commit()
-            return cur.rowcount > 0
+                )
+                cur = self._conn.execute(
+                    """
+                    UPDATE memories
+                    SET memory_type=?,
+                        content=?,
+                        evidence=?,
+                        importance=?,
+                        confidence=?,
+                        visibility=?,
+                        lifecycle=?,
+                        content_fingerprint=?,
+                        updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        next_type,
+                        next_content,
+                        next_evidence,
+                        next_importance,
+                        next_confidence,
+                        next_visibility,
+                        next_lifecycle,
+                        fingerprint,
+                        utc_now(),
+                        memory_id,
+                    ),
+                )
+                row = self._conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
+                self._upsert_memory_fts_row(row)
+                return cur.rowcount > 0
 
     async def update_memory_reaction_feedback(
         self,

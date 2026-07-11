@@ -150,10 +150,34 @@
               <section class="archive-section" data-archive-section="maintenance">
                 <h4>维护 / 迁移 / 清理</h4>
                 <div class="maintenance-box">
-                  <p class="archive-note">推荐顺序：先预览 LivingMemory 导入，再执行导入；如旧导入出现纯编号内容，再修复内容；最后运行维护刷新索引和统计。清空数据会先备份数据库，请谨慎执行。</p>
+                  <p class="archive-note">推荐先选择运行预设并查看诊断，再执行迁移或维护。所有导入与清空操作都会先备份数据库。</p>
                   <div class="maintenance-tool-grid">
                     <section class="maintenance-action">
-                      <b>1. LivingMemory 导入</b>
+                      <b>1. 运行预设</b>
+                      <p class="archive-note">轻量模式关闭外部检索调用；标准模式平衡功能和成本；陪伴模式提高关系与连续性记忆预算。已有 Provider 选择不会被覆盖。</p>
+                      <div class="inline-actions">
+                        <button type="button" data-operation-preset="light">轻量</button>
+                        <button type="button" data-operation-preset="standard">标准</button>
+                        <button type="button" data-operation-preset="companion">陪伴</button>
+                      </div>
+                    </section>
+                    <section class="maintenance-action">
+                      <b>2. 运维诊断</b>
+                      <p class="archive-note">查看检索路径、缓存命中率、模型 Token 与耗时，以及可能重复注入的记忆插件目录。</p>
+                      <button id="operationsDiagnosticsBtn" type="button">生成诊断</button>
+                    </section>
+                    <section class="maintenance-action">
+                      <b>3. 可移植数据</b>
+                      <p class="archive-note">UTF-8 JSONL 包含记忆、身份、关系、时间线与 ACL；不包含凭据、向量和注入日志。</p>
+                      <input id="portableArchivePath" type="text" placeholder="导入时填写 JSONL 路径；导出无需填写" />
+                      <div class="inline-actions">
+                        <button id="portableExportBtn" type="button">导出</button>
+                        <button id="portablePreviewBtn" type="button">预览</button>
+                        <button id="portableImportBtn" type="button">导入</button>
+                      </div>
+                    </section>
+                    <section class="maintenance-action">
+                      <b>4. LivingMemory 导入</b>
                       <p class="archive-note">先预览可导入数量和跳过原因，再执行导入。当前策略只导入完整摘要，跳过派生碎片。</p>
                       <input class="livingmemory-path" type="text" placeholder="LivingMemory 数据库路径，可留空自动扫描" />
                       <div class="inline-actions">
@@ -162,18 +186,18 @@
                       </div>
                     </section>
                     <section class="maintenance-action">
-                      <b>2. 内容修复</b>
+                      <b>5. 内容修复</b>
                       <p class="archive-note">用于修复早期导入后只剩旧库编号的记忆。建议先确认 LivingMemory 数据库路径，再执行修复。</p>
                       <input class="livingmemory-path" type="text" placeholder="LivingMemory 数据库路径，可留空自动扫描" />
                       <button id="repairLivingMemoryBtn" type="button">修复 LivingMemory 内容</button>
                     </section>
                     <section class="maintenance-action">
-                      <b>3. 维护检查</b>
+                      <b>6. 维护检查</b>
                       <p class="archive-note">修复索引、刷新统计并整理数据库状态。适合导入、清理或配置调整后手动执行一次。</p>
                       <button id="maintenanceBtn" type="button">运行维护</button>
                     </section>
                     <section class="maintenance-action">
-                      <b>4. 危险清理</b>
+                      <b>7. 危险清理</b>
                       <p class="archive-note">清空会先备份数据库，再删除记忆、权限规则、时间线、关系、身份、注入日志和导入批次。</p>
                       <button id="clearAllMemoryBtn" class="danger" type="button">清空全部记忆</button>
                     </section>

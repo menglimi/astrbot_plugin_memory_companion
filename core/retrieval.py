@@ -1811,11 +1811,32 @@ class RetrievalEngine:
                 continue
             terms.append(term_word)
             terms.extend(self._current_state_anchor_terms(term_word))
-        return [
+        normalized_terms = [
             term
             for term in dict.fromkeys(term.lower() for term in terms if len(term.strip()) >= 2)
             if not self._is_query_scaffold_term(term)
-        ][:20]
+        ]
+        normalized_terms.extend(
+            term for term in self._preference_equivalent_terms(query) if term not in normalized_terms
+        )
+        return normalized_terms[:24]
+
+    @staticmethod
+    def _preference_equivalent_terms(text: str) -> list[str]:
+        compact = re.sub(r"\s+", "", clean_text(text, 1000)).lower()
+        if not compact:
+            return []
+        families = (
+            ("无糖", "不加糖", "不要加糖", "不放糖"),
+            ("少糖", "低糖", "微糖"),
+            ("无冰", "去冰", "不加冰", "不要冰"),
+            ("不要香菜", "不吃香菜", "去香菜"),
+        )
+        expanded: list[str] = []
+        for family in families:
+            if any(term in compact for term in family):
+                expanded.extend(term for term in family if term not in expanded)
+        return expanded
 
     def _query_profile(self, query: str, terms: list[str]) -> dict[str, object]:
         compact = re.sub(r"\s+", "", query).lower()

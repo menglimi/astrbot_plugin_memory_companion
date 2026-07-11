@@ -97,6 +97,23 @@ class RetrievalPerformanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, store.keyword_calls)
         self.assertFalse(engine._rank_path_info["keyword_fallback_used"])
 
+    async def test_common_preference_equivalence_is_recalled_without_embedding(self) -> None:
+        current = _memory("preference-1", "用户喝拿铁时不要加糖。")
+        store = _CandidateStore(current=[current])
+        engine = RetrievalEngine(
+            store,
+            VisibilityPolicy(enable_acl_rules=False),
+            retrieval_mode="basic",
+            embedding_enabled=False,
+            knowledge_graph_enabled=False,
+        )
+        ctx = SessionContext(session_id="s1", scope="private", user_id="u1")
+
+        results, _blocked = await engine._rank_candidates("无糖拿铁", ctx)
+
+        self.assertIn("preference-1", {item.memory.id for item in results})
+        self.assertIn("不要加糖", engine._terms("无糖拿铁"))
+
     async def test_vector_candidate_cache_is_copy_safe_and_revisioned(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             store = MemoryStore(Path(temp) / "memory.db")

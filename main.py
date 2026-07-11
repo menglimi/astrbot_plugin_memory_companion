@@ -16,7 +16,7 @@ from .core.models import json_dumps
 from .core.service import MemoryCompanionService
 
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
-PLUGIN_VERSION = "1.4.6"
+PLUGIN_VERSION = "1.5.0"
 
 _ACTIVE_BRIDGE: MemoryCompanionBridge | None = None
 
@@ -272,6 +272,25 @@ class MemoryCompanionPlugin(Star):
     @mcomp.command("maintenance", priority=10)
     async def cmd_mcomp_maintenance(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
         yield event.plain_result(await self.commands.maintenance())
+
+    @permission_type(PermissionType.ADMIN)
+    @mcomp.command("diagnostics", priority=10)
+    async def cmd_mcomp_diagnostics(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
+        yield event.plain_result(await self.commands.diagnostics())
+
+    @permission_type(PermissionType.ADMIN)
+    @mcomp.command("preset", priority=10)
+    async def cmd_mcomp_preset(
+        self, event: AstrMessageEvent, action: str = "status", name: str = ""
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        yield event.plain_result(self.commands.preset(action, name))
+
+    @permission_type(PermissionType.ADMIN)
+    @mcomp.command("data", priority=10)
+    async def cmd_mcomp_data(
+        self, event: AstrMessageEvent, action: str = "help", path: str = ""
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        yield event.plain_result(await self.commands.portable_data(action, path))
 
     @permission_type(PermissionType.ADMIN)
     @mcomp.command("sleep", priority=10)

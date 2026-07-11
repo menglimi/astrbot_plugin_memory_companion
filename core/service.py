@@ -36,6 +36,14 @@ from .injection import (
 )
 from .migration_livingmemory import LivingMemoryMigrator
 from .models import EntityRef, MemoryRecord, SearchResult, SessionContext, clean_text, json_dumps, json_loads, utc_now
+from .operations import (
+    PRESET_LABELS,
+    PortableMemoryArchive,
+    apply_preset,
+    build_operational_report,
+    detect_preset,
+    persist_runtime_config,
+)
 from .reply_chain import ReplyChainResolver
 from .retrieval import RetrievalEngine
 from .store import MemoryStore
@@ -100,6 +108,7 @@ class MemoryCompanionService:
         self._RETRIEVAL_RESULT_CACHE_TTL: float = 45.0
         self._RETRIEVAL_RESULT_CACHE_MAX: int = 128
         self.migrator = LivingMemoryMigrator(self.store, self.plugin_root, self.data_dir)
+        self.portable_archive = PortableMemoryArchive(self.store, self.data_dir)
         self.sleep_state_path = self.data_dir / "memory_companion_sleep_state.json"
         self.token_usage_path = self.data_dir / "memory_companion_token_usage.json"
         self._token_usage_last_save_at: float = 0.0
@@ -2631,6 +2640,33 @@ class MemoryCompanionService:
             limit=self.config.int("livingmemory_migration.import_limit", 5000),
         )
 
+    def operation_preset_status(self) -> dict[str, Any]:
+        preset = detect_preset(self.config)
+        return {"preset": preset, "label": PRESET_LABELS[preset]}
+
+    def apply_operation_preset(self, name: str) -> dict[str, Any]:
+        raw = self.config.raw
+        if not isinstance(raw, dict):
+            raise RuntimeError("runtime config is not writable")
+        result = apply_preset(raw, name)
+        result["config_path"] = str(persist_runtime_config(raw, self.data_dir))
+        self._retrieval_result_cache.clear()
+        return result
+
+    async def operational_report(self) -> dict[str, Any]:
+        return await build_operational_report(self)
+
+    async def export_portable_data(self) -> dict[str, Any]:
+        return await self.portable_archive.export()
+
+    def preview_portable_data(self, path: str) -> dict[str, Any]:
+        return self.portable_archive.preview(path)
+
+    async def import_portable_data(self, path: str) -> dict[str, Any]:
+        result = await self.portable_archive.import_data(path)
+        self._retrieval_result_cache.clear()
+        return result
+
     async def clear_all_memory_data(self) -> dict[str, Any]:
         await self._cancel_background_tasks_for_clear()
         result = await self.store.clear_all_memory_data()
@@ -3986,6 +4022,17 @@ class MemoryCompanionService:
                 suppress_long_memory=True,
                 suppress_reason="recent_context_request",
                 guard_lines=["- 当前消息询问或承接近端原始上下文；优先依据 AstrBot 原始上下文，不主动召回长期记忆。"],
+            )
+        if self._message_is_shared_routine_invocation(text):
+            return MemoryRouteDecision(
+                layer="shared_routine",
+                query_mode="current_message",
+                allow_contextual_expansion=False,
+                guard_lines=[
+                    "- 当前消息可能是双方约定俗成的例行互动简称，也可能只是普通状态确认；结合当前上下文和直接相关记忆判断。",
+                    "- 如果多条可靠记忆对简称含义给出一致线索，可以自然承接；不要仅因处于夜间或休息状态就忽略这些线索。",
+                    "- 证据不足、只有单条弱线索或彼此矛盾时，简短自然地确认含义；只使用必要信息，不复述密码、无关私密细节或旧检查结果。",
+                ],
             )
         if correction and not explicit_memory:
             return MemoryRouteDecision(
@@ -5360,6 +5407,10 @@ class MemoryCompanionService:
             return "tone", "mention_policy:tone_only"
         if not explicit_memory and mentionability <= 0.25:
             return "tone", "user_reaction_boundary:low_mentionability"
+        if decision.layer == "shared_routine":
+            if self._memory_supports_shared_routine(memory, text):
+                return "mention", "shared_routine:direct_evidence"
+            return "tone", "shared_routine:indirect_background"
         if slot == "open_loop":
             if short_rest_check and not explicit_memory:
                 return "tone", "short_rest_check:open_loop_tone_only"
@@ -5437,8 +5488,8 @@ class MemoryCompanionService:
         if not compact:
             return False
         check_like = (
-            compact in {"例行检查", "查岗", "查岗了", "在吗", "在不在", "还在吗", "睡了吗", "睡没", "醒着吗"}
-            or any(word in compact for word in ("例行检查", "查岗", "在不在", "还在吗", "醒着吗"))
+            compact in {"查岗", "查岗了", "在吗", "在不在", "还在吗", "睡了吗", "睡没", "醒着吗"}
+            or any(word in compact for word in ("查岗", "在不在", "还在吗", "醒着吗"))
         )
         if not check_like:
             return False
@@ -5447,6 +5498,49 @@ class MemoryCompanionService:
         except Exception:
             return True
         return hour >= 23 or hour < 7
+
+    @staticmethod
+    def _message_is_shared_routine_invocation(text: str) -> bool:
+        text = clean_text(text, 80)
+        if not text or len(text) > 24:
+            return False
+        compact = re.sub(r"[\s，。！？!?,.、~～…]+", "", text)
+        if not compact:
+            return False
+        markers = ("例行检查", "日常检查", "每日检查", "晚间检查", "夜间检查")
+        if compact in markers:
+            return True
+        prefixes = ("开始", "来", "继续", "进行", "该")
+        suffixes = ("啦", "咯", "了", "开始", "时间", "时间到", "一下")
+        return any(
+            compact == f"{prefix}{marker}" or compact == f"{marker}{suffix}"
+            for marker in markers
+            for prefix in prefixes
+            for suffix in suffixes
+        )
+
+    @staticmethod
+    def _memory_supports_shared_routine(memory: MemoryRecord, query_text: str) -> bool:
+        if not MemoryCompanionService._message_is_shared_routine_invocation(query_text):
+            return False
+        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+        metadata_parts: list[str] = []
+        for key in ("canonical_summary", "memory_reason"):
+            value = clean_text(metadata.get(key), 1000)
+            if value:
+                metadata_parts.append(value)
+        for key in ("key_facts", "routine_check_notes"):
+            values = metadata.get(key)
+            if isinstance(values, list):
+                metadata_parts.extend(clean_text(value, 500) for value in values if clean_text(value, 500))
+        evidence = " ".join(
+            [
+                clean_text(memory.content, 3000),
+                clean_text(memory.evidence, 1500),
+                *metadata_parts,
+            ]
+        )
+        return any(marker in evidence for marker in ("例行检查", "日常检查", "每日检查", "晚间检查", "夜间检查"))
 
     @staticmethod
     def _append_expression_reason(reason: Any, expression: str, expression_reason: str) -> str:

@@ -246,7 +246,7 @@ class EpistemicCalibrationTests(unittest.TestCase):
             platform="qq",
             user_id="u",
             bot_id="b",
-            message_text="例行检查的是胖次啦",
+            message_text="在不在呀",
         )
         memory = MemoryRecord(
             id="rest-summary",
@@ -275,6 +275,94 @@ class EpistemicCalibrationTests(unittest.TestCase):
         self.assertNotIn("<open_loops>", injected)
         self.assertNotIn("5739", injected)
         self.assertNotIn("夹层密码", injected)
+
+    def test_shared_routine_invocation_keeps_direct_memory_evidence(self) -> None:
+        composer = InjectionComposer()
+        ctx = SessionContext(
+            session_id="s",
+            scope="private",
+            platform="qq",
+            user_id="u",
+            bot_id="b",
+            message_text="例行检查",
+        )
+        memory = MemoryRecord(
+            id="routine-summary",
+            memory_type="conversation_summary",
+            subject=EntityRef(kind="user", id="u"),
+            scope="private",
+            session_id="s",
+            visibility="private_pair",
+            content="双方过去多次把例行检查用于胖次检查。夹层密码是5739。",
+            confidence=0.9,
+            importance=0.9,
+        )
+        result = SearchResult(memory=memory, score=1.0, reason="expression=mention")
+
+        injected = composer.compose(
+            ctx,
+            [result],
+            max_chars=4000,
+            slot_sections=[("conversation_summary", [result])],
+            time_of_day="late_night",
+        )
+
+        self.assertNotIn("<rest_check_hint>", injected)
+        self.assertNotIn("<rest_check_memory>", injected)
+        self.assertIn("例行检查用于胖次检查", injected)
+        self.assertNotIn("5739", injected)
+
+    def test_shared_routine_has_dedicated_route_and_direct_expression(self) -> None:
+        service = self.make_service()
+        ctx = SessionContext(
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            platform="qq",
+            user_id="u1",
+            bot_id="bot-1",
+            message_text="例行检查",
+        )
+        decision = service._memory_route_decision(
+            ctx,
+            analyze_turn_signal(ctx.message_text),
+            parse_time_intent(ctx.message_text),
+        )
+        memory = MemoryRecord(
+            id="routine-evidence",
+            memory_type="conversation_summary",
+            subject=EntityRef(kind="user", id="u1"),
+            scope="private",
+            session_id=ctx.session_id,
+            visibility="private_pair",
+            content="过去的例行检查指胖次检查。",
+            confidence=0.9,
+            importance=0.9,
+        )
+        expression, reason = service._memory_expression_decision(
+            ctx,
+            memory,
+            SearchResult(memory=memory, score=1.0),
+            "conversation_summary",
+            decision,
+            parse_time_intent(ctx.message_text),
+            query_text=ctx.message_text,
+        )
+
+        self.assertEqual("shared_routine", decision.layer)
+        self.assertFalse(decision.suppress_long_memory)
+        self.assertFalse(decision.allow_contextual_expansion)
+        self.assertTrue(any("结合当前上下文" in line for line in decision.guard_lines))
+        self.assertTrue(any("多条可靠记忆" in line for line in decision.guard_lines))
+        self.assertTrue(any("证据不足" in line for line in decision.guard_lines))
+        self.assertEqual("mention", expression)
+        self.assertEqual("shared_routine:direct_evidence", reason)
+
+    def test_presence_check_remains_separate_from_shared_routine(self) -> None:
+        self.assertTrue(InjectionComposer._short_rest_check_hint("在不在", "late_night", "困倦"))
+        self.assertFalse(InjectionComposer._short_rest_check_hint("例行检查", "late_night", "困倦"))
+        self.assertTrue(MemoryCompanionService._message_is_shared_routine_invocation("例行检查"))
+        self.assertTrue(MemoryCompanionService._message_is_shared_routine_invocation("晚间检查时间到"))
+        self.assertFalse(MemoryCompanionService._message_is_shared_routine_invocation("上次例行检查结果是什么"))
 
     def test_tone_open_loop_is_not_framed_as_pending_task(self) -> None:
         composer = InjectionComposer()

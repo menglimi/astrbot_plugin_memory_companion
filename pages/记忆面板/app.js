@@ -23,6 +23,11 @@ const PERSONAL_MEMORY_VIEW = {
     hint: "需要安装并启用主动陪伴插件后，才能查看 Bot 自身的日程与细化。",
     small: "需要陪伴插件",
   },
+  error: {
+    title: "个人记忆检测失败",
+    hint: "陪伴插件状态暂时无法读取，请查看错误并重试。",
+    small: "检测失败 · 可重试",
+  },
 };
 
 const SECONDARY_NAV = {
@@ -154,6 +159,7 @@ const state = {
   activeMemoryId: "",
   secondaryNav: {},
   companionPersonalAvailable: null,
+  companionPersonalError: "",
   personalDates: [],
   selectedPersonalDate: "",
   selectedScheduleIndex: "",
@@ -1070,7 +1076,7 @@ function renderPersonalDateRail(dates, selectedDate) {
     `;
   }).join("") : `<div class="empty-state">还没有可选择的日期。</div>`;
   $$("#bucketList [data-personal-date]").forEach((item) => {
-    item.addEventListener("click", () => selectPersonalDate(item.dataset.personalDate));
+    item.addEventListener("click", () => withBusy("正在切换个人记忆日期...", () => selectPersonalDate(item.dataset.personalDate)));
   });
   $("#activeTarget").textContent = state.selectedPersonalDate ? `个人记忆 · ${state.selectedPersonalDate}` : "个人记忆";
   resetRailCoverflow();
@@ -1083,22 +1089,48 @@ async function selectPersonalDate(date) {
   const nextDate = date || "";
   const changed = nextDate && nextDate !== state.selectedPersonalDate;
   if (!changed) return;
-  if (changed && state.personalViewport !== "album") {
-    await retractScheduleFilmBeforeDateMove();
-  }
-  state.selectedPersonalDate = nextDate;
-  state.selectedScheduleIndex = "";
-  state.selectedPersonalAlbumIndex = "";
-  state.selectedSubjectiveMemoryIndex = "";
-  state.animatePersonalDateRail = true;
-  if (state.personalViewport === "album" && changed) {
-    await switchPersonalAlbumDate();
+  const previous = {
+    date: state.selectedPersonalDate,
+    schedule: state.selectedScheduleIndex,
+    album: state.selectedPersonalAlbumIndex,
+    subjective: state.selectedSubjectiveMemoryIndex,
+    snapshot: state.personalSnapshot,
+    data: state.personalData,
+  };
+  try {
+    if (state.personalViewport !== "album") {
+      await retractScheduleFilmBeforeDateMove();
+    }
+    state.selectedPersonalDate = nextDate;
+    state.selectedScheduleIndex = "";
+    state.selectedPersonalAlbumIndex = "";
+    state.selectedSubjectiveMemoryIndex = "";
+    state.animatePersonalDateRail = true;
+    if (state.personalViewport === "album") {
+      await switchPersonalAlbumDate();
+      resetRailCoverflow();
+      return;
+    }
+    clearDetail();
+    await loadPersonalMemory();
     resetRailCoverflow();
-    return;
+  } catch (error) {
+    state.selectedPersonalDate = previous.date;
+    state.selectedScheduleIndex = previous.schedule;
+    state.selectedPersonalAlbumIndex = previous.album;
+    state.selectedSubjectiveMemoryIndex = previous.subjective;
+    state.personalSnapshot = previous.snapshot;
+    state.personalData = previous.data;
+    state.animatePersonalDateRail = false;
+    renderPersonalDateRail(state.personalDates, previous.date);
+    const target = $("#personalMemoryList");
+    if (target && previous.snapshot && previous.data) {
+      target.innerHTML = renderPersonalMemoryWorkspace(previous.snapshot, previous.data);
+      bindPersonalMemoryWorkspace(target, previous.snapshot, previous.data);
+      hydratePersonalAlbumImages(target);
+    }
+    throw error;
   }
-  clearDetail();
-  await loadPersonalMemory();
-  resetRailCoverflow();
 }
 
 function movePersonalDateToStandard(immediate = false) {
@@ -2068,6 +2100,12 @@ async function loadPersonalMemory() {
   removeRailMountedScheduleFilm();
   const shouldAnimateEntrance = state.personalEntranceRevealRequested;
   state.personalEntranceRevealRequested = false;
+  if (state.companionPersonalAvailable === null && state.companionPersonalError) {
+    updatePersonalMemoryAvailability(null, state.companionPersonalError);
+    target.innerHTML = renderPersonalMemoryDetectionError(state.companionPersonalError);
+    bindCompanionDetectionRetry(target);
+    return;
+  }
   if (state.companionPersonalAvailable === false) {
     updatePersonalMemoryAvailability(false);
     target.innerHTML = renderPersonalMemoryUnavailable("未检测到已加载的主动陪伴插件");
@@ -2585,15 +2623,23 @@ function centerScheduleFrame(film, index, immediate = false) {
 async function loadCompanionAvailability() {
   try {
     const data = await apiGet("/companion/personal-memory?limit=0");
-    updatePersonalMemoryAvailability(Boolean(data.available));
+    updatePersonalMemoryAvailability(Boolean(data.available), "");
   } catch (error) {
-    updatePersonalMemoryAvailability(false);
+    updatePersonalMemoryAvailability(null, error?.message || "陪伴插件状态读取失败");
+    if (state.activeView === "review") {
+      showToast(error?.message || "陪伴插件状态读取失败", "error");
+    }
   }
 }
 
-function updatePersonalMemoryAvailability(available) {
+function updatePersonalMemoryAvailability(available, error = "") {
   state.companionPersonalAvailable = available;
-  const view = available ? PERSONAL_MEMORY_VIEW.available : PERSONAL_MEMORY_VIEW.unavailable;
+  state.companionPersonalError = error || "";
+  const view = available === null && error
+    ? PERSONAL_MEMORY_VIEW.error
+    : available
+      ? PERSONAL_MEMORY_VIEW.available
+      : PERSONAL_MEMORY_VIEW.unavailable;
   VIEWS.review.title = view.title;
   VIEWS.review.hint = view.hint;
   const strip = document.querySelector('[data-view="review"]');
@@ -2616,6 +2662,25 @@ function updatePersonalMemoryAvailability(available) {
     $("#workspaceTitle").textContent = view.title;
     $("#workspaceHint").textContent = view.hint;
   }
+}
+
+function renderPersonalMemoryDetectionError(error) {
+  return `
+    <div class="empty-state error-state">
+      <b>个人记忆检测失败</b>
+      <span>${escapeHtml(error || "陪伴插件状态读取失败")}</span>
+      <button data-retry-companion-detection type="button">重新检测</button>
+    </div>
+  `;
+}
+
+function bindCompanionDetectionRetry(root) {
+  root.querySelector("[data-retry-companion-detection]")?.addEventListener("click", () => {
+    withBusy("正在重新检测陪伴插件...", async () => {
+      await loadCompanionAvailability();
+      await loadPersonalMemory();
+    });
+  });
 }
 
 function renderPersonalMemoryUnavailable(reason) {
@@ -3920,11 +3985,21 @@ async function showMemory(id) {
     event.preventDefault();
     withButton($("#saveMemoryBtn"), "保存中", () => saveMemoryManagement(id, form));
   });
-  $("#detailDrawer [data-delete]").addEventListener("click", async () => {
-    if (!confirm("确认删除这条记忆？")) return;
-    await apiPost("/memory/delete", { id });
-    clearDetail();
-    await refreshAll();
+  $("#detailDrawer [data-delete]").addEventListener("click", () => {
+    showInlineConfirmation({
+      host: "#detailDrawer",
+      title: "删除这条记忆",
+      message: "删除后会同时清理关联的向量、关系边和知识图谱边。",
+      confirmLabel: "确认删除",
+      busyText: "正在删除记忆...",
+      dangerous: true,
+      onConfirm: async () => {
+        await apiPost("/memory/delete", { id });
+        clearDetail();
+        await refreshAll();
+      },
+      onCancel: () => showMemory(id),
+    });
   });
 }
 
@@ -4046,13 +4121,7 @@ async function saveMemoryManagement(id, form) {
     evidence: String(data.get("evidence") || ""),
     importance: num("importance", 0.3),
     confidence: num("confidence", 0.5),
-  });
-  await apiPost("/memory/visibility", {
-    id,
     visibility: String(data.get("visibility") || "internal"),
-  });
-  await apiPost("/memory/lifecycle", {
-    id,
     lifecycle: String(data.get("lifecycle") || "stable_memory"),
   });
   showToast("这条记忆已保存");
@@ -4305,11 +4374,124 @@ function showArchiveResult(value, kind = "generic") {
   }
 }
 
+function showInlineConfirmation({
+  host,
+  title,
+  message,
+  confirmLabel = "确认执行",
+  busyText = "正在执行...",
+  dangerous = false,
+  onConfirm,
+  onCancel,
+}) {
+  const box = typeof host === "string" ? $(host) : host;
+  if (!box || typeof onConfirm !== "function") return;
+  if (box.id === "detailDrawer") {
+    box.className = "detail-drawer";
+  } else {
+    box.hidden = false;
+  }
+  box.innerHTML = `
+    <div class="clear-confirm inline-confirm">
+      <b>${escapeHtml(title || "确认操作")}</b>
+      <p>${escapeHtml(message || "请确认是否继续。")}</p>
+      <div class="inline-actions">
+        <button data-inline-confirm type="button" class="${dangerous ? "danger" : ""}">${escapeHtml(confirmLabel)}</button>
+        <button data-inline-cancel type="button">取消</button>
+      </div>
+    </div>
+  `;
+  const confirmButton = box.querySelector("[data-inline-confirm]");
+  const cancelButton = box.querySelector("[data-inline-cancel]");
+  confirmButton?.addEventListener("click", () => withBusy(busyText, onConfirm));
+  cancelButton?.addEventListener("click", async () => {
+    if (typeof onCancel === "function") {
+      await onCancel();
+    } else {
+      box.innerHTML = "";
+      if (box.id !== "detailDrawer") box.hidden = true;
+    }
+    showToast("已取消操作");
+  });
+  confirmButton?.focus();
+}
+
 async function runMaintenance() {
   const data = await apiPost("/maintenance");
   await refreshAll();
   showArchiveResult(data.result, "maintenance");
   showToast("维护已完成");
+}
+
+async function runOperationsDiagnostics() {
+  const data = await apiGet("/operations/diagnostics");
+  showArchiveResult(data.diagnostics, "diagnostics");
+  showToast("运维诊断已生成");
+}
+
+async function applyOperationPreset(preset) {
+  const labels = { light: "轻量", standard: "标准", companion: "陪伴" };
+  const label = labels[preset] || preset;
+  showInlineConfirmation({
+    host: "#importResult",
+    title: `应用${label}预设`,
+    message: "将调整检索、图谱、总结阈值和注入预算；已有模型 Provider 选择会保留。",
+    confirmLabel: "应用预设",
+    busyText: "正在应用运行预设...",
+    onConfirm: () => executeOperationPreset(preset, label),
+  });
+}
+
+async function executeOperationPreset(preset, label) {
+  const data = await apiPost("/operations/preset", { preset });
+  await refreshAll();
+  showArchiveResult(data.preset, "preset");
+  showToast(`已应用${label}预设`);
+}
+
+function portableArchivePath() {
+  return String($("#portableArchivePath")?.value || "").trim();
+}
+
+async function exportPortableArchive() {
+  const data = await apiPost("/data/export", {});
+  showArchiveResult(data.result, "portable-export");
+  showToast("可移植档案已导出");
+}
+
+async function previewPortableArchive() {
+  const path = portableArchivePath();
+  if (!path) {
+    showToast("请先填写 JSONL 路径", "error");
+    return;
+  }
+  const params = new URLSearchParams({ path });
+  const data = await apiGet(`/data/import/preview?${params.toString()}`);
+  showArchiveResult(data.result, "portable-preview");
+  showToast("可移植档案预览已生成");
+}
+
+async function importPortableArchive() {
+  const path = portableArchivePath();
+  if (!path) {
+    showToast("请先填写 JSONL 路径", "error");
+    return;
+  }
+  showInlineConfirmation({
+    host: "#importResult",
+    title: "导入可移植档案",
+    message: `将从 ${path} 导入记忆、身份、关系、时间线和 ACL；执行前会自动备份当前数据库。`,
+    confirmLabel: "执行导入",
+    busyText: "正在导入可移植档案...",
+    onConfirm: () => executePortableArchiveImport(path),
+  });
+}
+
+async function executePortableArchiveImport(path) {
+  const data = await apiPost("/data/import/run", { path });
+  await refreshAll();
+  showArchiveResult(data.result, "portable-import");
+  showToast("可移植档案已导入");
 }
 
 async function repairLivingMemoryContent() {
@@ -4494,7 +4676,19 @@ async function previewImport() {
 
 async function runImport() {
   const path = livingMemoryPathValue();
-  if (!confirm("确认开始导入？导入内容默认会按保守策略处理。")) return;
+  showInlineConfirmation({
+    host: "#importResult",
+    title: "导入 LivingMemory",
+    message: path
+      ? `将从 ${path} 导入完整摘要，跳过派生碎片；执行前会自动备份当前数据库。`
+      : "将从自动发现的 LivingMemory 数据库导入完整摘要，跳过派生碎片；执行前会自动备份当前数据库。",
+    confirmLabel: "执行导入",
+    busyText: "正在导入 LivingMemory...",
+    onConfirm: () => executeLivingMemoryImport(path),
+  });
+}
+
+async function executeLivingMemoryImport(path) {
   const data = await apiPost("/import/livingmemory/run", { path });
   await refreshAll();
   showArchiveResult(data.result, "import");
@@ -4565,6 +4759,13 @@ function bindActions() {
   });
   $("#runSearchBtn").addEventListener("click", (event) => withButton(event.currentTarget, "检索中", runSearch));
   $("#maintenanceBtn").addEventListener("click", () => withBusy("正在运行维护...", runMaintenance));
+  $("#operationsDiagnosticsBtn").addEventListener("click", () => withBusy("正在生成运维诊断...", runOperationsDiagnostics));
+  $$('[data-operation-preset]').forEach((button) => {
+    button.addEventListener("click", () => withBusy("正在应用运行预设...", () => applyOperationPreset(button.dataset.operationPreset)));
+  });
+  $("#portableExportBtn").addEventListener("click", () => withBusy("正在导出可移植档案...", exportPortableArchive));
+  $("#portablePreviewBtn").addEventListener("click", () => withBusy("正在读取可移植档案...", previewPortableArchive));
+  $("#portableImportBtn").addEventListener("click", () => withBusy("正在导入可移植档案...", importPortableArchive));
   $("#repairLivingMemoryBtn").addEventListener("click", () => withBusy("正在修复 LivingMemory 内容...", repairLivingMemoryContent));
   $("#clearAllMemoryBtn").addEventListener("click", clearAllMemoryData);
   $("#clearCurrentGroupMemoryBtn")?.addEventListener("click", () => withBusy("正在预览范围清理...", () => clearCurrentScopedMemory("group")));

@@ -251,6 +251,103 @@ class MemoryCompanionCommandHandler:
             f"睡眠维护时间 {state.get('ran_at', '-')}"
         )
 
+    async def diagnostics(self) -> str:
+        report = await self.service.operational_report()
+        cache = report.get("cache") or {}
+        usage = report.get("model_usage") or {}
+        retrieval = report.get("retrieval") or {}
+        conflicts = report.get("conflicts") or []
+        hit_rate = cache.get("hit_rate")
+        hit_label = f"{float(hit_rate) * 100:.1f}%" if hit_rate is not None else "暂无样本"
+        avg_ms = usage.get("average_elapsed_ms")
+        avg_label = f"{float(avg_ms):.1f}ms" if avg_ms is not None else "暂无样本"
+        lines = [
+            "记忆运维诊断：",
+            f"配置预设：{report.get('preset_label')} ({report.get('preset')})",
+            f"检索：mode={retrieval.get('mode')}｜Embedding={retrieval.get('embedding_enabled')}｜零外部检索调用={retrieval.get('zero_external_retrieval_calls')}",
+            f"缓存：命中 {cache.get('hits', 0)}｜未命中 {cache.get('misses', 0)}｜命中率 {hit_label}｜当前 {cache.get('entries', 0)} 项",
+            f"模型消耗：调用 {usage.get('calls', 0)}｜Token {usage.get('total_tokens', 0)}｜估算 Token {usage.get('estimated_tokens', 0)}｜平均耗时 {avg_label}",
+        ]
+        if conflicts:
+            lines.append("插件共存：")
+            for item in conflicts:
+                lines.append(
+                    f"- {item.get('label')}｜{item.get('level')}｜{item.get('reason')}"
+                )
+        else:
+            lines.append("插件共存：未检测到已知记忆插件目录。")
+        warnings = report.get("warnings") or []
+        if warnings:
+            lines.append("注意：")
+            lines.extend(f"- {warning}" for warning in warnings)
+        lines.append(str(report.get("benchmark_note") or ""))
+        return "\n".join(line for line in lines if line)
+
+    def preset(self, action: str = "status", name: str = "") -> str:
+        action = clean_text(action, 40).lower() or "status"
+        name = clean_text(name, 40).lower()
+        if action in {"light", "standard", "companion"} and not name:
+            name = action
+            action = "apply"
+        if action in {"status", "show", "current"}:
+            status = self.service.operation_preset_status()
+            return (
+                f"当前配置预设：{status.get('label')} ({status.get('preset')})\n"
+                "可用：light（轻量）、standard（标准）、companion（陪伴）\n"
+                "应用：/mcomp preset apply <名称>"
+            )
+        if action in {"apply", "use", "set"} and name in {"light", "standard", "companion"}:
+            result = self.service.apply_operation_preset(name)
+            return (
+                f"已应用{result.get('label')}预设。\n"
+                f"修改 {len(result.get('changed') or {})} 项；模型 Provider 选择保持不变。\n"
+                f"配置：{result.get('config_path')}"
+            )
+        return "用法：/mcomp preset status|apply light|standard|companion"
+
+    async def portable_data(self, action: str = "help", path: str = "") -> str:
+        action = clean_text(action, 40).lower() or "help"
+        path = str(path or "").strip()
+        try:
+            if action in {"export", "backup"}:
+                result = await self.service.export_portable_data()
+                counts = result.get("counts") or {}
+                return (
+                    "UTF-8 JSONL 导出完成：\n"
+                    f"路径：{result.get('path')}\n"
+                    f"记忆 {counts.get('memory', 0)}｜身份 {counts.get('identity', 0)}｜关系 {counts.get('relationship', 0)}｜"
+                    f"时间线 {counts.get('timeline', 0)}｜ACL {counts.get('acl_rule', 0) + counts.get('acl_policy', 0)}"
+                )
+            if action in {"preview", "check"}:
+                if not path:
+                    return "用法：/mcomp data preview <jsonl_path>"
+                result = self.service.preview_portable_data(path)
+                return (
+                    "可移植档案预览：\n"
+                    f"路径：{result.get('path')}\n"
+                    f"格式：{result.get('format')} v{result.get('version')}｜记录 {result.get('total_records', 0)}\n"
+                    f"分类：{result.get('counts')}"
+                )
+            if action in {"import", "restore"}:
+                if not path:
+                    return "用法：/mcomp data import <jsonl_path>"
+                result = await self.service.import_portable_data(path)
+                return (
+                    "可移植档案导入完成：\n"
+                    f"导入：{result.get('imported')}\n"
+                    f"跳过：{result.get('skipped')}\n"
+                    f"导入前备份：{result.get('backup')}\n"
+                    f"错误示例：{result.get('errors') or '无'}"
+                )
+        except (OSError, ValueError, RuntimeError) as exc:
+            return f"数据操作失败：{exc}"
+        return (
+            "可移植数据命令：\n"
+            "/mcomp data export\n"
+            "/mcomp data preview <jsonl_path>\n"
+            "/mcomp data import <jsonl_path>"
+        )
+
     async def sleep(self, action: str = "status") -> str:
         action = (action or "status").lower()
         if action in {"run", "maintenance", "now"}:
@@ -328,6 +425,9 @@ class MemoryCompanionCommandHandler:
             "/mcomp threads list|close <thread_id>\n"
             "/mcomp logs 5\n"
             "/mcomp maintenance\n"
+            "/mcomp diagnostics\n"
+            "/mcomp preset status|apply light|standard|companion\n"
+            "/mcomp data export|preview|import [jsonl_path]\n"
             "/mcomp sleep status|run\n"
             "/mcomp delete <memory_id>\n"
             "/mcomp import_livingmemory preview|run|detail [db_path]"

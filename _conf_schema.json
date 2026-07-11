@@ -178,7 +178,7 @@
           "basic",
           "rerank"
         ],
-        "default": "rerank"
+        "default": "auto"
       },
       "rerank_provider_id": {
         "description": "重排模型 Provider",

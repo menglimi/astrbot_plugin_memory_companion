@@ -555,8 +555,8 @@ class InjectionComposer:
         if not compact:
             return ""
         check_like = (
-            compact in {"例行检查", "查岗", "查岗了", "在吗", "在不在", "还在吗", "睡了吗", "睡没", "醒着吗"}
-            or any(word in compact for word in ("例行检查", "查岗", "在不在", "还在吗", "醒着吗"))
+            compact in {"查岗", "查岗了", "在吗", "在不在", "还在吗", "睡了吗", "睡没", "醒着吗"}
+            or any(word in compact for word in ("查岗", "在不在", "还在吗", "醒着吗"))
         )
         if not check_like:
             return ""
@@ -568,7 +568,7 @@ class InjectionComposer:
             return ""
         return (
             "当前像是睡眠/休息中的短检查或查岗；先简短回应人在、不必展开。"
-            "召回到的旧“例行检查/查岗/梦境/穿着”等记忆只能影响亲近感和语气，"
+            "召回到的旧“查岗/梦境/穿着”等记忆只能影响亲近感和语气，"
             "不要复述旧细节，不要把旧记录当作此刻正在发生，也不要新编具体梦境或继续追问。"
         )
 

@@ -112,6 +112,55 @@ class StoreConsistencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(store._conn.execute("SELECT id FROM timeline WHERE id=?", (summarized_id,)).fetchone())
         self.assertIsNotNone(store._conn.execute("SELECT id FROM timeline WHERE id=?", (pending_id,)).fetchone())
 
+    async def test_memory_management_update_is_atomic(self) -> None:
+        store = self.make_store()
+        memory_id = await store.insert_memory(
+            MemoryRecord(
+                content="原内容",
+                evidence="原证据",
+                visibility="private_pair",
+                lifecycle="stable_memory",
+            )
+        )
+        original = store._upsert_memory_fts_row
+
+        def fail(_row) -> None:
+            raise RuntimeError("forced fts failure")
+
+        store._upsert_memory_fts_row = fail
+        try:
+            with self.assertRaisesRegex(RuntimeError, "forced fts failure"):
+                await store.update_memory_payload(
+                    memory_id,
+                    content="新内容",
+                    evidence="新证据",
+                    visibility="shareable",
+                    lifecycle="archived",
+                )
+        finally:
+            store._upsert_memory_fts_row = original
+
+        restored = await store.get_memory(memory_id)
+        self.assertEqual("原内容", restored.content)
+        self.assertEqual("原证据", restored.evidence)
+        self.assertEqual("private_pair", restored.visibility)
+        self.assertEqual("stable_memory", restored.lifecycle)
+
+        self.assertTrue(
+            await store.update_memory_payload(
+                memory_id,
+                content="新内容",
+                evidence="新证据",
+                visibility="shareable",
+                lifecycle="archived",
+            )
+        )
+        updated = await store.get_memory(memory_id)
+        self.assertEqual("新内容", updated.content)
+        self.assertEqual("新证据", updated.evidence)
+        self.assertEqual("shareable", updated.visibility)
+        self.assertEqual("archived", updated.lifecycle)
+
     async def test_concurrent_timeline_ingest_is_idempotent_by_message_id(self) -> None:
         store = self.make_store()
         kwargs = {

@@ -77,6 +77,11 @@ class PluginPageApi:
             ("/config/schema", self.config_schema, ["GET"], "MemoryCompanion Page config schema"),
             ("/config/module/update", self.config_module_update, ["POST"], "MemoryCompanion Page config module update"),
             ("/retrieval/config/update", self.retrieval_config_update, ["POST"], "MemoryCompanion Page retrieval config update"),
+            ("/operations/diagnostics", self.operations_diagnostics, ["GET"], "MemoryCompanion operations diagnostics"),
+            ("/operations/preset", self.operations_preset, ["GET", "POST"], "MemoryCompanion operations preset"),
+            ("/data/export", self.data_export, ["POST"], "MemoryCompanion portable data export"),
+            ("/data/import/preview", self.data_import_preview, ["GET"], "MemoryCompanion portable data preview"),
+            ("/data/import/run", self.data_import_run, ["POST"], "MemoryCompanion portable data import"),
             ("/companion/personal-memory", self.companion_personal_memory, ["GET"], "MemoryCompanion Page companion personal memory"),
             ("/companion/personal-photo", self.companion_personal_photo, ["GET"], "MemoryCompanion Page companion personal photo"),
             ("/companion/personal-photo-data", self.companion_personal_photo_data, ["GET"], "MemoryCompanion Page companion personal photo data"),
@@ -98,6 +103,51 @@ class PluginPageApi:
         stats = await self.plugin.service.store.stats()
         stats.pop("pending_review", None)
         return self._ok({"stats": stats})
+
+    async def operations_diagnostics(self):
+        try:
+            return self._ok({"diagnostics": await self.plugin.service.operational_report()})
+        except Exception as exc:
+            return self._err(f"运维诊断失败: {exc}", 500)
+
+    async def operations_preset(self):
+        if request.method == "GET":
+            return self._ok({"preset": self.plugin.service.operation_preset_status()})
+        payload = await self._json()
+        try:
+            result = self.plugin.service.apply_operation_preset(clean_text(payload.get("preset"), 40))
+            return self._ok({"preset": result})
+        except ValueError as exc:
+            return self._err(str(exc), 400)
+        except Exception as exc:
+            return self._err(f"应用预设失败: {exc}", 500)
+
+    async def data_export(self):
+        try:
+            return self._ok({"result": await self.plugin.service.export_portable_data()})
+        except Exception as exc:
+            return self._err(f"导出失败: {exc}", 500)
+
+    async def data_import_preview(self):
+        path = clean_text(request.args.get("path", ""), 2000)
+        if not path:
+            return self._err("path is required", 400)
+        try:
+            return self._ok({"result": self.plugin.service.preview_portable_data(path)})
+        except (OSError, ValueError) as exc:
+            return self._err(str(exc), 400)
+
+    async def data_import_run(self):
+        payload = await self._json()
+        path = clean_text(payload.get("path"), 2000)
+        if not path:
+            return self._err("path is required", 400)
+        try:
+            return self._ok({"result": await self.plugin.service.import_portable_data(path)})
+        except (OSError, ValueError) as exc:
+            return self._err(str(exc), 400)
+        except Exception as exc:
+            return self._err(f"导入失败: {exc}", 500)
 
     async def persona_state(self):
         """Return persona state: relationship phases, emotional events, address evolution, cross-window state."""
@@ -293,7 +343,11 @@ class PluginPageApi:
             evidence=payload.get("evidence"),
             importance=payload.get("importance"),
             confidence=payload.get("confidence"),
+            visibility=payload.get("visibility"),
+            lifecycle=payload.get("lifecycle"),
         )
+        if not ok:
+            return self._err("memory not found", 404)
         return self._ok({"updated": ok})
 
     async def memory_delete(self):
