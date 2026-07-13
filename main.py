@@ -315,5 +315,5 @@ class MemoryCompanionPlugin(Star):
         global _ACTIVE_BRIDGE
         if _ACTIVE_BRIDGE is self.memory_companion:
             _ACTIVE_BRIDGE = None
-        self.service.close()
+        await self.service.aclose()
         logger.info("[MemoryCompanion] 我会牢牢记住你 已停止")

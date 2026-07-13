@@ -47,6 +47,29 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(service.close)
         return service
 
+    async def test_async_close_finishes_background_cancellation_before_store_close(self) -> None:
+        service = self.make_service()
+        started = asyncio.Event()
+        finalized = asyncio.Event()
+
+        async def background_work() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)
+                finalized.set()
+
+        task = service._spawn_background(background_work(), label="shutdown_test")
+        self.assertIsNotNone(task)
+        await started.wait()
+
+        await service.aclose()
+
+        self.assertTrue(finalized.is_set())
+        self.assertTrue(task.done())
+        self.assertTrue(service.store._closed)
+
     async def test_non_json_summary_is_rejected(self) -> None:
         summarizer = MemorySummarizer(provider_timeout_seconds=1)
         rows = [{"content": "一条需要总结的消息", "scope": "private", "subject_id": "u1"}]

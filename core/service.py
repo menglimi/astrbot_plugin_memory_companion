@@ -95,6 +95,8 @@ class MemoryCompanionService:
         self._SUMMARY_LOCK_TTL: float = 600.0  # 10 minutes
         self._decay_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._closing = False
+        self._closed = False
         self._embedding_backfill_inflight: set[str] = set()
         self._embedding_memory_inflight: set[str] = set()
         self._embedding_backfill_last_run: dict[str, float] = {}
@@ -1526,6 +1528,11 @@ class MemoryCompanionService:
         self._save_token_usage()
 
     def _spawn_background(self, coro: Any, *, label: str) -> asyncio.Task[Any] | None:
+        if self._closing or self._closed:
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            return None
         try:
             task = asyncio.create_task(coro, name=f"memory_companion:{label}")
         except RuntimeError:
@@ -6207,6 +6214,9 @@ class MemoryCompanionService:
         return result
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closing = True
         for task in list(self._background_tasks):
             task.cancel()
         self._background_tasks.clear()
@@ -6215,3 +6225,24 @@ class MemoryCompanionService:
             self.store.close()
         except Exception as exc:
             logger.warning("[MemoryCompanion] 关闭记忆库连接失败: %s", exc, exc_info=True)
+        finally:
+            self._closed = True
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closing = True
+        current = asyncio.current_task()
+        tasks = [task for task in self._background_tasks if task is not current and not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._background_tasks.clear()
+        self._save_token_usage(force=True)
+        try:
+            self.store.close()
+        except Exception as exc:
+            logger.warning("[MemoryCompanion] 关闭记忆库连接失败: %s", exc, exc_info=True)
+        finally:
+            self._closed = True

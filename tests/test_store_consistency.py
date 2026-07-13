@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -175,6 +176,39 @@ class StoreConsistencyTests(unittest.IsolatedAsyncioTestCase):
         ids = await asyncio.gather(*(store.add_timeline_event(**kwargs) for _ in range(12)))
         self.assertEqual(1, len(set(ids)))
         self.assertEqual(1, store._conn.execute("SELECT COUNT(*) FROM timeline").fetchone()[0])
+
+    async def test_insert_recovers_once_from_database_path_error(self) -> None:
+        store = self.make_store()
+        original = store._insert_memory_sync
+        attempts = 0
+
+        def fail_once(record: MemoryRecord, review_reason: str = "") -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise sqlite3.OperationalError("unable to open database file")
+            return original(record, review_reason)
+
+        store._insert_memory_sync = fail_once
+        memory_id = await store.insert_memory(
+            MemoryRecord(content="数据库路径恢复", lifecycle="stable_memory", visibility="private_pair")
+        )
+
+        self.assertEqual(2, attempts)
+        self.assertIsNotNone(await store.get_memory(memory_id))
+
+    async def test_recovery_never_replaces_a_missing_database_with_empty_file(self) -> None:
+        store = self.make_store()
+        store.close()
+        store.db_path.unlink()
+        store._closed = False
+
+        try:
+            with self.assertRaisesRegex(sqlite3.OperationalError, "database file is missing"):
+                store._recover_connection_sync()
+        finally:
+            store._closed = True
+        self.assertFalse(store.db_path.exists())
 
 
 if __name__ == "__main__":

@@ -16,8 +16,7 @@ class MemoryStore:
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+        self._conn = self._open_connection()
         self._lock = threading.RLock()
         self._closed = False
         self._fts_enabled = False
@@ -27,6 +26,55 @@ class MemoryStore:
             tuple[str, bool, int],
             list[tuple[MemoryRecord, list[float], str]],
         ] = {}
+
+    def _open_connection(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        return connection
+
+    @staticmethod
+    def _is_database_path_error(error: BaseException) -> bool:
+        if not isinstance(error, sqlite3.OperationalError):
+            return False
+        message = str(error).strip().lower()
+        return "unable to open database file" in message or "cannot open database" in message
+
+    def _recover_connection_sync(self) -> None:
+        """Replace a broken connection without ever creating an empty database."""
+        with self._lock:
+            if self._closed:
+                raise sqlite3.ProgrammingError("memory database is closed")
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            if not self.db_path.is_file():
+                raise sqlite3.OperationalError(
+                    f"memory database file is missing: {self.db_path}; restart or restore the data directory"
+                )
+            replacement = self._open_connection()
+            try:
+                replacement.execute("PRAGMA journal_mode=WAL")
+                replacement.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            except BaseException:
+                replacement.close()
+                raise
+            previous = self._conn
+            self._conn = replacement
+            try:
+                previous.close()
+            except sqlite3.Error:
+                pass
+
+    def _run_with_database_recovery_sync(self, operation: Any, *args: Any) -> Any:
+        try:
+            return operation(*args)
+        except sqlite3.OperationalError as error:
+            if not self._is_database_path_error(error):
+                raise
+            with self._lock:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+            self._recover_connection_sync()
+            return operation(*args)
 
     @contextmanager
     def _transaction_sync(self):
@@ -953,7 +1001,12 @@ class MemoryStore:
         return (f"{from_where} OR {to_where}", [*from_params, *to_params])
 
     async def insert_memory(self, record: MemoryRecord, review_reason: str = "") -> str:
-        return await asyncio.to_thread(self._insert_memory_sync, record, review_reason)
+        return await asyncio.to_thread(
+            self._run_with_database_recovery_sync,
+            self._insert_memory_sync,
+            record,
+            review_reason,
+        )
 
     def _insert_memory_sync(self, record: MemoryRecord, review_reason: str = "") -> str:
         record.ensure_defaults()
