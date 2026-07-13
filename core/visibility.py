@@ -42,6 +42,9 @@ class VisibilityPolicy:
         if self.admin_read_all:
             return True, "admin_search"
         if memory.visibility == "bot_self":
+            owner_ok, owner_reason = self._bot_owner_visible(memory, ctx)
+            if not owner_ok:
+                return False, owner_reason
             return (self.allow_self_timeline_everywhere, "bot_self")
         if memory.visibility == "shareable":
             return True, "shareable"

@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT.parent) not in sys.path:
     sys.path.insert(0, str(ROOT.parent))
 
-from astrbot_plugin_remember_you.core.models import MemoryRecord, SessionContext
+from astrbot_plugin_remember_you.core.models import MemoryRecord, SearchResult, SessionContext
 from astrbot_plugin_remember_you.core.retrieval import RetrievalEngine
 from astrbot_plugin_remember_you.core.store import MemoryStore
 from astrbot_plugin_remember_you.core.visibility import VisibilityPolicy
@@ -63,7 +63,44 @@ class _CandidateStore:
         return None
 
 
+class _EmptyRerankProvider:
+    model = "BAAI/bge-reranker-v2-m3"
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def rerank(self, **kwargs):
+        self.calls.append(kwargs)
+        return []
+
+
 class RetrievalPerformanceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rerank_filters_empty_documents_and_reports_safe_request_shape(self) -> None:
+        provider = _EmptyRerankProvider()
+        engine = RetrievalEngine(
+            _CandidateStore(),
+            VisibilityPolicy(enable_acl_rules=False),
+            retrieval_mode="rerank",
+            rerank_provider=provider,
+            rerank_provider_id="reranker",
+            embedding_enabled=False,
+            knowledge_graph_enabled=False,
+        )
+        ranked = [
+            SearchResult(memory=_memory("empty", ""), score=2.0),
+            SearchResult(memory=_memory("valid", "有效候选文本"), score=1.0),
+        ]
+
+        results = await engine._maybe_rerank_results("有效查询", ranked, 2)
+
+        self.assertEqual(1, len(provider.calls))
+        self.assertEqual(1, len(provider.calls[0]["documents"]))
+        self.assertEqual(ranked, results)
+        self.assertEqual("rerank_empty_response", engine.last_path_info["reason"])
+        self.assertGreater(engine.last_path_info["rerank_query_chars"], 0)
+        self.assertEqual(1, engine.last_path_info["rerank_document_count"])
+        self.assertGreater(engine.last_path_info["rerank_document_min_chars"], 0)
+        self.assertGreater(engine.last_path_info["rerank_model_chars"], 0)
     async def test_current_window_candidates_are_merged_even_without_global_hits(self) -> None:
         current = _memory("current-1", "current window anchor")
         store = _CandidateStore(current=[current])

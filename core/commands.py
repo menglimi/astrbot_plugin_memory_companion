@@ -239,6 +239,7 @@ class MemoryCompanionCommandHandler:
         result = state.get("repair", {})
         raw = state.get("raw_retention", {})
         decay = state.get("decay", {})
+        wal = state.get("wal", {})
         return (
             "维护完成："
             f"可见性修正 {result.get('manual_visibility_fixed', 0)}，"
@@ -248,6 +249,8 @@ class MemoryCompanionCommandHandler:
             f"全文索引 {result.get('fts_rebuilt', 0)}；"
             f"原始事件归档 {raw.get('archived', 0)}；"
             f"衰减总结 {decay.get('summaries', 0)}，衰减归档 {decay.get('archived', 0)}；"
+            f"WAL checkpoint busy={wal.get('checkpoint_busy', '-')} "
+            f"frames={wal.get('checkpointed_frames', '-')}/{wal.get('checkpoint_log_frames', '-')}；"
             f"睡眠维护时间 {state.get('ran_at', '-')}"
         )
 
@@ -355,6 +358,7 @@ class MemoryCompanionCommandHandler:
             repair = state.get("repair", {})
             raw = state.get("raw_retention", {})
             decay = state.get("decay", {})
+            wal = state.get("wal", {})
             return (
                 "睡眠维护完成："
                 f"{state.get('ran_at', '-')}｜"
@@ -363,7 +367,8 @@ class MemoryCompanionCommandHandler:
                 f"全文索引 {repair.get('fts_rebuilt', 0)}｜"
                 f"原始事件归档 {raw.get('archived', 0)}｜"
                 f"衰减总结 {decay.get('summaries', 0)}｜"
-                f"衰减归档 {decay.get('archived', 0)}"
+                f"衰减归档 {decay.get('archived', 0)}｜"
+                f"WAL {wal.get('checkpointed_frames', '-')}/{wal.get('checkpoint_log_frames', '-')}"
             )
         if action in {"status", "state", "last"}:
             state = self.service.sleep_status()

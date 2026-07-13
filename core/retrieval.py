@@ -255,16 +255,52 @@ class RetrievalEngine:
             }
             return ranked
 
+        query_text = clean_text(query, 1000)
+        if not query_text:
+            path = "fallback_basic" if self.retrieval_mode == "rerank" else "basic"
+            self.last_path_info = {
+                "mode": self.retrieval_mode,
+                "path": path,
+                "provider_id": self.rerank_provider_id,
+                "reason": "rerank_skipped_empty_query",
+                "candidate_count": len(ranked),
+                **self._rank_path_info,
+            }
+            return ranked
+
         pool_size = min(
             len(ranked),
             max(max(1, int(final_limit or 1)) * self.rerank_candidate_multiplier, max(1, int(final_limit or 1))),
             self.rerank_candidate_limit,
         )
         pool = ranked[:pool_size]
-        documents = [self._rerank_document_text(item) for item in pool]
+        rerank_pool: list[SearchResult] = []
+        documents: list[str] = []
+        for item in pool:
+            document = clean_text(self._rerank_document_text(item), 1200)
+            if not document:
+                continue
+            rerank_pool.append(item)
+            documents.append(document)
+        filtered_count = pool_size - len(rerank_pool)
+        request_shape = self._rerank_request_shape(query_text, documents)
+        if not documents:
+            path = "fallback_basic" if self.retrieval_mode == "rerank" else "basic"
+            self.last_path_info = {
+                "mode": self.retrieval_mode,
+                "path": path,
+                "provider_id": self.rerank_provider_id,
+                "reason": "rerank_skipped_no_valid_documents",
+                "candidate_count": len(ranked),
+                "rerank_pool": 0,
+                "rerank_filtered": filtered_count,
+                **request_shape,
+                **self._rank_path_info,
+            }
+            return ranked
         try:
-            rerank_resp = await self._call_rerank_provider(query, documents)
-            reranked = self._apply_rerank_response(rerank_resp, pool)
+            rerank_resp = await self._call_rerank_provider(query_text, documents)
+            reranked = self._apply_rerank_response(rerank_resp, rerank_pool)
         except Exception as error:
             self.last_path_info = {
                 "mode": self.retrieval_mode,
@@ -272,7 +308,9 @@ class RetrievalEngine:
                 "provider_id": self.rerank_provider_id,
                 "reason": f"rerank_error:{clean_text(error, 160)}",
                 "candidate_count": len(ranked),
-                "rerank_pool": pool_size,
+                "rerank_pool": len(rerank_pool),
+                "rerank_filtered": filtered_count,
+                **request_shape,
                 **self._rank_path_info,
             }
             return ranked
@@ -284,12 +322,14 @@ class RetrievalEngine:
                 "provider_id": self.rerank_provider_id,
                 "reason": "rerank_empty_response",
                 "candidate_count": len(ranked),
-                "rerank_pool": pool_size,
+                "rerank_pool": len(rerank_pool),
+                "rerank_filtered": filtered_count,
+                **request_shape,
                 **self._rank_path_info,
             }
             return ranked
 
-        anchors = self._rerank_anchor_results(query, pool, final_limit)
+        anchors = self._rerank_anchor_results(query_text, pool, final_limit)
         merged: list[SearchResult] = []
         seen: set[str] = set()
         for item in [*anchors, *reranked]:
@@ -307,9 +347,11 @@ class RetrievalEngine:
             "provider_id": self.rerank_provider_id or "<auto>",
             "reason": "rerank_applied",
             "candidate_count": len(ranked),
-            "rerank_pool": pool_size,
+            "rerank_pool": len(rerank_pool),
+            "rerank_filtered": filtered_count,
             "reranked_count": len(reranked),
             "lexical_anchors": len(anchors),
+            **request_shape,
             **self._rank_path_info,
         }
         return merged + tail + rest
@@ -350,7 +392,13 @@ class RetrievalEngine:
 
     async def _call_rerank_provider(self, query: str, documents: list[str]) -> Any:
         method = self.rerank_provider.rerank
-        kwargs: dict[str, Any] = {"query": clean_text(query, 1000), "documents": documents}
+        query_text = clean_text(query, 1000)
+        document_texts = [clean_text(document, 1200) for document in documents]
+        if not query_text:
+            raise ValueError("rerank query must not be empty")
+        if not document_texts or any(not document for document in document_texts):
+            raise ValueError("rerank documents must not contain empty text")
+        kwargs: dict[str, Any] = {"query": query_text, "documents": document_texts}
         try:
             signature = inspect.signature(method)
             params = signature.parameters
@@ -361,7 +409,7 @@ class RetrievalEngine:
             accepts_top_n = True
         if accepts_top_n:
             kwargs["top_n"] = len(documents)
-        prompt = self._usage_prompt_for_rerank(query, documents)
+        prompt = self._usage_prompt_for_rerank(query_text, document_texts)
         started = datetime.now(timezone.utc)
         resp: Any = None
         success = False
@@ -392,6 +440,21 @@ class RetrievalEngine:
                 elapsed_ms=elapsed_ms,
                 error=error,
             )
+
+    def _rerank_request_shape(self, query: str, documents: list[str]) -> dict[str, Any]:
+        lengths = [len(clean_text(document, 1200)) for document in documents]
+        model = clean_text(getattr(self.rerank_provider, "model", ""), 240)
+        if not model:
+            provider_config = getattr(self.rerank_provider, "provider_config", None)
+            if isinstance(provider_config, dict):
+                model = clean_text(provider_config.get("rerank_model") or provider_config.get("model"), 240)
+        return {
+            "rerank_query_chars": len(clean_text(query, 1000)),
+            "rerank_document_count": len(lengths),
+            "rerank_document_min_chars": min(lengths) if lengths else 0,
+            "rerank_document_max_chars": max(lengths) if lengths else 0,
+            "rerank_model_chars": len(model),
+        }
 
     def _apply_rerank_response(
         self,
@@ -510,14 +573,21 @@ class RetrievalEngine:
 
     def _rerank_document_text(self, item: SearchResult) -> str:
         memory = item.memory
+        content = clean_text(memory.content, 1000)
+        evidence = clean_text(memory.evidence, 600)
+        tags = [clean_text(tag, 80) for tag in (memory.tags or []) if clean_text(tag, 80)]
+        if not content and not evidence and not tags:
+            return ""
         parts = [
             f"类型: {memory.memory_type}",
             f"范围: {memory.scope}/{memory.visibility}",
-            f"标签: {' '.join(memory.tags or [])}",
-            f"内容: {memory.content}",
         ]
-        if memory.evidence:
-            parts.append(f"证据: {memory.evidence}")
+        if tags:
+            parts.append(f"标签: {' '.join(tags)}")
+        if content:
+            parts.append(f"内容: {content}")
+        if evidence:
+            parts.append(f"证据: {evidence}")
         return clean_text("\n".join(parts), 1200)
 
     def _with_slot_reason(self, reason: str, slot: str) -> str:

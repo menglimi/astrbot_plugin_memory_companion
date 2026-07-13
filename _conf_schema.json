@@ -510,6 +510,18 @@
         "type": "bool",
         "default": true
       },
+      "schedule_fast_context_enabled": {
+        "description": "启用日程快速上下文",
+        "hint": "让陪伴插件读取日程连续性时使用本地只读候选，不调用 Embedding 或 Rerank；关闭后回退完整检索。",
+        "type": "bool",
+        "default": true
+      },
+      "outfit_fast_context_enabled": {
+        "description": "启用穿搭快速上下文",
+        "hint": "让每日穿搭仅快速读取相关日程、历史穿搭、服装偏好和自拍记录；关闭后回退完整检索。",
+        "type": "bool",
+        "default": true
+      },
       "accept_external_records": {
         "description": "接受外部写入",
         "hint": "关闭后只保留本插件自动捕获和管理命令写入。",

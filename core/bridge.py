@@ -196,6 +196,7 @@ class MemoryCompanionBridge:
         max_chars: int | None = None,
         companion_bot_mood: str = "",
         companion_bot_energy: float = 0.0,
+        retrieval_profile: str = "",
     ) -> str:
         return await self._plugin.bridge_compose_context(
             query=query,
@@ -204,6 +205,7 @@ class MemoryCompanionBridge:
             max_chars=max_chars,
             companion_bot_mood=companion_bot_mood,
             companion_bot_energy=companion_bot_energy,
+            retrieval_profile=retrieval_profile,
         )
 
     async def remember(self, *, event: Any, content: str, note_type: str = "memory") -> dict[str, Any]:

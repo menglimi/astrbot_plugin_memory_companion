@@ -35,6 +35,23 @@ class StrictSessionVisibilityTests(unittest.TestCase):
         )
         self.assertEqual(self.policy.is_visible(memory, self.context), (True, "same_private_session"))
 
+    def test_bot_self_memory_rejects_another_bot_owner(self) -> None:
+        context = SessionContext(
+            session_id="platform:FriendMessage:user-1",
+            scope="private",
+            user_id="user-1",
+            bot_id="bot-1",
+        )
+        memory = MemoryRecord(
+            session_id=context.session_id,
+            scope="private",
+            visibility="bot_self",
+            subject=EntityRef.bot_self(bot_id="bot-2"),
+            metadata={"owner_bot_id": "bot-2"},
+        )
+
+        self.assertEqual(self.policy.is_visible(memory, context), (False, "other_bot_owner"))
+
     def test_bridge_context_preserves_strict_session_flag(self) -> None:
         service = object.__new__(MemoryCompanionService)
         context = service.session_context_from_bridge(

@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT.parent) not in sys.path:
     sys.path.insert(0, str(ROOT.parent))
 
-from astrbot_plugin_remember_you.core.models import MemoryRecord
+from astrbot_plugin_remember_you.core.models import EntityRef, MemoryRecord
 from astrbot_plugin_remember_you.core.store import MemoryStore
 
 
@@ -24,6 +24,105 @@ class StoreConsistencyTests(unittest.IsolatedAsyncioTestCase):
         store.initialize()
         self.addCleanup(store.close)
         return store
+
+    async def test_connection_uses_conservative_wal_and_busy_settings(self) -> None:
+        store = self.make_store()
+
+        self.assertEqual(1, store._conn.execute("PRAGMA foreign_keys").fetchone()[0])
+        self.assertEqual(3000, store._conn.execute("PRAGMA busy_timeout").fetchone()[0])
+        self.assertEqual(500, store._conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0])
+
+    async def test_schedule_context_read_is_scoped_and_checkpoint_is_observable(self) -> None:
+        store = self.make_store()
+        current_session = "qq:FriendMessage:u1"
+        await store.insert_memory(
+            MemoryRecord(
+                id="schedule-current",
+                memory_type="schedule_fragment",
+                subject=EntityRef.bot_self(),
+                object=EntityRef(kind="user", id="u1"),
+                scope="private",
+                session_id=current_session,
+                visibility="bot_self",
+                reality_level="persona_life",
+                lifecycle="stable_memory",
+                content="今天傍晚继续剪视频。",
+            )
+        )
+        await store.insert_memory(
+            MemoryRecord(
+                id="profile-current",
+                memory_type="user_preference",
+                subject=EntityRef(kind="user", id="u1"),
+                object=EntityRef.bot_self(),
+                scope="private",
+                session_id=current_session,
+                visibility="private_pair",
+                lifecycle="stable_memory",
+                content="当前用户不喜欢被连续催问。",
+            )
+        )
+        await store.insert_memory(
+            MemoryRecord(
+                id="other-private-action",
+                memory_type="proactive_message",
+                subject=EntityRef.bot_self(),
+                object=EntityRef(kind="user", id="u2"),
+                scope="private",
+                session_id="qq:FriendMessage:u2",
+                visibility="bot_self",
+                reality_level="bot_action",
+                lifecycle="stable_memory",
+                content="只属于另一个私聊对象的主动消息。",
+            )
+        )
+        await store.insert_memory(
+            MemoryRecord(
+                id="same-bot-group-action",
+                memory_type="self_action",
+                subject=EntityRef.bot_self(bot_id="b1"),
+                scope="group",
+                session_id="qq:GroupMessage:g1",
+                visibility="bot_self",
+                reality_level="bot_action",
+                lifecycle="stable_memory",
+                content="当前 Bot 在群里的公开动作。",
+                metadata={"owner_bot_id": "b1"},
+            )
+        )
+        await store.insert_memory(
+            MemoryRecord(
+                id="other-bot-group-action",
+                memory_type="self_action",
+                subject=EntityRef.bot_self(bot_id="b2"),
+                scope="group",
+                session_id="qq:GroupMessage:g2",
+                visibility="bot_self",
+                reality_level="bot_action",
+                lifecycle="stable_memory",
+                content="另一个 Bot 的群聊动作。",
+                metadata={"owner_bot_id": "b2"},
+            )
+        )
+
+        records = await store.list_schedule_context_memories(
+            session_id=current_session,
+            user_id="u1",
+            bot_id="b1",
+            limit=12,
+        )
+        ids = {record.id for record in records}
+        self.assertIn("schedule-current", ids)
+        self.assertIn("profile-current", ids)
+        self.assertIn("same-bot-group-action", ids)
+        self.assertNotIn("other-private-action", ids)
+        self.assertNotIn("other-bot-group-action", ids)
+
+        wal = await store.wal_health(checkpoint=True)
+        self.assertTrue(wal["checkpoint_attempted"])
+        self.assertIn("checkpoint_busy", wal)
+        self.assertIn("checkpoint_log_frames", wal)
+        self.assertIn("checkpointed_frames", wal)
 
     async def test_delete_memory_cascades_graph_and_relationship_edges(self) -> None:
         store = self.make_store()
@@ -196,6 +295,21 @@ class StoreConsistencyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(2, attempts)
         self.assertIsNotNone(await store.get_memory(memory_id))
+        stats = await store.stats()
+        self.assertEqual(1, stats["wal"]["database_recovery_attempts"])
+        self.assertEqual(1, stats["wal"]["database_recovery_successes"])
+        self.assertIn("unable to open", stats["wal"]["last_database_error"]["message"])
+
+    async def test_stats_prefers_current_wal_file_snapshot(self) -> None:
+        store = self.make_store()
+        store._last_wal_health = {"wal_bytes": 999999999, "checkpoint_attempted": True}
+
+        stats = await store.stats()
+        expected = store._database_file_snapshot()["wal_bytes"]
+
+        self.assertEqual(expected, stats["wal"]["wal_bytes"])
+        self.assertEqual(expected, stats["wal"]["current_files"]["wal_bytes"])
+        self.assertEqual(999999999, stats["wal"]["last_health_check"]["wal_bytes"])
 
     async def test_recovery_never_replaces_a_missing_database_with_empty_file(self) -> None:
         store = self.make_store()

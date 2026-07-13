@@ -26,11 +26,21 @@ class MemoryStore:
             tuple[str, bool, int],
             list[tuple[MemoryRecord, list[float], str]],
         ] = {}
+        self._last_wal_health: dict[str, Any] = {}
+        self._last_database_error: dict[str, Any] = {}
+        self._database_recovery_attempts = 0
+        self._database_recovery_successes = 0
 
     def _open_connection(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        connection = sqlite3.connect(
+            str(self.db_path),
+            timeout=3.0,
+            check_same_thread=False,
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=3000")
+        connection.execute("PRAGMA wal_autocheckpoint=500")
         return connection
 
     @staticmethod
@@ -70,11 +80,89 @@ class MemoryStore:
         except sqlite3.OperationalError as error:
             if not self._is_database_path_error(error):
                 raise
+            self._database_recovery_attempts += 1
+            error_details = {
+                "recorded_at": utc_now(),
+                "message": clean_text(error, 500),
+                "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+                "sqlite_errorname": clean_text(getattr(error, "sqlite_errorname", ""), 80),
+                **self._database_file_snapshot(),
+            }
+            self._last_database_error = dict(error_details)
+            try:
+                health = self._wal_health_sync(checkpoint=False)
+            except Exception as health_error:
+                health = {
+                    "health_error": clean_text(health_error, 500),
+                    **self._database_file_snapshot(),
+                }
+            self._last_wal_health = {
+                **health,
+                "last_database_error": dict(error_details),
+                "database_recovery_attempts": self._database_recovery_attempts,
+                "database_recovery_successes": self._database_recovery_successes,
+            }
             with self._lock:
                 if self._conn.in_transaction:
                     self._conn.rollback()
             self._recover_connection_sync()
+            self._database_recovery_successes += 1
             return operation(*args)
+
+    async def _run_recoverable_database_operation(self, operation: Any, *args: Any) -> Any:
+        return await asyncio.to_thread(self._run_with_database_recovery_sync, operation, *args)
+
+    def _database_file_snapshot(self) -> dict[str, Any]:
+        def size(path: Path) -> int:
+            try:
+                return int(path.stat().st_size)
+            except OSError:
+                return -1
+
+        wal_path = Path(str(self.db_path) + "-wal")
+        shm_path = Path(str(self.db_path) + "-shm")
+        return {
+            "db_exists": self.db_path.is_file(),
+            "db_bytes": size(self.db_path),
+            "wal_exists": wal_path.is_file(),
+            "wal_bytes": size(wal_path),
+            "shm_exists": shm_path.is_file(),
+            "shm_bytes": size(shm_path),
+        }
+
+    async def wal_health(self, *, checkpoint: bool = False) -> dict[str, Any]:
+        return await asyncio.to_thread(self._wal_health_sync, checkpoint)
+
+    def _wal_health_sync(self, checkpoint: bool = False) -> dict[str, Any]:
+        result = self._database_file_snapshot()
+        result.update(
+            {
+                "checkpoint_attempted": False,
+                "checkpoint_busy": None,
+                "checkpoint_log_frames": None,
+                "checkpointed_frames": None,
+            }
+        )
+        with self._lock:
+            result["in_transaction"] = bool(self._conn.in_transaction)
+            result["busy_timeout_ms"] = int(self._conn.execute("PRAGMA busy_timeout").fetchone()[0] or 0)
+            result["wal_autocheckpoint_pages"] = int(
+                self._conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0] or 0
+            )
+            if checkpoint and not self._conn.in_transaction:
+                row = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                result["checkpoint_attempted"] = True
+                if row is not None and len(row) >= 3:
+                    result["checkpoint_busy"] = int(row[0] or 0)
+                    result["checkpoint_log_frames"] = int(row[1] or 0)
+                    result["checkpointed_frames"] = int(row[2] or 0)
+        result.update({f"after_{key}": value for key, value in self._database_file_snapshot().items()})
+        result["database_recovery_attempts"] = self._database_recovery_attempts
+        result["database_recovery_successes"] = self._database_recovery_successes
+        if self._last_database_error:
+            result["last_database_error"] = dict(self._last_database_error)
+        self._last_wal_health = dict(result)
+        return result
 
     @contextmanager
     def _transaction_sync(self):
@@ -1001,8 +1089,7 @@ class MemoryStore:
         return (f"{from_where} OR {to_where}", [*from_params, *to_params])
 
     async def insert_memory(self, record: MemoryRecord, review_reason: str = "") -> str:
-        return await asyncio.to_thread(
-            self._run_with_database_recovery_sync,
+        return await self._run_recoverable_database_operation(
             self._insert_memory_sync,
             record,
             review_reason,
@@ -2276,7 +2363,7 @@ class MemoryStore:
         return result
 
     async def list_candidate_memories(self, limit: int = 500, include_pending: bool = False) -> list[MemoryRecord]:
-        return await asyncio.to_thread(self._list_candidate_memories_sync, limit, include_pending)
+        return await self._run_recoverable_database_operation(self._list_candidate_memories_sync, limit, include_pending)
 
     def _list_candidate_memories_sync(self, limit: int, include_pending: bool) -> list[MemoryRecord]:
         where = "lifecycle != 'archived'"
@@ -2295,6 +2382,149 @@ class MemoryStore:
             ).fetchall()
         return [MemoryRecord.from_row(row) for row in rows]
 
+    async def list_schedule_context_memories(
+        self,
+        *,
+        session_id: str = "",
+        user_id: str = "",
+        bot_id: str = "",
+        limit: int = 36,
+        strict_session_only: bool = False,
+    ) -> list[MemoryRecord]:
+        """Read a small schedule-focused snapshot without waiting on the shared writer lock."""
+        return await asyncio.to_thread(
+            self._list_schedule_context_memories_sync,
+            session_id,
+            user_id,
+            bot_id,
+            limit,
+            strict_session_only,
+        )
+
+    def _list_schedule_context_memories_sync(
+        self,
+        session_id: str,
+        user_id: str,
+        bot_id: str,
+        limit: int,
+        strict_session_only: bool,
+    ) -> list[MemoryRecord]:
+        session_id = clean_text(session_id, 200)
+        user_id = clean_text(user_id, 120)
+        bot_id = clean_text(bot_id, 120)
+        if not self.db_path.is_file():
+            return []
+        bot_types = (
+            "schedule_fragment",
+            "persona_life",
+            "self_action",
+            "proactive_message",
+            "reading_memory",
+            "creative_work",
+            "search_action",
+            "image_action",
+            "qzone_action",
+            "companion_note",
+        )
+        profile_types = (
+            "user_profile",
+            "user_preference",
+            "relationship_claim",
+        )
+        bot_placeholders = ",".join("?" for _ in bot_types)
+        profile_placeholders = ",".join("?" for _ in profile_types)
+        clauses = [
+            """
+            (
+                visibility='bot_self'
+                AND memory_type IN (BOT_TYPE_PLACEHOLDERS)
+                AND (
+                    scope!='private'
+                    OR session_id=''
+                    OR session_id=?
+                    OR (? != '' AND (subject_id=? OR object_id=?))
+                )
+                AND (
+                    CASE
+                        WHEN json_valid(metadata)
+                        THEN COALESCE(CAST(json_extract(metadata, '$.owner_bot_id') AS TEXT), '')
+                        ELSE ''
+                    END
+                ) IN ('', 'self', ?)
+                AND (subject_kind!='bot' OR subject_id IN ('', 'self', ?))
+                AND (object_kind!='bot' OR object_id IN ('', 'self', ?))
+            )
+            """.replace("BOT_TYPE_PLACEHOLDERS", bot_placeholders)
+        ]
+        params: list[Any] = [
+            *bot_types,
+            session_id,
+            user_id,
+            user_id,
+            user_id,
+            bot_id,
+            bot_id,
+            bot_id,
+        ]
+        if user_id:
+            clauses.append(
+                f"""
+                (
+                    scope='private'
+                    AND visibility IN ('private_pair', 'shareable')
+                    AND memory_type IN ({profile_placeholders})
+                    AND (session_id=? OR subject_id=? OR object_id=?)
+                    AND (
+                        CASE
+                            WHEN json_valid(metadata)
+                            THEN COALESCE(CAST(json_extract(metadata, '$.owner_bot_id') AS TEXT), '')
+                            ELSE ''
+                        END
+                    ) IN ('', 'self', ?)
+                    AND (subject_kind!='bot' OR subject_id IN ('', 'self', ?))
+                    AND (object_kind!='bot' OR object_id IN ('', 'self', ?))
+                )
+                """
+            )
+            params.extend([*profile_types, session_id, user_id, user_id, bot_id, bot_id, bot_id])
+        where = "lifecycle!='archived' AND review_status!='pending' AND (" + " OR ".join(clauses) + ")"
+        if strict_session_only:
+            if not session_id:
+                return []
+            where += " AND session_id=?"
+            params.append(session_id)
+        uri = self.db_path.resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=0.35, check_same_thread=False)) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("PRAGMA busy_timeout=350")
+            type_count = max(1, len(bot_types) + (len(profile_types) if user_id else 0))
+            per_type_limit = max(2, min(12, (max(1, int(limit or 36)) + type_count - 1) // type_count))
+            rows = connection.execute(
+                f"""
+                WITH ranked AS (
+                    SELECT
+                        memories.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY memory_type
+                            ORDER BY
+                                COALESCE(NULLIF(occurred_at, ''), NULLIF(updated_at, ''), created_at) DESC,
+                                importance DESC
+                        ) AS fast_type_rank
+                    FROM memories
+                    WHERE {where}
+                )
+                SELECT *
+                FROM ranked
+                WHERE fast_type_rank<=?
+                ORDER BY
+                    COALESCE(NULLIF(occurred_at, ''), NULLIF(updated_at, ''), created_at) DESC,
+                    importance DESC
+                """,
+                [*params, per_type_limit],
+            ).fetchall()
+        return [MemoryRecord.from_row(row) for row in rows[:120]]
+
     async def list_current_window_candidate_memories(
         self,
         *,
@@ -2305,7 +2535,7 @@ class MemoryStore:
         limit: int = 600,
         include_pending: bool = False,
     ) -> list[MemoryRecord]:
-        return await asyncio.to_thread(
+        return await self._run_recoverable_database_operation(
             self._list_current_window_candidate_memories_sync,
             scope,
             session_id,
@@ -2365,7 +2595,7 @@ class MemoryStore:
         limit: int = 1200,
         include_pending: bool = False,
     ) -> list[MemoryRecord]:
-        return await asyncio.to_thread(
+        return await self._run_recoverable_database_operation(
             self._list_time_window_candidate_memories_sync,
             start_at,
             end_at,
@@ -2414,7 +2644,7 @@ class MemoryStore:
         limit: int = 800,
         include_pending: bool = False,
     ) -> list[MemoryRecord]:
-        return await asyncio.to_thread(
+        return await self._run_recoverable_database_operation(
             self._list_fts_candidate_memories_sync,
             terms,
             limit,
@@ -2486,7 +2716,7 @@ class MemoryStore:
         limit: int = 800,
         include_pending: bool = False,
     ) -> list[MemoryRecord]:
-        return await asyncio.to_thread(
+        return await self._run_recoverable_database_operation(
             self._list_keyword_candidate_memories_sync,
             terms,
             limit,
@@ -2558,7 +2788,7 @@ class MemoryStore:
         return f"%{escaped}%"
 
     async def recent_memories(self, limit: int = 10, include_pending: bool = True) -> list[MemoryRecord]:
-        return await asyncio.to_thread(self._recent_memories_sync, limit, include_pending)
+        return await self._run_recoverable_database_operation(self._recent_memories_sync, limit, include_pending)
 
     def _recent_memories_sync(self, limit: int, include_pending: bool) -> list[MemoryRecord]:
         where = "1=1"
@@ -2586,7 +2816,7 @@ class MemoryStore:
         group_id: str = "",
         entity_id: str = "",
     ) -> list[MemoryRecord]:
-        return await asyncio.to_thread(
+        return await self._run_recoverable_database_operation(
             self._list_memories_sync,
             limit,
             include_pending,
@@ -3076,7 +3306,7 @@ class MemoryStore:
         return "blacklist" if clean_text(mode, 20).lower() in {"blacklist", "deny", "block"} else "whitelist"
 
     async def get_memory(self, memory_id: str) -> MemoryRecord | None:
-        return await asyncio.to_thread(self._get_memory_sync, memory_id)
+        return await self._run_recoverable_database_operation(self._get_memory_sync, memory_id)
 
     def _get_memory_sync(self, memory_id: str) -> MemoryRecord | None:
         with self._lock:
@@ -3084,7 +3314,7 @@ class MemoryStore:
         return MemoryRecord.from_row(row) if row else None
 
     async def get_memories_by_ids(self, memory_ids: list[str]) -> dict[str, MemoryRecord]:
-        return await asyncio.to_thread(self._get_memories_by_ids_sync, memory_ids)
+        return await self._run_recoverable_database_operation(self._get_memories_by_ids_sync, memory_ids)
 
     def _get_memories_by_ids_sync(self, memory_ids: list[str]) -> dict[str, MemoryRecord]:
         ids = [clean_text(mid, 120) for mid in memory_ids if clean_text(mid, 120)]
@@ -3110,7 +3340,7 @@ class MemoryStore:
         visibility: str | None = None,
         lifecycle: str | None = None,
     ) -> bool:
-        return await asyncio.to_thread(
+        return await self._run_recoverable_database_operation(
             self._update_memory_payload_sync,
             memory_id,
             memory_type,
@@ -3778,7 +4008,7 @@ class MemoryStore:
         text_hash: str,
         vector: list[float],
     ) -> None:
-        await asyncio.to_thread(
+        await self._run_recoverable_database_operation(
             self._upsert_memory_embedding_sync,
             memory_id,
             provider_id,
@@ -3834,7 +4064,7 @@ class MemoryStore:
         limit: int = 3000,
         include_pending: bool = False,
     ) -> list[tuple[MemoryRecord, list[float], str]]:
-        return await asyncio.to_thread(
+        return await self._run_recoverable_database_operation(
             self._list_embedding_candidate_rows_sync,
             provider_id,
             limit,
@@ -3905,7 +4135,7 @@ class MemoryStore:
         limit: int = 80,
         include_pending: bool = False,
     ) -> list[MemoryRecord]:
-        return await asyncio.to_thread(
+        return await self._run_recoverable_database_operation(
             self._list_memories_missing_embeddings_sync,
             provider_id,
             limit,
@@ -3962,10 +4192,10 @@ class MemoryStore:
             self._conn.commit()
 
     async def stats(self) -> dict[str, Any]:
-        return await asyncio.to_thread(self._stats_sync)
+        return await self._run_recoverable_database_operation(self._stats_sync)
 
     async def memory_revision(self) -> str:
-        return await asyncio.to_thread(self._memory_revision_sync)
+        return await self._run_recoverable_database_operation(self._memory_revision_sync)
 
     def _memory_revision_sync(self) -> str:
         with self._lock:
@@ -3995,6 +4225,8 @@ class MemoryStore:
                 row["scope"]: row["count"]
                 for row in self._conn.execute("SELECT scope, COUNT(*) AS count FROM memories GROUP BY scope").fetchall()
             }
+        current_wal_files = self._database_file_snapshot()
+        last_wal_health = dict(self._last_wal_health)
         return {
             "db_path": str(self.db_path),
             "total_memories": total,
@@ -4009,6 +4241,15 @@ class MemoryStore:
             "injection_logs": injection_logs,
             "acl_rules": acl_rules,
             "by_scope": by_scope,
+            "wal": {
+                **last_wal_health,
+                **current_wal_files,
+                "current_files": current_wal_files,
+                "last_health_check": last_wal_health,
+                "last_database_error": dict(self._last_database_error),
+                "database_recovery_attempts": self._database_recovery_attempts,
+                "database_recovery_successes": self._database_recovery_successes,
+            },
         }
 
     async def add_import_batch(

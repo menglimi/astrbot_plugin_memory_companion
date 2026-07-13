@@ -4,7 +4,7 @@
 
 - 插件名：`astrbot_plugin_memory_companion`
 - 中文名：`我会牢牢记住你`
-- 版本：`1.5.0`
+- 版本：`1.5.1`
 - 适配平台：`aiocqhttp`
 - AstrBot 版本：`>=4.22.0`
 - 编码要求：UTF-8
@@ -162,6 +162,8 @@ astrbot_plugin_memory_companion
 注入结构会按拟人化用途分区：`open_loops` 放未完成事项和承诺，`relationship_memory` 放关系线索，`emotional_context` 放情绪脉络，`creative_threads` 放创作连续性，`self_continuity` 放 Bot 自我日程与主动行为，`stable_facts` 放偏好、画像和稳定事实。每条记忆仍保留“可明说/只调语气/不确定”的用法标记。
 
 与主动陪伴插件配合时，陪伴插件负责当前状态、即时日程、情绪底色和主动行为提示；MemoryCompanion 只补充长期解释层：为什么这个状态重要、它和用户有什么关系、过去是否有类似情境、还有什么未完成话题可以自然接上。检测到陪伴插件已注入当前状态后，MemoryCompanion 会过滤近期“当前状态复读”型记忆，只保留有关系、承诺、创作或伤痕意义的长期线索。
+
+PrivateCompanion 读取日程连续性或每日穿搭时会协商使用 `schedule_fast` / `outfit_fast`：通过短生命周期只读连接，按 Bot 所有者和当前私聊对象隔离后均衡读取相关日程、行动、边界、历史穿搭与自拍，不调用 Embedding、Rerank 或全库候选。两个快速路径可在“陪伴插件协同”中分别关闭并回退完整检索；普通聊天召回始终使用完整检索链。
 
 `private_companion_bridge.cross_window_emotional_continuity_enabled` 默认关闭。只有明确开启后，其他会话的近期情绪余波才会进入当前窗口提示或被陪伴插件全局读取；当前会话自己的情绪事件不受影响。
 
@@ -421,6 +423,8 @@ blocked_count: ...
 主要数据存储在 SQLite 数据库中。插件保留旧版字段以兼容历史数据，但默认不再暴露记忆审核工作流。旧的 pending 数据不会参与普通检索和页面列表。
 
 睡眠维护会按配置归档过期 `raw_event` 长期记录，并删除过期的注入诊断日志。时间线只会清理已经成功生成长期总结的记录；未总结或进入总结死信状态的原始消息会一直保留，等待手动强制重试。相关配置为 `maintenance.retention_summarized_timeline_days`、`maintenance.retention_injection_log_days` 和 `maintenance.retention_cleanup_limit`。
+
+睡眠维护结束时会执行一次限频 `wal_checkpoint(PASSIVE)`，并记录 checkpoint 是否繁忙、WAL 总帧和已合并帧。正常写入不会逐次强制 checkpoint；Rerank 调试日志只记录 query/document/model 长度，不记录候选正文。
 
 开启 Embedding 后，当前窗口候选会单独保底；FTS 候选足量时会跳过宽泛多列 LIKE。后台补向量默认每个 Provider 至少间隔 300 秒，最多并发 2 个任务，可通过 `retrieval_advanced` 中的对应参数调整。
 

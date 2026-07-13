@@ -60,6 +60,8 @@ PRESETS: dict[str, dict[str, Any]] = {
         "memory_summary.min_events": 8,
         "memory_summary.trigger_event_count": 12,
         "private_companion_bridge.enabled": True,
+        "private_companion_bridge.schedule_fast_context_enabled": True,
+        "private_companion_bridge.outfit_fast_context_enabled": True,
         "private_companion_bridge.dedupe_prompt_context": True,
         "private_companion_bridge.prefer_memory_companion_memory": True,
         "private_companion_bridge.suppress_self_timeline_when_companion_seen": True,
