@@ -67,6 +67,9 @@ class ReplyChainResolver:
     def cached_context_for_event(self, event: Any, *, max_chars: int = 640) -> str:
         return self.format_for_query(self._cached_chain(event), max_chars=max_chars)
 
+    def cached_chain_for_event(self, event: Any) -> list[dict[str, Any]]:
+        return list(self._cached_chain(event))
+
     def metadata(self, chain: list[dict[str, Any]]) -> dict[str, Any]:
         if not chain:
             return {}

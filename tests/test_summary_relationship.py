@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -167,6 +168,143 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("胖次话题", text)
         self.assertEqual("schedule_fast_local", service._last_retrieval_path_info["path"])
         self.assertEqual("skipped_schedule_fast", service._last_retrieval_path_info["embedding_reason"])
+
+    async def test_short_group_reply_chain_keeps_only_quote_relevant_memories(self) -> None:
+        service = self.make_service()
+        ctx = SessionContext(
+            session_id="qq:GroupMessage:g1",
+            scope="group",
+            group_id="g1",
+            user_id="u1",
+            bot_id="b1",
+            message_text="让比折给你送",
+        )
+        event = SimpleNamespace(
+            private_companion_reply_message_chain=[
+                {
+                    "message_id": "quoted-1",
+                    "depth": 1,
+                    "text": "可不是嘛，界园欠我一个送包子的信使呢！",
+                }
+            ]
+        )
+        relevant_open_loop = SearchResult(
+            MemoryRecord(id="package-promise", content="答应等信使打完界园后送包子。"),
+            2.4,
+        )
+        unrelated_schedule = SearchResult(
+            MemoryRecord(id="unrelated-school", content="Bot 自称不是小机器人而是普通高中生。"),
+            2.3,
+        )
+        relevant_action = SearchResult(
+            MemoryRecord(id="package-action", content="建议先找零食，等界园里的信使送包子。"),
+            2.2,
+        )
+        relevant_summary = SearchResult(
+            MemoryRecord(id="package-summary", content="群里讨论了界园路线和送包子的安排。"),
+            2.1,
+        )
+        blocked: list[dict] = []
+
+        anchor = service._short_reply_chain_anchor(ctx, event)
+        filtered = service._filter_short_reply_chain_slots(
+            {
+                "open_loop": [relevant_open_loop],
+                "self_timeline": [unrelated_schedule, relevant_action],
+                "conversation_summary": [relevant_summary],
+            },
+            anchor,
+            blocked,
+        )
+        selected_ids = {item.memory.id for items in filtered.values() for item in items}
+
+        self.assertIn("界园", anchor)
+        self.assertEqual({"package-promise", "package-action", "package-summary"}, selected_ids)
+        self.assertTrue(any(item.get("id") == "unrelated-school" for item in blocked))
+        self.assertLessEqual(sum(len(items) for items in filtered.values()), 3)
+
+    async def test_main_injection_applies_short_quote_limits_and_actor_guard(self) -> None:
+        service = self.make_service(
+            {
+                "memory_injection": {"enable_injection_logs": False, "max_chars": 1800},
+                "conversation_memory_advanced": {
+                    "low_information_guard_enabled": False,
+                    "topic_shift_guard_enabled": False,
+                },
+            }
+        )
+        ctx = SessionContext(
+            session_id="qq:GroupMessage:g1",
+            scope="group",
+            group_id="g1",
+            user_id="u1",
+            bot_id="b1",
+            message_text="让比折给你送",
+        )
+        event = SimpleNamespace(
+            private_companion_reply_message_chain=[
+                {
+                    "message_id": "quoted-1",
+                    "depth": 1,
+                    "text": "可不是嘛，界园欠我一个送包子的信使呢！",
+                }
+            ]
+        )
+        relevant_open_loop = SearchResult(
+            MemoryRecord(id="package-promise", content="答应等信使打完界园后送包子。"),
+            2.4,
+        )
+        unrelated_schedule = SearchResult(
+            MemoryRecord(id="unrelated-school", content="Bot 自称不是小机器人而是普通高中生。"),
+            2.3,
+        )
+        relevant_action = SearchResult(
+            MemoryRecord(id="package-action", content="建议先找零食，等界园里的信使送包子。"),
+            2.2,
+        )
+        relevant_summary = SearchResult(
+            MemoryRecord(id="package-summary", content="群里讨论了界园路线和送包子的安排。"),
+            2.1,
+        )
+        relevant_window = SearchResult(
+            MemoryRecord(id="package-window", content="刚才仍在聊界园和包子。"),
+            2.0,
+        )
+
+        async def fake_search_context_slots(*_args, **_kwargs):
+            slot_map = {
+                "open_loop": [relevant_open_loop],
+                "self_timeline": [unrelated_schedule, relevant_action],
+                "conversation_summary": [relevant_summary],
+                "current_window": [relevant_window],
+            }
+            return list(slot_map.values())[0], [], slot_map
+
+        service.search_context_slots = fake_search_context_slots
+        captured: dict[str, object] = {}
+        original_compose = service.injection.compose
+
+        def capture_compose(*args, **kwargs):
+            captured.update(kwargs)
+            if len(args) >= 3:
+                captured["max_chars"] = args[2]
+            return original_compose(*args, **kwargs)
+
+        service.injection.compose = capture_compose
+        req = SimpleNamespace(prompt="", system_prompt="", contexts=[], extra_user_content_parts=[])
+
+        await service.inject_memories(ctx, req, event=event)
+
+        state = getattr(req, "memory_companion_injection_state", {})
+        self.assertTrue(state.get("injected"))
+        self.assertEqual(
+            {"package-promise", "package-action", "package-summary"},
+            set(state.get("selected_memory_ids") or []),
+        )
+        self.assertNotIn("unrelated-school", state.get("selected_memory_ids") or [])
+        self.assertLessEqual(int(captured.get("max_chars") or 0), 1050)
+        self.assertTrue(captured.get("compact_memory"))
+        self.assertIn("人物、动作和地点尽量按原句对应", str(captured.get("intent_context") or ""))
 
     async def test_outfit_fast_context_balances_history_schedule_preference_and_photo(self) -> None:
         service = self.make_service()

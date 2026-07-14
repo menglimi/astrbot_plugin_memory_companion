@@ -3724,22 +3724,39 @@ class MemoryCompanionService:
             time_intent,
             query_text=intent.query or route_text,
         )
+        short_reply_anchor, slot_map = self._apply_short_reply_chain_policy(
+            ctx,
+            event,
+            slot_map,
+            blocked,
+            retrieval_path_info,
+        )
         results = self._flatten_slot_map(slot_map)
         conversation_memory_note = self._conversation_memory_injection_note(slot_map)
         intent_context = self._intent_context_for_injection(intent, time_intent=time_intent)
         if decision.guard_lines:
             guard_text = "\n".join(decision.guard_lines)
             intent_context = f"{guard_text}\n{intent_context}" if intent_context else guard_text
+        if short_reply_anchor:
+            short_reply_guard = self._short_reply_chain_guard()
+            intent_context = f"{short_reply_guard}\n{intent_context}" if intent_context else short_reply_guard
         # Merge companion emotional state: explicit params take priority, fall back to intent-extracted values
         merged_bot_mood = companion_bot_mood or getattr(intent, "companion_bot_mood", "") or ""
         merged_bot_energy = companion_bot_energy or getattr(intent, "companion_bot_energy", 0.0) or 0.0
+        injection_max_chars = max_chars or self._injection_max_chars_for_query(
+            ctx,
+            retrieval_query,
+            time_intent=time_intent,
+        )
+        if short_reply_anchor:
+            injection_max_chars = min(injection_max_chars, 1050)
         injection = self.injection.compose(
             ctx,
             results,
-            max_chars or self._injection_max_chars_for_query(ctx, retrieval_query, time_intent=time_intent),
+            injection_max_chars,
             intent_context=intent_context,
             slot_sections=self._slot_sections(slot_map),
-            compact_memory=time_intent.active or self._message_requests_temporal_aggregate(ctx.message_text or intent.query),
+            compact_memory=bool(short_reply_anchor) or time_intent.active or self._message_requests_temporal_aggregate(ctx.message_text or intent.query),
             time_context=time_intent.display_range if time_intent.active else "",
             emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"),
             intimacy_level=getattr(turn_signal, "intimacy_level", 0.0),
@@ -3968,22 +3985,35 @@ class MemoryCompanionService:
             time_intent,
             query_text=intent.query or ctx.message_text,
         )
+        short_reply_anchor, slot_map = self._apply_short_reply_chain_policy(
+            ctx,
+            event,
+            slot_map,
+            blocked,
+            retrieval_path_info,
+        )
         results = self._flatten_slot_map(slot_map)
         conversation_memory_note = self._conversation_memory_injection_note(slot_map)
         intent_context = self._intent_context_for_injection(intent, time_intent=time_intent)
         if decision.guard_lines:
             guard_text = "\n".join(decision.guard_lines)
             intent_context = f"{guard_text}\n{intent_context}" if intent_context else guard_text
+        if short_reply_anchor:
+            short_reply_guard = self._short_reply_chain_guard()
+            intent_context = f"{short_reply_guard}\n{intent_context}" if intent_context else short_reply_guard
 
         _bot_mood = getattr(intent, "companion_bot_mood", "") or ""
         _bot_energy = getattr(intent, "companion_bot_energy", 0.0) or 0.0
+        injection_max_chars = self._injection_max_chars_for_query(ctx, retrieval_query, time_intent=time_intent)
+        if short_reply_anchor:
+            injection_max_chars = min(injection_max_chars, 1050)
         injection = self.injection.compose(
             ctx,
             results,
-            self._injection_max_chars_for_query(ctx, retrieval_query, time_intent=time_intent),
+            injection_max_chars,
             intent_context=intent_context,
             slot_sections=self._slot_sections(slot_map),
-            compact_memory=time_intent.active or self._message_requests_temporal_aggregate(ctx.message_text or intent.query),
+            compact_memory=bool(short_reply_anchor) or time_intent.active or self._message_requests_temporal_aggregate(ctx.message_text or intent.query),
             time_context=time_intent.display_range if time_intent.active else "",
             emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"),
             intimacy_level=getattr(turn_signal, "intimacy_level", 0.0),
@@ -5916,6 +5946,129 @@ class MemoryCompanionService:
             "conversation_summary": min(total, conversation_limit),
             "stable_memory": min(total, self.config.int("context_orchestration.stable_memory_limit", 3)),
         }
+
+    def _short_reply_chain_anchor(self, ctx: SessionContext, event: Any) -> str:
+        if ctx.scope != "group" or event is None:
+            return ""
+        current = clean_text(ctx.message_text, 180)
+        compact = re.sub(r"\s+", "", current)
+        if not compact or len(compact) > 32:
+            return ""
+        if self._message_requests_memory_context(current) or self._message_requests_temporal_aggregate(current):
+            return ""
+        chain = self.reply_chain.cached_chain_for_event(event)
+        if not chain:
+            return ""
+        direct = next(
+            (row for row in chain if int(row.get("depth") or 1) == 1 and clean_text(row.get("text"), 360)),
+            None,
+        )
+        if direct is None:
+            return ""
+        quoted = clean_text(direct.get("text"), 360)
+        return clean_text(f"{current} {quoted}", 520) if quoted else ""
+
+    def _apply_short_reply_chain_policy(
+        self,
+        ctx: SessionContext,
+        event: Any,
+        slot_map: dict[str, list[Any]],
+        blocked: list[dict[str, Any]],
+        retrieval_path_info: dict[str, Any],
+    ) -> tuple[str, dict[str, list[Any]]]:
+        anchor = self._short_reply_chain_anchor(ctx, event)
+        if not anchor:
+            return "", slot_map
+        filtered = self._filter_short_reply_chain_slots(slot_map, anchor, blocked)
+        retrieval_path_info["short_reply_chain"] = True
+        retrieval_path_info["short_reply_selected"] = len(self._flatten_slot_map(filtered))
+        return anchor, filtered
+
+    @staticmethod
+    def _short_reply_chain_guard() -> str:
+        return (
+            "- 当前是短引用接话：优先依据本轮用户文字和直接引用，旧记忆只补充少量连续性。\n"
+            "- 人物、动作和地点尽量按原句对应；除非上下文明确指向同一对象，不要把引用中信使、第三方或旧记忆里的动作顺手换到另一个人身上。"
+        )
+
+    def _filter_short_reply_chain_slots(
+        self,
+        slot_map: dict[str, list[Any]],
+        anchor_text: str,
+        blocked: list[dict[str, Any]],
+    ) -> dict[str, list[Any]]:
+        ignored_terms = {"给你", "让你", "这个", "那个", "怎么", "什么", "可以", "不是", "就是", "一下"}
+        anchors = {term for term in message_terms(anchor_text, limit=60) if term not in ignored_terms}
+        if not anchors:
+            return {}
+        slot_limits = {
+            "open_loop": 1,
+            "self_timeline": 1,
+            "conversation_summary": 1,
+            "current_window": 1,
+        }
+        for slot, items in slot_map.items():
+            if slot in slot_limits:
+                continue
+            for item in items or []:
+                memory = getattr(item, "memory", None)
+                blocked.append(
+                    {
+                        "id": clean_text(getattr(memory, "id", ""), 120),
+                        "reason": f"short_reply_slot_suppressed:{clean_text(slot, 60)}",
+                        "content": clean_text(getattr(memory, "content", ""), 180),
+                    }
+                )
+        filtered: dict[str, list[Any]] = {}
+        total = 0
+        for slot in ("open_loop", "self_timeline", "conversation_summary", "current_window"):
+            kept: list[Any] = []
+            for item in slot_map.get(slot) or []:
+                memory = getattr(item, "memory", None)
+                if memory is None:
+                    continue
+                if total >= 3:
+                    blocked.append(
+                        {
+                            "id": clean_text(memory.id, 120),
+                            "reason": "short_reply_global_limit",
+                            "content": clean_text(memory.content, 180),
+                        }
+                    )
+                    continue
+                if len(kept) >= slot_limits[slot]:
+                    blocked.append(
+                        {
+                            "id": clean_text(memory.id, 120),
+                            "reason": f"short_reply_slot_limit:{slot}",
+                            "content": clean_text(memory.content, 180),
+                        }
+                    )
+                    continue
+                metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+                memory_text = " ".join(
+                    [
+                        clean_text(memory.content, 2200),
+                        clean_text(memory.evidence, 1000),
+                        " ".join(clean_text(tag, 80) for tag in (memory.tags or [])),
+                        clean_text(metadata.get("canonical_summary"), 1000),
+                    ]
+                )
+                memory_terms = set(message_terms(memory_text, limit=120))
+                if not anchors.intersection(memory_terms):
+                    blocked.append(
+                        {
+                            "id": clean_text(memory.id, 120),
+                            "reason": "short_reply_quote_topic_mismatch",
+                            "content": clean_text(memory.content, 180),
+                        }
+                    )
+                    continue
+                kept.append(item)
+                total += 1
+            if kept:
+                filtered[slot] = kept
+        return filtered
 
     def _intent_context_for_injection(self, intent: RetrievalIntent, *, time_intent: TimeIntent | None = None) -> str:
         if not self.config.bool("context_orchestration.include_intent_context", True):
