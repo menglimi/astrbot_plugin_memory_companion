@@ -32,6 +32,70 @@ class StoreConsistencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(3000, store._conn.execute("PRAGMA busy_timeout").fetchone()[0])
         self.assertEqual(500, store._conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0])
 
+    async def test_internal_dreams_leave_private_buckets_and_legacy_sessions_are_typed(self) -> None:
+        store = self.make_store()
+        legacy_session_id = "7e6a17fd-d9c9-4753-95cc-5e93922fa72f"
+        await store.insert_memory(
+            MemoryRecord(
+                id="private_companion_dream_test",
+                memory_type="persona_life",
+                subject=EntityRef.bot_self(),
+                object=EntityRef(kind="session", id="private_companion:dream"),
+                scope="private",
+                session_id="private_companion:dream",
+                visibility="bot_self",
+                reality_level="persona_life",
+                lifecycle="stable_memory",
+                source_plugin="private_companion",
+                content="Bot 梦境碎片：测试梦境。",
+                tags=["dream", "dream_fragment", "persona_life"],
+            )
+        )
+        await store.insert_memory(
+            MemoryRecord(
+                id="legacy-live2d-summary",
+                memory_type="conversation_summary",
+                subject=EntityRef(kind="unknown"),
+                object=EntityRef(kind="user", id=legacy_session_id),
+                scope="private",
+                session_id=f"live2d_default:FriendMessage:{legacy_session_id}",
+                visibility="private_pair",
+                reality_level="imported_summary",
+                lifecycle="stable_memory",
+                source_plugin="livingmemory",
+                content="旧 Live2D 会话摘要。",
+            )
+        )
+        await store.insert_memory(
+            MemoryRecord(
+                id="native-private-memory",
+                memory_type="user_preference",
+                subject=EntityRef(kind="user", id="995051631", name="比折"),
+                object=EntityRef.bot_self(),
+                scope="private",
+                session_id="default:FriendMessage:995051631",
+                visibility="private_pair",
+                lifecycle="stable_memory",
+                content="正常 QQ 私聊记忆。",
+            )
+        )
+
+        fingerprint_before = (await store.get_memory("private_companion_dream_test")).content_fingerprint
+        self.assertEqual(1, store.normalize_internal_bot_self_scopes())
+        dream = await store.get_memory("private_companion_dream_test")
+        self.assertIsNotNone(dream)
+        self.assertEqual("unknown", dream.scope)
+        self.assertEqual("bot_self", dream.visibility)
+        self.assertNotEqual(fingerprint_before, dream.content_fingerprint)
+
+        buckets = {item["target_id"]: item for item in await store.list_memory_buckets()}
+        self.assertNotIn("private_companion:dream", buckets)
+        self.assertEqual("legacy_live2d", buckets[legacy_session_id]["target_kind"])
+        self.assertEqual("qq", buckets["995051631"]["target_kind"])
+        legacy = await store.get_memory("legacy-live2d-summary")
+        self.assertEqual("private", legacy.scope)
+        self.assertEqual("private_pair", legacy.visibility)
+
     async def test_schedule_context_read_is_scoped_and_checkpoint_is_observable(self) -> None:
         store = self.make_store()
         current_session = "qq:FriendMessage:u1"
@@ -305,11 +369,19 @@ class StoreConsistencyTests(unittest.IsolatedAsyncioTestCase):
         store._last_wal_health = {"wal_bytes": 999999999, "checkpoint_attempted": True}
 
         stats = await store.stats()
-        expected = store._database_file_snapshot()["wal_bytes"]
+        snapshot = store._database_file_snapshot()
+        expected = snapshot["wal_bytes"]
+        expected_storage = sum(
+            max(0, int(snapshot[key] or 0))
+            for key in ("db_bytes", "wal_bytes", "shm_bytes")
+        )
 
         self.assertEqual(expected, stats["wal"]["wal_bytes"])
         self.assertEqual(expected, stats["wal"]["current_files"]["wal_bytes"])
         self.assertEqual(999999999, stats["wal"]["last_health_check"]["wal_bytes"])
+        self.assertEqual(expected_storage, stats["memory_storage_bytes"])
+        self.assertEqual(max(0, snapshot["db_bytes"]), stats["memory_storage"]["database_bytes"])
+        self.assertEqual(expected, stats["memory_storage"]["wal_bytes"])
 
     async def test_recovery_never_replaces_a_missing_database_with_empty_file(self) -> None:
         store = self.make_store()

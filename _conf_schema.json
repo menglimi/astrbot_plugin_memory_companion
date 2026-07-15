@@ -152,6 +152,61 @@
       }
     }
   },
+  "historical_chat_import": {
+    "description": "历史对话整理导入",
+    "hint": "上传 UTF-8 对话文本，确认用户/Bot 身份后按时间和会话片段逐步整理；原始时间线默认永久保留，并支持暂停、恢复和整批回滚。",
+    "type": "object",
+    "items": {
+      "max_retries": {
+        "description": "片段失败重试次数",
+        "hint": "单个历史会话片段连续失败达到该次数后暂停整个批次，保留已完成进度。",
+        "type": "int",
+        "default": 3
+      },
+      "merge_seconds": {
+        "description": "连续发言合并秒数",
+        "hint": "同一说话人在该秒数内连续发送的消息会合并成一次逻辑发言；原始消息仍分别保存。",
+        "type": "int",
+        "default": 120
+      },
+      "hard_gap_minutes": {
+        "description": "会话硬分段分钟",
+        "hint": "相邻发言超过该间隔时一定开始新的会话片段。",
+        "type": "int",
+        "default": 120
+      },
+      "soft_gap_minutes": {
+        "description": "会话软分段分钟",
+        "hint": "超过该间隔且遇到跨日、晚安、离开或重新问候时开始新片段。",
+        "type": "int",
+        "default": 30
+      },
+      "max_turns": {
+        "description": "单片段逻辑发言数",
+        "hint": "限制一个会话片段最多包含多少次逻辑发言，避免提示过长。",
+        "type": "int",
+        "default": 30
+      },
+      "max_segment_chars": {
+        "description": "单片段正文字数",
+        "hint": "单个会话片段的正文上限；切分时尽量不拆开用户提问与 Bot 回答。",
+        "type": "int",
+        "default": 4200
+      },
+      "package_chars": {
+        "description": "单次总结打包字数",
+        "hint": "允许把多个较短片段打包到一次模型请求中，但每个片段仍独立返回摘要和事件。",
+        "type": "int",
+        "default": 4600
+      },
+      "detail_package_chars": {
+        "description": "详细回忆补全打包字数",
+        "hint": "旧批次升级为第三人称详细回忆时，单次发送给总结模型的片段与原文总量。数值越大调用更少，但更容易超时。",
+        "type": "int",
+        "default": 9000
+      }
+    }
+  },
   "retrieval": {
     "description": "记忆召回模型",
     "hint": "控制长期记忆如何被找出来：嵌入模型负责语义候选，重排模型负责二阶段排序；权限和窗口隔离始终优先。",

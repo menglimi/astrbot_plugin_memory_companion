@@ -279,7 +279,17 @@ class InjectionComposer:
         content_limit = detail_limit or (140 if compact else 360)
         content = self._redact_sensitive_text(clean_text(memory.content, content_limit))
         evidence = self._redact_sensitive_text(clean_text(memory.evidence, min(180, max(80, content_limit))))
-        detail = self._redact_sensitive_text(clean_text(fact_text or canonical or content, content_limit))
+        try:
+            detail_schema_version = int(metadata.get("detail_schema_version") or 0)
+        except Exception:
+            detail_schema_version = 0
+        historical_detailed = (
+            memory.source_plugin == "historical_chat_import"
+            and clean_text(metadata.get("summary_perspective"), 40) == "neutral_third_person"
+            and detail_schema_version > 0
+        )
+        detail_source = content if historical_detailed else (fact_text or canonical or content)
+        detail = self._redact_sensitive_text(clean_text(detail_source, content_limit))
         if evidence and evidence != detail and evidence not in detail and not compact:
             detail = clean_text(f"{detail}（证据：{evidence}）", content_limit + 120)
         detail = self._safe_text(detail, content_limit + (120 if not compact else 0))

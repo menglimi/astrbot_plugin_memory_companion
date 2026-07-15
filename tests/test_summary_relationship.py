@@ -35,12 +35,22 @@ class _TextProvider:
         return _Response(self.text)
 
 
+class _CapturingProvider:
+    def __init__(self, text: str):
+        self.text = text
+        self.prompt = ""
+
+    async def text_chat(self, **kwargs):
+        self.prompt = str(kwargs.get("prompt") or "")
+        return _Response(self.text)
+
+
 class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
-    def make_service(self, config: dict | None = None) -> MemoryCompanionService:
+    def make_service(self, config: dict | None = None, *, context=None) -> MemoryCompanionService:
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         service = MemoryCompanionService(
-            context=None,
+            context=context,
             config=config or {},
             plugin_root=ROOT,
             data_dir=Path(temp_dir.name),
@@ -425,12 +435,76 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
     async def test_summary_provider_timeout_is_enforced(self) -> None:
         summarizer = MemorySummarizer(provider_timeout_seconds=0.01)
         rows = [{"content": "一条需要总结的消息", "scope": "private", "subject_id": "u1"}]
-        with self.assertRaises(TimeoutError):
+        with self.assertRaisesRegex(TimeoutError, "总结模型在 0.01 秒内未返回"):
             await summarizer.summarize_with_provider(
                 _TextProvider('{"summary":"ok"}', delay=0.1),
                 rows=rows,
                 session_label="私聊 u1",
             )
+
+    async def test_summary_provider_attempts_do_not_repeat_same_runtime_provider(self) -> None:
+        provider = _TextProvider('{"summary":"ok"}')
+
+        async def get_provider_by_id(_provider_id):
+            return provider
+
+        async def get_using_provider(_session_id):
+            return provider
+
+        context = SimpleNamespace(
+            get_provider_by_id=get_provider_by_id,
+            get_using_provider=get_using_provider,
+        )
+        service = self.make_service(
+            {
+                "memory_summary": {
+                    "provider_id": "ollama-summary",
+                    "fallback_provider_id": "ollama-fallback",
+                }
+            },
+            context=context,
+        )
+
+        attempts = await service._summary_provider_attempts(
+            SessionContext(session_id="qq:FriendMessage:u1", scope="private", user_id="u1")
+        )
+
+        self.assertEqual(1, len(attempts))
+        self.assertEqual("primary", attempts[0]["source"])
+        self.assertIs(provider, attempts[0]["provider"])
+
+    async def test_summary_reports_only_rows_actually_sent_to_provider(self) -> None:
+        summarizer = MemorySummarizer(max_input_chars=1000, provider_timeout_seconds=1)
+        rows = [
+            {
+                "id": f"event-{index}",
+                "event_type": "user_message",
+                "scope": "private",
+                "subject_id": "u1",
+                "content": f"第{index}条" + ("很长的消息" * 120),
+                "occurred_at": f"2026-07-15T0{index}:00:00+08:00",
+            }
+            for index in range(1, 4)
+        ]
+        provider = _CapturingProvider(
+            json.dumps(
+                {
+                    "summary": "只总结实际看到的消息。",
+                    "canonical_summary": "已消费事件摘要。",
+                    "key_facts": ["事件有明确证据"],
+                    "importance": 0.6,
+                },
+                ensure_ascii=False,
+            )
+        )
+
+        payload = await summarizer.summarize_with_provider(provider, rows=rows, session_label="测试")
+
+        consumed = payload.get("_consumed_event_ids") or []
+        self.assertGreaterEqual(len(consumed), 1)
+        self.assertLess(len(consumed), len(rows))
+        self.assertIn(consumed[-1], provider.prompt)
+        self.assertNotIn(rows[-1]["id"], provider.prompt)
 
     async def test_retry_exhaustion_preserves_unsummarized_timeline(self) -> None:
         service = self.make_service(

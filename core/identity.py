@@ -28,6 +28,15 @@ def parse_scope_from_session(session_id: str) -> tuple[str, str]:
     return "unknown", ""
 
 
+def session_target_id(session_id: str, expected_scope: str = "") -> str:
+    """Return the stable window target carried by an AstrBot session key."""
+    scope, target_id = parse_scope_from_session(clean_text(session_id, 200))
+    expected_scope = clean_text(expected_scope, 40)
+    if expected_scope and scope != expected_scope:
+        return ""
+    return clean_text(target_id, 120)
+
+
 def normalize_session_context_fields(
     *,
     session_id: str = "",

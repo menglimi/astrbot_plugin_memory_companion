@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .identity import session_target_id
 from .models import MemoryRecord, SessionContext
 
 
@@ -56,6 +57,8 @@ class VisibilityPolicy:
             ids = {memory.subject.id, memory.object.id}
             if ctx.user_id and ctx.user_id in ids:
                 return True, "same_private_user"
+            if ctx.user_id and session_target_id(memory.session_id, "private") == ctx.user_id:
+                return True, "same_private_session_target"
             return False, "other_private_pair"
         if memory.visibility == "group_public":
             if ctx.scope == "group" and memory.group_id and memory.group_id == ctx.group_id:

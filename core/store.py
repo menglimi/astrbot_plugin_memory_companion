@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from .identity import parse_scope_from_session
 from .models import EntityRef, MemoryRecord, clean_text, json_dumps, json_loads, new_id, stable_fingerprint, utc_now
 
 
@@ -271,7 +272,10 @@ class MemoryStore:
                     dedupe_key TEXT NOT NULL DEFAULT '',
                     occurred_at TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL DEFAULT '',
-                    summarized_at TEXT NOT NULL DEFAULT ''
+                    summarized_at TEXT NOT NULL DEFAULT '',
+                    retention_class TEXT NOT NULL DEFAULT 'normal',
+                    import_batch_id TEXT NOT NULL DEFAULT '',
+                    source_sequence INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS summary_failures (
@@ -284,6 +288,55 @@ class MemoryStore:
                     metadata TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS chat_import_batches (
+                    id TEXT PRIMARY KEY,
+                    upload_id TEXT NOT NULL DEFAULT '',
+                    source_name TEXT NOT NULL DEFAULT '',
+                    source_hash TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL DEFAULT 'prepared',
+                    session_id TEXT NOT NULL DEFAULT '',
+                    scope TEXT NOT NULL DEFAULT 'private',
+                    platform TEXT NOT NULL DEFAULT '',
+                    user_id TEXT NOT NULL DEFAULT '',
+                    user_name TEXT NOT NULL DEFAULT '',
+                    bot_id TEXT NOT NULL DEFAULT '',
+                    bot_name TEXT NOT NULL DEFAULT '',
+                    speaker_map TEXT NOT NULL DEFAULT '{}',
+                    options TEXT NOT NULL DEFAULT '{}',
+                    stats TEXT NOT NULL DEFAULT '{}',
+                    checkpoint_segment INTEGER NOT NULL DEFAULT 0,
+                    total_segments INTEGER NOT NULL DEFAULT 0,
+                    completed_segments INTEGER NOT NULL DEFAULT 0,
+                    summary_memory_count INTEGER NOT NULL DEFAULT 0,
+                    important_event_count INTEGER NOT NULL DEFAULT 0,
+                    relationship_observation_count INTEGER NOT NULL DEFAULT 0,
+                    backup_path TEXT NOT NULL DEFAULT '',
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS chat_import_segments (
+                    id TEXT PRIMARY KEY,
+                    batch_id TEXT NOT NULL DEFAULT '',
+                    segment_index INTEGER NOT NULL DEFAULT 0,
+                    start_at TEXT NOT NULL DEFAULT '',
+                    end_at TEXT NOT NULL DEFAULT '',
+                    local_date TEXT NOT NULL DEFAULT '',
+                    message_ids TEXT NOT NULL DEFAULT '[]',
+                    transcript TEXT NOT NULL DEFAULT '',
+                    char_count INTEGER NOT NULL DEFAULT 0,
+                    turn_count INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    result TEXT NOT NULL DEFAULT '{}',
+                    summary_memory_id TEXT NOT NULL DEFAULT '',
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    UNIQUE(batch_id, segment_index)
                 );
 
                 CREATE TABLE IF NOT EXISTS relationship_edges (
@@ -449,6 +502,9 @@ class MemoryStore:
                 "CREATE INDEX IF NOT EXISTS idx_timeline_retention ON timeline(occurred_at, created_at) WHERE summarized_at!=''"
             )
             self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_timeline_import_batch ON timeline(import_batch_id, source_sequence)"
+            )
+            self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_injection_logs_created ON injection_logs(created_at)"
             )
             self._conn.execute(
@@ -456,6 +512,15 @@ class MemoryStore:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_summary_failures_updated ON summary_failures(updated_at)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_import_batches_state ON chat_import_batches(state, updated_at)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_import_segments_state ON chat_import_segments(batch_id, status, segment_index)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_import_batch ON memories(import_batch_id, memory_type)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memory_acl_owner ON memory_acl_rules(owner_scope, owner_id, enabled)"
@@ -714,6 +779,9 @@ class MemoryStore:
             "summarized_at": "TEXT NOT NULL DEFAULT ''",
             "message_id": "TEXT NOT NULL DEFAULT ''",
             "dedupe_key": "TEXT NOT NULL DEFAULT ''",
+            "retention_class": "TEXT NOT NULL DEFAULT 'normal'",
+            "import_batch_id": "TEXT NOT NULL DEFAULT ''",
+            "source_sequence": "INTEGER NOT NULL DEFAULT 0",
         }
         for name, ddl in additions.items():
             if name not in existing:
@@ -732,6 +800,12 @@ class MemoryStore:
         with self._lock:
             with self._transaction_sync():
                 return self._normalize_legacy_manual_visibility_sync()
+
+    def normalize_internal_bot_self_scopes(self) -> int:
+        """Move legacy internal Bot memories out of user-facing private scopes."""
+        with self._lock:
+            with self._transaction_sync():
+                return self._normalize_internal_bot_self_scopes_sync()
 
     def _normalize_legacy_manual_visibility_sync(self) -> int:
         private_cur = self._conn.execute(
@@ -760,6 +834,37 @@ class MemoryStore:
         )
         return int(private_cur.rowcount or 0) + int(group_cur.rowcount or 0) + int(unknown_cur.rowcount or 0)
 
+    def _normalize_internal_bot_self_scopes_sync(self) -> int:
+        rows = self._conn.execute(
+            """
+            SELECT * FROM memories
+            WHERE scope='private'
+              AND visibility='bot_self'
+              AND source_plugin='private_companion'
+              AND (
+                    session_id='private_companion:dream'
+                    OR id LIKE 'private_companion_dream_%'
+                    OR tags LIKE '%"dream_fragment"%'
+              )
+            """,
+        ).fetchall()
+        now = utc_now()
+        for row in rows:
+            record = MemoryRecord.from_row(row)
+            record.scope = "unknown"
+            record.group_id = ""
+            record.content_fingerprint = ""
+            record.ensure_defaults()
+            self._conn.execute(
+                """
+                UPDATE memories
+                SET scope='unknown', group_id='', content_fingerprint=?, updated_at=?
+                WHERE id=?
+                """,
+                (record.content_fingerprint, now, record.id),
+            )
+        return len(rows)
+
     def close(self) -> None:
         with self._lock:
             if self._closed:
@@ -787,6 +892,8 @@ class MemoryStore:
             "review_queue",
             "injection_logs",
             "summary_failures",
+            "chat_import_segments",
+            "chat_import_batches",
             "relationship_edges",
             "knowledge_nodes",
             "knowledge_edges",
@@ -1865,9 +1972,10 @@ class MemoryStore:
                     INSERT OR IGNORE INTO timeline(
                         id, event_type, session_id, scope, subject_id, object_id,
                         content, metadata, message_id, dedupe_key,
-                        occurred_at, created_at, summarized_at
+                        occurred_at, created_at, summarized_at,
+                        retention_class, import_batch_id, source_sequence
                     )
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?, '')
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?, '',?,?,?)
                     """,
                     (
                         row_id,
@@ -1882,6 +1990,9 @@ class MemoryStore:
                         dedupe_key,
                         occurred_at or now,
                         now,
+                        clean_text(metadata.get("retention_class"), 40) or "normal",
+                        clean_text(metadata.get("import_batch_id"), 120),
+                        max(0, int(metadata.get("source_sequence") or 0)),
                     ),
                 )
                 if cur.rowcount == 0 and dedupe_key:
@@ -1892,6 +2003,664 @@ class MemoryStore:
                     if existing:
                         return clean_text(existing["id"], 120)
         return row_id
+
+    async def add_historical_timeline_events(self, rows: list[dict[str, Any]]) -> dict[str, str]:
+        return await asyncio.to_thread(self._add_historical_timeline_events_sync, rows)
+
+    def _add_historical_timeline_events_sync(self, rows: list[dict[str, Any]]) -> dict[str, str]:
+        now = utc_now()
+        inserted: dict[str, str] = {}
+        with self._lock:
+            with self._transaction_sync():
+                for raw in rows:
+                    if not isinstance(raw, dict):
+                        continue
+                    event_type = clean_text(raw.get("event_type"), 80)
+                    session_id = clean_text(raw.get("session_id"), 200)
+                    subject_id = clean_text(raw.get("subject_id"), 120)
+                    message_id = clean_text(raw.get("message_id"), 120)
+                    if not event_type or not session_id or not subject_id or not message_id:
+                        continue
+                    dedupe_key = stable_fingerprint("timeline", event_type, session_id, subject_id, message_id)
+                    row_id = clean_text(raw.get("id"), 120) or new_id("tl")
+                    metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+                    self._conn.execute(
+                        """
+                        INSERT OR IGNORE INTO timeline(
+                            id, event_type, session_id, scope, subject_id, object_id,
+                            content, metadata, message_id, dedupe_key,
+                            occurred_at, created_at, summarized_at,
+                            retention_class, import_batch_id, source_sequence
+                        )
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?, '',?,?,?)
+                        """,
+                        (
+                            row_id,
+                            event_type,
+                            session_id,
+                            clean_text(raw.get("scope"), 40),
+                            subject_id,
+                            clean_text(raw.get("object_id"), 120),
+                            clean_text(raw.get("content"), 4000),
+                            json_dumps(metadata),
+                            message_id,
+                            dedupe_key,
+                            clean_text(raw.get("occurred_at"), 80) or now,
+                            now,
+                            clean_text(raw.get("retention_class"), 40) or "historical_archive",
+                            clean_text(raw.get("import_batch_id"), 120),
+                            max(0, int(raw.get("source_sequence") or 0)),
+                        ),
+                    )
+                    existing = self._conn.execute(
+                        "SELECT id FROM timeline WHERE dedupe_key=?",
+                        (dedupe_key,),
+                    ).fetchone()
+                    if existing:
+                        inserted[message_id] = clean_text(existing["id"], 120)
+        return inserted
+
+    async def upsert_chat_import_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await asyncio.to_thread(self._upsert_chat_import_batch_sync, payload)
+
+    def _upsert_chat_import_batch_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
+        batch_id = clean_text(payload.get("id"), 120)
+        if not batch_id:
+            raise ValueError("chat import batch id is required")
+        now = utc_now()
+        json_fields = {"speaker_map", "options", "stats"}
+        values: dict[str, Any] = {
+            "id": batch_id,
+            "upload_id": clean_text(payload.get("upload_id"), 120),
+            "source_name": clean_text(payload.get("source_name"), 240),
+            "source_hash": clean_text(payload.get("source_hash"), 120),
+            "state": clean_text(payload.get("state"), 40) or "prepared",
+            "session_id": clean_text(payload.get("session_id"), 200),
+            "scope": clean_text(payload.get("scope"), 40) or "private",
+            "platform": clean_text(payload.get("platform"), 40),
+            "user_id": clean_text(payload.get("user_id"), 120),
+            "user_name": clean_text(payload.get("user_name"), 120),
+            "bot_id": clean_text(payload.get("bot_id"), 120),
+            "bot_name": clean_text(payload.get("bot_name"), 120),
+            "speaker_map": payload.get("speaker_map") if isinstance(payload.get("speaker_map"), dict) else {},
+            "options": payload.get("options") if isinstance(payload.get("options"), dict) else {},
+            "stats": payload.get("stats") if isinstance(payload.get("stats"), dict) else {},
+            "checkpoint_segment": max(0, int(payload.get("checkpoint_segment") or 0)),
+            "total_segments": max(0, int(payload.get("total_segments") or 0)),
+            "completed_segments": max(0, int(payload.get("completed_segments") or 0)),
+            "summary_memory_count": max(0, int(payload.get("summary_memory_count") or 0)),
+            "important_event_count": max(0, int(payload.get("important_event_count") or 0)),
+            "relationship_observation_count": max(0, int(payload.get("relationship_observation_count") or 0)),
+            "backup_path": clean_text(payload.get("backup_path"), 2000),
+            "error": clean_text(payload.get("error"), 1000),
+            "created_at": clean_text(payload.get("created_at"), 80) or now,
+            "updated_at": now,
+        }
+        columns = list(values)
+        db_values = [json_dumps(values[name]) if name in json_fields else values[name] for name in columns]
+        updates = ",".join(f"{name}=excluded.{name}" for name in columns if name not in {"id", "created_at"})
+        with self._lock:
+            with self._transaction_sync():
+                self._conn.execute(
+                    f"INSERT INTO chat_import_batches({','.join(columns)}) VALUES({','.join('?' for _ in columns)}) "
+                    f"ON CONFLICT(id) DO UPDATE SET {updates}",
+                    db_values,
+                )
+        return self._get_chat_import_batch_sync(batch_id) or {}
+
+    async def get_chat_import_batch(self, batch_id: str) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._get_chat_import_batch_sync, batch_id)
+
+    def _get_chat_import_batch_sync(self, batch_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM chat_import_batches WHERE id=?",
+                (clean_text(batch_id, 120),),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        for key in ("speaker_map", "options", "stats"):
+            result[key] = json_loads(result.get(key), {})
+        return result
+
+    async def list_chat_import_batches(self, limit: int = 20) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_chat_import_batches_sync, limit)
+
+    def _list_chat_import_batches_sync(self, limit: int) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM chat_import_batches ORDER BY updated_at DESC LIMIT ?",
+                (max(1, min(1000, int(limit or 20))),),
+            ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            for key in ("speaker_map", "options", "stats"):
+                item[key] = json_loads(item.get(key), {})
+            results.append(item)
+        return results
+
+    async def update_chat_import_batch(self, batch_id: str, **changes: Any) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._update_chat_import_batch_sync, batch_id, changes)
+
+    def _update_chat_import_batch_sync(self, batch_id: str, changes: dict[str, Any]) -> dict[str, Any] | None:
+        allowed = {
+            "state", "checkpoint_segment", "total_segments", "completed_segments",
+            "summary_memory_count", "important_event_count", "relationship_observation_count",
+            "stats", "options", "speaker_map", "backup_path", "error",
+        }
+        json_fields = {"stats", "options", "speaker_map"}
+        selected = {key: value for key, value in changes.items() if key in allowed}
+        if not selected:
+            return self._get_chat_import_batch_sync(batch_id)
+        selected["updated_at"] = utc_now()
+        clauses = ",".join(f"{key}=?" for key in selected)
+        params = [json_dumps(value) if key in json_fields else value for key, value in selected.items()]
+        params.append(clean_text(batch_id, 120))
+        with self._lock:
+            with self._transaction_sync():
+                self._conn.execute(f"UPDATE chat_import_batches SET {clauses} WHERE id=?", params)
+        return self._get_chat_import_batch_sync(batch_id)
+
+    async def replace_chat_import_segments(self, batch_id: str, segments: list[dict[str, Any]]) -> int:
+        return await asyncio.to_thread(self._replace_chat_import_segments_sync, batch_id, segments)
+
+    def _replace_chat_import_segments_sync(self, batch_id: str, segments: list[dict[str, Any]]) -> int:
+        batch_id = clean_text(batch_id, 120)
+        now = utc_now()
+        with self._lock:
+            with self._transaction_sync():
+                self._conn.execute("DELETE FROM chat_import_segments WHERE batch_id=?", (batch_id,))
+                for raw in segments:
+                    self._conn.execute(
+                        """
+                        INSERT INTO chat_import_segments(
+                            id,batch_id,segment_index,start_at,end_at,local_date,message_ids,
+                            transcript,char_count,turn_count,status,attempts,result,
+                            summary_memory_id,error,created_at,updated_at
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            clean_text(raw.get("id"), 120), batch_id, max(0, int(raw.get("segment_index") or 0)),
+                            clean_text(raw.get("start_at"), 80), clean_text(raw.get("end_at"), 80),
+                            clean_text(raw.get("local_date"), 20), json_dumps(raw.get("message_ids") or []),
+                            str(raw.get("transcript") or ""), max(0, int(raw.get("char_count") or 0)),
+                            max(0, int(raw.get("turn_count") or 0)), clean_text(raw.get("status"), 30) or "pending",
+                            max(0, int(raw.get("attempts") or 0)), json_dumps(raw.get("result") or {}),
+                            clean_text(raw.get("summary_memory_id"), 120), clean_text(raw.get("error"), 1000), now, now,
+                        ),
+                    )
+        return len(segments)
+
+    async def chat_import_segments(self, batch_id: str, *, statuses: set[str] | None = None) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._chat_import_segments_sync, batch_id, statuses)
+
+    def _chat_import_segments_sync(self, batch_id: str, statuses: set[str] | None) -> list[dict[str, Any]]:
+        params: list[Any] = [clean_text(batch_id, 120)]
+        where = "batch_id=?"
+        normalized = sorted({clean_text(item, 30) for item in (statuses or set()) if clean_text(item, 30)})
+        if normalized:
+            where += f" AND status IN ({','.join('?' for _ in normalized)})"
+            params.extend(normalized)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM chat_import_segments WHERE {where} ORDER BY segment_index ASC",
+                params,
+            ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["message_ids"] = json_loads(item.get("message_ids"), [])
+            item["result"] = json_loads(item.get("result"), {})
+            results.append(item)
+        return results
+
+    async def update_chat_import_segment(self, segment_id: str, **changes: Any) -> bool:
+        return await asyncio.to_thread(self._update_chat_import_segment_sync, segment_id, changes)
+
+    def _update_chat_import_segment_sync(self, segment_id: str, changes: dict[str, Any]) -> bool:
+        allowed = {"status", "attempts", "result", "summary_memory_id", "error"}
+        selected = {key: value for key, value in changes.items() if key in allowed}
+        if not selected:
+            return False
+        selected["updated_at"] = utc_now()
+        clauses = ",".join(f"{key}=?" for key in selected)
+        params = [json_dumps(value) if key == "result" else value for key, value in selected.items()]
+        params.append(clean_text(segment_id, 120))
+        with self._lock:
+            cur = self._conn.execute(f"UPDATE chat_import_segments SET {clauses} WHERE id=?", params)
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    async def rollback_chat_import_batch(self, batch_id: str) -> dict[str, int]:
+        return await asyncio.to_thread(self._rollback_chat_import_batch_sync, batch_id)
+
+    async def chat_import_memory_counts(self, batch_id: str) -> dict[str, int]:
+        return await asyncio.to_thread(self._chat_import_memory_counts_sync, batch_id)
+
+    def _chat_import_memory_counts_sync(self, batch_id: str) -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT memory_type, COUNT(*) AS count FROM memories WHERE import_batch_id=? GROUP BY memory_type",
+                (clean_text(batch_id, 120),),
+            ).fetchall()
+        result = {clean_text(row["memory_type"], 80): int(row["count"] or 0) for row in rows}
+        result["total"] = sum(result.values())
+        return result
+
+    async def repair_chat_import_identity_links(
+        self,
+        *,
+        batch_id: str,
+        session_id: str,
+        entity_links: dict[str, dict[str, dict[str, str]]] | None = None,
+    ) -> dict[str, int]:
+        return await asyncio.to_thread(
+            self._repair_chat_import_identity_links_sync,
+            batch_id,
+            session_id,
+            entity_links or {},
+        )
+
+    def _repair_chat_import_identity_links_sync(
+        self,
+        batch_id: str,
+        session_id: str,
+        entity_links: dict[str, dict[str, dict[str, str]]],
+    ) -> dict[str, int]:
+        batch_id = clean_text(batch_id, 120)
+        session_id = clean_text(session_id, 200)
+        if not batch_id or not session_id:
+            return {"memories": 0, "entities": 0, "timeline": 0, "batch": 0}
+        repaired_memories = 0
+        repaired_entities = 0
+        now = utc_now()
+        with self._lock:
+            with self._transaction_sync():
+                rows = self._conn.execute(
+                    "SELECT * FROM memories WHERE import_batch_id=?",
+                    (batch_id,),
+                ).fetchall()
+                for row in rows:
+                    link = entity_links.get(clean_text(row["id"], 120), {})
+
+                    def resolved(prefix: str) -> tuple[str, str, str, str]:
+                        current = (
+                            clean_text(row[f"{prefix}_kind"], 40),
+                            clean_text(row[f"{prefix}_id"], 120),
+                            clean_text(row[f"{prefix}_name"], 80),
+                            clean_text(row[f"{prefix}_role"], 80),
+                        )
+                        candidate = link.get(prefix) if isinstance(link.get(prefix), dict) else {}
+                        candidate_id = clean_text(candidate.get("id"), 120)
+                        if not candidate_id:
+                            return current
+                        return (
+                            clean_text(candidate.get("kind"), 40) or current[0],
+                            candidate_id,
+                            clean_text(candidate.get("name"), 80) or current[2],
+                            clean_text(candidate.get("role"), 80) or current[3],
+                        )
+
+                    subject = resolved("subject")
+                    object_ref = resolved("object")
+                    entity_changed = (
+                        subject != (
+                            clean_text(row["subject_kind"], 40), clean_text(row["subject_id"], 120),
+                            clean_text(row["subject_name"], 80), clean_text(row["subject_role"], 80),
+                        )
+                        or object_ref != (
+                            clean_text(row["object_kind"], 40), clean_text(row["object_id"], 120),
+                            clean_text(row["object_name"], 80), clean_text(row["object_role"], 80),
+                        )
+                    )
+                    session_changed = clean_text(row["session_id"], 200) != session_id
+                    if not entity_changed and not session_changed:
+                        continue
+                    fingerprint = stable_fingerprint(
+                        row["memory_type"], row["scope"], session_id, row["group_id"],
+                        subject[0], subject[1], object_ref[0], object_ref[1],
+                        row["visibility"], row["reality_level"], row["content"],
+                    )
+                    self._conn.execute(
+                        """
+                        UPDATE memories
+                        SET subject_kind=?, subject_id=?, subject_name=?, subject_role=?,
+                            object_kind=?, object_id=?, object_name=?, object_role=?,
+                            session_id=?, content_fingerprint=?, updated_at=?
+                        WHERE id=?
+                        """,
+                        (*subject, *object_ref, session_id, fingerprint, now, row["id"]),
+                    )
+                    repaired_memories += 1
+                    repaired_entities += int(entity_changed)
+                timeline_cur = self._conn.execute(
+                    "UPDATE timeline SET session_id=? WHERE import_batch_id=? AND session_id!=?",
+                    (session_id, batch_id, session_id),
+                )
+                batch_cur = self._conn.execute(
+                    "UPDATE chat_import_batches SET session_id=?, updated_at=? WHERE id=? AND session_id!=?",
+                    (session_id, now, batch_id, session_id),
+                )
+        return {
+            "memories": repaired_memories,
+            "entities": repaired_entities,
+            "timeline": int(timeline_cur.rowcount or 0),
+            "batch": int(batch_cur.rowcount or 0),
+        }
+
+    async def neutralize_chat_import_summary_perspective(self, batch_id: str) -> dict[str, int]:
+        return await asyncio.to_thread(self._neutralize_chat_import_summary_perspective_sync, batch_id)
+
+    def _neutralize_chat_import_summary_perspective_sync(self, batch_id: str) -> dict[str, int]:
+        batch_id = clean_text(batch_id, 120)
+        if not batch_id:
+            return {"memories": 0, "embeddings_removed": 0}
+        updated = 0
+        embeddings_removed = 0
+        now = utc_now()
+        with self._lock:
+            with self._transaction_sync():
+                rows = self._conn.execute(
+                    """
+                    SELECT * FROM memories
+                    WHERE import_batch_id=? AND memory_type='conversation_summary'
+                    """,
+                    (batch_id,),
+                ).fetchall()
+                for row in rows:
+                    metadata = json_loads(row["metadata"], {})
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                    try:
+                        detail_version = int(metadata.get("detail_schema_version") or 0)
+                    except (TypeError, ValueError):
+                        detail_version = 0
+                    if (
+                        clean_text(metadata.get("summary_perspective"), 40) == "neutral_third_person"
+                        and detail_version >= 1
+                    ):
+                        continue
+                    canonical = clean_text(metadata.get("canonical_summary"), 1600)
+                    current = clean_text(row["content"], 4000)
+                    if not canonical or canonical == current:
+                        continue
+                    metadata.setdefault("legacy_perspective_summary", current)
+                    metadata["summary_perspective"] = "neutral_third_person"
+                    fingerprint = stable_fingerprint(
+                        row["memory_type"], row["scope"], row["session_id"], row["group_id"],
+                        row["subject_kind"], row["subject_id"], row["object_kind"], row["object_id"],
+                        row["visibility"], row["reality_level"], canonical,
+                    )
+                    self._conn.execute(
+                        """
+                        UPDATE memories
+                        SET content=?, metadata=?, content_fingerprint=?, updated_at=?
+                        WHERE id=?
+                        """,
+                        (canonical, json_dumps(metadata), fingerprint, now, row["id"]),
+                    )
+                    embeddings_removed += int(
+                        self._conn.execute(
+                            "DELETE FROM memory_embeddings WHERE memory_id=?",
+                            (row["id"],),
+                        ).rowcount or 0
+                    )
+                    refreshed = self._conn.execute(
+                        "SELECT * FROM memories WHERE id=?",
+                        (row["id"],),
+                    ).fetchone()
+                    self._upsert_memory_fts_row(refreshed)
+                    updated += 1
+        return {"memories": updated, "embeddings_removed": embeddings_removed}
+
+    async def update_chat_import_summary_detail(
+        self,
+        *,
+        memory_id: str,
+        detailed_summary: str,
+        canonical_summary: str,
+        detail_schema_version: int,
+    ) -> dict[str, int]:
+        return await asyncio.to_thread(
+            self._update_chat_import_summary_detail_sync,
+            memory_id,
+            detailed_summary,
+            canonical_summary,
+            detail_schema_version,
+        )
+
+    def _update_chat_import_summary_detail_sync(
+        self,
+        memory_id: str,
+        detailed_summary: str,
+        canonical_summary: str,
+        detail_schema_version: int,
+    ) -> dict[str, int]:
+        memory_id = clean_text(memory_id, 120)
+        detailed_summary = clean_text(detailed_summary, 2200)
+        canonical_summary = clean_text(canonical_summary, 800)
+        if not memory_id or not detailed_summary:
+            return {"memories": 0, "embeddings_removed": 0}
+        with self._lock:
+            with self._transaction_sync():
+                row = self._conn.execute(
+                    """
+                    SELECT * FROM memories
+                    WHERE id=? AND source_plugin='historical_chat_import'
+                      AND memory_type='conversation_summary'
+                    """,
+                    (memory_id,),
+                ).fetchone()
+                if not row:
+                    return {"memories": 0, "embeddings_removed": 0}
+                metadata = json_loads(row["metadata"], {})
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                current = clean_text(row["content"], 4000)
+                canonical_summary = canonical_summary or clean_text(metadata.get("canonical_summary"), 800) or current
+                if current != detailed_summary:
+                    metadata.setdefault("legacy_brief_summary", current)
+                metadata["canonical_summary"] = canonical_summary
+                metadata["summary_perspective"] = "neutral_third_person"
+                metadata["detail_schema_version"] = max(1, int(detail_schema_version or 1))
+                fingerprint = stable_fingerprint(
+                    row["memory_type"], row["scope"], row["session_id"], row["group_id"],
+                    row["subject_kind"], row["subject_id"], row["object_kind"], row["object_id"],
+                    row["visibility"], row["reality_level"], detailed_summary,
+                )
+                self._conn.execute(
+                    """
+                    UPDATE memories
+                    SET content=?, metadata=?, content_fingerprint=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (detailed_summary, json_dumps(metadata), fingerprint, utc_now(), memory_id),
+                )
+                removed = int(
+                    self._conn.execute(
+                        "DELETE FROM memory_embeddings WHERE memory_id=?",
+                        (memory_id,),
+                    ).rowcount or 0
+                )
+                refreshed = self._conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
+                self._upsert_memory_fts_row(refreshed)
+        return {"memories": 1, "embeddings_removed": removed}
+
+    async def update_chat_import_daily_digest(
+        self,
+        *,
+        batch_id: str,
+        date: str,
+        detailed_summary: str,
+        segment_ids: list[str],
+        source_message_ids: list[str],
+        detail_schema_version: int,
+    ) -> dict[str, int]:
+        return await asyncio.to_thread(
+            self._update_chat_import_daily_digest_sync,
+            batch_id,
+            date,
+            detailed_summary,
+            segment_ids,
+            source_message_ids,
+            detail_schema_version,
+        )
+
+    def _update_chat_import_daily_digest_sync(
+        self,
+        batch_id: str,
+        date: str,
+        detailed_summary: str,
+        segment_ids: list[str],
+        source_message_ids: list[str],
+        detail_schema_version: int,
+    ) -> dict[str, int]:
+        batch_id = clean_text(batch_id, 120)
+        date = clean_text(date, 20)
+        detailed_summary = clean_text(detailed_summary, 2200)
+        if not batch_id or not date or not detailed_summary:
+            return {"memories": 0, "embeddings_removed": 0}
+        with self._lock:
+            with self._transaction_sync():
+                row = self._conn.execute(
+                    """
+                    SELECT * FROM memories
+                    WHERE import_batch_id=? AND memory_type='daily_digest'
+                      AND json_valid(metadata) AND json_extract(metadata, '$.date')=?
+                    ORDER BY created_at ASC LIMIT 1
+                    """,
+                    (batch_id, date),
+                ).fetchone()
+                if not row:
+                    return {"memories": 0, "embeddings_removed": 0}
+                metadata = json_loads(row["metadata"], {})
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                current = clean_text(row["content"], 4000)
+                if current != detailed_summary:
+                    metadata.setdefault("legacy_brief_summary", current)
+                metadata["segment_ids"] = [clean_text(item, 120) for item in segment_ids if clean_text(item, 120)][:32]
+                metadata["source_message_ids"] = [
+                    clean_text(item, 120) for item in source_message_ids if clean_text(item, 120)
+                ][:64]
+                metadata["summary_perspective"] = "neutral_third_person"
+                metadata["detail_schema_version"] = max(1, int(detail_schema_version or 1))
+                fingerprint = stable_fingerprint(
+                    row["memory_type"], row["scope"], row["session_id"], row["group_id"],
+                    row["subject_kind"], row["subject_id"], row["object_kind"], row["object_id"],
+                    row["visibility"], row["reality_level"], detailed_summary,
+                )
+                evidence = "；".join(metadata["source_message_ids"])
+                self._conn.execute(
+                    """
+                    UPDATE memories
+                    SET content=?, evidence=?, metadata=?, content_fingerprint=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (detailed_summary, evidence, json_dumps(metadata), fingerprint, utc_now(), row["id"]),
+                )
+                removed = int(
+                    self._conn.execute(
+                        "DELETE FROM memory_embeddings WHERE memory_id=?",
+                        (row["id"],),
+                    ).rowcount or 0
+                )
+                refreshed = self._conn.execute("SELECT * FROM memories WHERE id=?", (row["id"],)).fetchone()
+                self._upsert_memory_fts_row(refreshed)
+        return {"memories": 1, "embeddings_removed": removed}
+
+    async def list_chat_import_memories(self, batch_id: str) -> list[MemoryRecord]:
+        return await self._run_recoverable_database_operation(
+            self._list_chat_import_memories_sync,
+            batch_id,
+        )
+
+    def _list_chat_import_memories_sync(self, batch_id: str) -> list[MemoryRecord]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM memories
+                WHERE import_batch_id=? AND lifecycle!='archived'
+                ORDER BY importance DESC, COALESCE(NULLIF(occurred_at, ''), created_at) ASC
+                """,
+                (clean_text(batch_id, 120),),
+            ).fetchall()
+        return [MemoryRecord.from_row(row) for row in rows]
+
+    async def list_chat_import_memories_missing_embeddings(
+        self,
+        batch_id: str,
+        provider_id: str,
+        *,
+        include_pending: bool = False,
+    ) -> list[MemoryRecord]:
+        return await self._run_recoverable_database_operation(
+            self._list_chat_import_memories_missing_embeddings_sync,
+            batch_id,
+            provider_id,
+            include_pending,
+        )
+
+    def _list_chat_import_memories_missing_embeddings_sync(
+        self,
+        batch_id: str,
+        provider_id: str,
+        include_pending: bool,
+    ) -> list[MemoryRecord]:
+        where = "m.import_batch_id=? AND m.lifecycle!='archived'"
+        if not include_pending:
+            where += " AND m.review_status!='pending'"
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT m.* FROM memories m
+                LEFT JOIN memory_embeddings e
+                  ON e.memory_id=m.id AND e.provider_id=?
+                WHERE {where} AND (e.memory_id IS NULL OR e.text_hash='')
+                ORDER BY m.importance DESC, COALESCE(NULLIF(m.occurred_at, ''), m.created_at) ASC
+                """,
+                (clean_text(provider_id, 160), clean_text(batch_id, 120)),
+            ).fetchall()
+        return [MemoryRecord.from_row(row) for row in rows]
+
+    def _rollback_chat_import_batch_sync(self, batch_id: str) -> dict[str, int]:
+        batch_id = clean_text(batch_id, 120)
+        deleted = {"memories": 0, "timeline": 0, "segments": 0}
+        with self._lock:
+            with self._transaction_sync():
+                memory_rows = self._conn.execute(
+                    "SELECT id FROM memories WHERE import_batch_id=?",
+                    (batch_id,),
+                ).fetchall()
+                memory_ids = [clean_text(row["id"], 120) for row in memory_rows]
+                for memory_id in memory_ids:
+                    self._conn.execute("DELETE FROM review_queue WHERE memory_id=?", (memory_id,))
+                    self._conn.execute("DELETE FROM memory_embeddings WHERE memory_id=?", (memory_id,))
+                    self._conn.execute("DELETE FROM relationship_edges WHERE source_memory_id=?", (memory_id,))
+                    self._conn.execute("DELETE FROM knowledge_edges WHERE source_memory_id=?", (memory_id,))
+                    self._delete_memory_fts_row(memory_id)
+                    deleted["memories"] += int(
+                        self._conn.execute("DELETE FROM memories WHERE id=?", (memory_id,)).rowcount or 0
+                    )
+                deleted["timeline"] = int(
+                    self._conn.execute("DELETE FROM timeline WHERE import_batch_id=?", (batch_id,)).rowcount or 0
+                )
+                deleted["segments"] = int(
+                    self._conn.execute("DELETE FROM chat_import_segments WHERE batch_id=?", (batch_id,)).rowcount or 0
+                )
+                self._conn.execute(
+                    """
+                    UPDATE chat_import_batches
+                    SET state='rolled_back', checkpoint_segment=0, completed_segments=0,
+                        summary_memory_count=0, important_event_count=0,
+                        relationship_observation_count=0, error='', updated_at=?
+                    WHERE id=?
+                    """,
+                    (utc_now(), batch_id),
+                )
+        return deleted
 
     async def recent_timeline(
         self,
@@ -2897,6 +3666,36 @@ class MemoryStore:
     async def list_memory_buckets(self, limit: int = 160) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self._list_memory_buckets_sync, limit)
 
+    async def preferred_private_session_id(self, user_id: str) -> str:
+        return await asyncio.to_thread(self._preferred_private_session_id_sync, user_id)
+
+    def _preferred_private_session_id_sync(self, user_id: str) -> str:
+        user_id = clean_text(user_id, 120)
+        if not user_id:
+            return ""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    session_id,
+                    SUM(CASE WHEN COALESCE(import_batch_id, '')='' THEN 1 ELSE 0 END) AS native_count,
+                    COUNT(*) AS total_count,
+                    MAX(COALESCE(NULLIF(occurred_at, ''), created_at)) AS latest_at
+                FROM memories
+                WHERE scope='private' AND session_id!=''
+                  AND (subject_id=? OR object_id=? OR session_id LIKE ?)
+                GROUP BY session_id
+                ORDER BY native_count DESC, total_count DESC, latest_at DESC
+                LIMIT 64
+                """,
+                (user_id, user_id, f"%{user_id}%"),
+            ).fetchall()
+        for row in rows:
+            parsed_scope, parsed_target = parse_scope_from_session(clean_text(row["session_id"], 200))
+            if parsed_scope == "private" and clean_text(parsed_target, 120) == user_id:
+                return clean_text(row["session_id"], 200)
+        return ""
+
     def _list_memory_buckets_sync(self, limit: int) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
@@ -2952,18 +3751,67 @@ class MemoryStore:
                 WHERE target_id!=''
                 GROUP BY scope, target_id
                 ORDER BY scope ASC, latest_at DESC
-                LIMIT ?
-                """,
-                (max(1, int(limit)),),
-            ).fetchall()
-            buckets = [dict(row) for row in rows]
+                    LIMIT ?
+                    """,
+                    (max(1, int(limit)) * 4,),
+                ).fetchall()
+            merged: dict[tuple[str, str], dict[str, Any]] = {}
+            for raw in rows:
+                bucket = dict(raw)
+                scope = clean_text(bucket.get("scope"), 40)
+                target_id = clean_text(bucket.get("target_id"), 200)
+                parsed_scope, parsed_target = parse_scope_from_session(target_id)
+                if parsed_scope == scope and clean_text(parsed_target, 120):
+                    target_id = clean_text(parsed_target, 120)
+                key = (scope, target_id)
+                current = merged.get(key)
+                if current is None:
+                    bucket["target_id"] = target_id
+                    merged[key] = bucket
+                    continue
+                current["memory_count"] = int(current.get("memory_count") or 0) + int(bucket.get("memory_count") or 0)
+                current["archived_count"] = int(current.get("archived_count") or 0) + int(bucket.get("archived_count") or 0)
+                if clean_text(bucket.get("latest_at"), 80) > clean_text(current.get("latest_at"), 80):
+                    current["latest_at"] = bucket.get("latest_at")
+                    current["sample_session_id"] = bucket.get("sample_session_id")
+                    current["sample_group_id"] = bucket.get("sample_group_id")
+                candidate_name = clean_text(bucket.get("target_name"), 120)
+                if candidate_name and candidate_name not in {target_id, clean_text(bucket.get("sample_session_id"), 200)}:
+                    current["target_name"] = candidate_name
+            buckets = list(merged.values())
+            buckets.sort(key=lambda item: clean_text(item.get("latest_at"), 80), reverse=True)
+            buckets.sort(key=lambda item: clean_text(item.get("scope"), 40))
+            buckets = buckets[: max(1, int(limit))]
             for bucket in buckets:
                 bucket["target_name"] = self._resolve_bucket_target_name_sync(
                     clean_text(bucket.get("scope"), 40),
                     clean_text(bucket.get("target_id"), 160),
                     clean_text(bucket.get("target_name"), 120),
                 )
+                bucket["target_kind"] = self._bucket_target_kind(
+                    clean_text(bucket.get("scope"), 40),
+                    clean_text(bucket.get("target_id"), 160),
+                    clean_text(bucket.get("sample_session_id"), 200),
+                )
         return buckets
+
+    @staticmethod
+    def _bucket_target_kind(scope: str, target_id: str, session_id: str = "") -> str:
+        if scope == "group":
+            return "group"
+        if scope != "private":
+            return "unknown"
+        target_id = clean_text(target_id, 160)
+        session_id = clean_text(session_id, 200).lower()
+        if target_id.isdigit():
+            return "qq"
+        if "live2d" in session_id:
+            return "legacy_live2d"
+        if target_id.startswith("private_companion:"):
+            return "internal"
+        if re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", target_id):
+            return "legacy_session"
+        return "private_session"
 
     def _resolve_bucket_target_name_sync(self, scope: str, target_id: str, fallback: str = "") -> str:
         fallback = self._clean_window_display_name(fallback)
@@ -3700,6 +4548,7 @@ class MemoryStore:
         with self._lock:
             with self._transaction_sync():
                 manual_fixed = self._normalize_legacy_manual_visibility_sync()
+                internal_bot_self_fixed = self._normalize_internal_bot_self_scopes_sync()
                 utterance_fixed_cur = self._conn.execute(
                     """
                     UPDATE memories
@@ -3773,6 +4622,7 @@ class MemoryStore:
                 fts_rebuilt = self._rebuild_memory_fts_sync() if self._fts_enabled else 0
         return {
             "manual_visibility_fixed": manual_fixed,
+            "internal_bot_self_scope_fixed": internal_bot_self_fixed,
             "utterance_reality_fixed": int(utterance_fixed_cur.rowcount or 0),
             "fingerprint_fixed": fingerprint_fixed,
             "duplicates_archived": merged,
@@ -3875,6 +4725,7 @@ class MemoryStore:
                         SELECT id
                         FROM timeline
                         WHERE summarized_at!=''
+                          AND retention_class!='historical_archive'
                           AND COALESCE(NULLIF(occurred_at, ''), created_at) < ?
                         ORDER BY COALESCE(NULLIF(occurred_at, ''), created_at) ASC
                         LIMIT ?
@@ -4227,8 +5078,16 @@ class MemoryStore:
             }
         current_wal_files = self._database_file_snapshot()
         last_wal_health = dict(self._last_wal_health)
+        memory_storage = {
+            "database_bytes": max(0, int(current_wal_files.get("db_bytes") or 0)),
+            "wal_bytes": max(0, int(current_wal_files.get("wal_bytes") or 0)),
+            "shm_bytes": max(0, int(current_wal_files.get("shm_bytes") or 0)),
+        }
+        memory_storage["total_bytes"] = sum(memory_storage.values())
         return {
             "db_path": str(self.db_path),
+            "memory_storage_bytes": memory_storage["total_bytes"],
+            "memory_storage": memory_storage,
             "total_memories": total,
             "pending_review": pending,
             "stable_memories": stable,

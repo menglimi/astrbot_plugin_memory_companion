@@ -24,6 +24,7 @@ from .astrbot_compat import (
     sanitize_request_history,
 )
 from .bridge import serialize_memory
+from .chat_import import HistoricalChatImporter
 from .classifier import MemoryClassifier
 from .config import ConfigView
 from .context_orchestrator import RetrievalIntent, RetrievalIntentBuilder
@@ -75,6 +76,9 @@ class MemoryCompanionService:
         normalized = self.store.normalize_legacy_manual_visibility()
         if normalized:
             logger.info("[MemoryCompanion] 已收回早期过宽的手动记忆可见性: count=%s", normalized)
+        internal_normalized = self.store.normalize_internal_bot_self_scopes()
+        if internal_normalized:
+            logger.info("[MemoryCompanion] 已将内部 Bot 梦境移出私聊用户范围: count=%s", internal_normalized)
 
         self.identity = IdentityResolver()
         self.reply_chain = ReplyChainResolver()
@@ -111,6 +115,7 @@ class MemoryCompanionService:
         self._RETRIEVAL_RESULT_CACHE_MAX: int = 128
         self.migrator = LivingMemoryMigrator(self.store, self.plugin_root, self.data_dir)
         self.portable_archive = PortableMemoryArchive(self.store, self.data_dir)
+        self.chat_importer = HistoricalChatImporter(self)
         self.sleep_state_path = self.data_dir / "memory_companion_sleep_state.json"
         self.token_usage_path = self.data_dir / "memory_companion_token_usage.json"
         self._token_usage_last_save_at: float = 0.0
@@ -121,6 +126,34 @@ class MemoryCompanionService:
         self._relationship_phase_state: dict[str, dict[str, Any]] = {}
         self._RELATIONSHIP_PHASE_FILE = self.data_dir / "memory_companion_relationship_phase.json"
         self._load_relationship_phase_state()
+
+    def preview_historical_chat_upload(
+        self,
+        *,
+        filename: str,
+        content: bytes,
+        base_year: int = 0,
+    ) -> dict[str, Any]:
+        return self.chat_importer.stage_upload(
+            filename=filename,
+            content=content,
+            base_year=base_year,
+        )
+
+    async def start_historical_chat_import(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self.chat_importer.start_import(payload)
+
+    async def historical_chat_import_status(self, batch_id: str = "") -> dict[str, Any]:
+        return await self.chat_importer.status(batch_id)
+
+    async def pause_historical_chat_import(self, batch_id: str) -> dict[str, Any]:
+        return await self.chat_importer.pause_batch(batch_id)
+
+    async def resume_historical_chat_import(self, batch_id: str) -> dict[str, Any]:
+        return await self.chat_importer.resume_batch(batch_id)
+
+    async def rollback_historical_chat_import(self, batch_id: str) -> dict[str, Any]:
+        return await self.chat_importer.rollback_batch(batch_id)
 
     async def handle_llm_request(self, event: Any, req: Any) -> None:
         ctx = await self.identity.resolve_event_context(event)
@@ -1507,13 +1540,16 @@ class MemoryCompanionService:
             for name in ("get_embedding", "get_embeddings", "get_embeddings_batch")
         )
 
-    def _provider_runtime_id(self, provider: Any) -> str:
+    def _provider_runtime_id(self, provider: Any, *, fallback_type: bool = True) -> str:
         try:
             meta = provider.meta() if callable(getattr(provider, "meta", None)) else None
         except Exception:
             meta = None
         if meta is not None:
-            provider_id = clean_text(getattr(meta, "id", ""), 160)
+            provider_id = clean_text(
+                meta.get("id") if isinstance(meta, dict) else getattr(meta, "id", ""),
+                160,
+            )
             if provider_id:
                 return provider_id
         provider_config = getattr(provider, "provider_config", None)
@@ -1529,7 +1565,7 @@ class MemoryCompanionService:
             value = clean_text(getattr(provider, attr, ""), 160)
             if value:
                 return value
-        return clean_text(type(provider).__name__, 160)
+        return clean_text(type(provider).__name__, 160) if fallback_type else ""
 
     def _load_token_usage(self) -> dict[str, Any]:
         try:
@@ -2197,12 +2233,21 @@ class MemoryCompanionService:
                         )
                     except Exception as exc:
                         last_error = exc
+                        error_text = self._describe_exception(exc)
+                        expected_failure = isinstance(exc, (TimeoutError, ValueError)) or type(exc).__name__ in {
+                            "APIConnectionError",
+                            "APITimeoutError",
+                            "ConnectError",
+                            "ConnectTimeout",
+                            "ReadError",
+                            "ReadTimeout",
+                        }
                         logger.warning(
                             "[MemoryCompanion] 阶段性总结候选失败，尝试下一个: session=%s provider=%s error=%s",
                             ctx.session_id,
                             attempt["provider_id"] or attempt["source"],
-                            exc,
-                            exc_info=True,
+                            error_text,
+                            exc_info=not expected_failure,
                         )
             except Exception as exc:
                 last_error = exc
@@ -2224,6 +2269,17 @@ class MemoryCompanionService:
                     await self.store.mark_summary_failure_dead_letter(ctx.session_id, max_retries)
                 logger.warning("[MemoryCompanion] 阶段性记忆总结全部失败: session=%s error=%s", ctx.session_id, last_error)
                 logger.warning("[MemoryCompanion] 已记录阶段性总结待重试: session=%s retry=%s/%s", ctx.session_id, retries, max_retries)
+                return ""
+
+            consumed_ids = {
+                clean_text(item, 160)
+                for item in ((payload or {}).get("_consumed_event_ids") or [])
+                if clean_text(item, 160)
+            }
+            if consumed_ids:
+                rows = [row for row in rows if clean_text(row.get("id"), 160) in consumed_ids]
+            if not rows:
+                logger.warning("[MemoryCompanion] 阶段性总结没有可确认的已消费事件，拒绝标记时间线: session=%s", ctx.session_id)
                 return ""
 
             visibility = "group_public" if ctx.scope == "group" else "private_pair"
@@ -2618,6 +2674,7 @@ class MemoryCompanionService:
     ) -> list[dict[str, Any]]:
         attempts: list[dict[str, Any]] = []
         seen: set[str] = set()
+        seen_provider_objects: set[int] = set()
         configured = [
             (
                 "primary",
@@ -2634,9 +2691,12 @@ class MemoryCompanionService:
             provider = await self._provider_by_id(provider_id, ctx, source)
             if provider is None:
                 continue
-            if provider_id in seen:
+            runtime_id = self._provider_runtime_id(provider, fallback_type=False)
+            identity_ids = {item for item in (provider_id, runtime_id) if item}
+            if id(provider) in seen_provider_objects or identity_ids.intersection(seen):
                 continue
-            seen.add(provider_id)
+            seen.update(identity_ids)
+            seen_provider_objects.add(id(provider))
             attempts.append(
                 {
                     "source": source,
@@ -2649,7 +2709,8 @@ class MemoryCompanionService:
             return attempts
         current = await self._current_provider(ctx)
         if current is not None:
-            if "<current_session>" not in seen:
+            current_id = self._provider_runtime_id(current, fallback_type=False)
+            if id(current) not in seen_provider_objects and (not current_id or current_id not in seen):
                 attempts.append(
                     {
                         "source": "current_session",
@@ -2923,7 +2984,10 @@ class MemoryCompanionService:
 
     async def clear_all_memory_data(self) -> dict[str, Any]:
         await self._cancel_background_tasks_for_clear()
+        relationship_observations = await self.chat_importer.clear_relationship_observations()
         result = await self.store.clear_all_memory_data()
+        result["historical_chat_archives"] = await asyncio.to_thread(self.chat_importer.clear_archives)
+        result["historical_relationship_observations"] = relationship_observations
         self._relationship_phase_state.clear()
         self._save_relationship_phase_state()
         self._emotional_event_queue.clear()

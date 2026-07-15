@@ -2,9 +2,9 @@ name: astrbot_plugin_memory_companion
 display_name: 我会牢牢记住你
 author: menglimi
 author_url: https://github.com/menglimi
-version: 1.5.2
-description: 我会牢牢记住你是面向 AstrBot 陪伴体系的记忆陪伴中枢。它统一管理长期记忆、群聊连续对话记忆、主链注入、权限边界、知识图谱、陪伴插件桥接、自然衰减、可移植数据和运行诊断。
-desc: 为 AstrBot 提供主链记忆注入、连续对话记忆、陪伴插件协同、主动记忆/回忆工具、知识图谱、权限边界、自我时间线、自然衰减、迁移导出和成本诊断。
+version: 1.6.0
+description: 我会牢牢记住你是面向 AstrBot 陪伴体系的记忆陪伴中枢。它统一管理长期记忆、历史对话整理、群聊连续对话记忆、主链注入、权限边界、知识图谱、陪伴插件桥接、自然衰减、可移植数据和运行诊断。
+desc: 为 AstrBot 提供主链记忆注入、历史聊天整理导入、连续对话记忆、陪伴插件协同、主动记忆/回忆工具、知识图谱、权限边界、自我时间线、自然衰减、迁移导出和成本诊断。
 repo: https://github.com/menglimi/astrbot_plugin_memory_companion
 category: AI 增强
 tags:
@@ -12,6 +12,7 @@ tags:
   - 关系边界
   - 自我时间线
   - 记忆迁移
+  - 历史对话导入
   - 可视化管理
   - 陪伴体系
 icon: logo.png

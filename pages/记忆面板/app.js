@@ -51,6 +51,7 @@ const SECONDARY_NAV = {
     { id: "explicit", label: "明确记住", sublabel: "用户主动要求记住", badge: "记住" },
   ],
   archive: [
+    { id: "maintenance", label: "维护 / 迁移 / 清理", sublabel: "维护、修复、导入与清理", badge: "维护" },
     { id: "config:memory_capture", label: "记忆捕获", sublabel: "记录用户消息与稳定事实", badge: "捕获" },
     { id: "config:memory_summary", label: "长期总结", sublabel: "阶段总结模型与阈值", badge: "总结" },
     { id: "config:conversation_memory", label: "连续对话", sublabel: "群聊片段与低信息保护", badge: "连续" },
@@ -63,7 +64,6 @@ const SECONDARY_NAV = {
     { id: "config:knowledge_graph", label: "图谱关联", sublabel: "节点、边与检索扩展", badge: "图谱" },
     { id: "config:memory_tools", label: "主动工具", sublabel: "回忆、记住、陪伴笔记", badge: "工具" },
     { id: "config:maintenance", label: "维护策略", sublabel: "备份、保留与自然衰减", badge: "维护" },
-    { id: "maintenance", label: "维护 / 迁移 / 清理", sublabel: "维护、修复、导入与清理", badge: "维护" },
     { id: "config:appearance", label: "外观", sublabel: "拓展页主题", badge: "主题" },
   ],
 };
@@ -175,6 +175,10 @@ const state = {
   pendingPersonalFilmReveal: false,
   personalEntranceRevealRequested: false,
   personalAlignTimer: 0,
+  historicalChatPreview: null,
+  historicalChatBatchId: "",
+  historicalChatPollTimer: 0,
+  historicalChatFile: null,
 };
 
 const DEFAULT_THEME = "yuebai";
@@ -258,6 +262,11 @@ function compact(value, fallback = "-") {
 function finiteNumber(value, fallback = 0) {
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
+}
+
+function number(value) {
+  const parsed = Number(value || 0);
+  return Number.isFinite(parsed) ? Math.max(0, parsed).toLocaleString("zh-CN") : "0";
 }
 
 function percentLabel(value) {
@@ -583,9 +592,14 @@ function bucketByWindow(scope, id) {
   return state.buckets.find((bucket) => bucket.scope === scope && bucket.target_id === id);
 }
 
-function windowIdentifierLabel(scope, id) {
-  if (!id) return scope === "group" ? "群号未知" : "QQ 未知";
-  return scope === "group" ? `群号 ${id}` : `QQ ${id}`;
+function windowIdentifierLabel(scope, id, targetKind = "") {
+  if (!id) return scope === "group" ? "群号未知" : "会话 ID 未知";
+  if (scope === "group") return `群号 ${id}`;
+  if (targetKind === "legacy_live2d") return `Live2D 会话 ${id}`;
+  if (targetKind === "internal") return `内部会话 ${id}`;
+  if (targetKind === "legacy_session") return `旧会话 ${id}`;
+  if (targetKind === "qq" || /^\d+$/.test(String(id))) return `QQ ${id}`;
+  return `私聊会话 ${id}`;
 }
 
 function stripLabeledPrefix(value) {
@@ -603,6 +617,7 @@ function cleanWindowDisplayName(value) {
 function splitWindowBucketTitle(bucket = {}) {
   const scope = bucket.scope || "";
   const targetId = compact(bucket.target_id || bucket.group_id, "");
+  const targetKind = compact(bucket.target_kind, "");
   const rawLabel = cleanWindowDisplayName(bucket.label || "");
   const rawSublabel = cleanWindowDisplayName(bucket.sublabel || "");
   const escapedId = targetId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -611,7 +626,7 @@ function splitWindowBucketTitle(bucket = {}) {
     : rawLabel;
   const explicitName = cleanWindowDisplayName(bucket.target_name || bucket.display_name || "");
   const inferredName = cleanWindowDisplayName(nameFromLabel || "");
-  const genericNames = new Set(["群聊", "私聊", "用户", "好友"]);
+  const genericNames = new Set(["群聊", "私聊", "用户", "好友", "旧 Live2D 会话", "旧私聊会话", "内部会话", "私聊会话"]);
   const name = explicitName || (genericNames.has(inferredName) ? "" : inferredName);
   if (scope === "group") {
     return {
@@ -620,6 +635,30 @@ function splitWindowBucketTitle(bucket = {}) {
     };
   }
   if (scope === "private") {
+    if (targetKind === "legacy_live2d") {
+      return {
+        primary: "旧 Live2D 会话",
+        secondary: name && name !== targetId ? name : `ID ${targetId || "未知"}`,
+      };
+    }
+    if (targetKind === "internal") {
+      return {
+        primary: "内部会话",
+        secondary: name && name !== targetId ? name : (targetId || "未记录标识"),
+      };
+    }
+    if (targetKind === "legacy_session") {
+      return {
+        primary: "旧私聊会话",
+        secondary: name && name !== targetId ? name : `ID ${targetId || "未知"}`,
+      };
+    }
+    if (targetKind !== "qq" && !/^\d+$/.test(String(targetId))) {
+      return {
+        primary: "私聊会话",
+        secondary: name && name !== targetId ? name : (targetId || "未记录标识"),
+      };
+    }
     return {
       primary: targetId ? `QQ ${targetId}` : "QQ 未知",
       secondary: name && name !== targetId ? name : (rawSublabel && rawSublabel !== targetId ? rawSublabel : "未记录昵称"),
@@ -628,10 +667,14 @@ function splitWindowBucketTitle(bucket = {}) {
   return { primary: rawLabel || bucket.label || "未命名", secondary: rawSublabel || "" };
 }
 
-function windowDisplayLabel(scope, id, name = "") {
+function windowDisplayLabel(scope, id, name = "", targetKind = "") {
   const displayName = compact(name, "");
   if (displayName && displayName !== id) return displayName;
-  return scope === "group" ? `群聊 ${id || "未知群聊"}` : `私聊 ${id || "未知用户"}`;
+  if (scope === "group") return `群聊 ${id || "未知群聊"}`;
+  if (targetKind === "legacy_live2d") return "旧 Live2D 会话";
+  if (targetKind === "internal") return "内部会话";
+  if (targetKind === "legacy_session") return "旧私聊会话";
+  return `私聊 ${id || "未知用户"}`;
 }
 
 function secondaryNavItems(view = state.activeView) {
@@ -824,14 +867,29 @@ function contextPayload(query) {
 }
 
 function renderStats(stats) {
+  const currentFiles = stats.memory_storage || stats.wal?.current_files || stats.wal || {};
+  const databaseBytes = Math.max(0, Number(currentFiles.database_bytes ?? currentFiles.db_bytes ?? 0));
+  const walBytes = Math.max(0, Number(currentFiles.wal_bytes ?? 0));
+  const shmBytes = Math.max(0, Number(currentFiles.shm_bytes ?? 0));
+  const reportedBytes = Number(stats.memory_storage_bytes ?? currentFiles.total_bytes);
+  const storageBytes = Number.isFinite(reportedBytes)
+    ? Math.max(0, reportedBytes)
+    : databaseBytes + walBytes + shmBytes;
   const items = [
-    ["记忆", stats.total_memories],
-    ["群聊记忆", stats.by_scope?.group ?? 0],
-    ["私聊记忆", stats.by_scope?.private ?? 0],
-    ["稳定记忆", stats.stable_memories ?? 0],
+    { key: "memory-count", label: "记忆", value: stats.total_memories ?? 0 },
+    {
+      key: "memory-storage",
+      label: "记忆大小",
+      value: formatFileSize(storageBytes),
+      title: `数据库 ${formatFileSize(databaseBytes)} · WAL ${formatFileSize(walBytes)} · SHM ${formatFileSize(shmBytes)}`,
+    },
+    { key: "private-memory", label: "私聊记忆", value: stats.by_scope?.private ?? 0 },
+    { key: "group-memory", label: "群聊记忆", value: stats.by_scope?.group ?? 0 },
   ];
-  $("#stats").innerHTML = items.map(([label, value]) => `
-    <article class="stat"><b>${escapeHtml(value ?? 0)}</b><span>${escapeHtml(label)}</span></article>
+  $("#stats").innerHTML = items.map(({ key, label, value, title = "" }) => `
+    <article class="stat ${key === "memory-storage" ? "is-storage" : ""}" data-stat="${escapeHtml(key)}"${title ? ` title="${escapeHtml(title)}"` : ""}>
+      <b>${escapeHtml(value)}</b><span>${escapeHtml(label)}</span>
+    </article>
   `).join("");
 }
 
@@ -856,13 +914,15 @@ function normalizeBuckets(rawBuckets) {
     const scope = compact(item.scope, "unknown");
     const targetId = compact(item.target_id, "");
     if (!targetId) continue;
+    const targetKind = compact(item.target_kind, "");
     const name = cleanWindowDisplayName(item.target_name || item.display_name || "");
-    const label = windowDisplayLabel(scope, targetId, name);
-    const identifierLabel = windowIdentifierLabel(scope, targetId);
+    const label = windowDisplayLabel(scope, targetId, name, targetKind);
+    const identifierLabel = windowIdentifierLabel(scope, targetId, targetKind);
     normalized.push({
       id: `${scope}:${targetId}`,
       scope,
       target_id: targetId,
+      target_kind: targetKind,
       display_name: name,
       identifier_label: identifierLabel,
       group_id: item.sample_group_id || (scope === "group" ? targetId : ""),
@@ -4494,6 +4554,591 @@ async function executePortableArchiveImport(path) {
   showToast("可移植档案已导入");
 }
 
+function fileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("文件读取失败"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function formatFileSize(bytes) {
+  const size = Math.max(0, Number(bytes || 0));
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(size >= 100 * 1024 ? 0 : 1)} KiB`;
+  if (size < 1024 * 1024 * 1024) {
+    const mib = size / (1024 * 1024);
+    return `${mib.toFixed(mib >= 100 ? 0 : mib >= 10 ? 1 : 2)} MiB`;
+  }
+  const gib = size / (1024 * 1024 * 1024);
+  return `${gib.toFixed(gib >= 100 ? 0 : gib >= 10 ? 1 : 2)} GiB`;
+}
+
+function setHistoricalChatStep(activeIndex, completed = false) {
+  const steps = $$(".chat-import-steps span");
+  steps.forEach((step, index) => {
+    step.classList.toggle("is-active", !completed && index === activeIndex);
+    step.classList.toggle("is-complete", completed || index < activeIndex);
+  });
+}
+
+function selectHistoricalChatFile(file) {
+  const meta = $("#historicalChatFileMeta");
+  const button = $("#historicalChatPreviewBtn");
+  const dropzone = $("#historicalChatDropzone");
+  const validExtension = /\.(txt|log|md)$/i.test(String(file?.name || ""));
+  const validSize = Number(file?.size || 0) > 0 && Number(file?.size || 0) <= 8 * 1024 * 1024;
+  if (!file || !validExtension || !validSize) {
+    state.historicalChatFile = null;
+    if (button) button.disabled = true;
+    dropzone?.classList.remove("has-file");
+    if (meta) {
+      meta.textContent = file && !validExtension
+        ? "仅支持 TXT、LOG 或 Markdown 文件"
+        : file && !validSize
+          ? "文件必须大于 0 且不能超过 8 MiB"
+          : "支持 TXT、LOG、Markdown，最大 8 MiB";
+    }
+    if (file) showToast(meta?.textContent || "文件不可用", "error");
+    return;
+  }
+  state.historicalChatFile = file;
+  state.historicalChatPreview = null;
+  renderHistoricalChatPreview(null);
+  setHistoricalChatStep(0);
+  if (button) button.disabled = false;
+  dropzone?.classList.add("has-file");
+  if (meta) meta.textContent = `${file.name} · ${formatFileSize(file.size)} · 已准备解析`;
+}
+
+function historicalChatSavedIdentity() {
+  try {
+    const value = JSON.parse(window.localStorage.getItem("memoryCompanionHistoricalIdentity") || "{}");
+    return value && typeof value === "object" ? value : {};
+  } catch (error) {
+    return {};
+  }
+}
+
+function saveHistoricalChatIdentity(payload) {
+  try {
+    window.localStorage.setItem("memoryCompanionHistoricalIdentity", JSON.stringify({
+      user_id: payload.user_id,
+      user_name: payload.user_name,
+      bot_id: payload.bot_id,
+      bot_name: payload.bot_name,
+    }));
+  } catch (error) {
+    // WebView 禁用 localStorage 时不影响导入主流程。
+  }
+}
+
+async function previewHistoricalChatImport() {
+  const file = state.historicalChatFile || $("#historicalChatFile")?.files?.[0];
+  if (!file) {
+    showToast("请先选择对话文本", "error");
+    return;
+  }
+  if (file.size > 8 * 1024 * 1024) {
+    showToast("对话文件不能超过 8 MiB", "error");
+    return;
+  }
+  const baseYear = Number.parseInt($("#historicalChatBaseYear")?.value || "0", 10) || 0;
+  const contentBase64 = await fileAsDataUrl(file);
+  const data = await apiPost("/conversation-import/upload", {
+    filename: file.name,
+    content_base64: contentBase64,
+    base_year: baseYear,
+  });
+  state.historicalChatPreview = data.result || null;
+  renderHistoricalChatPreview(state.historicalChatPreview);
+  setHistoricalChatStep(1);
+  showToast("对话解析预览已生成");
+}
+
+function historicalChatSuggestedTarget(preview) {
+  const identity = preview?.identity_context || {};
+  const targetUsers = Array.isArray(identity.target_users) ? identity.target_users : [];
+  const suggestions = Array.isArray(preview?.speaker_suggestions) ? preview.speaker_suggestions : [];
+  for (const item of suggestions) {
+    if (item.suggested_role !== "user") continue;
+    const candidates = Array.isArray(item.relationship_candidates) ? item.relationship_candidates : [];
+    if (candidates.length === 1) {
+      return { user_id: candidates[0].user_id || "", name: candidates[0].name || item.speaker || "" };
+    }
+  }
+  return targetUsers[0] || { user_id: "", name: "" };
+}
+
+function historicalChatIdentityDefaults(preview) {
+  const identity = preview?.identity_context || {};
+  const target = historicalChatSuggestedTarget(preview);
+  const bot = identity.bot || {};
+  const botIds = Array.isArray(bot.self_ids) ? bot.self_ids : [];
+  const saved = historicalChatSavedIdentity();
+  return {
+    user_id: target.user_id || saved.user_id || "",
+    user_name: target.name || saved.user_name || "",
+    bot_id: botIds.length === 1 ? botIds[0] : (saved.bot_id || ""),
+    bot_name: bot.name || saved.bot_name || "",
+  };
+}
+
+function historicalChatSuggestedRole(item) {
+  return ["user", "bot"].includes(item?.suggested_role) ? item.suggested_role : "";
+}
+
+function historicalChatConfidenceLabel(value) {
+  if (value === "high") return "高置信建议";
+  if (value === "medium") return "中等置信建议";
+  return "低置信，仅供参考";
+}
+
+function renderHistoricalChatPreview(preview) {
+  const panel = $("#historicalChatPanel");
+  if (!panel) return;
+  if (!preview) {
+    panel.hidden = true;
+    panel.innerHTML = "";
+    return;
+  }
+  const stats = preview.stats || {};
+  const defaults = historicalChatIdentityDefaults(preview);
+  const suggestions = Array.isArray(preview.speaker_suggestions) ? preview.speaker_suggestions : [];
+  const segmentPreview = Array.isArray(preview.segment_preview) ? preview.segment_preview : [];
+  const warningParts = [];
+  if (Number(stats.inferred_year_count || 0) > 0) warningParts.push(`${stats.inferred_year_count} 条时间由系统补推年份`);
+  if (Number(stats.time_inversion_count || 0) > 0) warningParts.push(`${stats.time_inversion_count} 处原文件时间倒序，已按绝对时间稳定重排`);
+  if (Number(stats.duplicate_timestamp_groups || 0) > 0) warningParts.push(`${stats.duplicate_timestamp_groups} 组相同时间戳将按原文件顺序保留`);
+  panel.hidden = false;
+  panel.innerHTML = `
+    <div class="chat-import-section-head">
+      <span><b>解析完成</b><small>${escapeHtml(preview.source_name || "历史对话")}</small></span>
+      <span class="chat-import-ready-badge">等待身份确认</span>
+    </div>
+    <div class="chat-import-summary">
+      <span><b>${number(stats.message_count)}</b><small>原始消息</small></span>
+      <span><b>${number(stats.logical_turn_count)}</b><small>逻辑发言</small></span>
+      <span><b>${number(stats.candidate_segment_count)}</b><small>候选片段</small></span>
+      <span><b>${number(stats.dialogue_chars)}</b><small>正文字符</small></span>
+      <span><b>${number(stats.estimated_summary_calls)}</b><small>预计首轮调用</small></span>
+      <span><b>${number(stats.estimated_reconcile_calls)}</b><small>预计整理调用</small></span>
+    </div>
+    <div class="chat-import-callout ${warningParts.length ? "is-warning" : "is-safe"}">
+      <b>时间检查</b>
+      <span>${escapeHtml(stats.first_at || "-")} → ${escapeHtml(stats.last_at || "-")}</span>
+      <small>${escapeHtml(warningParts.join("；") || "未发现明显时间异常，原文件顺序与绝对时间一致")}</small>
+    </div>
+    <div class="chat-import-callout is-info">
+      <b>预计模型工作量</b>
+      <span>约 ${number(Number(stats.estimated_summary_calls || 0) + Number(stats.estimated_reconcile_calls || 0))} 次调用</span>
+      <small>模型会分包处理，不会把整份长记录一次发送；实际次数可能因失败重试略有增加。</small>
+    </div>
+    <div class="chat-import-subhead">
+      <span><b>确认谁是用户、谁是 Bot</b><small>必须恰好选择一个 Bot；身份选反会让事件归属全部颠倒。</small></span>
+      <button id="historicalChatApplySuggestionsBtn" class="subtle" type="button">重新应用智能建议</button>
+    </div>
+    <div class="chat-import-speakers">
+      ${suggestions.map((item, index) => {
+        const candidates = Array.isArray(item.relationship_candidates) ? item.relationship_candidates : [];
+        const role = historicalChatSuggestedRole(item);
+        const reasons = Array.isArray(item.reasons) ? item.reasons.filter(Boolean) : [];
+        return `
+          <div class="chat-import-speaker ${role ? "has-suggestion" : "needs-choice"}" data-chat-speaker-index="${index}">
+            <span class="chat-import-speaker-name">
+              <strong>${escapeHtml(item.speaker || "未知")}</strong>
+              <small>${number(item.message_count)} 条消息</small>
+            </span>
+            <label>身份
+              <select id="chatRole${index}" data-chat-role>
+                <option value="" ${role ? "" : "selected"}>请选择</option>
+                <option value="user" ${role === "user" ? "selected" : ""}>用户</option>
+                <option value="bot" ${role === "bot" ? "selected" : ""}>Bot</option>
+              </select>
+            </label>
+            <span class="chat-import-confidence" data-confidence="${escapeHtml(item.confidence || "low")}">
+              <b>${escapeHtml(historicalChatConfidenceLabel(item.confidence))}</b>
+              <small>${escapeHtml(reasons[0] || (candidates.length === 1 ? "关系网名称唯一命中" : "请根据聊天内容人工判断"))}</small>
+            </span>
+          </div>
+        `;
+      }).join("")}
+    </div>
+    <div class="chat-import-subhead">
+      <span><b>绑定到当前 AstrBot 身份</b><small>这里只填写一次，系统会自动应用到上面的用户/Bot 说话人。</small></span>
+    </div>
+    <div class="chat-import-target-grid">
+      <label>目标用户 ID<input id="chatImportUserId" type="text" value="${escapeHtml(defaults.user_id)}" placeholder="例如用户 QQ 号" autocomplete="off" /><small>记忆最终归属的真实用户账号</small></label>
+      <label>用户稳定称呼<input id="chatImportUserName" type="text" value="${escapeHtml(defaults.user_name)}" placeholder="例如 烛雨" autocomplete="off" /><small>用于生成自然回忆，不会修改平台昵称</small></label>
+      <label>目标 Bot ID<input id="chatImportBotId" type="text" value="${escapeHtml(defaults.bot_id)}" placeholder="当前 Bot QQ 号" autocomplete="off" /><small>用于多 Bot 隔离，不能与用户 ID 相同</small></label>
+      <label>Bot 人格称呼<input id="chatImportBotName" type="text" value="${escapeHtml(defaults.bot_name)}" placeholder="例如 星缘" autocomplete="off" /><small>填写聊天里对应的人格名称</small></label>
+    </div>
+    ${segmentPreview.length ? `
+      <details class="chat-import-segment-preview">
+        <summary>抽查分段预览（${number(stats.candidate_segment_count)} 个片段）</summary>
+        <div>
+          ${segmentPreview.slice(0, 4).map((item) => `
+            <span><b>${escapeHtml(item.start_local || "-")}</b><small>${number(item.turn_count)} 个逻辑发言 · ${number(item.char_count)} 字</small><em>${escapeHtml(item.preview || "无预览")}</em></span>
+          `).join("")}
+        </div>
+      </details>
+    ` : ""}
+    <label class="chat-import-confirm-check">
+      <input id="historicalChatIdentityConfirmed" type="checkbox" />
+      <span><b>我已核对用户与 Bot 身份</b><small>身份一旦选反，所有历史事件和关系归属都会相反。</small></span>
+    </label>
+    <div id="historicalChatValidation" class="chat-import-validation" role="status"></div>
+    <div class="chat-import-primary-actions">
+      <button id="historicalChatStartBtn" type="button" disabled>确认身份并开始整理</button>
+      <button id="historicalChatRecentBtn" class="subtle" type="button">查看最近批次</button>
+    </div>
+    <div id="historicalChatStatus"></div>
+  `;
+  $("#historicalChatStartBtn")?.addEventListener("click", prepareHistoricalChatImport);
+  $("#historicalChatRecentBtn")?.addEventListener("click", loadRecentHistoricalChatBatch);
+  $("#historicalChatApplySuggestionsBtn")?.addEventListener("click", applyHistoricalChatSuggestions);
+  $$('[data-chat-role], #chatImportUserId, #chatImportUserName, #chatImportBotId, #chatImportBotName, #historicalChatIdentityConfirmed').forEach((control) => {
+    control.addEventListener("change", updateHistoricalChatValidation);
+    control.addEventListener("input", updateHistoricalChatValidation);
+  });
+  updateHistoricalChatValidation();
+}
+
+function applyHistoricalChatSuggestions() {
+  const preview = state.historicalChatPreview;
+  if (!preview) return;
+  const defaults = historicalChatIdentityDefaults(preview);
+  const suggestions = Array.isArray(preview.speaker_suggestions) ? preview.speaker_suggestions : [];
+  suggestions.forEach((item, index) => {
+    const select = $("#chatRole" + index);
+    if (select) select.value = historicalChatSuggestedRole(item);
+  });
+  const fields = {
+    chatImportUserId: defaults.user_id,
+    chatImportUserName: defaults.user_name,
+    chatImportBotId: defaults.bot_id,
+    chatImportBotName: defaults.bot_name,
+  };
+  Object.entries(fields).forEach(([id, value]) => {
+    const input = $("#" + id);
+    if (input) input.value = value || "";
+  });
+  const confirmed = $("#historicalChatIdentityConfirmed");
+  if (confirmed) confirmed.checked = false;
+  updateHistoricalChatValidation();
+  showToast("已重新应用身份建议，请再次人工核对");
+}
+
+function historicalChatImportPayload({ requireConfirmation = true } = {}) {
+  const preview = state.historicalChatPreview;
+  if (!preview) throw new Error("请先生成导入预览");
+  const suggestions = Array.isArray(preview.speaker_suggestions) ? preview.speaker_suggestions : [];
+  const userId = String($("#chatImportUserId")?.value || "").trim();
+  const botId = String($("#chatImportBotId")?.value || "").trim();
+  const userName = String($("#chatImportUserName")?.value || "").trim();
+  const botName = String($("#chatImportBotName")?.value || "").trim();
+  const speakerMap = {};
+  suggestions.forEach((item, index) => {
+    const role = $("#chatRole" + index)?.value || "";
+    speakerMap[item.speaker] = {
+      role,
+      entity_id: role === "bot" ? botId : userId,
+      display_name: role === "bot" ? (botName || item.speaker) : (userName || item.speaker),
+    };
+  });
+  if (requireConfirmation && !$("#historicalChatIdentityConfirmed")?.checked) {
+    throw new Error("请先勾选“我已核对用户与 Bot 身份”");
+  }
+  return {
+    upload_id: preview.upload_id,
+    speaker_map: speakerMap,
+    platform: "qq",
+    user_id: userId,
+    user_name: userName,
+    bot_id: botId,
+    bot_name: botName,
+    // 分段参数由插件配置统一管理，避免页面常量覆盖管理员调优值。
+    options: {},
+  };
+}
+
+function historicalChatValidationMessage() {
+  let payload;
+  try {
+    payload = historicalChatImportPayload({ requireConfirmation: false });
+  } catch (error) {
+    return { valid: false, message: error.message || "导入参数不完整" };
+  }
+  const roles = Object.values(payload.speaker_map).map((item) => item.role);
+  if (roles.some((role) => !["user", "bot"].includes(role))) {
+    return { valid: false, message: "还有说话人没有选择身份" };
+  }
+  if (roles.filter((role) => role === "bot").length !== 1) {
+    return { valid: false, message: "必须恰好选择一个 Bot" };
+  }
+  if (!roles.includes("user")) return { valid: false, message: "至少需要一个用户说话人" };
+  if (!payload.user_id || !payload.bot_id) return { valid: false, message: "请填写目标用户 ID 和 Bot ID" };
+  if (payload.user_id === payload.bot_id) return { valid: false, message: "用户 ID 和 Bot ID 不能相同" };
+  if (!payload.user_name || !payload.bot_name) return { valid: false, message: "请填写用户稳定称呼和 Bot 人格称呼" };
+  if (!$("#historicalChatIdentityConfirmed")?.checked) {
+    return { valid: false, message: "最后请勾选身份确认，避免整批归属选反" };
+  }
+  const mapping = Object.entries(payload.speaker_map)
+    .map(([speaker, item]) => `${speaker}＝${item.role === "bot" ? "Bot" : "用户"}`)
+    .join("，");
+  return { valid: true, message: `身份检查通过：${mapping}` };
+}
+
+function updateHistoricalChatValidation() {
+  const result = historicalChatValidationMessage();
+  const box = $("#historicalChatValidation");
+  const start = $("#historicalChatStartBtn");
+  if (box) {
+    box.textContent = result.message;
+    box.classList.toggle("is-valid", result.valid);
+    box.classList.toggle("is-error", !result.valid);
+  }
+  if (start) start.disabled = !result.valid;
+  return result;
+}
+
+function prepareHistoricalChatImport() {
+  const validation = updateHistoricalChatValidation();
+  if (!validation.valid) {
+    showToast(validation.message, "error");
+    return;
+  }
+  let payload;
+  try {
+    payload = historicalChatImportPayload();
+  } catch (error) {
+    showToast(error.message || "导入参数不完整", "error");
+    return;
+  }
+  const mapping = Object.entries(payload.speaker_map)
+    .map(([speaker, item]) => `${speaker} → ${item.role === "bot" ? `Bot ${payload.bot_name}` : `用户 ${payload.user_name}`}`)
+    .join("；");
+  const stats = state.historicalChatPreview?.stats || {};
+  showInlineConfirmation({
+    host: "#importResult",
+    title: "开始整理历史对话",
+    message: `${mapping}。将归档 ${number(stats.message_count)} 条原始消息、整理 ${number(stats.candidate_segment_count)} 个片段，预计约 ${number(Number(stats.estimated_summary_calls || 0) + Number(stats.estimated_reconcile_calls || 0))} 次模型调用。执行前会自动备份数据库。`,
+    confirmLabel: "开始导入",
+    busyText: "正在建立历史档案...",
+    onConfirm: () => executeHistoricalChatImport(payload),
+  });
+}
+
+async function executeHistoricalChatImport(payload) {
+  const data = await apiPost("/conversation-import/start", payload);
+  const result = data.result || {};
+  const batch = result.batch || {};
+  state.historicalChatBatchId = batch.id || "";
+  saveHistoricalChatIdentity(payload);
+  setHistoricalChatStep(2);
+  renderHistoricalChatStatus(result);
+  scheduleHistoricalChatPoll();
+  showToast("历史对话已进入后台整理队列");
+}
+
+async function loadRecentHistoricalChatBatch() {
+  const data = await apiGet("/conversation-import/status");
+  const batches = data.result?.batches || [];
+  if (!batches.length) {
+    showToast("还没有历史对话导入批次");
+    return;
+  }
+  state.historicalChatBatchId = batches[0].id || "";
+  const result = await refreshHistoricalChatStatus();
+  if (!["completed", "completed_with_warnings", "rolled_back", "paused", "failed"].includes(result?.batch?.state)) {
+    scheduleHistoricalChatPoll();
+  }
+}
+
+async function refreshHistoricalChatStatus() {
+  if (!state.historicalChatBatchId) return;
+  const params = new URLSearchParams({ batch_id: state.historicalChatBatchId });
+  const data = await apiGet(`/conversation-import/status?${params.toString()}`);
+  renderHistoricalChatStatus(data.result || {});
+  const finalStates = new Set(["completed", "completed_with_warnings", "rolled_back", "paused", "failed"]);
+  if (finalStates.has(data.result?.batch?.state)) stopHistoricalChatPoll();
+  return data.result || {};
+}
+
+function scheduleHistoricalChatPoll() {
+  stopHistoricalChatPoll();
+  state.historicalChatPollTimer = window.setInterval(() => {
+    refreshHistoricalChatStatus().catch(() => stopHistoricalChatPoll());
+  }, 3000);
+}
+
+function stopHistoricalChatPoll() {
+  if (state.historicalChatPollTimer) window.clearInterval(state.historicalChatPollTimer);
+  state.historicalChatPollTimer = 0;
+}
+
+function historicalChatSegmentStatusLabel(value) {
+  return {
+    pending: "待整理",
+    processing: "处理中",
+    retry: "等待重试",
+    completed: "已生成记忆",
+    archived_only: "仅保留原文",
+    failed: "失败",
+  }[value] || value;
+}
+
+function renderHistoricalChatStatus(result) {
+  let box = $("#historicalChatStatus");
+  if (!box) {
+    const panel = $("#historicalChatPanel");
+    if (!panel) return;
+    panel.hidden = false;
+    panel.innerHTML = `
+      <div class="chat-import-section-head">
+        <span><b>最近一次历史对话任务</b><small>可继续、查看结果或整批回滚</small></span>
+        <button id="historicalChatNewImportBtn" class="subtle" type="button">导入另一个文件</button>
+      </div>
+      <div id="historicalChatStatus"></div>
+    `;
+    $("#historicalChatNewImportBtn")?.addEventListener("click", resetHistoricalChatImportView);
+    box = $("#historicalChatStatus");
+  }
+  const batch = result.batch || {};
+  const total = Number(batch.total_segments || 0);
+  const completed = Number(batch.completed_segments || 0);
+  const segmentProgress = total > 0 ? Math.min(1, completed / total) : 0;
+  const statusCounts = result.segment_status || {};
+  const memoryCounts = batch.stats?.memory_counts || {};
+  const recentSegments = Array.isArray(result.recent_segments) ? result.recent_segments : [];
+  const errorSegments = recentSegments.filter((item) => item.error);
+  const stateLabel = {
+    prepared: "已准备", running: "整理中", reconciling: "跨片段去重整理中", enriching: "正在补充详细回忆", indexing: "正在建立向量索引", paused: "已暂停", failed: "失败",
+    completed: "已完成", completed_with_warnings: "完成但有警告", rolled_back: "已回滚",
+  }[batch.state] || batch.state || "未知";
+  const isFinished = ["completed", "completed_with_warnings"].includes(batch.state);
+  const progress = isFinished
+    ? 100
+    : batch.state === "indexing"
+      ? 94
+      : batch.state === "enriching"
+        ? 86
+      : batch.state === "reconciling"
+        ? 78
+        : Math.round(segmentProgress * 70);
+  const identityLinks = batch.stats?.identity_links || {};
+  const summaryPerspective = batch.stats?.summary_perspective || {};
+  const detailQuality = batch.stats?.detail_quality || {};
+  setHistoricalChatStep(2, isFinished);
+  const stageOrder = [
+    { key: "archive", label: "原文归档", done: Boolean(batch.id), active: false },
+    { key: "segments", label: "片段整理", done: total > 0 && completed >= total, active: batch.state === "running" },
+    { key: "reconcile", label: "跨片段去重", done: ["enriching", "indexing", "completed", "completed_with_warnings"].includes(batch.state), active: batch.state === "reconciling" },
+    { key: "detail", label: "细节补全", done: Number(detailQuality.version || 0) > 0, active: batch.state === "enriching" },
+    { key: "embedding", label: "向量收尾", done: isFinished, active: batch.state === "indexing" },
+  ];
+  box.innerHTML = `
+    <div class="chat-import-progress">
+      <div class="chat-import-progress-head">
+        <span><b>${escapeHtml(stateLabel)}</b><small>批次 ${escapeHtml(shortId(batch.id))}</small></span>
+        <strong>${progress}%</strong>
+      </div>
+      <progress max="100" value="${progress}" aria-label="历史对话整理进度 ${progress}%"></progress>
+      <div class="chat-import-stage-track">
+        ${stageOrder.map((item) => `<span class="${item.done ? "is-done" : ""} ${item.active ? "is-active" : ""}"><i></i>${escapeHtml(item.label)}</span>`).join("")}
+      </div>
+      <div class="chat-import-status-summary">
+        <span><b>${number(completed)}/${number(total)}</b><small>已整理片段</small></span>
+        <span><b>${number(batch.stats?.message_count || 0)}</b><small>永久原始消息</small></span>
+        <span><b>${number(memoryCounts.total ?? batch.summary_memory_count ?? 0)}</b><small>本批正式记忆</small></span>
+        <span><b>${number(batch.relationship_observation_count)}</b><small>关系待确认</small></span>
+      </div>
+      ${Object.keys(statusCounts).length ? `
+        <div class="chat-import-status-chips">
+          ${Object.entries(statusCounts).map(([key, value]) => `<span data-status="${escapeHtml(key)}">${escapeHtml(historicalChatSegmentStatusLabel(key))} ${number(value)}</span>`).join("")}
+        </div>
+      ` : ""}
+      ${memoryCounts.total != null ? `
+        <div class="chat-import-memory-breakdown">
+          <b>生成结果</b>
+          <span>片段回忆 ${number(memoryCounts.conversation_summary)}</span>
+          <span>重要事件 ${number(memoryCounts.important_event)}</span>
+          <span>日摘要 ${number(memoryCounts.daily_digest)}</span>
+          <span>稳定事实 ${number(memoryCounts.stable_fact)}</span>
+          <span>阶段摘要 ${number(memoryCounts.relationship_phase_summary)}</span>
+        </div>
+      ` : ""}
+      ${batch.stats?.embedding?.enabled ? `<small class="chat-import-embedding-note">向量索引 ${number(batch.stats.embedding.indexed)}/${number(batch.stats.embedding.eligible)} · ${escapeHtml(batch.stats.embedding.status || "处理中")}</small>` : ""}
+      ${Number(identityLinks.version || 0) > 0 ? `<div class="chat-import-callout is-safe"><b>私聊归属已统一</b><span>本批记忆已合并到用户 ${escapeHtml(identityLinks.target_user_id || batch.user_id || "-")} 的现有私聊窗口${Number(identityLinks.repaired_entities || 0) > 0 ? `，修复 ${number(identityLinks.repaired_entities)} 条实体关联` : ""}。</span></div>` : ""}
+      ${Number(summaryPerspective.version || 0) > 0 ? `<div class="chat-import-callout is-safe"><b>记忆视角已校正</b><span>可召回正文统一使用明确称呼的第三人称摘要，不会把用户的“我”误认成 Bot。</span></div>` : ""}
+      ${Number(detailQuality.version || 0) > 0 ? `<div class="chat-import-callout is-safe"><b>详细回忆已整理</b><span>片段回忆 ${number(detailQuality.conversation_summaries_enriched ?? detailQuality.conversation_summaries ?? batch.summary_memory_count)}/${number(detailQuality.conversation_summaries ?? batch.summary_memory_count)}，日摘要 ${number(detailQuality.daily_digests_enriched ?? detailQuality.daily_digests ?? memoryCounts.daily_digest)}/${number(detailQuality.daily_digests ?? memoryCounts.daily_digest)}；事件与稳定事实继续保持原子化，避免重复和混淆。</span></div>` : ""}
+      ${batch.error ? `<div class="chat-import-callout is-warning"><b>任务提示</b><span>${escapeHtml(batch.error)}</span></div>` : ""}
+      ${errorSegments.length ? `
+        <details class="chat-import-error-details">
+          <summary>查看最近失败片段（${number(errorSegments.length)}）</summary>
+          ${errorSegments.map((item) => `<p><b>片段 ${number(Number(item.segment_index || 0) + 1)}</b><span>${escapeHtml(item.error)}</span></p>`).join("")}
+        </details>
+      ` : ""}
+      ${isFinished ? `<div class="chat-import-callout is-safe"><b>可以开始使用了</b><span>长期记忆已写入；关系候选仍需在陪伴插件关系网页人工确认。</span></div>` : ""}
+      <div class="chat-import-primary-actions">
+        ${batch.state === "running" ? '<button id="historicalChatPauseBtn" type="button">暂停</button>' : ""}
+        ${["paused", "failed", "prepared"].includes(batch.state) ? '<button id="historicalChatResumeBtn" type="button">恢复</button>' : ""}
+        ${!["rolled_back"].includes(batch.state) ? '<button id="historicalChatRefreshBtn" class="subtle" type="button">立即刷新</button>' : ""}
+        ${batch.state !== "rolled_back" ? '<button id="historicalChatRollbackBtn" class="danger subtle" type="button">整批回滚</button>' : ""}
+      </div>
+    </div>
+  `;
+  $("#historicalChatPauseBtn")?.addEventListener("click", () => withBusy("正在暂停...", pauseHistoricalChatImport));
+  $("#historicalChatResumeBtn")?.addEventListener("click", () => withBusy("正在恢复...", resumeHistoricalChatImport));
+  $("#historicalChatRefreshBtn")?.addEventListener("click", () => withButton($("#historicalChatRefreshBtn"), "刷新中", refreshHistoricalChatStatus));
+  $("#historicalChatRollbackBtn")?.addEventListener("click", prepareHistoricalChatRollback);
+}
+
+function resetHistoricalChatImportView() {
+  stopHistoricalChatPoll();
+  state.historicalChatPreview = null;
+  state.historicalChatBatchId = "";
+  renderHistoricalChatPreview(null);
+  setHistoricalChatStep(0);
+  $("#historicalChatDropzone")?.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+async function pauseHistoricalChatImport() {
+  const data = await apiPost("/conversation-import/pause", { batch_id: state.historicalChatBatchId });
+  renderHistoricalChatStatus(data.result || {});
+  stopHistoricalChatPoll();
+  showToast("导入将在当前片段完成后暂停");
+}
+
+async function resumeHistoricalChatImport() {
+  const data = await apiPost("/conversation-import/resume", { batch_id: state.historicalChatBatchId });
+  renderHistoricalChatStatus(data.result || {});
+  scheduleHistoricalChatPoll();
+  showToast("历史对话整理已恢复");
+}
+
+function prepareHistoricalChatRollback() {
+  showInlineConfirmation({
+    host: "#importResult",
+    title: "回滚历史对话导入",
+    message: "将删除该批次写入的时间线、片段记忆、重要事件、向量和关系网待确认观察；其它记忆不受影响。",
+    confirmLabel: "确认回滚",
+    busyText: "正在整批回滚...",
+    dangerous: true,
+    onConfirm: rollbackHistoricalChatImport,
+  });
+}
+
+async function rollbackHistoricalChatImport() {
+  const data = await apiPost("/conversation-import/rollback", { batch_id: state.historicalChatBatchId });
+  stopHistoricalChatPoll();
+  await refreshAll();
+  showArchiveResult(data.result || {}, "historical-chat-rollback");
+  await refreshHistoricalChatStatus();
+  showToast("历史对话导入已回滚");
+}
+
 async function repairLivingMemoryContent() {
   const path = livingMemoryPathValue();
   const data = await apiPost("/maintenance/repair_livingmemory_content", { path });
@@ -4766,6 +5411,32 @@ function bindActions() {
   $("#portableExportBtn").addEventListener("click", () => withBusy("正在导出可移植档案...", exportPortableArchive));
   $("#portablePreviewBtn").addEventListener("click", () => withBusy("正在读取可移植档案...", previewPortableArchive));
   $("#portableImportBtn").addEventListener("click", () => withBusy("正在导入可移植档案...", importPortableArchive));
+  $("#historicalChatPreviewBtn")?.addEventListener("click", () => withBusy("正在解析历史对话...", previewHistoricalChatImport));
+  $("#historicalChatRecentTopBtn")?.addEventListener("click", () => withBusy("正在读取最近任务...", loadRecentHistoricalChatBatch));
+  $("#historicalChatFile")?.addEventListener("change", (event) => selectHistoricalChatFile(event.target.files?.[0]));
+  $("#historicalChatBaseYear")?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !$("#historicalChatPreviewBtn")?.disabled) {
+      event.preventDefault();
+      $("#historicalChatPreviewBtn")?.click();
+    }
+  });
+  const historicalDropzone = $("#historicalChatDropzone");
+  historicalDropzone?.addEventListener("dragover", (event) => {
+    event.preventDefault();
+    historicalDropzone.classList.add("is-dragging");
+  });
+  historicalDropzone?.addEventListener("dragleave", () => historicalDropzone.classList.remove("is-dragging"));
+  historicalDropzone?.addEventListener("drop", (event) => {
+    event.preventDefault();
+    historicalDropzone.classList.remove("is-dragging");
+    selectHistoricalChatFile(event.dataTransfer?.files?.[0]);
+  });
+  historicalDropzone?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      $("#historicalChatFile")?.click();
+    }
+  });
   $("#repairLivingMemoryBtn").addEventListener("click", () => withBusy("正在修复 LivingMemory 内容...", repairLivingMemoryContent));
   $("#clearAllMemoryBtn").addEventListener("click", clearAllMemoryData);
   $("#clearCurrentGroupMemoryBtn")?.addEventListener("click", () => withBusy("正在预览范围清理...", () => clearCurrentScopedMemory("group")));
@@ -5064,6 +5735,7 @@ function _topologyNodeLabels(node) {
     label: node.label || "",
     sublabel: node.identifier_label || "",
     target_name: node.target_name || node.display_name || "",
+    target_kind: node.target_kind || "",
   });
   const missingName = node.scope === "group" ? "未记录群名" : "未记录昵称";
   const name = bucketTitle.secondary && bucketTitle.secondary !== bucketTitle.primary
@@ -5071,7 +5743,7 @@ function _topologyNodeLabels(node) {
     : missingName;
   return {
     name,
-    id: bucketTitle.primary || windowIdentifierLabel(node.scope, node.id),
+    id: bucketTitle.primary || windowIdentifierLabel(node.scope, node.id, node.target_kind || ""),
   };
 }
 

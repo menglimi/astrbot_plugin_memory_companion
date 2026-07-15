@@ -50,7 +50,8 @@ class MemorySummarizer:
     ) -> dict[str, Any] | None:
         if not rows:
             return None
-        prompt = self._build_prompt(rows, session_label)
+        prepared_rows = self.rows_for_prompt(rows)
+        prompt = self._build_prompt(prepared_rows, session_label)
         if not prompt:
             return None
         kwargs: dict[str, Any] = {
@@ -62,7 +63,12 @@ class MemorySummarizer:
         try:
             call = provider.text_chat(**kwargs)
             if self.provider_timeout_seconds > 0:
-                resp = await asyncio.wait_for(call, timeout=self.provider_timeout_seconds)
+                try:
+                    resp = await asyncio.wait_for(call, timeout=self.provider_timeout_seconds)
+                except TimeoutError as exc:
+                    raise TimeoutError(
+                        f"总结模型在 {self.provider_timeout_seconds:g} 秒内未返回"
+                    ) from exc
             else:
                 resp = await call
         except Exception as exc:
@@ -99,7 +105,13 @@ class MemorySummarizer:
         payload = self._parse_response(text)
         if payload is None:
             raise ValueError("summary provider returned invalid JSON")
-        return self._normalize_payload(payload, rows)
+        normalized = self._normalize_payload(payload, prepared_rows)
+        normalized["_consumed_event_ids"] = [
+            clean_text(row.get("id"), 160)
+            for row in prepared_rows
+            if clean_text(row.get("id"), 160)
+        ]
+        return normalized
 
     def compose_memory_content(self, payload: dict[str, Any]) -> str:
         summary = clean_text(payload.get("summary"), self.max_summary_chars)
@@ -129,11 +141,13 @@ class MemorySummarizer:
             return "low"
         return "normal"
 
-    def _build_prompt(self, rows: list[dict[str, Any]], session_label: str) -> str:
+    def _transcript_lines_and_rows(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> tuple[list[str], list[dict[str, Any]]]:
         transcript_lines: list[str] = []
+        consumed_rows: list[dict[str, Any]] = []
         total = 0
-        is_group = any(str(row.get("scope") or "") == "group" for row in rows)
-        time_range = self._rows_local_time_range(rows)
         routine_check_window = 0
         for row in rows:
             event_type = clean_text(row.get("event_type"), 40)
@@ -177,11 +191,22 @@ class MemorySummarizer:
             if transcript_lines and total + cost > self.max_input_chars:
                 break
             transcript_lines.append(line)
+            consumed_rows.append(row)
             total += cost
             if routine_check_window > 0 and not routine_marker:
                 routine_check_window -= 1
+        return transcript_lines, consumed_rows
+
+    def rows_for_prompt(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return self._transcript_lines_and_rows(rows)[1]
+
+    def _build_prompt(self, rows: list[dict[str, Any]], session_label: str) -> str:
+        transcript_lines, consumed_rows = self._transcript_lines_and_rows(rows)
         if not transcript_lines:
             return ""
+        rows = consumed_rows
+        is_group = any(str(row.get("scope") or "") == "group" for row in rows)
+        time_range = self._rows_local_time_range(rows)
         transcript = "\n".join(transcript_lines)
         participant_rule = '\n  "participants": ["参与者昵称1", "参与者昵称2"],' if is_group else ""
         bot_self_fact_field = (

@@ -8,6 +8,7 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .identity import session_target_id
 from .models import MemoryRecord, SearchResult, SessionContext, clean_text
 from .store import MemoryStore
 from .time_intent import TimeIntent
@@ -1842,7 +1843,7 @@ class RetrievalEngine:
             if not owner_id and memory.subject.kind == "group":
                 owner_id = memory.subject.id
             if not owner_id:
-                owner_id = memory.session_id
+                owner_id = session_target_id(memory.session_id, "group") or memory.session_id
             return ("group", clean_text(owner_id, 160)) if owner_id else None
         if memory.scope == "private" or memory.visibility == "private_pair":
             owner_id = ""
@@ -1851,7 +1852,7 @@ class RetrievalEngine:
                     owner_id = entity.id
                     break
             if not owner_id:
-                owner_id = memory.session_id
+                owner_id = session_target_id(memory.session_id, "private") or memory.session_id
             return ("private", clean_text(owner_id, 160)) if owner_id else None
         return None
 

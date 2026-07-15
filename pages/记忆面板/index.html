@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>记忆放映馆</title>
-  <link rel="stylesheet" href="./app.css?v=20260708-embedding-timeout" />
+  <link rel="stylesheet" href="./app.css?v=20260715-memory-size-stat" />
 </head>
 <body>
   <main id="app" class="film-app">
@@ -20,7 +20,7 @@
       <button class="filmstrip" style="--a:76deg; --z:4;--off:-200px" data-view="film"       data-tip-title="群聊记忆" data-tip-sub="群聊范围内的记忆"      type="button"><span class="strip-label"><b>群聊记忆</b><small>群聊 · 记忆</small></span></button>
       <button class="filmstrip" style="--a:44deg; --z:7;--off:260px"  data-view="microscope" data-tip-title="记忆显微镜" data-tip-sub="模拟召回 · 检查注入"     type="button"><span class="strip-label" style="--label-edge:-260px"><b>记忆显微镜</b><small>模拟召回</small></span></button>
       <button class="filmstrip" style="--a:14deg; --z:5;--off:-225px;--tx:-440px" data-view="relations"  data-tip-title="用户记忆"     data-tip-sub="用户画像 · 偏好 · 关系"     type="button"><span class="strip-label" style="--label-edge:380px"><b>用户记忆</b><small>画像 · 偏好</small></span></button>
-      <button class="filmstrip" style="--a:162deg;--z:1;--off:215px;--tx:-260px"  data-view="review"     data-tip-title="个人记忆"       data-tip-sub="Bot 日程 · 生活细化"         type="button"><span class="strip-label is-flipped"><b>个人记忆</b><small>日程 · 细化</small></span></button>
+      <button class="filmstrip" style="--a:162deg;--z:1;--off:215px;--tx:-260px" data-view="review"     data-tip-title="个人记忆"       data-tip-sub="Bot 日程 · 生活细化"         type="button"><span class="strip-label is-flipped"><b>个人记忆</b><small>日程 · 细化</small></span></button>
       <button class="filmstrip" style="--a:136deg;--z:3;--off:-390px" data-view="archive"    data-tip-title="维护/迁移/配置"   data-tip-sub="工具 · 迁移 · 配置"        type="button"><span class="strip-label is-flipped"><b>维护/迁移/配置</b><small>工具 · 配置</small></span></button>
       <button class="filmstrip" style="--a:106deg;--z:6;--off:220px"  data-view="maintain"   data-tip-title="私聊记忆"  data-tip-sub="私聊范围内的记忆" type="button"><span class="strip-label is-flipped"><b>私聊记忆</b><small>私聊 · 记忆</small></span></button>
 
@@ -143,11 +143,11 @@
               <p>执行维护、LivingMemory 迁移、清理和导入修复。</p>
             </div>
             <div class="archive-grid">
-              <section class="archive-section is-active" data-archive-section="retrieval">
+              <section class="archive-section" data-archive-section="retrieval">
                 <h4>模块配置</h4>
                 <div id="selfMemoryList" class="config-panel-stack"></div>
               </section>
-              <section class="archive-section" data-archive-section="maintenance">
+              <section class="archive-section is-active" data-archive-section="maintenance">
                 <h4>维护 / 迁移 / 清理</h4>
                 <div class="maintenance-box">
                   <p class="archive-note">推荐先选择运行预设并查看诊断，再执行迁移或维护。所有导入与清空操作都会先备份数据库。</p>
@@ -177,7 +177,41 @@
                       </div>
                     </section>
                     <section class="maintenance-action">
-                      <b>4. LivingMemory 导入</b>
+                      <b>4. 历史对话整理导入</b>
+                      <p class="archive-note">三步完成：解析文件 → 确认身份 → 后台整理。系统会给出身份建议，但不会替你确认；原始消息和精确时间永久保留。</p>
+                      <div class="chat-import-steps" aria-label="历史对话导入步骤">
+                        <span class="is-active"><i>1</i>选择并解析</span>
+                        <span><i>2</i>确认身份</span>
+                        <span><i>3</i>整理完成</span>
+                      </div>
+                      <label id="historicalChatDropzone" class="chat-import-dropzone" for="historicalChatFile" tabindex="0">
+                        <input id="historicalChatFile" class="visually-hidden" type="file" accept=".txt,.log,.md,text/plain,text/markdown" />
+                        <span class="chat-import-drop-icon" aria-hidden="true">＋</span>
+                        <b>拖入聊天记录，或点击选择文件</b>
+                        <small id="historicalChatFileMeta">支持 TXT、LOG、Markdown，最大 8 MiB</small>
+                      </label>
+                      <div class="chat-import-inline-fields">
+                        <label>缺失年份起点
+                          <input id="historicalChatBaseYear" type="number" min="1970" max="2200" inputmode="numeric" placeholder="通常留空" />
+                          <small>仅当文件开头就是“12-14 15:10:22”这类无年份时间时填写</small>
+                        </label>
+                        <button id="historicalChatPreviewBtn" type="button" disabled>解析并预览</button>
+                      </div>
+                      <div class="chat-import-entry-actions">
+                        <button id="historicalChatRecentTopBtn" class="subtle" type="button">继续最近一次任务</button>
+                        <details>
+                          <summary>查看支持的文本格式</summary>
+                          <pre>烛雨: 2025-12-14 15:10:22
+消息正文，可包含多行
+
+Bot: 12-14 15:10:30
+缺失年份可由前文自动补推</pre>
+                        </details>
+                      </div>
+                      <div id="historicalChatPanel" class="chat-import-panel" aria-live="polite" hidden></div>
+                    </section>
+                    <section class="maintenance-action">
+                      <b>5. LivingMemory 导入</b>
                       <p class="archive-note">先预览可导入数量和跳过原因，再执行导入。当前策略只导入完整摘要，跳过派生碎片。</p>
                       <input class="livingmemory-path" type="text" placeholder="LivingMemory 数据库路径，可留空自动扫描" />
                       <div class="inline-actions">
@@ -186,18 +220,18 @@
                       </div>
                     </section>
                     <section class="maintenance-action">
-                      <b>5. 内容修复</b>
+                      <b>6. 内容修复</b>
                       <p class="archive-note">用于修复早期导入后只剩旧库编号的记忆。建议先确认 LivingMemory 数据库路径，再执行修复。</p>
                       <input class="livingmemory-path" type="text" placeholder="LivingMemory 数据库路径，可留空自动扫描" />
                       <button id="repairLivingMemoryBtn" type="button">修复 LivingMemory 内容</button>
                     </section>
                     <section class="maintenance-action">
-                      <b>6. 维护检查</b>
+                      <b>7. 维护检查</b>
                       <p class="archive-note">修复索引、刷新统计并整理数据库状态。适合导入、清理或配置调整后手动执行一次。</p>
                       <button id="maintenanceBtn" type="button">运行维护</button>
                     </section>
                     <section class="maintenance-action">
-                      <b>7. 危险清理</b>
+                      <b>8. 危险清理</b>
                       <p class="archive-note">清空会先备份数据库，再删除记忆、权限规则、时间线、关系、身份、注入日志和导入批次。</p>
                       <button id="clearAllMemoryBtn" class="danger" type="button">清空全部记忆</button>
                     </section>
@@ -226,6 +260,6 @@
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </main>
   <script src="/api/plugin/page/bridge-sdk.js"></script>
-  <script src="./app.js?v=20260708-embedding-timeout"></script>
+  <script src="./app.js?v=20260715-memory-size-stat"></script>
 </body>
 </html>

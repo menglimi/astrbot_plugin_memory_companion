@@ -82,6 +82,12 @@ class PluginPageApi:
             ("/data/export", self.data_export, ["POST"], "MemoryCompanion portable data export"),
             ("/data/import/preview", self.data_import_preview, ["GET"], "MemoryCompanion portable data preview"),
             ("/data/import/run", self.data_import_run, ["POST"], "MemoryCompanion portable data import"),
+            ("/conversation-import/upload", self.conversation_import_upload, ["POST"], "MemoryCompanion historical chat upload"),
+            ("/conversation-import/start", self.conversation_import_start, ["POST"], "MemoryCompanion historical chat start"),
+            ("/conversation-import/status", self.conversation_import_status, ["GET"], "MemoryCompanion historical chat status"),
+            ("/conversation-import/pause", self.conversation_import_pause, ["POST"], "MemoryCompanion historical chat pause"),
+            ("/conversation-import/resume", self.conversation_import_resume, ["POST"], "MemoryCompanion historical chat resume"),
+            ("/conversation-import/rollback", self.conversation_import_rollback, ["POST"], "MemoryCompanion historical chat rollback"),
             ("/companion/personal-memory", self.companion_personal_memory, ["GET"], "MemoryCompanion Page companion personal memory"),
             ("/companion/personal-photo", self.companion_personal_photo, ["GET"], "MemoryCompanion Page companion personal photo"),
             ("/companion/personal-photo-data", self.companion_personal_photo_data, ["GET"], "MemoryCompanion Page companion personal photo data"),
@@ -148,6 +154,83 @@ class PluginPageApi:
             return self._err(str(exc), 400)
         except Exception as exc:
             return self._err(f"导入失败: {exc}", 500)
+
+    async def conversation_import_upload(self):
+        payload = await self._json()
+        filename = clean_text(payload.get("filename"), 240) or "conversation.txt"
+        encoded = str(payload.get("content_base64") or "").strip()
+        if not encoded:
+            return self._err("content_base64 is required", 400)
+        if "," in encoded and encoded.lower().startswith("data:"):
+            encoded = encoded.split(",", 1)[1]
+        try:
+            content = base64.b64decode(encoded, validate=True)
+            result = await asyncio.to_thread(
+                self.plugin.service.preview_historical_chat_upload,
+                filename=filename,
+                content=content,
+                base_year=int(payload.get("base_year") or 0),
+            )
+            return self._ok({"result": result})
+        except (ValueError, OSError) as exc:
+            return self._err(str(exc), 400)
+        except Exception as exc:
+            logger.exception("历史对话预览失败")
+            return self._err(f"历史对话预览失败: {exc}", 500)
+
+    async def conversation_import_start(self):
+        payload = await self._json()
+        try:
+            result = await self.plugin.service.start_historical_chat_import(payload)
+            return self._ok({"result": result})
+        except (ValueError, OSError) as exc:
+            return self._err(str(exc), 400)
+        except Exception as exc:
+            logger.exception("历史对话导入启动失败")
+            return self._err(f"历史对话导入启动失败: {exc}", 500)
+
+    async def conversation_import_status(self):
+        batch_id = clean_text(request.args.get("batch_id", ""), 120)
+        try:
+            result = await self.plugin.service.historical_chat_import_status(batch_id)
+            return self._ok({"result": result})
+        except ValueError as exc:
+            return self._err(str(exc), 404)
+        except Exception as exc:
+            return self._err(f"读取历史对话导入状态失败: {exc}", 500)
+
+    async def conversation_import_pause(self):
+        payload = await self._json()
+        batch_id = clean_text(payload.get("batch_id"), 120)
+        if not batch_id:
+            return self._err("batch_id is required", 400)
+        try:
+            return self._ok({"result": await self.plugin.service.pause_historical_chat_import(batch_id)})
+        except ValueError as exc:
+            return self._err(str(exc), 404)
+
+    async def conversation_import_resume(self):
+        payload = await self._json()
+        batch_id = clean_text(payload.get("batch_id"), 120)
+        if not batch_id:
+            return self._err("batch_id is required", 400)
+        try:
+            return self._ok({"result": await self.plugin.service.resume_historical_chat_import(batch_id)})
+        except ValueError as exc:
+            return self._err(str(exc), 404)
+
+    async def conversation_import_rollback(self):
+        payload = await self._json()
+        batch_id = clean_text(payload.get("batch_id"), 120)
+        if not batch_id:
+            return self._err("batch_id is required", 400)
+        try:
+            return self._ok({"result": await self.plugin.service.rollback_historical_chat_import(batch_id)})
+        except ValueError as exc:
+            return self._err(str(exc), 404)
+        except Exception as exc:
+            logger.exception("历史对话导入回滚失败")
+            return self._err(f"历史对话导入回滚失败: {exc}", 500)
 
     async def persona_state(self):
         """Return persona state: relationship phases, emotional events, address evolution, cross-window state."""
@@ -257,6 +340,7 @@ class PluginPageApi:
                         "id": tid,
                         "label": clean_text(b.get("label"), 120),
                         "target_name": clean_text(b.get("target_name"), 120),
+                        "target_kind": clean_text(b.get("target_kind"), 40),
                         "sample_session_id": clean_text(b.get("sample_session_id"), 200),
                         "sample_group_id": clean_text(b.get("sample_group_id"), 120),
                         "memory_count": b.get("memory_count", 0),
