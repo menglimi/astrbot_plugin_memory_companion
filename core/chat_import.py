@@ -458,6 +458,103 @@ class HistoricalChatImporter:
                 continue
         raise ValueError("无法识别文本编码；请保存为 UTF-8 后重试")
 
+    @staticmethod
+    def _structured_source_text(messages: list[dict[str, Any]]) -> str:
+        blocks = []
+        for item in messages:
+            speaker = clean_text(item.get("speaker"), 80) or "未知说话人"
+            local_time = clean_text(item.get("local_time"), 80)
+            content = str(item.get("content") or "").strip()
+            blocks.append(f"{speaker}: {local_time}\n{content}")
+        return "\n\n".join(blocks).strip() + "\n"
+
+    def _stage_parsed_messages(
+        self,
+        *,
+        source_name: str,
+        source_hash: str,
+        source_text: str,
+        source_encoding: str,
+        base_year: int,
+        messages: list[dict[str, Any]],
+        stats: dict[str, Any],
+        source_kind: str,
+        source_metadata: dict[str, Any] | None = None,
+        identity_context: dict[str, Any] | None = None,
+        speaker_suggestions: list[dict[str, Any]] | None = None,
+        read_stats: dict[str, Any] | None = None,
+        truncated: bool = False,
+        warnings: list[str] | None = None,
+    ) -> dict[str, Any]:
+        parse_hash = stable_fingerprint(
+            source_hash,
+            [item.get("message_id") for item in messages],
+        )
+        upload_id = "chatup_" + parse_hash[:24]
+        speakers = list((stats.get("speakers") or {}).keys())
+        identity = identity_context if isinstance(identity_context, dict) else self._identity_context(speakers)
+        suggestions = (
+            speaker_suggestions
+            if isinstance(speaker_suggestions, list)
+            else self._suggest_speaker_roles(messages, identity)
+        )
+        provisional_map = {
+            item["speaker"]: {"role": item["suggested_role"]}
+            for item in suggestions
+            if isinstance(item, dict) and clean_text(item.get("speaker"), 80)
+        }
+        options = self._resolved_options()
+        segmenter = self._segmenter_from_options(options)
+        segments = segmenter.segments(messages, provisional_map)
+        resolved_stats = dict(stats)
+        resolved_stats.update(
+            {
+                "logical_turn_count": len(segmenter.logical_turns(messages, provisional_map)),
+                "candidate_segment_count": len(segments),
+                "estimated_summary_calls": max(
+                    1,
+                    math.ceil(sum(len(item["transcript"]) for item in segments) / options["package_chars"]),
+                ),
+                "estimated_reconcile_calls": max(1, math.ceil(max(1, len(segments)) / 16)),
+            }
+        )
+        if isinstance(read_stats, dict) and read_stats:
+            resolved_stats["source_read"] = dict(read_stats)
+            resolved_stats["source_truncated"] = bool(truncated)
+        self._cleanup_staged_uploads(keep=upload_id)
+        upload_dir = self._upload_dir(upload_id)
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        normalized_source = str(source_text or "").replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+        (upload_dir / "source.txt").write_text(normalized_source, encoding="utf-8", newline="\n")
+        with (upload_dir / "parsed.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
+            for item in messages:
+                handle.write(json_dumps(item) + "\n")
+        manifest = {
+            "upload_id": upload_id,
+            "source_name": clean_text(source_name, 240) or "历史对话",
+            "source_hash": source_hash,
+            "parse_hash": parse_hash,
+            "source_encoding": source_encoding,
+            "normalized_encoding": "utf-8",
+            "source_kind": clean_text(source_kind, 40) or "text_file",
+            "source_metadata": source_metadata if isinstance(source_metadata, dict) else {},
+            "base_year": int(base_year or 0),
+            "options": options,
+            "stats": resolved_stats,
+            "speaker_suggestions": suggestions,
+            "identity_context": identity,
+            "segment_preview": [self._segment_preview(item) for item in segments[:12]],
+            "read_stats": read_stats if isinstance(read_stats, dict) else {},
+            "truncated": bool(truncated),
+            "warnings": [clean_text(item, 240) for item in (warnings or []) if clean_text(item, 240)],
+            "created_at": utc_now(),
+        }
+        (upload_dir / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return manifest
+
     def stage_upload(self, *, filename: str, content: bytes, base_year: int = 0) -> dict[str, Any]:
         if len(content) > self.MAX_UPLOAD_BYTES:
             raise ValueError("对话文件不能超过 8 MiB")
@@ -471,59 +568,75 @@ class HistoricalChatImporter:
         normalized = text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
         source_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
         parsed = self.parser.parse(normalized, source_hash=source_hash, base_year=base_year)
-        parse_hash = stable_fingerprint(
-            source_hash,
-            [item.get("message_id") for item in parsed["messages"]],
+        return self._stage_parsed_messages(
+            source_name=safe_name,
+            source_hash=source_hash,
+            source_text=normalized,
+            source_encoding=source_encoding,
+            base_year=base_year,
+            messages=parsed["messages"],
+            stats=parsed["stats"],
+            source_kind="text_file",
         )
-        upload_id = "chatup_" + parse_hash[:24]
-        identity = self._identity_context(list(parsed["stats"]["speakers"]))
-        suggestions = self._suggest_speaker_roles(parsed["messages"], identity)
-        provisional_map = {
-            item["speaker"]: {"role": item["suggested_role"]}
-            for item in suggestions
-        }
-        options = self._resolved_options()
-        segmenter = self._segmenter_from_options(options)
-        segments = segmenter.segments(parsed["messages"], provisional_map)
-        stats = dict(parsed["stats"])
-        stats.update(
-            {
-                "logical_turn_count": len(segmenter.logical_turns(parsed["messages"], provisional_map)),
-                "candidate_segment_count": len(segments),
-                "estimated_summary_calls": max(
-                    1,
-                    math.ceil(sum(len(item["transcript"]) for item in segments) / options["package_chars"]),
-                ),
-                "estimated_reconcile_calls": max(1, math.ceil(max(1, len(segments)) / 16)),
-            }
+
+    def stage_structured_messages(
+        self,
+        *,
+        source_name: str,
+        source_hash: str,
+        messages: list[dict[str, Any]],
+        stats: dict[str, Any],
+        source_kind: str,
+        source_metadata: dict[str, Any] | None = None,
+        identity_context: dict[str, Any] | None = None,
+        speaker_suggestions: list[dict[str, Any]] | None = None,
+        read_stats: dict[str, Any] | None = None,
+        truncated: bool = False,
+        warnings: list[str] | None = None,
+    ) -> dict[str, Any]:
+        if not messages:
+            raise ValueError("没有可暂存的历史消息")
+        normalized: list[dict[str, Any]] = []
+        for index, raw in enumerate(messages, start=1):
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            speaker = clean_text(item.get("speaker"), 80)
+            content = str(item.get("content") or "").strip()
+            message_id = clean_text(item.get("message_id"), 120)
+            local_time = clean_text(item.get("local_time"), 80)
+            occurred_at = clean_text(item.get("occurred_at"), 80)
+            if not speaker or not content or not message_id or not local_time or not occurred_at:
+                raise ValueError(f"第 {index} 条结构化消息缺少说话人、时间、正文或消息 ID")
+            item["sequence"] = max(1, int(item.get("sequence") or index))
+            item["speaker"] = speaker
+            item["content"] = content[:15999].rstrip() + ("…" if len(content) > 15999 else "")
+            item["message_id"] = message_id
+            item["local_time"] = local_time
+            item["occurred_at"] = occurred_at
+            item["raw_time"] = clean_text(item.get("raw_time"), 80) or local_time
+            item["source_line"] = max(0, int(item.get("source_line") or index))
+            item["inferred_year"] = bool(item.get("inferred_year"))
+            normalized.append(item)
+        normalized.sort(key=lambda item: (item["local_time"], item["sequence"]))
+        if not normalized:
+            raise ValueError("没有可暂存的历史消息")
+        return self._stage_parsed_messages(
+            source_name=source_name,
+            source_hash=clean_text(source_hash, 120),
+            source_text=self._structured_source_text(normalized),
+            source_encoding="onebot-structured",
+            base_year=0,
+            messages=normalized,
+            stats=stats,
+            source_kind=source_kind,
+            source_metadata=source_metadata,
+            identity_context=identity_context,
+            speaker_suggestions=speaker_suggestions,
+            read_stats=read_stats,
+            truncated=truncated,
+            warnings=warnings,
         )
-        self._cleanup_staged_uploads(keep=upload_id)
-        upload_dir = self._upload_dir(upload_id)
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        (upload_dir / "source.txt").write_text(normalized, encoding="utf-8", newline="\n")
-        with (upload_dir / "parsed.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
-            for item in parsed["messages"]:
-                handle.write(json_dumps(item) + "\n")
-        manifest = {
-            "upload_id": upload_id,
-            "source_name": safe_name,
-            "source_hash": source_hash,
-            "parse_hash": parse_hash,
-            "source_encoding": source_encoding,
-            "normalized_encoding": "utf-8",
-            "base_year": base_year,
-            "options": options,
-            "stats": stats,
-            "speaker_suggestions": suggestions,
-            "identity_context": identity,
-            "segment_preview": [self._segment_preview(item) for item in segments[:12]],
-            "created_at": utc_now(),
-        }
-        (upload_dir / "manifest.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        return manifest
 
     @staticmethod
     def _segment_preview(item: dict[str, Any]) -> dict[str, Any]:
@@ -762,6 +875,11 @@ class HistoricalChatImporter:
         )
 
         timeline_rows: list[dict[str, Any]] = []
+        source_metadata = (
+            manifest.get("source_metadata")
+            if isinstance(manifest.get("source_metadata"), dict)
+            else {}
+        )
         for item in messages:
             mapping = speaker_map[clean_text(item.get("speaker"), 80)]
             is_bot = mapping["role"] == "bot"
@@ -785,9 +903,20 @@ class HistoricalChatImporter:
                         "raw_speaker": item["speaker"],
                         "message_id": item["message_id"],
                         "source": "historical_chat_import",
+                        "source_kind": clean_text(item.get("source_kind"), 40)
+                        or clean_text(manifest.get("source_kind"), 40)
+                        or "text_file",
                         "source_name": manifest.get("source_name"),
                         "source_line": item["source_line"],
                         "source_sequence": item["sequence"],
+                        "source_message_id": clean_text(item.get("source_message_id"), 120),
+                        "source_message_seq": max(0, int(item.get("source_message_seq") or 0)),
+                        "source_platform_id": clean_text(
+                            item.get("source_platform_id")
+                            or source_metadata.get("platform_id"),
+                            160,
+                        ),
+                        "source_sender_id": clean_text(item.get("source_sender_id"), 120),
                         "original_local_time": item["local_time"],
                         "original_time_text": item["raw_time"],
                         "timezone": "Asia/Shanghai",

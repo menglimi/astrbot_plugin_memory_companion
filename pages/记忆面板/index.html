@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>记忆放映馆</title>
-  <link rel="stylesheet" href="./app.css?v=20260715-memory-size-stat" />
+  <link rel="stylesheet" href="./app.css?v=20260716-album-full" />
 </head>
 <body>
   <main id="app" class="film-app">
@@ -177,41 +177,7 @@
                       </div>
                     </section>
                     <section class="maintenance-action">
-                      <b>4. 历史对话整理导入</b>
-                      <p class="archive-note">三步完成：解析文件 → 确认身份 → 后台整理。系统会给出身份建议，但不会替你确认；原始消息和精确时间永久保留。</p>
-                      <div class="chat-import-steps" aria-label="历史对话导入步骤">
-                        <span class="is-active"><i>1</i>选择并解析</span>
-                        <span><i>2</i>确认身份</span>
-                        <span><i>3</i>整理完成</span>
-                      </div>
-                      <label id="historicalChatDropzone" class="chat-import-dropzone" for="historicalChatFile" tabindex="0">
-                        <input id="historicalChatFile" class="visually-hidden" type="file" accept=".txt,.log,.md,text/plain,text/markdown" />
-                        <span class="chat-import-drop-icon" aria-hidden="true">＋</span>
-                        <b>拖入聊天记录，或点击选择文件</b>
-                        <small id="historicalChatFileMeta">支持 TXT、LOG、Markdown，最大 8 MiB</small>
-                      </label>
-                      <div class="chat-import-inline-fields">
-                        <label>缺失年份起点
-                          <input id="historicalChatBaseYear" type="number" min="1970" max="2200" inputmode="numeric" placeholder="通常留空" />
-                          <small>仅当文件开头就是“12-14 15:10:22”这类无年份时间时填写</small>
-                        </label>
-                        <button id="historicalChatPreviewBtn" type="button" disabled>解析并预览</button>
-                      </div>
-                      <div class="chat-import-entry-actions">
-                        <button id="historicalChatRecentTopBtn" class="subtle" type="button">继续最近一次任务</button>
-                        <details>
-                          <summary>查看支持的文本格式</summary>
-                          <pre>烛雨: 2025-12-14 15:10:22
-消息正文，可包含多行
-
-Bot: 12-14 15:10:30
-缺失年份可由前文自动补推</pre>
-                        </details>
-                      </div>
-                      <div id="historicalChatPanel" class="chat-import-panel" aria-live="polite" hidden></div>
-                    </section>
-                    <section class="maintenance-action">
-                      <b>5. LivingMemory 导入</b>
+                      <b>4. LivingMemory 导入</b>
                       <p class="archive-note">先预览可导入数量和跳过原因，再执行导入。当前策略只导入完整摘要，跳过派生碎片。</p>
                       <input class="livingmemory-path" type="text" placeholder="LivingMemory 数据库路径，可留空自动扫描" />
                       <div class="inline-actions">
@@ -220,22 +186,121 @@ Bot: 12-14 15:10:30
                       </div>
                     </section>
                     <section class="maintenance-action">
-                      <b>6. 内容修复</b>
+                      <b>5. 内容修复</b>
                       <p class="archive-note">用于修复早期导入后只剩旧库编号的记忆。建议先确认 LivingMemory 数据库路径，再执行修复。</p>
                       <input class="livingmemory-path" type="text" placeholder="LivingMemory 数据库路径，可留空自动扫描" />
                       <button id="repairLivingMemoryBtn" type="button">修复 LivingMemory 内容</button>
                     </section>
                     <section class="maintenance-action">
-                      <b>7. 维护检查</b>
+                      <b>6. 维护检查</b>
                       <p class="archive-note">修复索引、刷新统计并整理数据库状态。适合导入、清理或配置调整后手动执行一次。</p>
                       <button id="maintenanceBtn" type="button">运行维护</button>
                     </section>
                     <section class="maintenance-action">
-                      <b>8. 危险清理</b>
+                      <b>7. 危险清理</b>
                       <p class="archive-note">清空会先备份数据库，再删除记忆、权限规则、时间线、关系、身份、注入日志和导入批次。</p>
                       <button id="clearAllMemoryBtn" class="danger" type="button">清空全部记忆</button>
                     </section>
                   </div>
+                </div>
+              </section>
+              <section class="archive-section conversation-import-archive-section" data-archive-section="conversation-import">
+                <div class="conversation-import-page-head">
+                  <span>
+                    <h4>历史聊天导入</h4>
+                    <small>从当前 QQ 连接读取指定时段，或导入已有聊天文件；两种来源共用身份确认和记忆整理流程。</small>
+                  </span>
+                  <button id="historicalChatRecentTopBtn" class="subtle" type="button">继续最近任务</button>
+                </div>
+                <div class="conversation-import-tabs" role="tablist" aria-label="历史聊天来源">
+                  <button class="is-active" data-import-source-tab="qq" type="button" role="tab" aria-selected="true">QQ 直接读取</button>
+                  <button data-import-source-tab="file" type="button" role="tab" aria-selected="false" tabindex="-1">文件导入</button>
+                  <button data-import-source-tab="recent" type="button" role="tab" aria-selected="false" tabindex="-1">最近任务</button>
+                </div>
+                <div class="conversation-import-layout">
+                  <section class="conversation-import-source" data-import-source="qq">
+                    <div class="conversation-import-source-head">
+                      <span><b>QQ 直接读取</b><small>通过 NapCat / aiocqhttp 的好友历史接口读取，不碰本地加密数据库。</small></span>
+                      <button id="qqHistoryCapabilityBtn" class="subtle" type="button">重新检测</button>
+                    </div>
+                    <div id="qqHistoryCapability" class="qq-history-capability" role="status">
+                      正在检测当前 QQ 连接...
+                    </div>
+                    <div class="qq-history-form">
+                      <label>当前 Bot 连接
+                        <select id="qqHistoryPlatform" disabled>
+                          <option value="">等待能力检测</option>
+                        </select>
+                        <small>多 Bot 环境必须选对连接，避免把历史归到错误人格。</small>
+                      </label>
+                      <label>目标好友 QQ
+                        <input id="qqHistoryUserId" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="20" placeholder="输入纯数字 QQ 号" autocomplete="off" />
+                        <small>只读取该好友与你当前 Bot 的私聊历史。</small>
+                      </label>
+                      <div class="qq-history-range">
+                        <label>开始时间
+                          <input id="qqHistoryStartAt" type="datetime-local" />
+                        </label>
+                        <label>结束时间
+                          <input id="qqHistoryEndAt" type="datetime-local" />
+                        </label>
+                      </div>
+                      <div id="qqHistoryValidation" class="chat-import-validation is-error" role="status">请先完成能力检测并填写 QQ 与时间范围。</div>
+                      <button id="qqHistoryPreviewBtn" type="button" disabled>读取并生成预览</button>
+                    </div>
+                  </section>
+
+                  <section class="conversation-import-source" data-import-source="file" hidden>
+                    <div class="conversation-import-source-head">
+                      <span><b>文件导入</b><small>适合 QQ 接口不可用、历史太久或已经有导出文本的情况。</small></span>
+                    </div>
+                    <label id="historicalChatDropzone" class="chat-import-dropzone" for="historicalChatFile" tabindex="0">
+                      <input id="historicalChatFile" class="visually-hidden" type="file" accept=".txt,.log,.md,text/plain,text/markdown" />
+                      <span class="chat-import-drop-icon" aria-hidden="true">＋</span>
+                      <b>拖入聊天记录，或点击选择文件</b>
+                      <small id="historicalChatFileMeta">支持 TXT、LOG、Markdown，最大 8 MiB</small>
+                    </label>
+                    <div class="chat-import-inline-fields">
+                      <label>缺失年份起点
+                        <input id="historicalChatBaseYear" type="number" min="1970" max="2200" inputmode="numeric" placeholder="通常留空" />
+                        <small>仅当文件开头就是“12-14 15:10:22”这类无年份时间时填写。</small>
+                      </label>
+                      <button id="historicalChatPreviewBtn" type="button" disabled>解析并预览</button>
+                    </div>
+                    <details class="chat-import-format-help">
+                      <summary>查看支持的文本格式</summary>
+                      <pre>烛雨: 2025-12-14 15:10:22
+消息正文，可包含多行
+
+Bot: 12-14 15:10:30
+缺失年份可由前文自动补推</pre>
+                    </details>
+                  </section>
+
+                  <section class="conversation-import-source" data-import-source="recent" hidden>
+                    <div class="conversation-import-source-head">
+                      <span><b>最近任务</b><small>继续中断任务、检查整理结果或回滚指定批次。</small></span>
+                      <button id="historicalChatRecentRefreshBtn" class="subtle" type="button">刷新列表</button>
+                    </div>
+                    <div id="historicalChatRecentList" class="chat-import-recent-list">
+                      <div class="empty-state">正在读取最近任务...</div>
+                    </div>
+                  </section>
+
+                  <section class="conversation-import-output" aria-live="polite">
+                    <div class="chat-import-steps" aria-label="历史聊天导入步骤">
+                      <span class="is-active"><i>1</i>选择来源</span>
+                      <span><i>2</i>读取预览</span>
+                      <span><i>3</i>确认身份</span>
+                      <span><i>4</i>生成记忆</span>
+                    </div>
+                    <div id="historicalChatEmptyState" class="chat-import-empty-state">
+                      <b>预览会显示在这里</b>
+                      <span>先选择 QQ 时段或聊天文件。系统只会在你确认用户与 Bot 身份后开始生成记忆。</span>
+                    </div>
+                    <div id="historicalChatPanel" class="chat-import-panel" hidden></div>
+                    <div id="conversationImportResult" class="archive-result" hidden></div>
+                  </section>
                 </div>
               </section>
               <section class="archive-section" data-archive-section="topology">
@@ -260,6 +325,6 @@ Bot: 12-14 15:10:30
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </main>
   <script src="/api/plugin/page/bridge-sdk.js"></script>
-  <script src="./app.js?v=20260715-memory-size-stat"></script>
+  <script src="./app.js?v=20260716-qq-history-archive"></script>
 </body>
 </html>

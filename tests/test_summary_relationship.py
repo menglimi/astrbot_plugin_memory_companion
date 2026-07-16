@@ -316,6 +316,178 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(captured.get("compact_memory"))
         self.assertIn("人物、动作和地点尽量按原句对应", str(captured.get("intent_context") or ""))
 
+    async def test_recent_fact_guard_keeps_shower_fact_and_bot_acknowledgement(self) -> None:
+        self.assertEqual(set(), MemoryCompanionService._recent_fact_categories("你刚洗完澡吗？"))
+        self.assertEqual(set(), MemoryCompanionService._recent_fact_categories("我问你洗澡了吗？"))
+        self.assertEqual(
+            {"meal", "bath"},
+            MemoryCompanionService._recent_fact_categories("早吃过啦~刚才洗澡去了~"),
+        )
+        service = self.make_service(
+            {
+                "conversation_memory_advanced": {
+                    "recent_fact_guard_enabled": True,
+                    "recent_fact_guard_hours": 3,
+                    "recent_fact_guard_event_limit": 24,
+                    "recent_fact_guard_max_items": 4,
+                }
+            }
+        )
+        ctx = SessionContext(
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            platform="qq",
+            user_id="u1",
+            bot_id="b1",
+            message_text="我哪里凶你了，你不要冤枉人",
+        )
+        await service.store.add_timeline_event(
+            event_type="user_message",
+            session_id=ctx.session_id,
+            scope=ctx.scope,
+            subject_id=ctx.user_id,
+            object_id=ctx.user_id,
+            content="早吃过啦~刚才洗澡去了~",
+            metadata={"message_id": "shower-user"},
+        )
+        await service.store.add_timeline_event(
+            event_type="bot_response",
+            session_id=ctx.session_id,
+            scope=ctx.scope,
+            subject_id=ctx.bot_id,
+            object_id=ctx.user_id,
+            content="洗完澡是不是舒服多啦？",
+            metadata={"message_id": "shower-bot"},
+        )
+
+        recent_context = await service._recent_fact_guard_context(ctx)
+        injected = service.injection.compose(
+            ctx,
+            [],
+            max_chars=1800,
+            recent_fact_context=recent_context,
+        )
+        bridged = await service.bridge_compose_injection(
+            "不是这样",
+            session_context=ctx,
+            max_chars=1800,
+        )
+
+        self.assertIn("刚才洗澡去了", recent_context)
+        self.assertIn("Bot 随后已围绕此事回应", recent_context)
+        self.assertIn("洗完澡是不是舒服多啦", recent_context)
+        self.assertIn("<recent_fact_context>", injected)
+        self.assertIn("<recent_fact_context>", bridged)
+        self.assertIn("优先自然承认刚才没接住", injected)
+
+    async def test_topic_shift_guard_does_not_trim_astrbot_conversation_history(self) -> None:
+        service = self.make_service(
+            {
+                "memory_injection": {"enable_injection_logs": False},
+                "retrieval": {"mode": "basic"},
+                "conversation_memory_advanced": {
+                    "topic_shift_guard_enabled": True,
+                    "suppress_memory_on_topic_shift": True,
+                },
+            }
+        )
+        ctx = SessionContext(
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            platform="qq",
+            user_id="u1",
+            bot_id="b1",
+            message_text="给我发一张自拍",
+        )
+        await service.store.add_timeline_event(
+            event_type="user_message",
+            session_id=ctx.session_id,
+            scope=ctx.scope,
+            subject_id=ctx.user_id,
+            object_id=ctx.user_id,
+            content="刚才吃过晚饭，已经回宿舍了。",
+            metadata={"message_id": "state-before-photo"},
+        )
+        original_contexts = [
+            {"role": "user", "content": "早吃过啦，刚才洗澡去了。"},
+            {"role": "assistant", "content": "洗完澡舒服多啦？"},
+            {"role": "user", "content": "想看看你的自拍。"},
+            {"role": "assistant", "content": "等我一下。"},
+            {"role": "user", "content": "拍好了吗？"},
+            {"role": "assistant", "content": "快好啦。"},
+        ]
+        req = SimpleNamespace(
+            prompt="",
+            system_prompt="",
+            contexts=[dict(item) for item in original_contexts],
+            extra_user_content_parts=[],
+        )
+
+        await service.inject_memories(ctx, req)
+
+        self.assertEqual(original_contexts, req.contexts)
+
+    async def test_cold_joke_request_skips_group_long_term_retrieval(self) -> None:
+        service = self.make_service({"memory_injection": {"enable_injection_logs": False}})
+        ctx = SessionContext(
+            session_id="qq:GroupMessage:g1",
+            scope="group",
+            platform="qq",
+            group_id="g1",
+            user_id="u1",
+            bot_id="b1",
+            message_text="给我讲个冷笑话",
+        )
+
+        async def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("standalone generation must not start long-term retrieval")
+
+        service.search_context_slots = fail_if_called
+        captured: dict[str, object] = {}
+        original_compose = service.injection.compose
+
+        def capture_compose(*args, **kwargs):
+            captured["result_count"] = len(args[1]) if len(args) > 1 else -1
+            captured["intent_context"] = kwargs.get("intent_context", "")
+            return original_compose(*args, **kwargs)
+
+        service.injection.compose = capture_compose
+        req = SimpleNamespace(prompt="", system_prompt="", contexts=[], extra_user_content_parts=[])
+
+        await service.inject_memories(ctx, req)
+
+        self.assertEqual(0, captured.get("result_count"))
+        self.assertIn("独立的轻量创作请求", str(captured.get("intent_context") or ""))
+        state = getattr(req, "memory_companion_injection_state", {})
+        self.assertEqual([], state.get("selected_memory_ids") or [])
+
+    async def test_personalized_story_request_still_runs_long_term_retrieval(self) -> None:
+        service = self.make_service({"memory_injection": {"enable_injection_logs": False}})
+        ctx = SessionContext(
+            session_id="qq:GroupMessage:g1",
+            scope="group",
+            platform="qq",
+            group_id="g1",
+            user_id="u1",
+            bot_id="b1",
+            message_text="给我讲个符合我性格的故事",
+        )
+        called = False
+
+        async def fake_search(*_args, **_kwargs):
+            nonlocal called
+            called = True
+            return [], [], {}
+
+        service.search_context_slots = fake_search
+        req = SimpleNamespace(prompt="", system_prompt="", contexts=[], extra_user_content_parts=[])
+
+        await service.inject_memories(ctx, req)
+
+        self.assertTrue(called)
+        state = getattr(req, "memory_companion_injection_state", {})
+        self.assertTrue(state.get("injected"))
+
     async def test_outfit_fast_context_balances_history_schedule_preference_and_photo(self) -> None:
         service = self.make_service()
         ctx = SessionContext(

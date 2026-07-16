@@ -163,6 +163,36 @@
         "type": "int",
         "default": 3
       },
+      "qq_max_range_days": {
+        "description": "QQ 单次读取天数",
+        "hint": "通过 NapCat/OneBot 直接读取好友历史时允许选择的最长时间范围，硬上限为 31 天。",
+        "type": "int",
+        "default": 31
+      },
+      "qq_max_messages": {
+        "description": "QQ 单次消息上限",
+        "hint": "一个读取预览最多暂存的好友消息数量，硬上限为 5000；超出时会在预览中明确标记截断。",
+        "type": "int",
+        "default": 5000
+      },
+      "qq_page_size": {
+        "description": "QQ 历史分页条数",
+        "hint": "每次调用 get_friend_msg_history 请求的消息数量，最大为 100。",
+        "type": "int",
+        "default": 100
+      },
+      "qq_max_pages": {
+        "description": "QQ 历史扫描页数",
+        "hint": "从最新消息向前定位所选时段时最多扫描的页数，达到上限会停止并提示记录可能不完整。",
+        "type": "int",
+        "default": 100
+      },
+      "qq_request_timeout_seconds": {
+        "description": "QQ 接口超时秒数",
+        "hint": "单次 OneBot 能力检测或历史分页请求的等待时间。",
+        "type": "int",
+        "default": 15
+      },
       "merge_seconds": {
         "description": "连续发言合并秒数",
         "hint": "同一说话人在该秒数内连续发送的消息会合并成一次逻辑发言；原始消息仍分别保存。",
@@ -437,6 +467,30 @@
         "type": "int",
         "default": 12
       },
+      "recent_fact_guard_enabled": {
+        "description": "近期事实防遗忘",
+        "hint": "开启后，从同一私聊近期时间线中提取少量吃饭、洗澡、上下班、位置和休息状态，轻量提醒模型避免重复询问；不会回灌整段聊天。",
+        "type": "bool",
+        "default": true
+      },
+      "recent_fact_guard_hours": {
+        "description": "近期事实有效小时",
+        "hint": "只参考该小时数内的私聊即时状态；更近的明确更新会覆盖较早状态。",
+        "type": "int",
+        "default": 3
+      },
+      "recent_fact_guard_event_limit": {
+        "description": "近期事实扫描事件数",
+        "hint": "每轮最多检查多少条同一私聊时间线事件，用于寻找即时状态和 Bot 已回应证据。",
+        "type": "int",
+        "default": 24
+      },
+      "recent_fact_guard_max_items": {
+        "description": "近期事实最多条数",
+        "hint": "每轮最多给模型多少条近期状态锚点；默认 4 条以控制提示长度和干扰。",
+        "type": "int",
+        "default": 4
+      },
       "low_information_guard_enabled": {
         "description": "低信息输入保护",
         "hint": "开启后，摸摸、贴贴、嗯、哈哈等弱语义输入不会轻易继承过期话题。",
@@ -472,6 +526,12 @@
         "hint": "判断新请求是否与最近历史重叠时，最多比较多少条同会话时间线事件。",
         "type": "int",
         "default": 6
+      },
+      "group_actor_relevance_guard_enabled": {
+        "description": "群聊发言者相关性保护",
+        "hint": "开启后，群聊不会因普通请求带出其他成员画像；获准共享的私聊记忆只在明确回忆或个性化请求中，且当前发言者或点名对象匹配时注入。",
+        "type": "bool",
+        "default": true
       }
     }
   },

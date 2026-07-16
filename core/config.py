@@ -24,12 +24,23 @@ class ConfigView:
         # conversation_memory → conversation_memory_advanced
         "conversation_memory.recent_events_for_followup": ("conversation_memory_advanced.recent_events_for_followup",),
         "conversation_memory.time_window_timeline_limit": ("conversation_memory_advanced.time_window_timeline_limit",),
+        "conversation_memory.recent_fact_guard_enabled": ("conversation_memory_advanced.recent_fact_guard_enabled",),
+        "conversation_memory.recent_fact_guard_hours": ("conversation_memory_advanced.recent_fact_guard_hours",),
+        "conversation_memory.recent_fact_guard_event_limit": (
+            "conversation_memory_advanced.recent_fact_guard_event_limit",
+        ),
+        "conversation_memory.recent_fact_guard_max_items": (
+            "conversation_memory_advanced.recent_fact_guard_max_items",
+        ),
         "conversation_memory.low_information_guard_enabled": ("conversation_memory_advanced.low_information_guard_enabled",),
         "conversation_memory.low_information_gap_minutes": ("conversation_memory_advanced.low_information_gap_minutes",),
         "conversation_memory.suppress_memory_on_low_information": ("conversation_memory_advanced.suppress_memory_on_low_information",),
         "conversation_memory.topic_shift_guard_enabled": ("conversation_memory_advanced.topic_shift_guard_enabled",),
         "conversation_memory.suppress_memory_on_topic_shift": ("conversation_memory_advanced.suppress_memory_on_topic_shift",),
         "conversation_memory.topic_shift_guard_recent_events": ("conversation_memory_advanced.topic_shift_guard_recent_events",),
+        "conversation_memory.group_actor_relevance_guard_enabled": (
+            "conversation_memory_advanced.group_actor_relevance_guard_enabled",
+        ),
         # context_orchestration → context_orchestration_advanced
         "context_orchestration.intent_max_chars": ("context_orchestration_advanced.intent_max_chars",),
         "context_orchestration.self_timeline_limit": ("context_orchestration_advanced.self_timeline_limit",),

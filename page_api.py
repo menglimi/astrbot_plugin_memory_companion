@@ -82,6 +82,8 @@ class PluginPageApi:
             ("/data/export", self.data_export, ["POST"], "MemoryCompanion portable data export"),
             ("/data/import/preview", self.data_import_preview, ["GET"], "MemoryCompanion portable data preview"),
             ("/data/import/run", self.data_import_run, ["POST"], "MemoryCompanion portable data import"),
+            ("/conversation-import/qq/capabilities", self.conversation_import_qq_capabilities, ["GET"], "MemoryCompanion QQ history capabilities"),
+            ("/conversation-import/qq/preview", self.conversation_import_qq_preview, ["POST"], "MemoryCompanion QQ history preview"),
             ("/conversation-import/upload", self.conversation_import_upload, ["POST"], "MemoryCompanion historical chat upload"),
             ("/conversation-import/start", self.conversation_import_start, ["POST"], "MemoryCompanion historical chat start"),
             ("/conversation-import/status", self.conversation_import_status, ["GET"], "MemoryCompanion historical chat status"),
@@ -177,6 +179,27 @@ class PluginPageApi:
         except Exception as exc:
             logger.exception("历史对话预览失败")
             return self._err(f"历史对话预览失败: {exc}", 500)
+
+    async def conversation_import_qq_capabilities(self):
+        try:
+            result = await self.plugin.service.qq_history_capabilities()
+            return self._ok({"result": result})
+        except Exception as exc:
+            logger.exception("QQ 历史读取能力检测失败")
+            return self._err(f"QQ 历史读取能力检测失败: {exc}", 500)
+
+    async def conversation_import_qq_preview(self):
+        payload = await self._json()
+        try:
+            result = await self.plugin.service.preview_qq_historical_chat(payload)
+            return self._ok({"result": result})
+        except ValueError as exc:
+            return self._err(str(exc), 400)
+        except (RuntimeError, asyncio.TimeoutError) as exc:
+            return self._err(str(exc), 502)
+        except Exception as exc:
+            logger.exception("QQ 历史读取预览失败")
+            return self._err(f"QQ 历史读取预览失败: {exc}", 500)
 
     async def conversation_import_start(self):
         payload = await self._json()
@@ -661,6 +684,16 @@ class PluginPageApi:
                     "idle_gap_minutes": config.int("conversation_memory.idle_gap_minutes", 20),
                     "recent_events_for_followup": config.int("conversation_memory.recent_events_for_followup", 12),
                     "time_window_timeline_limit": config.int("conversation_memory.time_window_timeline_limit", 12),
+                    "recent_fact_guard_enabled": config.bool(
+                        "conversation_memory.recent_fact_guard_enabled", True
+                    ),
+                    "recent_fact_guard_hours": config.int("conversation_memory.recent_fact_guard_hours", 3),
+                    "recent_fact_guard_event_limit": config.int(
+                        "conversation_memory.recent_fact_guard_event_limit", 24
+                    ),
+                    "recent_fact_guard_max_items": config.int(
+                        "conversation_memory.recent_fact_guard_max_items", 4
+                    ),
                     "low_information_guard_enabled": config.bool("conversation_memory.low_information_guard_enabled", True),
                     "low_information_gap_minutes": config.int("conversation_memory.low_information_gap_minutes", 20),
                     "suppress_memory_on_low_information": config.bool(
@@ -672,6 +705,9 @@ class PluginPageApi:
                     ),
                     "topic_shift_guard_recent_events": config.int(
                         "conversation_memory.topic_shift_guard_recent_events", 6
+                    ),
+                    "group_actor_relevance_guard_enabled": config.bool(
+                        "conversation_memory.group_actor_relevance_guard_enabled", True
                     ),
                 },
                 "provider_options": self._provider_options(),

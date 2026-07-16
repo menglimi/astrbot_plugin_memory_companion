@@ -130,22 +130,17 @@ STANDALONE_REQUEST_MARKERS = (
     "来一张",
     "给我来",
     "给我发",
-    "自拍",
-    "自拍照",
-    "照片",
-    "图片",
-    "人设图",
-    "参考图",
-    "上传",
-    "生成",
-    "画",
-    "搜索",
-    "查询",
     "查一下",
-    "总结",
-    "解释",
-    "修",
-    "改",
+    "搜一下",
+    "搜索一下",
+    "查询一下",
+    "上传一下",
+    "生成一张",
+    "画一张",
+    "总结一下",
+    "解释一下",
+    "修一下",
+    "改一下",
 )
 TERM_STOPWORDS = {
     "给我",
@@ -495,7 +490,19 @@ def _has_context_dependent_marker(compact: str) -> bool:
 
 
 def _has_standalone_request_marker(compact: str) -> bool:
-    return any(marker in compact for marker in STANDALONE_REQUEST_MARKERS)
+    if any(marker in compact for marker in STANDALONE_REQUEST_MARKERS):
+        return True
+    if re.search(r"(?:请|帮我|给我|能不能|可以帮我)(?:上传|生成|画|搜索|查询|查|总结|解释|修复|修改|优化|改)", compact):
+        return True
+    if re.match(r"(?:上传|生成|画|搜索|查询|查|总结|解释|修复|修改|优化|改)(?:一下|一张|一个|个)", compact):
+        return True
+    return bool(
+        re.search(
+            r"(?:给我|请|能不能|可以|来)?(?:讲|说|编|写|来)(?:一个|个|一段|段|一则|则|一篇|篇)?"
+            r"(?:冷笑话|笑话|故事|段子|谜语|脑筋急转弯)",
+            compact,
+        )
+    )
 
 
 def _is_stopword_like(term: str) -> bool:

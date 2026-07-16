@@ -51,13 +51,33 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn('id="historicalChatDropzone"', page)
         self.assertIn('id="historicalChatRecentTopBtn"', page)
         self.assertIn('class="chat-import-steps"', page)
+        self.assertNotIn('id="view-import"', page)
+        self.assertNotIn('data-view="import"', page)
+        self.assertIn('data-archive-section="conversation-import"', page)
+        self.assertIn('data-import-source="qq"', page)
+        self.assertIn('data-import-source="file"', page)
+        self.assertIn('data-import-source="recent"', page)
+        archive_view = page[page.index('id="view-archive"'):]
+        self.assertIn('id="historicalChatDropzone"', archive_view)
+        self.assertIn('data-import-source-tab="qq"', archive_view)
+        self.assertIn('data-import-source-tab="file"', archive_view)
+        self.assertIn('data-import-source-tab="recent"', archive_view)
         self.assertIn("function selectHistoricalChatFile", script)
+        self.assertIn("function previewQQHistoryImport", script)
+        self.assertIn('{ id: "conversation-import", label: "历史聊天导入"', script)
+        self.assertIn('section === "conversation-import"', script)
+        self.assertIn('apiGet("/conversation-import/qq/capabilities")', script)
+        self.assertIn('apiPost("/conversation-import/qq/preview"', script)
         self.assertIn("function historicalChatValidationMessage", script)
         self.assertIn('roles.filter((role) => role === "bot").length !== 1', script)
         self.assertIn("historicalChatIdentityConfirmed", script)
         self.assertNotIn('$("#chatEntity"', script)
         self.assertIn("min-height:44px", styles)
         self.assertIn(".chat-import-stage-track", styles)
+        self.assertIn(".conversation-import-layout", styles)
+        self.assertIn(".conversation-import-tabs", styles)
+        self.assertIn("is-conversation-import", script)
+        self.assertIn(".film-app.is-workspace.is-conversation-import .workspace-main", styles)
 
     def test_memory_rows_expand_to_show_full_content(self) -> None:
         styles = (ROOT / "pages" / "记忆面板" / "app.css").read_text(encoding="utf-8")
@@ -71,6 +91,28 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn("display:block", title_block.group(1))
         self.assertIn("overflow-wrap:anywhere", title_block.group(1))
         self.assertNotIn("line-clamp", title_block.group(1))
+
+    def test_album_detail_contains_full_image_in_a_definite_frame(self) -> None:
+        page = (ROOT / "pages" / "记忆面板" / "index.html").read_text(encoding="utf-8")
+        styles = (ROOT / "pages" / "记忆面板" / "app.css").read_text(encoding="utf-8")
+        frame_block = re.search(r"\.album-detail-image\s*\{([^}]*)\}", styles)
+        image_block = re.search(r"\.album-detail-image img\s*\{([^}]*)\}", styles)
+        drawer_block = re.search(
+            r"\.film-app\.is-personal-memory \.detail-drawer\.is-album-detail\s*\{([^}]*)\}",
+            styles,
+        )
+
+        self.assertIsNotNone(frame_block)
+        self.assertIsNotNone(image_block)
+        self.assertIsNotNone(drawer_block)
+        self.assertIn("position:relative", frame_block.group(1))
+        self.assertIn("position:absolute", image_block.group(1))
+        self.assertIn("inset:8px", image_block.group(1))
+        self.assertIn("width:calc(100% - 16px)", image_block.group(1))
+        self.assertIn("height:calc(100% - 16px)", image_block.group(1))
+        self.assertIn("object-fit:contain", image_block.group(1))
+        self.assertIn("height:clamp(480px, 62vh, 820px)", drawer_block.group(1))
+        self.assertIn("app.css?v=20260716-album-full", page)
 
 
 if __name__ == "__main__":

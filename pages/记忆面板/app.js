@@ -52,8 +52,10 @@ const SECONDARY_NAV = {
   ],
   archive: [
     { id: "maintenance", label: "维护 / 迁移 / 清理", sublabel: "维护、修复、导入与清理", badge: "维护" },
+    { id: "conversation-import", label: "历史聊天导入", sublabel: "QQ 直读、文件与最近任务", badge: "导入" },
     { id: "config:memory_capture", label: "记忆捕获", sublabel: "记录用户消息与稳定事实", badge: "捕获" },
     { id: "config:memory_summary", label: "长期总结", sublabel: "阶段总结模型与阈值", badge: "总结" },
+    { id: "config:historical_chat_import", label: "导入参数", sublabel: "QQ 分页与分段上限", badge: "参数" },
     { id: "config:conversation_memory", label: "连续对话", sublabel: "群聊片段与低信息保护", badge: "连续" },
     { id: "retrieval", label: "检索召回", sublabel: "候选、Embedding、Rerank", badge: "召回" },
     { id: "config:memory_injection", label: "记忆注入", sublabel: "注入数量、字数与日志", badge: "注入" },
@@ -98,6 +100,11 @@ const CONFIG_MODULE_GUIDES = {
     purpose: "把时间线整理成长期可召回的阶段性记忆，是从流水到长期记忆的主要入口。",
     tune: "总结太慢时提高触发阈值；总结不及时或连续性弱时降低最少事件数和触发条数。",
     avoid: "不要把单次总结事件上限调得过大，输入太长会降低总结质量。",
+  },
+  historical_chat_import: {
+    purpose: "控制历史聊天的 QQ 分页读取、单次范围、分段和模型打包上限。",
+    tune: "接口读取不完整时先缩短页面里的时间范围；只有确认适配器稳定后再提高分页扫描页数。",
+    avoid: "不要把消息与打包上限同时拉满，过大的批次会增加接口等待、模型超时和人工核对成本。",
   },
   memory_injection: {
     purpose: "控制每轮主链请求前注入多少记忆、最多多少字，以及是否记录注入日志。",
@@ -179,6 +186,9 @@ const state = {
   historicalChatBatchId: "",
   historicalChatPollTimer: 0,
   historicalChatFile: null,
+  conversationImportSource: "qq",
+  qqHistoryCapabilities: null,
+  qqHistoryCapabilitiesLoading: false,
 };
 
 const DEFAULT_THEME = "yuebai";
@@ -729,7 +739,7 @@ function renderSecondaryNav(view = state.activeView, immediate = false) {
   const clearButton = $("#clearTargetBtn");
   rail?.classList.remove("is-scoped-rail");
   rail?.classList.add("is-secondary-nav", "is-looped-secondary-nav");
-  if (railTitle) railTitle.textContent = view === "archive" ? "配置列表" : "二级导航";
+  if (railTitle) railTitle.textContent = view === "archive" ? "维护与配置" : "二级导航";
   if (clearButton) clearButton.textContent = view === "archive" ? "回到顶部" : "默认";
   const renderItems = secondaryNavRenderItems(view);
   $("#bucketList").innerHTML = renderItems.map((item) => `
@@ -1552,6 +1562,7 @@ async function returnHome() {
   removeRailMountedScheduleFilm();
   app.classList.remove("is-workspace");
   app.classList.remove("is-personal-memory");
+  app.classList.remove("is-conversation-import");
   app.classList.remove("is-workspace-entering", "is-workspace-ready", "is-workspace-settled");
   app.classList.remove("is-view-switching", "is-view-exiting", "is-view-entering");
   app.classList.remove("is-scoped-view-switching", "is-scoped-view-exiting", "is-scoped-view-entering");
@@ -3440,6 +3451,10 @@ async function loadArchive() {
     await loadAclTopology();
     return;
   }
+  if (section === "conversation-import") {
+    await loadConversationImportView();
+    return;
+  }
   if (section !== "retrieval") return;
   $("#selfMemoryList").innerHTML = loadingState("正在读取检索配置...");
   const config = await apiGet("/context/config");
@@ -3455,6 +3470,7 @@ function bindArchiveJumpButtons(root = document) {
 
 function setArchiveSection(section) {
   const visibleSection = section.startsWith("config:") ? "retrieval" : section;
+  $("#app")?.classList.toggle("is-conversation-import", visibleSection === "conversation-import");
   $$("#view-archive [data-archive-section]").forEach((item) => {
     item.classList.toggle("is-active", item.dataset.archiveSection === visibleSection);
   });
@@ -4419,8 +4435,8 @@ function renderGenericArchiveResult(value = {}, title = "执行结果") {
   `;
 }
 
-function showArchiveResult(value, kind = "generic") {
-  const box = $("#importResult");
+function showArchiveResult(value, kind = "generic", host = "#importResult") {
+  const box = typeof host === "string" ? $(host) : host;
   if (!box) return;
   box.hidden = false;
   if (kind === "preview") {
@@ -4554,6 +4570,253 @@ async function executePortableArchiveImport(path) {
   showToast("可移植档案已导入");
 }
 
+function localDateTimeInputValue(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 16);
+}
+
+function initializeQQHistoryRange() {
+  const end = $("#qqHistoryEndAt");
+  const start = $("#qqHistoryStartAt");
+  if (!end || !start || (end.value && start.value)) return;
+  const now = new Date();
+  end.value = localDateTimeInputValue(now);
+  start.value = localDateTimeInputValue(new Date(now.getTime() - 24 * 60 * 60 * 1000));
+}
+
+function conversationImportSource() {
+  return state.conversationImportSource || "qq";
+}
+
+function showHistoricalChatOutput(hasContent) {
+  const empty = $("#historicalChatEmptyState");
+  if (empty) empty.hidden = Boolean(hasContent);
+}
+
+function clearConversationImportResult() {
+  const box = $("#conversationImportResult");
+  if (!box) return;
+  box.hidden = true;
+  box.innerHTML = "";
+}
+
+function applyConversationImportSource() {
+  const source = conversationImportSource();
+  $$('[data-import-source]').forEach((panel) => {
+    panel.hidden = panel.dataset.importSource !== source;
+  });
+  $$('[data-import-source-tab]').forEach((button) => {
+    const active = button.dataset.importSourceTab === source;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+    button.setAttribute("tabindex", active ? "0" : "-1");
+  });
+  initializeQQHistoryRange();
+}
+
+async function selectConversationImportSource(source) {
+  if (!["qq", "file", "recent"].includes(source)) return;
+  state.conversationImportSource = source;
+  applyConversationImportSource();
+  if (source === "qq") {
+    await loadQQHistoryCapabilities();
+  } else if (source === "recent") {
+    await loadHistoricalChatBatchList();
+  }
+}
+
+async function loadConversationImportView() {
+  applyConversationImportSource();
+  const source = conversationImportSource();
+  if (source === "qq") {
+    await loadQQHistoryCapabilities();
+  } else if (source === "recent") {
+    await loadHistoricalChatBatchList();
+  }
+  showHistoricalChatOutput(Boolean(state.historicalChatPreview || state.historicalChatBatchId));
+}
+
+function qqHistoryImplementationLabel(adapter = {}) {
+  const implementation = [adapter.implementation, adapter.implementation_version].filter(Boolean).join(" ");
+  const bot = adapter.bot_id
+    ? `${adapter.bot_name || "Bot"}（${adapter.bot_id}）`
+    : "未识别登录账号";
+  return implementation ? `${bot} · ${implementation}` : bot;
+}
+
+function renderQQHistoryCapabilities(result = {}) {
+  const box = $("#qqHistoryCapability");
+  const select = $("#qqHistoryPlatform");
+  if (!box || !select) return;
+  const adapters = Array.isArray(result.adapters) ? result.adapters : [];
+  const ready = adapters.filter((item) => item.connected && item.history_status === "ready");
+  select.innerHTML = ready.length
+    ? ready.map((item) => `<option value="${escapeHtml(item.platform_id)}">${escapeHtml(qqHistoryImplementationLabel(item))}</option>`).join("")
+    : '<option value="">没有可用的 QQ 连接</option>';
+  select.disabled = ready.length === 0;
+  box.classList.toggle("is-ready", ready.length > 0);
+  box.classList.toggle("is-error", ready.length === 0);
+  if (ready.length) {
+    const limits = result.limits || {};
+    box.innerHTML = `
+      <b>连接可用</b>
+      <span>检测到 ${number(ready.length)} 个 aiocqhttp/OneBot 连接，具备好友历史读取条件。</span>
+      <small>单次最多 ${number(limits.max_range_days || 31)} 天、${number(limits.max_messages || 5000)} 条；读取前仍会由接口做一次实际验证。</small>
+    `;
+  } else {
+    const reason = adapters.find((item) => item.error)?.error || "没有发现已登录的 aiocqhttp/OneBot 连接";
+    box.innerHTML = `<b>当前不能直读</b><span>${escapeHtml(reason)}</span><small>仍可切换到“文件导入”继续。</small>`;
+  }
+  updateQQHistoryValidation();
+}
+
+async function loadQQHistoryCapabilities(force = false) {
+  if (state.qqHistoryCapabilitiesLoading) return;
+  if (state.qqHistoryCapabilities && !force) {
+    renderQQHistoryCapabilities(state.qqHistoryCapabilities);
+    return;
+  }
+  const box = $("#qqHistoryCapability");
+  if (box) {
+    box.className = "qq-history-capability is-loading";
+    box.textContent = "正在检测当前 QQ 连接...";
+  }
+  state.qqHistoryCapabilitiesLoading = true;
+  try {
+    const data = await apiGet("/conversation-import/qq/capabilities");
+    state.qqHistoryCapabilities = data.result || { available: false, adapters: [] };
+    renderQQHistoryCapabilities(state.qqHistoryCapabilities);
+  } catch (error) {
+    state.qqHistoryCapabilities = null;
+    if (box) {
+      box.className = "qq-history-capability is-error";
+      box.innerHTML = `<b>检测失败</b><span>${escapeHtml(error.message || "无法读取 QQ 连接状态")}</span><small>可重新检测，或改用文件导入。</small>`;
+    }
+    updateQQHistoryValidation();
+  } finally {
+    state.qqHistoryCapabilitiesLoading = false;
+  }
+}
+
+function qqHistoryValidationMessage() {
+  const capabilities = state.qqHistoryCapabilities || {};
+  const adapterId = String($("#qqHistoryPlatform")?.value || "").trim();
+  const userId = String($("#qqHistoryUserId")?.value || "").trim();
+  const startValue = $("#qqHistoryStartAt")?.value || "";
+  const endValue = $("#qqHistoryEndAt")?.value || "";
+  if (!capabilities.available || !adapterId) return { valid: false, message: "当前没有可用的 QQ 直读连接" };
+  if (!/^\d{5,20}$/.test(userId)) return { valid: false, message: "目标 QQ 必须是 5 到 20 位纯数字" };
+  const adapter = (capabilities.adapters || []).find((item) => item.platform_id === adapterId) || {};
+  if (String(adapter.bot_id || "") === userId) return { valid: false, message: "目标 QQ 不能与当前 Bot QQ 相同" };
+  if (!startValue || !endValue) return { valid: false, message: "请选择开始时间和结束时间" };
+  const start = new Date(startValue);
+  const end = new Date(endValue);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return { valid: false, message: "时间格式无效" };
+  if (end <= start) return { valid: false, message: "结束时间必须晚于开始时间" };
+  const maxDays = Number(capabilities.limits?.max_range_days || 31);
+  if (end.getTime() - start.getTime() > maxDays * 24 * 60 * 60 * 1000) {
+    return { valid: false, message: `单次读取范围不能超过 ${maxDays} 天` };
+  }
+  if (end.getTime() > Date.now() + 5 * 60 * 1000) return { valid: false, message: "结束时间不能晚于当前时间" };
+  return { valid: true, message: `将读取 QQ ${userId} 在该时段的私聊记录` };
+}
+
+function updateQQHistoryValidation() {
+  const result = qqHistoryValidationMessage();
+  const box = $("#qqHistoryValidation");
+  const button = $("#qqHistoryPreviewBtn");
+  if (box) {
+    box.textContent = result.message;
+    box.classList.toggle("is-valid", result.valid);
+    box.classList.toggle("is-error", !result.valid);
+  }
+  if (button) button.disabled = !result.valid;
+  return result;
+}
+
+async function previewQQHistoryImport() {
+  const validation = updateQQHistoryValidation();
+  if (!validation.valid) {
+    showToast(validation.message, "error");
+    return;
+  }
+  clearConversationImportResult();
+  setHistoricalChatStep(1);
+  let data;
+  try {
+    data = await apiPost("/conversation-import/qq/preview", {
+      platform_id: $("#qqHistoryPlatform").value,
+      user_id: $("#qqHistoryUserId").value.trim(),
+      start_at: $("#qqHistoryStartAt").value,
+      end_at: $("#qqHistoryEndAt").value,
+    });
+  } catch (error) {
+    setHistoricalChatStep(0);
+    throw error;
+  }
+  state.historicalChatPreview = data.result || null;
+  state.historicalChatBatchId = "";
+  renderHistoricalChatPreview(state.historicalChatPreview);
+  setHistoricalChatStep(2);
+  showToast("QQ 历史读取预览已生成");
+}
+
+function historicalChatBatchStateLabel(value) {
+  return {
+    prepared: "已准备",
+    running: "整理中",
+    reconciling: "去重整理中",
+    enriching: "细节补全中",
+    indexing: "向量索引中",
+    paused: "已暂停",
+    failed: "失败",
+    completed: "已完成",
+    completed_with_warnings: "完成但有警告",
+    rolled_back: "已回滚",
+  }[value] || value || "未知";
+}
+
+async function loadHistoricalChatBatchList() {
+  const target = $("#historicalChatRecentList");
+  if (!target) return;
+  target.innerHTML = '<div class="empty-state">正在读取最近任务...</div>';
+  let data;
+  try {
+    data = await apiGet("/conversation-import/status");
+  } catch (error) {
+    target.innerHTML = panelError(error);
+    target.querySelector("[data-retry-active]")?.addEventListener("click", loadHistoricalChatBatchList);
+    return;
+  }
+  const batches = data.result?.batches || [];
+  if (!batches.length) {
+    target.innerHTML = '<div class="empty-state">还没有历史聊天导入任务。</div>';
+    return;
+  }
+  target.innerHTML = batches.map((batch) => `
+    <button class="chat-import-recent-item${batch.id === state.historicalChatBatchId ? " is-active" : ""}" data-chat-import-batch="${escapeHtml(batch.id)}" type="button">
+      <span><b>${escapeHtml(batch.source_name || "历史聊天")}</b><small>${escapeHtml(formatTime(batch.created_at || batch.updated_at) || "时间未知")}</small></span>
+      <span><strong>${escapeHtml(historicalChatBatchStateLabel(batch.state))}</strong><small>${number(batch.completed_segments)}/${number(batch.total_segments)} 片段</small></span>
+    </button>
+  `).join("");
+  $$('[data-chat-import-batch]').forEach((button) => {
+    button.addEventListener("click", () => withBusy("正在读取任务状态...", () => loadHistoricalChatBatch(button.dataset.chatImportBatch)));
+  });
+}
+
+async function loadHistoricalChatBatch(batchId) {
+  state.historicalChatBatchId = String(batchId || "");
+  const result = await refreshHistoricalChatStatus();
+  showHistoricalChatOutput(Boolean(result));
+  if (!new Set(["completed", "completed_with_warnings", "rolled_back", "paused", "failed"]).has(result?.batch?.state)) {
+    scheduleHistoricalChatPoll();
+  }
+  await loadHistoricalChatBatchList();
+  return result;
+}
+
 function fileAsDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -4605,6 +4868,8 @@ function selectHistoricalChatFile(file) {
   }
   state.historicalChatFile = file;
   state.historicalChatPreview = null;
+  state.historicalChatBatchId = "";
+  clearConversationImportResult();
   renderHistoricalChatPreview(null);
   setHistoricalChatStep(0);
   if (button) button.disabled = false;
@@ -4644,16 +4909,25 @@ async function previewHistoricalChatImport() {
     showToast("对话文件不能超过 8 MiB", "error");
     return;
   }
+  clearConversationImportResult();
   const baseYear = Number.parseInt($("#historicalChatBaseYear")?.value || "0", 10) || 0;
-  const contentBase64 = await fileAsDataUrl(file);
-  const data = await apiPost("/conversation-import/upload", {
-    filename: file.name,
-    content_base64: contentBase64,
-    base_year: baseYear,
-  });
-  state.historicalChatPreview = data.result || null;
-  renderHistoricalChatPreview(state.historicalChatPreview);
   setHistoricalChatStep(1);
+  const contentBase64 = await fileAsDataUrl(file);
+  let data;
+  try {
+    data = await apiPost("/conversation-import/upload", {
+      filename: file.name,
+      content_base64: contentBase64,
+      base_year: baseYear,
+    });
+  } catch (error) {
+    setHistoricalChatStep(0);
+    throw error;
+  }
+  state.historicalChatPreview = data.result || null;
+  state.historicalChatBatchId = "";
+  renderHistoricalChatPreview(state.historicalChatPreview);
+  setHistoricalChatStep(2);
   showToast("对话解析预览已生成");
 }
 
@@ -4701,6 +4975,7 @@ function renderHistoricalChatPreview(preview) {
   if (!preview) {
     panel.hidden = true;
     panel.innerHTML = "";
+    showHistoricalChatOutput(Boolean(state.historicalChatBatchId));
     return;
   }
   const stats = preview.stats || {};
@@ -4711,10 +4986,14 @@ function renderHistoricalChatPreview(preview) {
   if (Number(stats.inferred_year_count || 0) > 0) warningParts.push(`${stats.inferred_year_count} 条时间由系统补推年份`);
   if (Number(stats.time_inversion_count || 0) > 0) warningParts.push(`${stats.time_inversion_count} 处原文件时间倒序，已按绝对时间稳定重排`);
   if (Number(stats.duplicate_timestamp_groups || 0) > 0) warningParts.push(`${stats.duplicate_timestamp_groups} 组相同时间戳将按原文件顺序保留`);
+  if (Array.isArray(preview.warnings)) warningParts.push(...preview.warnings.filter(Boolean));
+  const directQQ = preview.source_kind === "qq_history";
+  const readStats = preview.read_stats || {};
   panel.hidden = false;
+  showHistoricalChatOutput(true);
   panel.innerHTML = `
     <div class="chat-import-section-head">
-      <span><b>解析完成</b><small>${escapeHtml(preview.source_name || "历史对话")}</small></span>
+      <span><b>${directQQ ? "QQ 读取完成" : "文件解析完成"}</b><small>${escapeHtml(preview.source_name || "历史对话")}</small></span>
       <span class="chat-import-ready-badge">等待身份确认</span>
     </div>
     <div class="chat-import-summary">
@@ -4730,6 +5009,13 @@ function renderHistoricalChatPreview(preview) {
       <span>${escapeHtml(stats.first_at || "-")} → ${escapeHtml(stats.last_at || "-")}</span>
       <small>${escapeHtml(warningParts.join("；") || "未发现明显时间异常，原文件顺序与绝对时间一致")}</small>
     </div>
+    ${directQQ ? `
+      <div class="chat-import-callout ${preview.truncated ? "is-warning" : "is-safe"}">
+        <b>读取范围${preview.truncated ? "可能不完整" : "完整"}</b>
+        <span>扫描 ${number(readStats.scanned_messages)} 条 · 选中 ${number(readStats.selected_messages)} 条 · ${number(readStats.pages)} 页</span>
+        <small>分页去重 ${number(readStats.duplicates_removed)} 条；${preview.truncated ? "请缩短时间范围后重试，以获得完整记录。" : "已覆盖所选时段或读到历史末尾。"}</small>
+      </div>
+    ` : ""}
     <div class="chat-import-callout is-info">
       <b>预计模型工作量</b>
       <span>约 ${number(Number(stats.estimated_summary_calls || 0) + Number(stats.estimated_reconcile_calls || 0))} 次调用</span>
@@ -4921,7 +5207,7 @@ function prepareHistoricalChatImport() {
     .join("；");
   const stats = state.historicalChatPreview?.stats || {};
   showInlineConfirmation({
-    host: "#importResult",
+    host: "#conversationImportResult",
     title: "开始整理历史对话",
     message: `${mapping}。将归档 ${number(stats.message_count)} 条原始消息、整理 ${number(stats.candidate_segment_count)} 个片段，预计约 ${number(Number(stats.estimated_summary_calls || 0) + Number(stats.estimated_reconcile_calls || 0))} 次模型调用。执行前会自动备份数据库。`,
     confirmLabel: "开始导入",
@@ -4935,8 +5221,9 @@ async function executeHistoricalChatImport(payload) {
   const result = data.result || {};
   const batch = result.batch || {};
   state.historicalChatBatchId = batch.id || "";
+  clearConversationImportResult();
   saveHistoricalChatIdentity(payload);
-  setHistoricalChatStep(2);
+  setHistoricalChatStep(3);
   renderHistoricalChatStatus(result);
   scheduleHistoricalChatPoll();
   showToast("历史对话已进入后台整理队列");
@@ -4949,11 +5236,7 @@ async function loadRecentHistoricalChatBatch() {
     showToast("还没有历史对话导入批次");
     return;
   }
-  state.historicalChatBatchId = batches[0].id || "";
-  const result = await refreshHistoricalChatStatus();
-  if (!["completed", "completed_with_warnings", "rolled_back", "paused", "failed"].includes(result?.batch?.state)) {
-    scheduleHistoricalChatPoll();
-  }
+  await loadHistoricalChatBatch(batches[0].id || "");
 }
 
 async function refreshHistoricalChatStatus() {
@@ -4998,7 +5281,7 @@ function renderHistoricalChatStatus(result) {
     panel.innerHTML = `
       <div class="chat-import-section-head">
         <span><b>最近一次历史对话任务</b><small>可继续、查看结果或整批回滚</small></span>
-        <button id="historicalChatNewImportBtn" class="subtle" type="button">导入另一个文件</button>
+        <button id="historicalChatNewImportBtn" class="subtle" type="button">导入另一份记录</button>
       </div>
       <div id="historicalChatStatus"></div>
     `;
@@ -5030,7 +5313,8 @@ function renderHistoricalChatStatus(result) {
   const identityLinks = batch.stats?.identity_links || {};
   const summaryPerspective = batch.stats?.summary_perspective || {};
   const detailQuality = batch.stats?.detail_quality || {};
-  setHistoricalChatStep(2, isFinished);
+  showHistoricalChatOutput(true);
+  setHistoricalChatStep(3, isFinished);
   const stageOrder = [
     { key: "archive", label: "原文归档", done: Boolean(batch.id), active: false },
     { key: "segments", label: "片段整理", done: total > 0 && completed >= total, active: batch.state === "running" },
@@ -5099,9 +5383,11 @@ function resetHistoricalChatImportView() {
   stopHistoricalChatPoll();
   state.historicalChatPreview = null;
   state.historicalChatBatchId = "";
+  clearConversationImportResult();
   renderHistoricalChatPreview(null);
   setHistoricalChatStep(0);
-  $("#historicalChatDropzone")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  showHistoricalChatOutput(false);
+  document.querySelector(`[data-import-source="${conversationImportSource()}"]`)?.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 async function pauseHistoricalChatImport() {
@@ -5120,7 +5406,7 @@ async function resumeHistoricalChatImport() {
 
 function prepareHistoricalChatRollback() {
   showInlineConfirmation({
-    host: "#importResult",
+    host: "#conversationImportResult",
     title: "回滚历史对话导入",
     message: "将删除该批次写入的时间线、片段记忆、重要事件、向量和关系网待确认观察；其它记忆不受影响。",
     confirmLabel: "确认回滚",
@@ -5134,7 +5420,7 @@ async function rollbackHistoricalChatImport() {
   const data = await apiPost("/conversation-import/rollback", { batch_id: state.historicalChatBatchId });
   stopHistoricalChatPoll();
   await refreshAll();
-  showArchiveResult(data.result || {}, "historical-chat-rollback");
+  showArchiveResult(data.result || {}, "historical-chat-rollback", "#conversationImportResult");
   await refreshHistoricalChatStatus();
   showToast("历史对话导入已回滚");
 }
@@ -5411,6 +5697,37 @@ function bindActions() {
   $("#portableExportBtn").addEventListener("click", () => withBusy("正在导出可移植档案...", exportPortableArchive));
   $("#portablePreviewBtn").addEventListener("click", () => withBusy("正在读取可移植档案...", previewPortableArchive));
   $("#portableImportBtn").addEventListener("click", () => withBusy("正在导入可移植档案...", importPortableArchive));
+  const conversationImportTabs = $$('[data-import-source-tab]');
+  conversationImportTabs.forEach((button, index) => {
+    button.addEventListener("click", async () => {
+      try {
+        await selectConversationImportSource(button.dataset.importSourceTab);
+      } catch (error) {
+        showToast(error.message || "切换导入来源失败", "error");
+      }
+    });
+    button.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+      event.preventDefault();
+      const offset = event.key === "ArrowRight" ? 1 : -1;
+      const next = conversationImportTabs[(index + offset + conversationImportTabs.length) % conversationImportTabs.length];
+      next?.focus();
+      next?.click();
+    });
+  });
+  $("#qqHistoryCapabilityBtn")?.addEventListener("click", (event) => withButton(event.currentTarget, "检测中", () => loadQQHistoryCapabilities(true)));
+  $("#qqHistoryPreviewBtn")?.addEventListener("click", () => withBusy("正在读取 QQ 历史...", previewQQHistoryImport));
+  $("#historicalChatRecentRefreshBtn")?.addEventListener("click", (event) => withButton(event.currentTarget, "刷新中", loadHistoricalChatBatchList));
+  $$("#qqHistoryPlatform, #qqHistoryUserId, #qqHistoryStartAt, #qqHistoryEndAt").forEach((control) => {
+    control.addEventListener("change", updateQQHistoryValidation);
+    control.addEventListener("input", updateQQHistoryValidation);
+  });
+  $("#qqHistoryUserId")?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !$("#qqHistoryPreviewBtn")?.disabled) {
+      event.preventDefault();
+      $("#qqHistoryPreviewBtn")?.click();
+    }
+  });
   $("#historicalChatPreviewBtn")?.addEventListener("click", () => withBusy("正在解析历史对话...", previewHistoricalChatImport));
   $("#historicalChatRecentTopBtn")?.addEventListener("click", () => withBusy("正在读取最近任务...", loadRecentHistoricalChatBatch));
   $("#historicalChatFile")?.addEventListener("change", (event) => selectHistoricalChatFile(event.target.files?.[0]));

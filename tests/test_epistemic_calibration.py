@@ -85,6 +85,146 @@ class EpistemicCalibrationTests(unittest.TestCase):
         self.assertIn("<group_context>", injected_from_open_loop)
         self.assertNotIn("<open_loops>", injected_from_open_loop)
 
+    def test_lightweight_story_request_skips_unrelated_long_term_memory(self) -> None:
+        service = self.make_service()
+        ctx = SessionContext(
+            session_id="qq:GroupMessage:g1",
+            scope="group",
+            platform="qq",
+            group_id="g1",
+            user_id="u1",
+            bot_id="bot-1",
+            message_text="给我讲个冷笑话",
+        )
+        turn_signal = analyze_turn_signal(ctx.message_text)
+        decision = service._memory_route_decision(
+            ctx,
+            turn_signal,
+            parse_time_intent(ctx.message_text),
+        )
+
+        self.assertTrue(turn_signal.standalone_request)
+        self.assertEqual("standalone_generation", decision.layer)
+        self.assertTrue(decision.suppress_long_memory)
+        self.assertEqual("standalone_generation_request", decision.suppress_reason)
+        for statement in ("这个故事很好笑", "这张自拍很好看", "你的解释很清楚", "这部漫画不错"):
+            self.assertFalse(analyze_turn_signal(statement).standalone_request, statement)
+        for request in ("帮我生成一张图片", "搜索一下天气", "解释一下这个报错"):
+            self.assertTrue(analyze_turn_signal(request).standalone_request, request)
+
+    def test_personalized_story_request_keeps_long_term_retrieval_available(self) -> None:
+        service = self.make_service()
+        ctx = SessionContext(
+            session_id="qq:GroupMessage:g1",
+            scope="group",
+            platform="qq",
+            group_id="g1",
+            user_id="u1",
+            bot_id="bot-1",
+            message_text="给我讲个你觉得我会喜欢的故事",
+        )
+        decision = service._memory_route_decision(
+            ctx,
+            analyze_turn_signal(ctx.message_text),
+            parse_time_intent(ctx.message_text),
+            isolate_request_context=True,
+            topic_shift_reason="standalone_request_no_recent_overlap",
+        )
+
+        self.assertEqual("personalized_generation", decision.layer)
+        self.assertFalse(decision.suppress_long_memory)
+        self.assertFalse(decision.allow_contextual_expansion)
+
+    def test_group_actor_guard_is_private_by_default_but_allows_named_recall(self) -> None:
+        service = self.make_service()
+        ctx = SessionContext(
+            session_id="qq:GroupMessage:g1",
+            scope="group",
+            platform="qq",
+            group_id="g1",
+            user_id="u1",
+            user_name="小王",
+            bot_id="bot-1",
+            message_text="今天聊点轻松的",
+        )
+        current_profile = MemoryRecord(
+            id="current-profile",
+            memory_type="user_profile",
+            subject=EntityRef(kind="user", id="u1", name="小王"),
+            object=EntityRef(kind="group", id="g1"),
+            scope="group",
+            group_id="g1",
+            visibility="group_public",
+            content="小王喜欢轻松聊天。",
+        )
+        other_profile = MemoryRecord(
+            id="other-profile",
+            memory_type="user_profile",
+            subject=EntityRef(kind="user", id="u2", name="小李"),
+            object=EntityRef(kind="group", id="g1"),
+            scope="group",
+            group_id="g1",
+            visibility="group_public",
+            content="小李喜欢热饮。",
+        )
+        other_private = MemoryRecord(
+            id="other-private",
+            memory_type="conversation_summary",
+            subject=EntityRef(kind="user", id="u2", name="小李"),
+            object=EntityRef.bot_self("bot-1"),
+            scope="private",
+            session_id="qq:FriendMessage:u2",
+            visibility="private_pair",
+            content="小李在私聊里提过蛋糕。",
+        )
+        current_private = MemoryRecord(
+            id="current-private",
+            memory_type="user_preference",
+            subject=EntityRef(kind="user", id="u1", name="小王"),
+            object=EntityRef.bot_self("bot-1"),
+            scope="private",
+            session_id="qq:FriendMessage:u1",
+            visibility="private_pair",
+            content="小王在私聊里偏爱轻松故事。",
+        )
+        slots = {
+            "user_profile": [
+                SearchResult(memory=current_profile, score=1.0),
+                SearchResult(memory=other_profile, score=1.0),
+            ],
+            "open_loop": [SearchResult(memory=other_private, score=1.0)],
+            "stable_memory": [SearchResult(memory=current_private, score=1.0)],
+        }
+
+        filtered, blocked = service._filter_group_actor_memory_slots(ctx, slots)
+        selected_ids = {item.memory.id for items in filtered.values() for item in items}
+        self.assertEqual({"current-profile"}, selected_ids)
+        self.assertEqual(
+            {"group_profile_actor_not_current_sender", "group_private_memory_requires_recall_or_personalization"},
+            {item["reason"] for item in blocked},
+        )
+
+        personalized, personalized_blocked = service._filter_group_actor_memory_slots(
+            ctx,
+            slots,
+            query_text="给我讲个符合我性格的故事",
+        )
+        personalized_ids = {item.memory.id for items in personalized.values() for item in items}
+        self.assertEqual({"current-profile", "current-private"}, personalized_ids)
+        self.assertEqual(
+            {"group_profile_actor_not_current_sender", "group_private_memory_actor_not_current_sender"},
+            {item["reason"] for item in personalized_blocked},
+        )
+
+        recalled, recalled_blocked = service._filter_group_actor_memory_slots(
+            ctx,
+            slots,
+            query_text="还记得小李之前说过的蛋糕吗？",
+        )
+        recalled_ids = {item.memory.id for items in recalled.values() for item in items}
+        self.assertEqual({"current-profile", "current-private", "other-profile", "other-private"}, recalled_ids)
+        self.assertEqual([], recalled_blocked)
+
     def test_future_arrangement_route_keeps_association_soft(self) -> None:
         service = self.make_service()
         ctx = SessionContext(
@@ -320,7 +460,7 @@ class EpistemicCalibrationTests(unittest.TestCase):
             platform="qq",
             user_id="u1",
             bot_id="bot-1",
-            message_text="例行检查",
+            message_text="那……例行检查",
         )
         decision = service._memory_route_decision(
             ctx,
@@ -361,8 +501,11 @@ class EpistemicCalibrationTests(unittest.TestCase):
         self.assertTrue(InjectionComposer._short_rest_check_hint("在不在", "late_night", "困倦"))
         self.assertFalse(InjectionComposer._short_rest_check_hint("例行检查", "late_night", "困倦"))
         self.assertTrue(MemoryCompanionService._message_is_shared_routine_invocation("例行检查"))
+        self.assertTrue(MemoryCompanionService._message_is_shared_routine_invocation("那……例行检查"))
+        self.assertTrue(MemoryCompanionService._message_is_shared_routine_invocation("嗯，那就晚间检查一下"))
         self.assertTrue(MemoryCompanionService._message_is_shared_routine_invocation("晚间检查时间到"))
         self.assertFalse(MemoryCompanionService._message_is_shared_routine_invocation("上次例行检查结果是什么"))
+        self.assertFalse(MemoryCompanionService._message_is_shared_routine_invocation("那……上次例行检查结果是什么"))
 
     def test_tone_open_loop_is_not_framed_as_pending_task(self) -> None:
         composer = InjectionComposer()
