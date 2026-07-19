@@ -228,6 +228,7 @@ class MemoryCompanionService:
     async def handle_llm_request(self, event: Any, req: Any) -> None:
         ctx = await self.identity.resolve_event_context(event)
         self._sanitize_session_context_message_text(ctx)
+        self._apply_private_companion_preferred_address(ctx, req=req, event=event)
         if self._private_companion_internal_generation_event(event):
             return
         if looks_like_command(ctx.message_text):
@@ -503,6 +504,26 @@ class MemoryCompanionService:
             "[MemoryCompanion] 已清理当前消息里的陪伴插件动态提示残留: session=%s drop=%s",
             ctx.session_id,
             drop,
+        )
+
+    @staticmethod
+    def _apply_private_companion_preferred_address(
+        ctx: SessionContext,
+        *,
+        req: Any = None,
+        event: Any = None,
+    ) -> None:
+        preferred = clean_text(
+            getattr(req, "_private_companion_preferred_address", "")
+            or getattr(event, "_private_companion_preferred_address", ""),
+            80,
+        )
+        if not preferred:
+            return
+        ctx.preferred_address = preferred
+        ctx.preferred_address_locked = bool(
+            getattr(req, "_private_companion_preferred_address_locked", False)
+            or getattr(event, "_private_companion_preferred_address_locked", False)
         )
 
     def _sanitize_visible_timeline_text(self, text: Any) -> str:
@@ -2191,6 +2212,9 @@ class MemoryCompanionService:
             bot_id=ctx.bot_id,
             message_id=ctx.message_id,
             message_text=ctx.message_text,
+            strict_session_only=ctx.strict_session_only,
+            preferred_address=ctx.preferred_address,
+            preferred_address_locked=ctx.preferred_address_locked,
         )
 
     def _bot_entity(self, ctx: SessionContext | None = None) -> EntityRef:
@@ -2226,6 +2250,59 @@ class MemoryCompanionService:
             self._summary_locks.pop(sid, None)
             self._summary_lock_ts.pop(sid, None)
 
+    @staticmethod
+    def _summary_failure_is_transient(error: Any) -> bool:
+        text = clean_text(error, 1000).lower()
+        if not text:
+            return False
+        markers = (
+            "connection error",
+            "connectionerror",
+            "apiconnectionerror",
+            "connecterror",
+            "connecttimeout",
+            "connection reset",
+            "connection refused",
+            "server disconnected",
+            "remoteprotocolerror",
+            "readerror",
+            "readtimeout",
+            "network error",
+            "temporarily unavailable",
+            "service unavailable",
+            "timeout",
+            "timed out",
+            "rate limit",
+            "too many requests",
+            "连接错误",
+            "连接失败",
+            "连接超时",
+            "网络错误",
+            "网络异常",
+            "暂时不可用",
+        )
+        if any(marker in text for marker in markers):
+            return True
+        return bool(re.search(r"(?:^|\D)(?:429|502|503|504)(?:\D|$)", text))
+
+    def _summary_failure_age_seconds(self, failure: dict[str, Any]) -> float:
+        updated_at = self._parse_utc_datetime(str(failure.get("updated_at") or ""))
+        if updated_at is None:
+            return 0.0
+        return max(0.0, (datetime.now(timezone.utc) - updated_at).total_seconds())
+
+    def _summary_transient_cooldown_seconds(self) -> int:
+        minutes = max(0, self.config.int("memory_summary.transient_retry_cooldown_minutes", 10))
+        return minutes * 60
+
+    def _summary_retry_backoff_seconds(self, retry_count: int) -> int:
+        base = max(0, self.config.int("memory_summary.retry_backoff_seconds", 60))
+        if base <= 0:
+            return 0
+        exponent = max(0, min(8, int(retry_count or 1) - 1))
+        cooldown = self._summary_transient_cooldown_seconds()
+        return min(base * (2**exponent), cooldown) if cooldown > 0 else base * (2**exponent)
+
     async def maybe_summarize_session(self, ctx: SessionContext, *, force: bool = False) -> str:
         if not force and not self.config.bool("memory_summary.enabled", True):
             return ""
@@ -2260,16 +2337,51 @@ class MemoryCompanionService:
 
             failure = await self.store.get_summary_failure(ctx.session_id)
             max_retries = max(1, self.config.int("memory_summary.max_retries", 3))
-            if failure and not force and int(failure.get("retry_count") or 0) >= max_retries:
-                if clean_text((failure.get("metadata") or {}).get("state"), 40) != "dead_letter":
-                    await self.store.mark_summary_failure_dead_letter(ctx.session_id, max_retries)
-                logger.warning(
-                    "[MemoryCompanion] 阶段性记忆总结连续失败已达上限，已暂停自动重试并保留原始时间线，可手动强制重试: session=%s retries=%s last_error=%s",
-                    ctx.session_id,
-                    failure.get("retry_count"),
-                    clean_text(failure.get("last_error"), 160),
-                )
-                return ""
+            if failure and not force:
+                retries = int(failure.get("retry_count") or 0)
+                metadata = failure.get("metadata") if isinstance(failure.get("metadata"), dict) else {}
+                state = clean_text(metadata.get("state"), 40)
+                last_error = clean_text(failure.get("last_error"), 1000)
+                transient = self._summary_failure_is_transient(last_error)
+                age_seconds = self._summary_failure_age_seconds(failure)
+                if retries >= max_retries:
+                    if transient:
+                        cooldown_seconds = self._summary_transient_cooldown_seconds()
+                        if state != "transient_cooldown":
+                            await self.store.mark_summary_failure_cooldown(
+                                ctx.session_id,
+                                max_retries,
+                                cooldown_seconds,
+                            )
+                            logger.warning(
+                                "[MemoryCompanion] 阶段性总结连续遇到连接类错误，已进入冷却并保留原始时间线；约 %s 分钟后自动探测，也可手动重试: session=%s retries=%s last_error=%s",
+                                max(0, cooldown_seconds // 60),
+                                ctx.session_id,
+                                retries,
+                                clean_text(last_error, 160),
+                            )
+                            return ""
+                        if age_seconds < cooldown_seconds:
+                            return ""
+                        await self.store.clear_summary_failure(ctx.session_id)
+                        logger.info(
+                            "[MemoryCompanion] 阶段性总结连接冷却结束，开始自动恢复探测: session=%s",
+                            ctx.session_id,
+                        )
+                    else:
+                        if state != "dead_letter":
+                            await self.store.mark_summary_failure_dead_letter(ctx.session_id, max_retries)
+                            logger.warning(
+                                "[MemoryCompanion] 阶段性记忆总结连续失败已达上限，已暂停自动重试并保留原始时间线，可手动强制重试: session=%s retries=%s last_error=%s",
+                                ctx.session_id,
+                                retries,
+                                clean_text(last_error, 160),
+                            )
+                        return ""
+                else:
+                    retry_delay = self._summary_retry_backoff_seconds(retries)
+                    if age_seconds < retry_delay:
+                        return ""
 
             summary_attempts = await self._summary_provider_attempts(ctx)
             if not summary_attempts:
@@ -2312,33 +2424,76 @@ class MemoryCompanionService:
                             "ReadError",
                             "ReadTimeout",
                         }
-                        logger.warning(
-                            "[MemoryCompanion] 阶段性总结候选失败，尝试下一个: session=%s provider=%s error=%s",
-                            ctx.session_id,
-                            attempt["provider_id"] or attempt["source"],
-                            error_text,
-                            exc_info=not expected_failure,
-                        )
+                        expected_failure = expected_failure or self._summary_failure_is_transient(error_text)
+                        if expected_failure:
+                            logger.info(
+                                "[MemoryCompanion] 阶段性总结候选暂不可用，尝试下一个: session=%s provider=%s error=%s",
+                                ctx.session_id,
+                                attempt["provider_id"] or attempt["source"],
+                                error_text,
+                            )
+                        else:
+                            logger.warning(
+                                "[MemoryCompanion] 阶段性总结候选失败，尝试下一个: session=%s provider=%s error=%s",
+                                ctx.session_id,
+                                attempt["provider_id"] or attempt["source"],
+                                error_text,
+                                exc_info=True,
+                            )
             except Exception as exc:
                 last_error = exc
             if not content:
+                failure_error = self._describe_exception(last_error) if last_error is not None else "summary failed"
+                transient_failure = self._summary_failure_is_transient(failure_error)
                 retries = await self.store.record_summary_failure(
                     session_id=ctx.session_id,
                     scope=ctx.scope,
                     start_timeline_id=str(rows[0].get("id") if rows else ""),
                     end_timeline_id=str(rows[-1].get("id") if rows else ""),
-                    error=str(last_error or "summary failed"),
+                    error=failure_error,
                     metadata={
                         "reason": "provider_or_parse_error",
                         "force": force,
                         "max_retries": max_retries,
                         "state": "retry_pending",
+                        "transient": transient_failure,
                     },
                 )
                 if retries >= max_retries:
-                    await self.store.mark_summary_failure_dead_letter(ctx.session_id, max_retries)
-                logger.warning("[MemoryCompanion] 阶段性记忆总结全部失败: session=%s error=%s", ctx.session_id, last_error)
-                logger.warning("[MemoryCompanion] 已记录阶段性总结待重试: session=%s retry=%s/%s", ctx.session_id, retries, max_retries)
+                    if transient_failure:
+                        cooldown_seconds = self._summary_transient_cooldown_seconds()
+                        await self.store.mark_summary_failure_cooldown(
+                            ctx.session_id,
+                            max_retries,
+                            cooldown_seconds,
+                        )
+                        logger.warning(
+                            "[MemoryCompanion] 阶段性总结连接暂不可用，已保留原始时间线并进入 %s 分钟冷却，之后会自动探测: session=%s retry=%s/%s error=%s",
+                            max(0, cooldown_seconds // 60),
+                            ctx.session_id,
+                            retries,
+                            max_retries,
+                            clean_text(failure_error, 160),
+                        )
+                    else:
+                        await self.store.mark_summary_failure_dead_letter(ctx.session_id, max_retries)
+                        logger.warning(
+                            "[MemoryCompanion] 阶段性总结失败达到上限，已保留原始时间线并暂停自动重试，可手动强制重试: session=%s retry=%s/%s error=%s",
+                            ctx.session_id,
+                            retries,
+                            max_retries,
+                            clean_text(failure_error, 160),
+                        )
+                else:
+                    retry_delay = self._summary_retry_backoff_seconds(retries)
+                    logger.warning(
+                        "[MemoryCompanion] 阶段性总结暂时失败，已保留原始时间线，将在至少 %s 秒后再试: session=%s retry=%s/%s error=%s",
+                        retry_delay,
+                        ctx.session_id,
+                        retries,
+                        max_retries,
+                        clean_text(failure_error, 160),
+                    )
                 return ""
 
             consumed_ids = {
@@ -6741,6 +6896,8 @@ class MemoryCompanionService:
             message_id=str(payload.get("message_id") or ""),
             message_text=str(payload.get("message_text") or ""),
             strict_session_only=bool(payload.get("strict_session_only", False)),
+            preferred_address=str(payload.get("preferred_address") or ""),
+            preferred_address_locked=bool(payload.get("preferred_address_locked", False)),
         )
 
     def _normalized_session_context(self, ctx: SessionContext) -> SessionContext:
@@ -6763,6 +6920,8 @@ class MemoryCompanionService:
             message_id=ctx.message_id,
             message_text=ctx.message_text,
             strict_session_only=ctx.strict_session_only,
+            preferred_address=ctx.preferred_address,
+            preferred_address_locked=ctx.preferred_address_locked,
         )
 
     def stable_id(self, *parts: Any) -> str:
@@ -7052,6 +7211,13 @@ class MemoryCompanionService:
         based on the current relationship phase, creating a bidirectional address
         evolution system.
         """
+        preferred_address = clean_text(ctx.preferred_address, 80)
+        if ctx.scope == "private" and ctx.preferred_address_locked and preferred_address:
+            return (
+                f"当前对象已明确固定称呼为“{preferred_address}”。需要直接称呼时只使用这一项，"
+                "不必每句都带称呼；关系阶段建议、历史称呼、显示名和旧记忆只作识别资料，"
+                "不能另造或追加亲昵称呼。若对方本轮明确要求改称呼，以本轮最新要求为准。"
+            )
         state = self._get_relationship_phase(ctx)
         user_address_phase = state.get("current_address_phase", "")
         relationship_phase = state.get("phase", "acquaintance")

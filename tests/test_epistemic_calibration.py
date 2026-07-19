@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -558,6 +559,58 @@ class EpistemicCalibrationTests(unittest.TestCase):
         self.assertIn("保持轻量回应", hint)
         self.assertNotIn("你们还不太熟", hint)
         self.assertNotIn("用'我也记得'", hint)
+
+    def test_locked_companion_address_overrides_relationship_suggestions(self) -> None:
+        service = self.make_service()
+        ctx = SessionContext(
+            session_id="s",
+            scope="private",
+            platform="qq",
+            user_id="u",
+            bot_id="b",
+            preferred_address="阿岚",
+            preferred_address_locked=True,
+        )
+        state = service._get_relationship_phase(ctx)
+        state["phase"] = "intimate"
+        state["current_address_phase"] = "intimate"
+
+        hint = service._address_hint_for_injection(ctx)
+
+        self.assertIn("只使用这一项", hint)
+        self.assertIn("阿岚", hint)
+        self.assertIn("不必每句都带称呼", hint)
+        self.assertNotIn("宝贝", hint)
+        self.assertNotIn("亲爱的", hint)
+
+    def test_bridge_context_preserves_locked_preferred_address(self) -> None:
+        service = self.make_service()
+
+        ctx = service.session_context_from_bridge(
+            {
+                "session_id": "qq:FriendMessage:u1",
+                "scope": "private",
+                "user_id": "u1",
+                "preferred_address": "阿岚",
+                "preferred_address_locked": True,
+            }
+        )
+
+        self.assertEqual("阿岚", ctx.preferred_address)
+        self.assertTrue(ctx.preferred_address_locked)
+
+    def test_request_scoped_companion_address_is_applied_to_event_context(self) -> None:
+        service = self.make_service()
+        ctx = SessionContext(session_id="s", scope="private", user_id="u")
+        req = SimpleNamespace(
+            _private_companion_preferred_address="阿岚",
+            _private_companion_preferred_address_locked=True,
+        )
+
+        service._apply_private_companion_preferred_address(ctx, req=req)
+
+        self.assertEqual("阿岚", ctx.preferred_address)
+        self.assertTrue(ctx.preferred_address_locked)
 
     def test_importance_does_not_turn_group_summary_into_personal_plan(self) -> None:
         evaluator = ImportanceEvaluator()

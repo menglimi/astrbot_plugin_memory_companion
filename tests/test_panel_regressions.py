@@ -112,7 +112,37 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn("height:calc(100% - 16px)", image_block.group(1))
         self.assertIn("object-fit:contain", image_block.group(1))
         self.assertIn("height:clamp(480px, 62vh, 820px)", drawer_block.group(1))
-        self.assertIn("app.css?v=20260716-album-full", page)
+        self.assertIn("app.css?v=20260719-overview-switch", page)
+
+    def test_overview_layout_switch_is_visible_persistent_and_accessible(self) -> None:
+        page = (ROOT / "pages" / "记忆面板" / "index.html").read_text(encoding="utf-8")
+        script = (ROOT / "pages" / "记忆面板" / "app.js").read_text(encoding="utf-8")
+        styles = (ROOT / "pages" / "记忆面板" / "app.css").read_text(encoding="utf-8")
+
+        self.assertIn('id="overviewLayoutSwitch"', page)
+        self.assertIn('role="radiogroup"', page)
+        self.assertEqual(2, page.count('class="overview-layout-option"'))
+        self.assertIn('data-overview-layout="standard"', page)
+        self.assertIn('data-overview-layout="cinema"', page)
+        self.assertIn('role="radio"', page)
+        self.assertIn('id="standardOverview"', page)
+        self.assertIn('id="cinemaOverview"', page)
+        self.assertIn('id="standardStats"', page)
+        self.assertIn('id="standardRecentBuckets"', page)
+        self.assertIn("memory_companion_overview_layout", page)
+        self.assertLess(page.index("memory_companion_overview_layout"), page.index('rel="stylesheet"'))
+        self.assertIn("function setOverviewLayout", script)
+        self.assertIn("function renderStandardRecentBuckets", script)
+        self.assertIn("state.stats", script)
+        self.assertIn("state.buckets", script)
+        self.assertIn('event.key === "ArrowLeft"', script)
+        self.assertIn(':root[data-overview-layout="standard"] .projection-stage', styles)
+        self.assertIn(".film-app.is-workspace .overview-layout-switch", styles)
+        self.assertIn("@media(max-width:760px)", styles)
+        self.assertIn("app.js?v=20260719-overview-switch", page)
+
+        ids = re.findall(r'\bid="([^"]+)"', page)
+        self.assertEqual(len(ids), len(set(ids)), "记忆面板不能包含重复 HTML id")
 
 
 if __name__ == "__main__":

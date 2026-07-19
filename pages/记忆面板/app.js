@@ -158,9 +158,12 @@ const CONFIG_MODULE_GUIDES = {
   },
 };
 
+const OVERVIEW_LAYOUT_KEY = "memory_companion_overview_layout";
+
 const state = {
   stats: {},
   buckets: [],
+  overviewLayout: document.documentElement.dataset.overviewLayout === "cinema" ? "cinema" : "standard",
   activeView: "objects",
   activeBucketId: "all",
   activeMemoryId: "",
@@ -876,7 +879,53 @@ function contextPayload(query) {
   return payload;
 }
 
-function renderStats(stats) {
+function normalizeOverviewLayout(layout) {
+  return layout === "cinema" ? "cinema" : "standard";
+}
+
+function syncOverviewLayoutControls() {
+  const layout = normalizeOverviewLayout(state.overviewLayout);
+  state.overviewLayout = layout;
+  document.documentElement.dataset.overviewLayout = layout;
+  $$(".overview-layout-option").forEach((button) => {
+    const active = button.dataset.overviewLayout === layout;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-checked", active ? "true" : "false");
+    button.tabIndex = active ? 0 : -1;
+  });
+}
+
+function setOverviewLayout(layout, { persist = true, announce = true } = {}) {
+  const next = normalizeOverviewLayout(layout);
+  const changed = next !== state.overviewLayout;
+  state.overviewLayout = next;
+  if (persist) {
+    try {
+      window.localStorage.setItem(OVERVIEW_LAYOUT_KEY, next);
+    } catch (_) {
+      // 本地存储不可用时，本次页面内的切换仍然有效。
+    }
+  }
+  syncOverviewLayoutControls();
+  if (!changed) return;
+
+  const app = $("#app");
+  app?.classList.remove("is-overview-restoring", "is-overview-booting", "is-standard-overview-entering");
+  if (app && !app.classList.contains("is-workspace")) {
+    if (next === "cinema") {
+      playInitialOverviewEntrance();
+    } else if (!prefersReducedMotion()) {
+      app.classList.add("is-standard-overview-entering");
+      window.setTimeout(() => app.classList.remove("is-standard-overview-entering"), 420);
+    }
+  }
+  if (announce) {
+    const live = $("#overviewLayoutAnnouncement");
+    if (live) live.textContent = next === "cinema" ? "已切换到放映馆视图" : "已切换到常规总览";
+  }
+}
+
+function memoryStatsItems(stats) {
   const currentFiles = stats.memory_storage || stats.wal?.current_files || stats.wal || {};
   const databaseBytes = Math.max(0, Number(currentFiles.database_bytes ?? currentFiles.db_bytes ?? 0));
   const walBytes = Math.max(0, Number(currentFiles.wal_bytes ?? 0));
@@ -885,7 +934,7 @@ function renderStats(stats) {
   const storageBytes = Number.isFinite(reportedBytes)
     ? Math.max(0, reportedBytes)
     : databaseBytes + walBytes + shmBytes;
-  const items = [
+  return [
     { key: "memory-count", label: "记忆", value: stats.total_memories ?? 0 },
     {
       key: "memory-storage",
@@ -896,9 +945,20 @@ function renderStats(stats) {
     { key: "private-memory", label: "私聊记忆", value: stats.by_scope?.private ?? 0 },
     { key: "group-memory", label: "群聊记忆", value: stats.by_scope?.group ?? 0 },
   ];
-  $("#stats").innerHTML = items.map(({ key, label, value, title = "" }) => `
+}
+
+function renderStats(stats) {
+  const items = memoryStatsItems(stats);
+  const filmStats = $("#stats");
+  if (filmStats) filmStats.innerHTML = items.map(({ key, label, value, title = "" }) => `
     <article class="stat ${key === "memory-storage" ? "is-storage" : ""}" data-stat="${escapeHtml(key)}"${title ? ` title="${escapeHtml(title)}"` : ""}>
       <b>${escapeHtml(value)}</b><span>${escapeHtml(label)}</span>
+    </article>
+  `).join("");
+  const standardStats = $("#standardStats");
+  if (standardStats) standardStats.innerHTML = items.map(({ key, label, value, title = "" }) => `
+    <article class="overview-kpi ${key === "memory-storage" ? "is-storage" : ""}" data-stat="${escapeHtml(key)}"${title ? ` title="${escapeHtml(title)}"` : ""}>
+      <span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b>
     </article>
   `).join("");
 }
@@ -945,6 +1005,38 @@ function normalizeBuckets(rawBuckets) {
     });
   }
   return normalized;
+}
+
+function renderStandardRecentBuckets() {
+  const host = $("#standardRecentBuckets");
+  const meta = $("#overviewScopeMeta");
+  if (!host) return;
+  const windows = state.buckets.filter(isWindowBucket);
+  const privateCount = windows.filter((bucket) => bucket.scope === "private").length;
+  const groupCount = windows.filter((bucket) => bucket.scope === "group").length;
+  if (meta) meta.textContent = `${privateCount} 个私聊 · ${groupCount} 个群聊`;
+
+  const recent = [...windows]
+    .sort((left, right) => String(right.latest_at || "").localeCompare(String(left.latest_at || "")))
+    .slice(0, 5);
+  if (!recent.length) {
+    host.innerHTML = '<p class="overview-empty">还没有私聊或群聊记忆</p>';
+    return;
+  }
+  host.innerHTML = recent.map((bucket) => {
+    const view = bucket.scope === "group" ? "film" : "maintain";
+    const kind = bucket.scope === "group" ? "群" : "私";
+    return `
+      <button class="overview-scope-row" data-overview-view="${view}" data-overview-bucket="${escapeHtml(bucket.id)}" type="button">
+        <span class="overview-scope-kind is-${escapeHtml(bucket.scope)}" aria-hidden="true">${kind}</span>
+        <span class="overview-scope-copy">
+          <b>${escapeHtml(bucket.label)}</b>
+          <small>${escapeHtml(formatTime(bucket.latest_at))}</small>
+        </span>
+        <span class="overview-scope-count">${escapeHtml(bucket.memory_count || 0)} 条</span>
+      </button>
+    `;
+  }).join("");
 }
 
 function bucketCard(bucket) {
@@ -1337,6 +1429,7 @@ async function loadBuckets() {
   } else if (state.activeView !== "review") {
     renderBuckets();
   }
+  renderStandardRecentBuckets();
 }
 
 async function selectBucket(id) {
@@ -1382,7 +1475,7 @@ function prepareOverviewStripExit(view) {
 
 function playInitialOverviewEntrance() {
   const app = $("#app");
-  if (!app || prefersReducedMotion() || app.classList.contains("is-workspace")) return;
+  if (!app || state.overviewLayout !== "cinema" || prefersReducedMotion() || app.classList.contains("is-workspace")) return;
   prepareOverviewStripReturn();
   app.classList.add("is-overview-restoring", "is-overview-booting");
   window.setTimeout(() => {
@@ -1486,7 +1579,7 @@ async function playRailRefreshTransition(task) {
   }
 }
 
-async function openView(view) {
+async function openView(view, { preserveBucket = false } = {}) {
   const app = $("#app");
   const wasWorkspace = app.classList.contains("is-workspace");
   const switchingWorkspaceView = wasWorkspace && state.activeView !== view;
@@ -1507,7 +1600,7 @@ async function openView(view) {
   if (view !== "review") removeRailMountedScheduleFilm();
   state.personalEntranceRevealRequested = enteringPersonalMemory;
   state.activeView = view;
-  if (view !== "review") state.activeBucketId = "all";
+  if (view !== "review" && !preserveBucket) state.activeBucketId = "all";
   app.classList.add("is-workspace");
   app.classList.toggle("is-workspace-entering", !wasWorkspace);
   app.classList.remove("is-workspace-ready");
@@ -5635,6 +5728,35 @@ async function refreshAll() {
 
 function bindActions() {
   const stage = document.querySelector(".projection-stage");
+  const layoutButtons = $$(".overview-layout-option");
+  layoutButtons.forEach((button, index) => {
+    button.addEventListener("click", () => setOverviewLayout(button.dataset.overviewLayout));
+    button.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      let nextIndex = index;
+      if (event.key === "ArrowLeft") nextIndex = (index - 1 + layoutButtons.length) % layoutButtons.length;
+      if (event.key === "ArrowRight") nextIndex = (index + 1) % layoutButtons.length;
+      if (event.key === "Home") nextIndex = 0;
+      if (event.key === "End") nextIndex = layoutButtons.length - 1;
+      const next = layoutButtons[nextIndex];
+      setOverviewLayout(next?.dataset.overviewLayout);
+      next?.focus();
+    });
+  });
+  $("#standardOverview")?.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-overview-view]");
+    if (!button || !$("#standardOverview").contains(button)) return;
+    const view = button.dataset.overviewView;
+    if (!VIEWS[view]) return;
+    const bucketId = button.dataset.overviewBucket || "";
+    if (bucketId && state.buckets.some((bucket) => bucket.id === bucketId)) {
+      state.activeBucketId = bucketId;
+      void openView(view, { preserveBucket: true });
+      return;
+    }
+    void openView(view);
+  });
   $$(".filmstrip").forEach((strip) => {
     const style = strip.getAttribute("style") || "";
     const ang = parseFloat((style.match(/--a:\s*(-?[\d.]+)deg/) || [0,0])[1]);
@@ -6336,6 +6458,7 @@ async function _toggleTopologyPermission(ownerKey, readerKey) {
 }
 
 async function init() {
+  syncOverviewLayoutControls();
   bindActions();
   playInitialOverviewEntrance();
   await loadConfiguredTheme();
@@ -6348,6 +6471,7 @@ async function init() {
     setMessage(`页面 API 暂不可用：${error.message}`);
     state.buckets = normalizeBuckets([]);
     renderBuckets();
+    renderStandardRecentBuckets();
   }
 }
 

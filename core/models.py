@@ -76,6 +76,8 @@ class SessionContext:
     message_id: str = ""
     message_text: str = ""
     strict_session_only: bool = False
+    preferred_address: str = ""
+    preferred_address_locked: bool = False
 
     @property
     def current_target_id(self) -> str:

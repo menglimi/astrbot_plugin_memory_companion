@@ -720,6 +720,131 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
         failure = await service.store.get_summary_failure(ctx.session_id)
         self.assertEqual("dead_letter", failure["metadata"]["state"])
 
+    async def test_transient_summary_failure_enters_quiet_cooldown(self) -> None:
+        service = self.make_service(
+            {
+                "memory_summary": {
+                    "enabled": True,
+                    "min_events": 1,
+                    "trigger_event_count": 1,
+                    "max_retries": 1,
+                    "transient_retry_cooldown_minutes": 10,
+                }
+            }
+        )
+        ctx = SessionContext(
+            session_id="qq:GroupMessage:g1",
+            scope="group",
+            platform="qq",
+            group_id="g1",
+            user_id="u1",
+        )
+        timeline_id = await service.store.add_timeline_event(
+            event_type="user_message",
+            session_id=ctx.session_id,
+            scope=ctx.scope,
+            subject_id=ctx.user_id,
+            object_id=ctx.group_id,
+            content="等待连接恢复后再总结",
+            metadata={"message_id": "m-transient-cooldown"},
+        )
+        await service.store.record_summary_failure(
+            session_id=ctx.session_id,
+            scope=ctx.scope,
+            start_timeline_id=timeline_id,
+            end_timeline_id=timeline_id,
+            error="APIConnectionError: Connection error.",
+        )
+
+        async def fail_if_called(*_args, **_kwargs):
+            raise AssertionError("provider must not run during transient cooldown")
+
+        service._summary_provider_attempts = fail_if_called
+        self.assertEqual("", await service.maybe_summarize_session(ctx))
+        first = await service.store.get_summary_failure(ctx.session_id)
+        self.assertEqual("transient_cooldown", first["metadata"]["state"])
+        self.assertEqual("", await service.maybe_summarize_session(ctx))
+        second = await service.store.get_summary_failure(ctx.session_id)
+        self.assertEqual(first["updated_at"], second["updated_at"])
+        row = service.store._conn.execute(
+            "SELECT summarized_at FROM timeline WHERE id=?", (timeline_id,)
+        ).fetchone()
+        self.assertEqual("", row["summarized_at"])
+
+    async def test_transient_summary_cooldown_auto_recovers(self) -> None:
+        service = self.make_service(
+            {
+                "memory_summary": {
+                    "enabled": True,
+                    "min_events": 1,
+                    "trigger_event_count": 1,
+                    "max_retries": 1,
+                    "retry_backoff_seconds": 0,
+                    "transient_retry_cooldown_minutes": 0,
+                }
+            }
+        )
+        ctx = SessionContext(
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            platform="qq",
+            user_id="u1",
+            bot_id="b1",
+        )
+        timeline_id = await service.store.add_timeline_event(
+            event_type="user_message",
+            session_id=ctx.session_id,
+            scope=ctx.scope,
+            subject_id=ctx.user_id,
+            object_id=ctx.bot_id,
+            content="网络恢复后可以自动完成总结",
+            metadata={"message_id": "m-transient-recover"},
+        )
+        await service.store.record_summary_failure(
+            session_id=ctx.session_id,
+            scope=ctx.scope,
+            start_timeline_id=timeline_id,
+            end_timeline_id=timeline_id,
+            error="Connection error.",
+        )
+        provider = _TextProvider(
+            json.dumps(
+                {
+                    "summary": "网络恢复后完成了阶段总结。",
+                    "canonical_summary": "用户确认网络恢复后可以继续总结。",
+                    "persona_summary": "我在网络恢复后完成了阶段总结。",
+                    "key_facts": ["连接已恢复"],
+                    "topics": ["阶段总结"],
+                    "importance": 0.6,
+                },
+                ensure_ascii=False,
+            )
+        )
+
+        async def attempts(*_args, **_kwargs):
+            return [{"source": "primary", "provider_id": "test-summary", "provider": provider}]
+
+        service._summary_provider_attempts = attempts
+        self.assertEqual("", await service.maybe_summarize_session(ctx))
+        failure = await service.store.get_summary_failure(ctx.session_id)
+        self.assertEqual("transient_cooldown", failure["metadata"]["state"])
+
+        memory_id = await service.maybe_summarize_session(ctx)
+
+        self.assertTrue(memory_id)
+        self.assertIsNone(await service.store.get_summary_failure(ctx.session_id))
+        row = service.store._conn.execute(
+            "SELECT summarized_at FROM timeline WHERE id=?", (timeline_id,)
+        ).fetchone()
+        self.assertTrue(row["summarized_at"])
+
+    def test_summary_failure_transience_is_narrow(self) -> None:
+        self.assertTrue(MemoryCompanionService._summary_failure_is_transient("Connection error."))
+        self.assertTrue(MemoryCompanionService._summary_failure_is_transient("HTTP 503 Service Unavailable"))
+        self.assertTrue(MemoryCompanionService._summary_failure_is_transient("ReadTimeout"))
+        self.assertFalse(MemoryCompanionService._summary_failure_is_transient("invalid JSON response"))
+        self.assertFalse(MemoryCompanionService._summary_failure_is_transient("empty summary content"))
+
     async def test_one_message_advances_relationship_at_most_once(self) -> None:
         service = self.make_service()
         ctx = SessionContext(

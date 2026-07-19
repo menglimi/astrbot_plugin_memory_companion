@@ -789,6 +789,10 @@ class PluginPageApi:
                     "trigger_interval_minutes": config.int("memory_summary.trigger_interval_minutes", 60),
                     "max_events_per_summary": config.int("memory_summary.max_events_per_summary", 40),
                     "max_retries": config.int("memory_summary.max_retries", 3),
+                    "retry_backoff_seconds": config.int("memory_summary.retry_backoff_seconds", 60),
+                    "transient_retry_cooldown_minutes": config.int(
+                        "memory_summary.transient_retry_cooldown_minutes", 10
+                    ),
                 },
                 "memory_tools": {
                     "enable_recall_tool": config.bool("memory_tools.enable_recall_tool", True),

@@ -2906,7 +2906,39 @@ class MemoryStore:
             max_retries,
         )
 
+    async def mark_summary_failure_cooldown(
+        self,
+        session_id: str,
+        max_retries: int,
+        cooldown_seconds: int,
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._mark_summary_failure_state_sync,
+            session_id,
+            "transient_cooldown",
+            {
+                "max_retries": max(1, int(max_retries or 1)),
+                "cooldown_seconds": max(0, int(cooldown_seconds or 0)),
+                "cooldown_at": utc_now(),
+            },
+        )
+
     def _mark_summary_failure_dead_letter_sync(self, session_id: str, max_retries: int) -> bool:
+        return self._mark_summary_failure_state_sync(
+            session_id,
+            "dead_letter",
+            {
+                "max_retries": max(1, int(max_retries or 1)),
+                "dead_letter_at": utc_now(),
+            },
+        )
+
+    def _mark_summary_failure_state_sync(
+        self,
+        session_id: str,
+        state: str,
+        extra_metadata: dict[str, Any],
+    ) -> bool:
         session_id = clean_text(session_id, 200)
         with self._lock:
             with self._transaction_sync():
@@ -2919,13 +2951,8 @@ class MemoryStore:
                 metadata = json_loads(row["metadata"], {})
                 if not isinstance(metadata, dict):
                     metadata = {}
-                metadata.update(
-                    {
-                        "state": "dead_letter",
-                        "max_retries": max(1, int(max_retries or 1)),
-                        "dead_letter_at": utc_now(),
-                    }
-                )
+                metadata.update(extra_metadata or {})
+                metadata["state"] = clean_text(state, 40)
                 cur = self._conn.execute(
                     "UPDATE summary_failures SET metadata=?, updated_at=? WHERE session_id=?",
                     (json_dumps(metadata), utc_now(), session_id),

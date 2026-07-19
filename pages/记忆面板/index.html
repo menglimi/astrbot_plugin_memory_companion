@@ -3,11 +3,34 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>记忆放映馆</title>
-  <link rel="stylesheet" href="./app.css?v=20260716-album-full" />
+  <title>记忆面板</title>
+  <script>
+    (() => {
+      const key = "memory_companion_overview_layout";
+      let layout = "standard";
+      try {
+        const saved = window.localStorage.getItem(key);
+        if (saved === "standard" || saved === "cinema") layout = saved;
+      } catch (_) {
+        // WebView 隐私模式下可能禁用本地存储，保持常规总览即可。
+      }
+      document.documentElement.dataset.overviewLayout = layout;
+    })();
+  </script>
+  <link rel="stylesheet" href="./app.css?v=20260719-overview-switch" />
 </head>
 <body>
   <main id="app" class="film-app">
+    <nav id="overviewLayoutSwitch" class="overview-layout-switch" role="radiogroup" aria-label="总览样式">
+      <button class="overview-layout-option" data-overview-layout="standard" type="button" role="radio" aria-checked="false" aria-controls="standardOverview">
+        常规总览
+      </button>
+      <button class="overview-layout-option" data-overview-layout="cinema" type="button" role="radio" aria-checked="false" aria-controls="cinemaOverview">
+        放映馆视图
+      </button>
+    </nav>
+    <span id="overviewLayoutAnnouncement" class="sr-only" aria-live="polite"></span>
+
     <header class="topbar">
       <div>
         <p class="eyebrow">我会牢牢记住你</p>
@@ -15,7 +38,105 @@
       </div>
     </header>
 
-    <section class="projection-stage" aria-label="记忆放映馆首页">
+    <section id="standardOverview" class="standard-overview" aria-label="常规记忆总览">
+      <header class="standard-overview-head">
+        <div>
+          <p class="eyebrow">Memory Companion</p>
+          <h1>记忆总览</h1>
+          <p class="standard-overview-summary">当前记忆库、会话范围与常用入口</p>
+        </div>
+        <button class="overview-primary-action" data-overview-view="microscope" type="button">
+          <span>检索记忆</span>
+          <span class="overview-action-arrow" aria-hidden="true">&rsaquo;</span>
+        </button>
+      </header>
+
+      <section id="standardStats" class="overview-kpi-grid" aria-label="记忆库统计" aria-live="polite">
+        <article class="overview-kpi is-loading"><span>记忆</span><b>--</b></article>
+        <article class="overview-kpi is-loading"><span>记忆大小</span><b>--</b></article>
+        <article class="overview-kpi is-loading"><span>私聊记忆</span><b>--</b></article>
+        <article class="overview-kpi is-loading"><span>群聊记忆</span><b>--</b></article>
+      </section>
+
+      <div class="standard-overview-body">
+        <section class="overview-destinations" aria-labelledby="overviewDestinationsTitle">
+          <div class="overview-section-head">
+            <div>
+              <p class="eyebrow">Workspace</p>
+              <h2 id="overviewDestinationsTitle">功能入口</h2>
+            </div>
+            <span>7 个工作区</span>
+          </div>
+          <div class="overview-entry-grid">
+            <button class="overview-entry is-private" data-overview-view="maintain" type="button">
+              <span class="overview-entry-index">01</span>
+              <span class="overview-entry-copy"><b>私聊记忆</b><small>对话 · 偏好 · 稳定事实</small></span>
+              <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
+            </button>
+            <button class="overview-entry is-group" data-overview-view="film" type="button">
+              <span class="overview-entry-index">02</span>
+              <span class="overview-entry-copy"><b>群聊记忆</b><small>群聊 · 成员 · 上下文</small></span>
+              <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
+            </button>
+            <button class="overview-entry is-user" data-overview-view="relations" type="button">
+              <span class="overview-entry-index">03</span>
+              <span class="overview-entry-copy"><b>用户记忆</b><small>画像 · 偏好 · 关系</small></span>
+              <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
+            </button>
+            <button class="overview-entry is-personal" data-overview-view="review" type="button">
+              <span class="overview-entry-index">04</span>
+              <span class="overview-entry-copy"><b>个人记忆</b><small>日程 · 相册 · 主观记忆</small></span>
+              <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
+            </button>
+            <button class="overview-entry is-graph" data-overview-view="objects" type="button">
+              <span class="overview-entry-index">05</span>
+              <span class="overview-entry-copy"><b>知识图谱</b><small>节点 · 关系 · 时间线</small></span>
+              <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
+            </button>
+            <button class="overview-entry is-search" data-overview-view="microscope" type="button">
+              <span class="overview-entry-index">06</span>
+              <span class="overview-entry-copy"><b>记忆显微镜</b><small>模拟召回 · 注入检查</small></span>
+              <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
+            </button>
+            <button class="overview-entry is-archive is-wide" data-overview-view="archive" type="button">
+              <span class="overview-entry-index">07</span>
+              <span class="overview-entry-copy"><b>维护 / 迁移 / 配置</b><small>运行状态 · 备份 · 导入 · 配置</small></span>
+              <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
+            </button>
+          </div>
+        </section>
+
+        <aside class="overview-side-column" aria-label="最近范围与快捷入口">
+          <section class="overview-recent-scopes" aria-labelledby="recentScopesTitle">
+            <div class="overview-section-head is-compact">
+              <div>
+                <p class="eyebrow">Recent</p>
+                <h2 id="recentScopesTitle">最近记忆范围</h2>
+              </div>
+              <span id="overviewScopeMeta">正在读取</span>
+            </div>
+            <div id="standardRecentBuckets" class="overview-scope-list" aria-live="polite">
+              <p class="overview-empty">正在读取最近范围...</p>
+            </div>
+          </section>
+
+          <section class="overview-quick-tools" aria-labelledby="quickToolsTitle">
+            <div class="overview-section-head is-compact">
+              <div>
+                <p class="eyebrow">Shortcuts</p>
+                <h2 id="quickToolsTitle">快捷入口</h2>
+              </div>
+            </div>
+            <div class="overview-quick-grid">
+              <button data-overview-view="microscope" type="button"><b>检索检查</b><small>查看召回结果</small></button>
+              <button data-overview-view="archive" type="button"><b>维护中心</b><small>备份与配置</small></button>
+            </div>
+          </section>
+        </aside>
+      </div>
+    </section>
+
+    <section id="cinemaOverview" class="projection-stage" aria-label="记忆放映馆首页">
       <button class="filmstrip" style="--a:-18deg;--z:2;--off:240px"  data-view="objects"    data-tip-title="知识图谱" data-tip-sub="关系 · 线程 · 时间线"     type="button"><span class="strip-label"><b>知识图谱</b><small>关系 · 节点</small></span></button>
       <button class="filmstrip" style="--a:76deg; --z:4;--off:-200px" data-view="film"       data-tip-title="群聊记忆" data-tip-sub="群聊范围内的记忆"      type="button"><span class="strip-label"><b>群聊记忆</b><small>群聊 · 记忆</small></span></button>
       <button class="filmstrip" style="--a:44deg; --z:7;--off:260px"  data-view="microscope" data-tip-title="记忆显微镜" data-tip-sub="模拟召回 · 检查注入"     type="button"><span class="strip-label" style="--label-edge:-260px"><b>记忆显微镜</b><small>模拟召回</small></span></button>
@@ -325,6 +446,6 @@ Bot: 12-14 15:10:30
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </main>
   <script src="/api/plugin/page/bridge-sdk.js"></script>
-  <script src="./app.js?v=20260716-qq-history-archive"></script>
+  <script src="./app.js?v=20260719-overview-switch"></script>
 </body>
 </html>
