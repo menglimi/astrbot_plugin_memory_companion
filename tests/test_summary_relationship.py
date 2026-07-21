@@ -842,8 +842,20 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(MemoryCompanionService._summary_failure_is_transient("Connection error."))
         self.assertTrue(MemoryCompanionService._summary_failure_is_transient("HTTP 503 Service Unavailable"))
         self.assertTrue(MemoryCompanionService._summary_failure_is_transient("ReadTimeout"))
+        self.assertTrue(
+            MemoryCompanionService._summary_failure_is_transient(
+                "Error code: 402 - {'error': {'message': 'Insufficient Balance', 'code': 'invalid_request_error'}}"
+            )
+        )
+        self.assertTrue(MemoryCompanionService._summary_failure_is_transient("type=insufficient_quota"))
+        self.assertTrue(MemoryCompanionService._summary_failure_is_transient("You exceeded your current quota"))
         self.assertFalse(MemoryCompanionService._summary_failure_is_transient("invalid JSON response"))
         self.assertFalse(MemoryCompanionService._summary_failure_is_transient("empty summary content"))
+        self.assertFalse(
+            MemoryCompanionService._summary_failure_is_transient(
+                "invalid_request_error: messages must contain text"
+            )
+        )
 
     async def test_one_message_advances_relationship_at_most_once(self) -> None:
         service = self.make_service()

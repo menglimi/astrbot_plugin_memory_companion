@@ -41,6 +41,21 @@ class ConfigView:
         "conversation_memory.group_actor_relevance_guard_enabled": (
             "conversation_memory_advanced.group_actor_relevance_guard_enabled",
         ),
+        "conversation_memory.cross_window_recent_continuity_enabled": (
+            "conversation_memory_advanced.cross_window_recent_continuity_enabled",
+        ),
+        "conversation_memory.cross_window_recent_minutes": (
+            "conversation_memory_advanced.cross_window_recent_minutes",
+        ),
+        "conversation_memory.cross_window_recent_event_limit": (
+            "conversation_memory_advanced.cross_window_recent_event_limit",
+        ),
+        "conversation_memory.cross_window_group_to_private_enabled": (
+            "conversation_memory_advanced.cross_window_group_to_private_enabled",
+        ),
+        "conversation_memory.cross_window_private_to_group_enabled": (
+            "conversation_memory_advanced.cross_window_private_to_group_enabled",
+        ),
         # context_orchestration → context_orchestration_advanced
         "context_orchestration.intent_max_chars": ("context_orchestration_advanced.intent_max_chars",),
         "context_orchestration.self_timeline_limit": ("context_orchestration_advanced.self_timeline_limit",),

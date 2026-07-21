@@ -74,6 +74,106 @@ b: 2026-01-01 09:00:00
         self.assertEqual([2, 1], [item["sequence"] for item in parsed["messages"]])
         self.assertEqual("更早的消息", parsed["messages"][0]["content"])
 
+    def test_parser_understands_labeled_export_with_speaker_before_time(self) -> None:
+        text = """发送者：比折
+时间：2026-07-19 16:55:36
+内容：已经吃过饭了
+消息ID：1001
+----------------
+发送者：星缘
+时间：2026-07-19 16:55:42
+内容：那就好
+早点休息
+"""
+        parsed = HistoricalChatParser().parse(
+            text,
+            source_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        )
+
+        self.assertEqual("labeled_fields", parsed["stats"]["source_format"])
+        self.assertEqual("before_time", parsed["stats"]["field_speaker_layout"])
+        self.assertEqual(2, parsed["stats"]["message_count"])
+        self.assertEqual({"比折": 1, "星缘": 1}, parsed["stats"]["speakers"])
+        self.assertEqual("已经吃过饭了", parsed["messages"][0]["content"])
+        self.assertEqual("那就好\n早点休息", parsed["messages"][1]["content"])
+        self.assertNotIn("时间", parsed["stats"]["speakers"])
+        self.assertNotIn("内容", parsed["stats"]["speakers"])
+
+    def test_parser_understands_labeled_export_with_speaker_after_time(self) -> None:
+        text = """时间: 2026-07-19 16:55:36
+发送者: 比折
+内容: 刚才去洗澡了
+
+时间: 2026-07-19 16:55:42
+发送者: 星缘
+内容: 洗完舒服些了吗
+"""
+        parsed = HistoricalChatParser().parse(
+            text,
+            source_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        )
+
+        self.assertEqual("after_time", parsed["stats"]["field_speaker_layout"])
+        self.assertEqual(["比折", "星缘"], [item["speaker"] for item in parsed["messages"]])
+        self.assertEqual("刚才去洗澡了", parsed["messages"][0]["content"])
+
+    def test_parser_keeps_content_when_content_field_precedes_time(self) -> None:
+        text = """发送者：比折
+内容：晚饭已经吃过
+时间：2026-07-19 16:55:36
+
+发送者：星缘
+内容：那就早点休息
+时间：2026-07-19 16:55:42
+"""
+        parsed = HistoricalChatParser().parse(
+            text,
+            source_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        )
+
+        self.assertEqual("before_time", parsed["stats"]["field_content_layout"])
+        self.assertEqual("晚饭已经吃过", parsed["messages"][0]["content"])
+        self.assertEqual("那就早点休息", parsed["messages"][1]["content"])
+
+    def test_labeled_export_without_sender_fails_before_cost_estimation(self) -> None:
+        text = """时间：2026-07-19 16:55:36
+内容：第一条
+
+时间：2026-07-19 16:55:42
+内容：第二条
+
+时间：2026-07-19 16:55:48
+内容：第三条
+"""
+        with self.assertRaisesRegex(ValueError, "没有找到发送者或昵称字段"):
+            HistoricalChatParser().parse(
+                text,
+                source_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            )
+
+    def test_labeled_upload_reports_normalization_in_preview(self) -> None:
+        text = """发送者：比折
+时间：2026-07-19 16:55:36
+内容：第一条
+
+发送者：星缘
+时间：2026-07-19 16:55:42
+内容：第二条
+"""
+        with tempfile.TemporaryDirectory() as temp:
+            service = type("Service", (), {"data_dir": Path(temp), "store": object()})()
+            importer = HistoricalChatImporter(service)
+            importer._identity_context = lambda _speakers: {
+                "available": False,
+                "matches": {},
+                "bot": {},
+                "target_users": [],
+            }
+            preview = importer.stage_upload(filename="friend.txt", content=text.encode("utf-8"))
+
+        self.assertEqual(2, preview["stats"]["speaker_count"])
+        self.assertTrue(any("字段式导出" in warning for warning in preview["warnings"]))
+
 
 class HistoricalChatStoreTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:

@@ -274,6 +274,7 @@ class MemoryCompanionService:
                 "source": "llm_request",
                 "conversation_memory": ctx.scope == "group",
             }
+            event_metadata.update(self._cross_window_event_metadata(ctx))
             event_metadata.update(self._reply_chain_metadata(reply_chain))
             if ctx.scope == "group":
                 event_metadata.update(await self._conversation_memory_metadata(ctx, source="llm_request"))
@@ -345,6 +346,7 @@ class MemoryCompanionService:
                 "message_id": ctx.message_id,
             }
         )
+        event_metadata.update(self._cross_window_event_metadata(ctx))
         event_metadata.update(self._reply_chain_metadata(reply_chain))
         await self.store.add_timeline_event(
             event_type="user_message",
@@ -394,7 +396,7 @@ class MemoryCompanionService:
             metadata={
                 "memory_id": memory_id,
                 "memory_companion_injection_state": injection_state,
-                "owner_bot_id": self._bot_subject_id(ctx),
+                **self._cross_window_event_metadata(ctx),
             },
         )
         self._schedule_session_summary(ctx, reason="after_bot_response")
@@ -484,6 +486,16 @@ class MemoryCompanionService:
         if text:
             return clean_text(f"{text}\n[引用链上下文] {reply_context}", 2000)
         return clean_text(f"[引用链上下文] {reply_context}", 2000)
+
+    def _cross_window_event_metadata(self, ctx: SessionContext) -> dict[str, str]:
+        return {
+            "owner_bot_id": clean_text(self._bot_subject_id(ctx), 120),
+            "platform": clean_text(ctx.platform, 80),
+            "participant_user_id": clean_text(ctx.user_id, 120),
+            "participant_user_name": clean_text(ctx.user_name, 80),
+            "source_group_id": clean_text(ctx.group_id, 120),
+            "source_group_name": clean_text(ctx.group_name, 80),
+        }
 
     def _private_companion_internal_generation_event(self, event: Any) -> bool:
         if event is None:
@@ -2274,16 +2286,27 @@ class MemoryCompanionService:
             "timed out",
             "rate limit",
             "too many requests",
+            "payment required",
+            "insufficient balance",
+            "insufficient_balance",
+            "insufficient quota",
+            "insufficient_quota",
+            "quota exceeded",
+            "exceeded your current quota",
+            "resource exhausted",
             "连接错误",
             "连接失败",
             "连接超时",
             "网络错误",
             "网络异常",
             "暂时不可用",
+            "余额不足",
+            "额度不足",
+            "配额不足",
         )
         if any(marker in text for marker in markers):
             return True
-        return bool(re.search(r"(?:^|\D)(?:429|502|503|504)(?:\D|$)", text))
+        return bool(re.search(r"(?:^|\D)(?:402|429|502|503|504)(?:\D|$)", text))
 
     def _summary_failure_age_seconds(self, failure: dict[str, Any]) -> float:
         updated_at = self._parse_utc_datetime(str(failure.get("updated_at") or ""))
@@ -2354,7 +2377,7 @@ class MemoryCompanionService:
                                 cooldown_seconds,
                             )
                             logger.warning(
-                                "[MemoryCompanion] 阶段性总结连续遇到连接类错误，已进入冷却并保留原始时间线；约 %s 分钟后自动探测，也可手动重试: session=%s retries=%s last_error=%s",
+                                "[MemoryCompanion] 阶段性总结连续遇到可恢复的 Provider 错误，已进入冷却并保留原始时间线；约 %s 分钟后自动探测，也可手动重试: session=%s retries=%s last_error=%s",
                                 max(0, cooldown_seconds // 60),
                                 ctx.session_id,
                                 retries,
@@ -2365,7 +2388,7 @@ class MemoryCompanionService:
                             return ""
                         await self.store.clear_summary_failure(ctx.session_id)
                         logger.info(
-                            "[MemoryCompanion] 阶段性总结连接冷却结束，开始自动恢复探测: session=%s",
+                            "[MemoryCompanion] 阶段性总结 Provider 冷却结束，开始自动恢复探测: session=%s",
                             ctx.session_id,
                         )
                     else:
@@ -2468,7 +2491,7 @@ class MemoryCompanionService:
                             cooldown_seconds,
                         )
                         logger.warning(
-                            "[MemoryCompanion] 阶段性总结连接暂不可用，已保留原始时间线并进入 %s 分钟冷却，之后会自动探测: session=%s retry=%s/%s error=%s",
+                            "[MemoryCompanion] 阶段性总结 Provider 暂不可用，已保留原始时间线并进入 %s 分钟冷却，之后会自动探测: session=%s retry=%s/%s error=%s",
                             max(0, cooldown_seconds // 60),
                             ctx.session_id,
                             retries,
@@ -3909,6 +3932,7 @@ class MemoryCompanionService:
     ) -> str:
         ctx = self._normalized_session_context(ctx)
         recent_fact_context = await self._recent_fact_guard_context(ctx)
+        recent_cross_window_context = await self._recent_cross_window_context(ctx)
         turn_signal = analyze_turn_signal(explicit_query or ctx.message_text)
         time_intent = parse_time_intent(explicit_query or ctx.message_text)
         route_text = explicit_query or ctx.message_text
@@ -3926,7 +3950,7 @@ class MemoryCompanionService:
         retrieval_query = self._query_for_time_intent(intent.query, time_intent)
 
         def compose_recent_guard(intent_context: str) -> str:
-            if not recent_fact_context:
+            if not recent_fact_context and not recent_cross_window_context:
                 return ""
             return self.injection.compose(
                 ctx,
@@ -3939,6 +3963,7 @@ class MemoryCompanionService:
                 companion_bot_energy=companion_bot_energy,
                 time_of_day=self._compute_time_of_day(),
                 recent_fact_context=recent_fact_context,
+                recent_cross_window_context=recent_cross_window_context,
             )
 
         if decision.suppress_long_memory:
@@ -4093,6 +4118,7 @@ class MemoryCompanionService:
             cross_window_emotional_hint=self._get_cross_window_emotional_hint(ctx),
             address_hint=self._address_hint_for_injection(ctx),
             recent_fact_context=recent_fact_context,
+            recent_cross_window_context=recent_cross_window_context,
         )
         conversation_memory_note = self._conversation_memory_injection_note(
             slot_map,
@@ -4139,6 +4165,7 @@ class MemoryCompanionService:
             return
         self._sanitize_request_history_for_companion(ctx, req)
         recent_fact_context = await self._recent_fact_guard_context(ctx)
+        recent_cross_window_context = await self._recent_cross_window_context(ctx)
 
         turn_signal = analyze_turn_signal(ctx.message_text)
         low_guard_enabled = self._context_bool(ctx, "low_information_guard_enabled", True)
@@ -4208,15 +4235,34 @@ class MemoryCompanionService:
                 "route_layer": decision.layer,
             }
             blocked = [{"id": "", "reason": "empty_retrieval_query", "content": ""}]
+            intent_context = "\n".join(decision.guard_lines)
+            injection = ""
+            if recent_fact_context or recent_cross_window_context:
+                injection = self.injection.compose(
+                    ctx,
+                    [],
+                    self.config.int("memory_injection.max_chars", 1800),
+                    intent_context=intent_context,
+                    emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"),
+                    intimacy_level=getattr(turn_signal, "intimacy_level", 0.0),
+                    companion_bot_mood=getattr(intent, "companion_bot_mood", "") or "",
+                    companion_bot_energy=getattr(intent, "companion_bot_energy", 0.0) or 0.0,
+                    time_of_day=self._compute_time_of_day(),
+                    recent_fact_context=recent_fact_context,
+                    recent_cross_window_context=recent_cross_window_context,
+                )
             self._log_injection_debug(
                 ctx=ctx,
                 intent=intent,
                 results=[],
                 slot_map={},
                 blocked=blocked,
-                conversation_memory="",
-                intent_context="",
-                injection="",
+                conversation_memory=self._conversation_memory_injection_note(
+                    {},
+                    recent_fact_context=(recent_fact_context if "<recent_fact_context>" in injection else ""),
+                ),
+                intent_context=intent_context,
+                injection=injection,
                 note="empty_retrieval_query",
                 retrieval_info=retrieval_path_info,
             )
@@ -4227,8 +4273,20 @@ class MemoryCompanionService:
                     query="",
                     selected_memory_ids=[],
                     blocked_reasons=blocked,
-                    injection_chars=0,
+                    injection_chars=len(injection),
                 )
+            if injection:
+                self._mark_memory_companion_injection_state(
+                    event,
+                    req,
+                    injected=True,
+                    conversation_memory=False,
+                    slot_map={},
+                )
+                if append_temp_text(req, injection):
+                    return
+                prompt = clean_text(getattr(req, "prompt", "") or "", 8000)
+                req.prompt = f"{prompt}\n\n{injection}" if prompt else injection
             return
         blocked: list[dict[str, Any]] = []
         retrieval_path_info: dict[str, Any] = {
@@ -4346,6 +4404,7 @@ class MemoryCompanionService:
             cross_window_emotional_hint=self._get_cross_window_emotional_hint(ctx),
             address_hint=self._address_hint_for_injection(ctx),
             recent_fact_context=recent_fact_context,
+            recent_cross_window_context=recent_cross_window_context,
         )
         conversation_memory_note = self._conversation_memory_injection_note(
             slot_map,
@@ -4607,6 +4666,122 @@ class MemoryCompanionService:
             return ""
         text = text.split("[引用链上下文]", 1)[0]
         return clean_text(text, 180)
+
+    @staticmethod
+    def _message_explicitly_shares_private_context(text: Any) -> bool:
+        compact = re.sub(r"\s+", "", clean_text(text, 800)).lower()
+        if not compact:
+            return False
+        if re.search(r"(?:不要|别|不许|禁止|不能|不可以|拒绝).{0,16}(?:私聊|私信|小窗|单聊)", compact):
+            return False
+        if re.search(r"(?:私聊|私信|小窗|单聊).{0,16}(?:不要|别|不许|禁止|不能|不可以|拒绝).{0,12}(?:群|公开|说|提|发|同步|带)", compact):
+            return False
+        private_reference = r"(?:私聊|私信|小窗|单聊|单独聊)"
+        group_destination = r"(?:群里|群聊|这个群|大家|公开)"
+        private_then_group = re.search(
+            rf"{private_reference}.{{0,24}}(?:带到|拿到|同步到|转到|发到|贴到|放到|接到|搬到|公开给|告诉).{{0,8}}{group_destination}",
+            compact,
+        )
+        group_then_private = re.search(
+            rf"{group_destination}.{{0,16}}(?:继续|接着|说|聊|同步|公开|提起|提到).{{0,20}}{private_reference}",
+            compact,
+        )
+        private_in_group = re.search(
+            rf"{private_reference}.{{0,20}}(?:在|到).{{0,6}}{group_destination}.{{0,12}}(?:继续|接着|说|聊|同步|公开|提起|提到)",
+            compact,
+        )
+        return bool(private_then_group or group_then_private or private_in_group)
+
+    async def _recent_cross_window_context(self, ctx: SessionContext) -> str:
+        if not self._context_bool(ctx, "cross_window_recent_continuity_enabled", True):
+            return ""
+        if ctx.scope not in {"private", "group"}:
+            return ""
+        current_session_id = clean_text(ctx.session_id, 200)
+        current_user_id = clean_text(ctx.user_id, 120)
+        current_bot_id = clean_text(ctx.bot_id, 120)
+        current_platform = clean_text(ctx.platform, 80).lower()
+        if not current_session_id or not current_user_id or not current_bot_id or not current_platform:
+            return ""
+
+        if ctx.scope == "private":
+            if not self._context_bool(ctx, "cross_window_group_to_private_enabled", True):
+                return ""
+            source_scope = "group"
+            direction = "近期群聊到当前私聊"
+        else:
+            source_scope = "private"
+            if not self._context_bool(ctx, "cross_window_private_to_group_enabled", True):
+                return ""
+            if not self._message_explicitly_shares_private_context(ctx.message_text):
+                return ""
+            direction = "经当前用户本轮明确授权，从近期私聊到当前群聊"
+
+        ttl_minutes = max(1, min(24 * 60, self._context_int(ctx, "cross_window_recent_minutes", 30)))
+        event_limit = max(1, min(12, self._context_int(ctx, "cross_window_recent_event_limit", 6)))
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=ttl_minutes)
+        rows = await self.store.recent_cross_window_timeline(
+            source_scope=source_scope,
+            current_session_id=current_session_id,
+            since_at=cutoff.isoformat(timespec="seconds"),
+            limit=max(32, event_limit * 8),
+        )
+        if not rows:
+            return ""
+
+        selected: list[dict[str, Any]] = []
+        for row in rows:
+            raw_metadata = row.get("metadata")
+            metadata = raw_metadata if isinstance(raw_metadata, dict) else json_loads(raw_metadata, {})
+            if not isinstance(metadata, dict):
+                continue
+            if clean_text(metadata.get("owner_bot_id"), 120) != current_bot_id:
+                continue
+            if clean_text(metadata.get("platform"), 80).lower() != current_platform:
+                continue
+            if clean_text(metadata.get("participant_user_id"), 120) != current_user_id:
+                continue
+
+            event_type = clean_text(row.get("event_type"), 40)
+            subject_id = clean_text(row.get("subject_id"), 120)
+            if event_type == "user_message":
+                if subject_id != current_user_id:
+                    continue
+                speaker = "当前用户"
+            elif event_type == "bot_response":
+                if subject_id not in {current_bot_id, "self"}:
+                    continue
+                speaker = "Bot"
+            else:
+                continue
+
+            occurred_at = self._parse_utc_datetime(
+                clean_text(row.get("occurred_at") or row.get("created_at"), 80)
+            )
+            if occurred_at is None or occurred_at < cutoff:
+                continue
+            visible = self._sanitize_visible_timeline_text(row.get("content"))
+            snippet = self._recent_fact_direct_text(visible)
+            snippet = self.injection._redact_sensitive_text(snippet)
+            if not snippet:
+                continue
+            selected.append(
+                {
+                    "occurred_at": occurred_at,
+                    "speaker": speaker,
+                    "text": clean_text(snippet, 160),
+                }
+            )
+            if len(selected) >= event_limit:
+                break
+
+        if not selected:
+            return ""
+        lines = [f"方向：{direction}；有效窗口：近 {ttl_minutes} 分钟；仅含当前用户与同一 Bot 的片段。"]
+        for item in reversed(selected):
+            local_time = item["occurred_at"].astimezone(ZoneInfo("Asia/Shanghai")).strftime("%H:%M")
+            lines.append(f"{local_time} {item['speaker']}：{item['text']}")
+        return clean_text(" | ".join(lines), 1100)
 
     async def _recent_fact_guard_context(self, ctx: SessionContext) -> str:
         if ctx.scope != "private" or not ctx.session_id or not ctx.user_id:

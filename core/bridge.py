@@ -109,6 +109,73 @@ class MemoryCompanionBridge:
         """Record a real visible chat turn into the short-term timeline only."""
         return await self._plugin.record_visible_turn(role=role, content=content, **kwargs)
 
+    async def record_shared_experience(
+        self,
+        *,
+        content: str,
+        experience_type: str,
+        bot_id: str = "",
+        bot_name: str = "",
+        user_id: str = "",
+        user_name: str = "",
+        scope: str = "private",
+        session_id: str = "",
+        platform: str = "",
+        source_plugin: str = "external",
+        memory_id: str = "",
+        confidence: float = 0.9,
+        importance: float = 0.7,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """Record one distilled call/watch experience with explicit ownership."""
+        normalized_type = clean_text(experience_type, 40).lower()
+        if normalized_type in {"watch", "shared_watch", "video"}:
+            memory_type = "shared_watch"
+            experience_tag = "watch"
+        elif normalized_type in {"call", "shared_call", "voice"}:
+            memory_type = "shared_call"
+            experience_tag = "call"
+        else:
+            memory_type = "shared_experience"
+            experience_tag = normalized_type or "shared"
+        subject = EntityRef.bot_self(bot_id=bot_id, bot_name=bot_name)
+        target = EntityRef(
+            kind="user",
+            id=clean_text(user_id, 120),
+            name=clean_text(user_name, 80),
+            role="shared_experience_partner",
+        )
+        return await self.record_event(
+            content=content,
+            memory_type=memory_type,
+            scope=scope,
+            session_id=session_id,
+            platform=platform,
+            subject={
+                "kind": subject.kind,
+                "id": subject.id,
+                "name": subject.name,
+                "role": subject.role,
+            },
+            object={
+                "kind": target.kind,
+                "id": target.id,
+                "name": target.name,
+                "role": target.role,
+            },
+            visibility="bot_self",
+            sayability="direct",
+            reality_level="bot_action",
+            lifecycle="stable_memory",
+            confidence=confidence,
+            importance=importance,
+            review_status="auto",
+            tags=["shared_experience", experience_tag, "bot_action"],
+            metadata=metadata or {},
+            source_plugin=source_plugin,
+            memory_id=memory_id,
+        )
+
     async def record_search_action(self, *, content: str, **kwargs: Any) -> str:
         kwargs.setdefault("memory_type", "search_action")
         kwargs.setdefault("visibility", "bot_self")

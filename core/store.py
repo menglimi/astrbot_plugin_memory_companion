@@ -499,6 +499,9 @@ class MemoryStore:
                 "CREATE INDEX IF NOT EXISTS idx_timeline_summary ON timeline(session_id, summarized_at, occurred_at)"
             )
             self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_timeline_scope_recent ON timeline(scope, occurred_at DESC)"
+            )
+            self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_timeline_retention ON timeline(occurred_at, created_at) WHERE summarized_at!=''"
             )
             self._conn.execute(
@@ -2698,6 +2701,49 @@ class MemoryStore:
                 LIMIT ?
                 """,
                 params + [max(1, int(limit))],
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    async def recent_cross_window_timeline(
+        self,
+        *,
+        source_scope: str,
+        current_session_id: str,
+        since_at: str,
+        limit: int = 48,
+    ) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._recent_cross_window_timeline_sync,
+            source_scope,
+            current_session_id,
+            since_at,
+            limit,
+        )
+
+    def _recent_cross_window_timeline_sync(
+        self,
+        source_scope: str,
+        current_session_id: str,
+        since_at: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        scope = clean_text(source_scope, 40)
+        session_id = clean_text(current_session_id, 200)
+        cutoff = clean_text(since_at, 80)
+        if scope not in {"private", "group"} or not session_id or not cutoff:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM timeline
+                WHERE scope=?
+                  AND session_id!=?
+                  AND occurred_at>=?
+                  AND event_type IN ('user_message', 'bot_response')
+                ORDER BY occurred_at DESC, created_at DESC
+                LIMIT ?
+                """,
+                (scope, session_id, cutoff, max(1, min(240, int(limit or 48)))),
             ).fetchall()
         return [dict(row) for row in rows]
 

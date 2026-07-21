@@ -139,7 +139,7 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn(':root[data-overview-layout="standard"] .projection-stage', styles)
         self.assertIn(".film-app.is-workspace .overview-layout-switch", styles)
         self.assertIn("@media(max-width:760px)", styles)
-        self.assertIn("app.js?v=20260719-overview-switch", page)
+        self.assertIn("app.js?v=20260721-labeled-chat-import", page)
 
         ids = re.findall(r'\bid="([^"]+)"', page)
         self.assertEqual(len(ids), len(set(ids)), "记忆面板不能包含重复 HTML id")

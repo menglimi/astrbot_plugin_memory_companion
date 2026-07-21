@@ -544,6 +544,36 @@
         "hint": "开启后，群聊不会因普通请求带出其他成员画像；获准共享的私聊记忆只在明确回忆或个性化请求中，且当前发言者或点名对象匹配时注入。",
         "type": "bool",
         "default": true
+      },
+      "cross_window_recent_continuity_enabled": {
+        "description": "跨窗口近期衔接",
+        "hint": "开启后，为同一平台、同一 Bot 和同一用户生成少量短时上下文片段，使群聊与私聊切换后可以自然续接；不会回灌完整聊天记录。",
+        "type": "bool",
+        "default": true
+      },
+      "cross_window_recent_minutes": {
+        "description": "跨窗口衔接有效分钟",
+        "hint": "只读取该分钟数内相反会话类型的近期消息，过期内容不会进入跨窗口上下文。",
+        "type": "int",
+        "default": 30
+      },
+      "cross_window_recent_event_limit": {
+        "description": "跨窗口衔接片段数",
+        "hint": "每轮最多提供多少条当前用户与同一 Bot 的近期往返片段。默认 6 条，避免把原始历史整段塞给模型。",
+        "type": "int",
+        "default": 6
+      },
+      "cross_window_group_to_private_enabled": {
+        "description": "群聊衔接到私聊",
+        "hint": "开启后，当前用户参与的近期群聊内容可在其私聊中作为语义续接参考。",
+        "type": "bool",
+        "default": true
+      },
+      "cross_window_private_to_group_enabled": {
+        "description": "允许私聊授权后衔接群聊",
+        "hint": "开启后，当前用户可在群聊本轮明确授权，把自己的近期私聊话题带到群里；明确授权始终是必要条件。关闭后完全禁用该方向。",
+        "type": "bool",
+        "default": true
       }
     }
   },
