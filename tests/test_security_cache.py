@@ -166,6 +166,72 @@ class SecurityAndCacheTests(unittest.IsolatedAsyncioTestCase):
         events = service.bridge_get_emotional_events(session_id="")
         self.assertEqual(["emotion-1"], [item["id"] for item in events])
 
+    async def test_note_tools_keep_read_and_delete_scoped_to_current_bot(self) -> None:
+        service = self.make_service({"retrieval": {"embedding_enabled": False}})
+
+        async def resolve_event_context(event):
+            return event
+
+        service.identity = SimpleNamespace(resolve_event_context=resolve_event_context)
+        current = SessionContext(session_id="qq:FriendMessage:u1", scope="private", bot_id="b1")
+        other = SessionContext(session_id="qq:FriendMessage:u2", scope="private", bot_id="b2")
+        own = await service.tool_note_create(current, "当前 Bot 的笔记", "只允许 b1 读取和删除")
+        foreign = await service.tool_note_create(other, "另一个 Bot 的笔记", "只允许 b2 读取和删除")
+        ordinary = await service.store.insert_memory(self.group_memory("普通长期记忆不能由笔记工具删除"))
+
+        visible = await service.tool_note_read(current, "", limit=20)
+        self.assertEqual([own["memory_id"]], [item["id"] for item in visible["notes"]])
+
+        denied = await service.tool_note_delete(current, foreign["memory_id"])
+        self.assertEqual({"ok": False, "error": "note not found"}, denied)
+        self.assertIsNotNone(await service.store.get_memory(foreign["memory_id"]))
+
+        wrong_type = await service.tool_note_delete(current, ordinary)
+        self.assertEqual({"ok": False, "error": "note not found"}, wrong_type)
+        self.assertIsNotNone(await service.store.get_memory(ordinary))
+
+        deleted = await service.tool_note_delete(current, own["memory_id"])
+        self.assertTrue(deleted["ok"])
+        self.assertTrue(deleted["deleted"])
+        self.assertIsNone(await service.store.get_memory(own["memory_id"]))
+
+    async def test_note_delete_requires_unique_exact_title_or_memory_id(self) -> None:
+        service = self.make_service({"retrieval": {"embedding_enabled": False}})
+
+        async def resolve_event_context(event):
+            return event
+
+        service.identity = SimpleNamespace(resolve_event_context=resolve_event_context)
+        ctx = SessionContext(session_id="qq:FriendMessage:u1", scope="private", bot_id="b1")
+        first = await service.tool_note_create(ctx, "周末计划", "第一版")
+        second = await service.tool_note_create(ctx, "周末计划", "第二版")
+        unique = await service.tool_note_create(ctx, "阅读清单", "读完测试文档")
+
+        ambiguous = await service.tool_note_delete(ctx, title="周末计划")
+        self.assertFalse(ambiguous["ok"])
+        self.assertEqual("ambiguous note title", ambiguous["error"])
+        self.assertEqual({first["memory_id"], second["memory_id"]}, {item["memory_id"] for item in ambiguous["matches"]})
+
+        fuzzy = await service.tool_note_delete(ctx, title="阅读")
+        self.assertFalse(fuzzy["ok"])
+        self.assertEqual("title match requires confirmation", fuzzy["error"])
+        self.assertEqual(unique["memory_id"], fuzzy["matches"][0]["memory_id"])
+        self.assertIsNotNone(await service.store.get_memory(unique["memory_id"]))
+
+        deleted = await service.tool_note_delete(ctx, title="阅读清单")
+        self.assertTrue(deleted["ok"])
+        self.assertIsNone(await service.store.get_memory(unique["memory_id"]))
+
+    def test_note_delete_llm_tool_is_registered_and_documented(self) -> None:
+        main = (ROOT / "main.py").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        schema = (ROOT / "_conf_schema.json").read_text(encoding="utf-8")
+
+        self.assertIn('@filter.llm_tool(name="memory_companion_note_delete")', main)
+        self.assertIn("memory_tools.enable_note_tools", main)
+        self.assertIn("memory_companion_note_delete", readme)
+        self.assertIn("创建、读取和删除当前 Bot", schema)
+
     def test_photo_path_is_confined_and_local_path_is_not_exposed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)

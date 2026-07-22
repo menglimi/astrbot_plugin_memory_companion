@@ -16,7 +16,7 @@ from .core.models import json_dumps
 from .core.service import MemoryCompanionService
 
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
-PLUGIN_VERSION = "1.6.2"
+PLUGIN_VERSION = "1.6.3"
 
 _ACTIVE_BRIDGE: MemoryCompanionBridge | None = None
 
@@ -154,6 +154,26 @@ class MemoryCompanionPlugin(Star):
             event,
             str(kwargs.get("query") or ""),
             int(kwargs.get("limit") or 5),
+        )
+        return json_dumps(result)
+
+    @filter.llm_tool(name="memory_companion_note_delete")
+    async def memory_companion_note_delete_tool(self, event: AstrMessageEvent, **kwargs: Any) -> str:
+        """删除一条当前 Bot 自己创建的陪伴笔记。
+
+        只在笔记已经过期、不再需要或用户明确要求清理时使用。优先传入 note_read 返回的 memory_id；
+        仅有标题且不是唯一精确匹配时，应先读取返回的候选，再使用 memory_id 确认删除。
+
+        Args:
+            memory_id(string): 可选，要删除的笔记 ID。
+            title(string): 可选，笔记标题；只有唯一精确匹配时会直接删除。
+        """
+        if not self.service.config.bool("memory_tools.enable_note_tools", True):
+            return json_dumps({"ok": False, "error": "note tools disabled"})
+        result = await self.service.tool_note_delete(
+            event,
+            str(kwargs.get("memory_id") or ""),
+            title=str(kwargs.get("title") or ""),
         )
         return json_dumps(result)
 

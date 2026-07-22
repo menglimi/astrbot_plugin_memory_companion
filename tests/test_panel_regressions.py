@@ -112,7 +112,54 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn("height:calc(100% - 16px)", image_block.group(1))
         self.assertIn("object-fit:contain", image_block.group(1))
         self.assertIn("height:clamp(480px, 62vh, 820px)", drawer_block.group(1))
-        self.assertIn("app.css?v=20260719-overview-switch", page)
+        self.assertIn("app.css?v=20260723-mobile-polish", page)
+
+    def test_mobile_workspace_uses_page_scroll_instead_of_clipping_content(self) -> None:
+        styles = (ROOT / "pages" / "记忆面板" / "app.css").read_text(encoding="utf-8")
+        tablet_start = styles.index("@media(max-width:1080px)")
+        phone_start = styles.index("@media(max-width:760px)", tablet_start)
+        responsive_workspace = styles[tablet_start:phone_start]
+
+        self.assertIn(
+            ".film-app.is-workspace .workspace-frame{\n    max-height:none;\n  }",
+            responsive_workspace,
+        )
+        self.assertIn(
+            ".film-app.is-workspace:not(.is-personal-memory) .workspace-main{\n"
+            "    min-height:320px;\n"
+            "    height:auto;\n"
+            "    max-height:none;\n"
+            "    overflow:visible;\n"
+            "  }",
+            responsive_workspace,
+        )
+        self.assertIn(
+            ".film-app.is-workspace:not(.is-personal-memory) .view.is-active{\n"
+            "    display:block;\n"
+            "    height:auto;\n"
+            "    min-height:0;\n"
+            "    overflow:visible;\n"
+            "  }",
+            responsive_workspace,
+        )
+
+    def test_mobile_controls_and_schedule_preserve_native_touch_behavior(self) -> None:
+        page = (ROOT / "pages" / "记忆面板" / "index.html").read_text(encoding="utf-8")
+        script = (ROOT / "pages" / "记忆面板" / "app.js").read_text(encoding="utf-8")
+        styles = (ROOT / "pages" / "记忆面板" / "app.css").read_text(encoding="utf-8")
+        phone_start = styles.index("@media(max-width:760px)")
+        narrow_start = styles.index("@media(max-width:420px)", phone_start)
+        phone_styles = styles[phone_start:narrow_start]
+
+        self.assertIn("viewport-fit=cover", page)
+        self.assertIn("min-height:100dvh", styles)
+        self.assertIn("touch-action:pan-y", styles)
+        self.assertIn("font-size:16px", phone_styles)
+        self.assertIn("min-height:44px", phone_styles)
+        self.assertIn("-webkit-overflow-scrolling:touch", phone_styles)
+        self.assertIn("overscroll-behavior:contain", phone_styles)
+        self.assertIn('dragAxis = Math.abs(dx) > Math.abs(dy) ? "horizontal" : "vertical"', script)
+        self.assertIn('#view-persona{\n    max-height:none;\n    overflow:visible;', styles)
 
     def test_overview_layout_switch_is_visible_persistent_and_accessible(self) -> None:
         page = (ROOT / "pages" / "记忆面板" / "index.html").read_text(encoding="utf-8")
@@ -139,7 +186,7 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn(':root[data-overview-layout="standard"] .projection-stage', styles)
         self.assertIn(".film-app.is-workspace .overview-layout-switch", styles)
         self.assertIn("@media(max-width:760px)", styles)
-        self.assertIn("app.js?v=20260721-labeled-chat-import", page)
+        self.assertIn("app.js?v=20260723-mobile-polish", page)
 
         ids = re.findall(r'\bid="([^"]+)"', page)
         self.assertEqual(len(ids), len(set(ids)), "记忆面板不能包含重复 HTML id")

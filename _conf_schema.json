@@ -773,7 +773,7 @@
       },
       "enable_note_tools": {
         "description": "启用陪伴笔记工具",
-        "hint": "开启后模型可创建和读取 Bot 自己可见的 companion_note，用于日程、状态、创作草稿和陪伴线索整理。",
+        "hint": "开启后模型可创建、读取和删除当前 Bot 自己可见的 companion_note，用于日程、状态、创作草稿和陪伴线索整理。",
         "type": "bool",
         "default": true
       }

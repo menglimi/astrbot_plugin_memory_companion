@@ -187,7 +187,7 @@
 }
 *{box-sizing:border-box}
 body{
-  margin:0;min-height:100vh;
+  margin:0;min-height:100vh;min-height:100dvh;
   background:var(--page-bg);
   color:var(--ink);
   font-family:"Segoe UI","Microsoft YaHei","PingFang SC",system-ui,sans-serif;
@@ -2250,7 +2250,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
   background:transparent;
   box-shadow:0 18px 42px rgba(var(--dark-rgb),.26);
   transition:width .64s cubic-bezier(.14,.78,.16,1);
-  touch-action:none;
+  touch-action:pan-y;
 }
 .schedule-film.is-rail-mounted{
   position:absolute;
@@ -4356,7 +4356,12 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
   .object-rail,.workspace-main,.detail-drawer{min-height:auto}
   .film-app.is-workspace:not(.is-personal-memory) .workspace-main{
     min-height:320px;
-    max-height:min(620px, 58vh);
+    height:auto;
+    max-height:none;
+    overflow:visible;
+  }
+  .film-app.is-workspace .workspace-frame{
+    max-height:none;
   }
   .film-app.is-workspace.is-conversation-import .workspace-main{
     height:auto;
@@ -4364,8 +4369,18 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
     overflow:visible;
   }
   .film-app.is-workspace:not(.is-personal-memory) .view.is-active{
-    height:100%;
+    display:block;
+    height:auto;
     min-height:0;
+    overflow:visible;
+  }
+  .film-app.is-workspace:not(.is-personal-memory) .page-panel-stack,
+  .film-app.is-workspace:not(.is-personal-memory) .archive-grid,
+  .film-app.is-workspace:not(.is-personal-memory) .row-list,
+  .film-app.is-workspace:not(.is-personal-memory) .result-grid,
+  .film-app.is-workspace:not(.is-personal-memory) .config-panel-stack{
+    overflow:visible;
+    padding-right:0;
   }
   .film-app.is-workspace.is-conversation-import #view-archive{
     height:auto;
@@ -4470,6 +4485,25 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
   .detail-drawer{position:static}
 }
 @media(max-width:760px){
+  body{
+    padding:
+      env(safe-area-inset-top, 0px)
+      env(safe-area-inset-right, 0px)
+      env(safe-area-inset-bottom, 0px)
+      env(safe-area-inset-left, 0px);
+  }
+  button,
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="hidden"]):not([type="file"]),
+  select{
+    min-height:44px;
+  }
+  input,textarea,select{font-size:16px}
+  .memory-raw-detail summary,
+  .persona-address-log summary{
+    display:flex;
+    align-items:center;
+    min-height:44px;
+  }
   .overview-layout-switch{
     top:18px;
     left:18px;
@@ -4503,8 +4537,8 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
   }
   .overview-section-head{align-items:flex-end}
   .film-app{
-    width:calc(100vw - 12px);
-    margin:8px auto;
+    width:auto;
+    margin:8px 6px;
     padding:10px;
   }
   .memory-manage-grid{
@@ -4543,7 +4577,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
   .conversation-import-layout{
     grid-template-columns:1fr;
     min-height:0;
-    overflow:auto;
+    overflow:visible;
   }
   .conversation-import-source,
   .conversation-import-output{
@@ -4684,6 +4718,18 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
     overflow:auto;
     padding-right:2px;
   }
+  .bucket-window,
+  .bucket-list,
+  .row-list,
+  .action-strip,
+  .track-strip,
+  .json-box,
+  .detail-drawer pre,
+  .memory-raw-detail pre,
+  .topo-canvas-wrap{
+    -webkit-overflow-scrolling:touch;
+    overscroll-behavior:contain;
+  }
   .bucket{min-height:86px;padding:12px 10px}
   .memory-frame{
     grid-template-columns:1fr;
@@ -4750,7 +4796,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
 }
 @media(max-width:420px){
   .overview-layout-switch{top:14px;left:12px;right:12px}
-  .overview-layout-option{min-height:36px;font-size:12px}
+  .overview-layout-option{min-height:44px;font-size:12px}
   .standard-overview{padding-top:56px}
   .standard-overview-head{padding-inline:2px}
   .standard-overview-head h1{font-size:26px}
@@ -4764,7 +4810,8 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
   .overview-scope-count{grid-column:2;text-align:left}
   .overview-quick-grid{grid-template-columns:1fr}
   .film-app{
-    width:calc(100vw - 8px);
+    width:auto;
+    margin-inline:4px;
     padding:8px;
   }
   .workspace-head{padding:10px}
@@ -4948,4 +4995,12 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
   .topo-legend{flex-direction:column;align-items:flex-start;gap:6px}
   .topo-legend-hint{margin-left:0}
   .topo-canvas-wrap{max-height:400px}
+}
+
+@media(max-width:1080px){
+  #view-persona{
+    max-height:none;
+    overflow:visible;
+  }
+  #view-persona .section-head{position:static}
 }

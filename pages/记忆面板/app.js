@@ -2648,8 +2648,10 @@ function setupScheduleFilmDrag(film, selectSchedule) {
   if (!track) return;
   let isDown = false;
   let startX = 0;
+  let startY = 0;
   let startOffset = 0;
   let moved = 0;
+  let dragAxis = "";
   let lastSelected = "";
   const selectNearestAtMarker = () => {
     const nearest = nearestScheduleFrame(film);
@@ -2663,15 +2665,24 @@ function setupScheduleFilmDrag(film, selectSchedule) {
     if (event.button !== undefined && event.button !== 0) return;
     isDown = true;
     moved = 0;
+    dragAxis = "";
     startX = event.clientX;
+    startY = event.clientY;
     startOffset = Number(film.dataset.offset || 0);
-    film.classList.add("is-dragging");
-    film.setPointerCapture?.(event.pointerId);
   });
   film.addEventListener("pointermove", (event) => {
     if (!isDown) return;
-    event.preventDefault();
     const dx = event.clientX - startX;
+    const dy = event.clientY - startY;
+    if (!dragAxis) {
+      if (Math.max(Math.abs(dx), Math.abs(dy)) < 6) return;
+      dragAxis = Math.abs(dx) > Math.abs(dy) ? "horizontal" : "vertical";
+      if (dragAxis === "vertical") return;
+      film.classList.add("is-dragging");
+      film.setPointerCapture?.(event.pointerId);
+    }
+    if (dragAxis !== "horizontal") return;
+    event.preventDefault();
     moved = Math.max(moved, Math.abs(dx));
     applyScheduleFilmOffset(film, startOffset + dx);
     selectNearestAtMarker();
@@ -2679,10 +2690,10 @@ function setupScheduleFilmDrag(film, selectSchedule) {
   const finish = (event) => {
     if (!isDown) return;
     isDown = false;
-    const nearest = moved > 8 ? nearestScheduleFrame(film) : null;
+    const nearest = dragAxis === "horizontal" && moved > 8 ? nearestScheduleFrame(film) : null;
     film.classList.remove("is-dragging");
-    film.releasePointerCapture?.(event.pointerId);
-    if (moved > 8) {
+    if (film.hasPointerCapture?.(event.pointerId)) film.releasePointerCapture(event.pointerId);
+    if (dragAxis === "horizontal" && moved > 8) {
       film.dataset.draggingClick = "1";
       if (nearest) selectSchedule(nearest.dataset.scheduleIndex, { preserveOffset: true });
       window.setTimeout(() => {

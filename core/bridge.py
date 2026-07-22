@@ -287,6 +287,9 @@ class MemoryCompanionBridge:
     async def read_notes(self, *, event: Any, query: str = "", limit: int = 5) -> dict[str, Any]:
         return await self._plugin.tool_note_read(event, query, limit=limit)
 
+    async def delete_note(self, *, event: Any, memory_id: str = "", title: str = "") -> dict[str, Any]:
+        return await self._plugin.tool_note_delete(event, memory_id, title=title)
+
     def coordination_status(self) -> dict[str, Any]:
         getter = getattr(self._plugin, "companion_coordination_status", None)
         if callable(getter):

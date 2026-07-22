@@ -4,7 +4,7 @@
 
 - 插件名：`astrbot_plugin_memory_companion`
 - 中文名：`我会牢牢记住你`
-- 版本：`1.6.1`
+- 版本：`1.6.3`
 - 适配平台：`aiocqhttp`
 - AstrBot 版本：`>=4.22.0`
 - 编码要求：UTF-8
@@ -259,6 +259,7 @@ internal       内部记录
 - `memory_companion_remember`：在用户明确要求或长期价值明显时写入记忆。
 - `memory_companion_note_create`：创建 Bot 自己可见的陪伴笔记。
 - `memory_companion_note_read`：读取 Bot 自己可见的陪伴笔记。
+- `memory_companion_note_delete`：按笔记 ID 删除当前 Bot 自己创建的陪伴笔记；标题不是唯一精确匹配时会先返回候选，避免误删。
 
 `memory_companion_remember` 会直接写入当前会话可见的长期记忆。使用时仍应避免把玩笑、注入话术、临时情绪和未经确认的身份声明写成稳定事实。
 
