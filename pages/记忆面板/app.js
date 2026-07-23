@@ -186,6 +186,7 @@ const state = {
   personalEntranceRevealRequested: false,
   personalAlignTimer: 0,
   historicalChatPreview: null,
+  historicalChatPreviewSource: "",
   historicalChatBatchId: "",
   historicalChatPollTimer: 0,
   historicalChatFile: null,
@@ -4706,6 +4707,25 @@ function clearConversationImportResult() {
   box.innerHTML = "";
 }
 
+function showConversationImportError(title, error, retryTask) {
+  const box = $("#conversationImportResult");
+  if (!box) return;
+  const message = String(error?.message || error || "操作失败");
+  box.hidden = false;
+  box.innerHTML = `
+    <div class="chat-import-callout is-warning" role="alert">
+      <b>${escapeHtml(title || "读取失败")}</b>
+      <span>${escapeHtml(message)}</span>
+      <small>请检查文件格式、大小和来源后重试；已生成的记忆不会受到影响。</small>
+    </div>
+    ${typeof retryTask === "function" ? '<div class="chat-import-primary-actions"><button id="conversationImportRetryBtn" type="button">重新尝试</button></div>' : ""}
+  `;
+  showHistoricalChatOutput(true);
+  $("#conversationImportRetryBtn")?.addEventListener("click", (event) => {
+    withButton(event.currentTarget, "重试中", retryTask);
+  });
+}
+
 function applyConversationImportSource() {
   const source = conversationImportSource();
   $$('[data-import-source]').forEach((panel) => {
@@ -4722,8 +4742,15 @@ function applyConversationImportSource() {
 
 async function selectConversationImportSource(source) {
   if (!["qq", "file", "recent"].includes(source)) return;
+  const changed = state.conversationImportSource !== source;
   state.conversationImportSource = source;
   applyConversationImportSource();
+  if (changed) {
+    clearConversationImportResult();
+    const matchingPreview = state.historicalChatPreviewSource === source ? state.historicalChatPreview : null;
+    renderHistoricalChatPreview(matchingPreview);
+    if (!matchingPreview && !state.historicalChatBatchId) setHistoricalChatStep(0);
+  }
   if (source === "qq") {
     await loadQQHistoryCapabilities();
   } else if (source === "recent") {
@@ -4858,9 +4885,14 @@ async function previewQQHistoryImport() {
     });
   } catch (error) {
     setHistoricalChatStep(0);
+    state.historicalChatPreview = null;
+    state.historicalChatPreviewSource = "";
+    renderHistoricalChatPreview(null);
+    showConversationImportError("QQ 历史读取失败", error, previewQQHistoryImport);
     throw error;
   }
   state.historicalChatPreview = data.result || null;
+  state.historicalChatPreviewSource = "qq";
   state.historicalChatBatchId = "";
   renderHistoricalChatPreview(state.historicalChatPreview);
   setHistoricalChatStep(2);
@@ -4954,7 +4986,7 @@ function selectHistoricalChatFile(file) {
   const meta = $("#historicalChatFileMeta");
   const button = $("#historicalChatPreviewBtn");
   const dropzone = $("#historicalChatDropzone");
-  const validExtension = /\.(txt|log|md)$/i.test(String(file?.name || ""));
+  const validExtension = /\.(txt|log|md|json)$/i.test(String(file?.name || ""));
   const validSize = Number(file?.size || 0) > 0 && Number(file?.size || 0) <= 8 * 1024 * 1024;
   if (!file || !validExtension || !validSize) {
     state.historicalChatFile = null;
@@ -4962,16 +4994,17 @@ function selectHistoricalChatFile(file) {
     dropzone?.classList.remove("has-file");
     if (meta) {
       meta.textContent = file && !validExtension
-        ? "仅支持 TXT、LOG 或 Markdown 文件"
+        ? "仅支持 TXT、LOG、Markdown 或 QQChatExporter JSON 文件"
         : file && !validSize
           ? "文件必须大于 0 且不能超过 8 MiB"
-          : "支持 TXT、LOG、Markdown，最大 8 MiB";
+          : "支持 TXT、LOG、Markdown 和 QQChatExporter JSON，最大 8 MiB";
     }
     if (file) showToast(meta?.textContent || "文件不可用", "error");
     return;
   }
   state.historicalChatFile = file;
   state.historicalChatPreview = null;
+  state.historicalChatPreviewSource = "";
   state.historicalChatBatchId = "";
   clearConversationImportResult();
   renderHistoricalChatPreview(null);
@@ -5006,7 +5039,7 @@ function saveHistoricalChatIdentity(payload) {
 async function previewHistoricalChatImport() {
   const file = state.historicalChatFile || $("#historicalChatFile")?.files?.[0];
   if (!file) {
-    showToast("请先选择对话文本", "error");
+    showToast("请先选择聊天记录文件", "error");
     return;
   }
   if (file.size > 8 * 1024 * 1024) {
@@ -5026,9 +5059,14 @@ async function previewHistoricalChatImport() {
     });
   } catch (error) {
     setHistoricalChatStep(0);
+    state.historicalChatPreview = null;
+    state.historicalChatPreviewSource = "";
+    renderHistoricalChatPreview(null);
+    showConversationImportError("聊天文件解析失败", error, previewHistoricalChatImport);
     throw error;
   }
   state.historicalChatPreview = data.result || null;
+  state.historicalChatPreviewSource = "file";
   state.historicalChatBatchId = "";
   renderHistoricalChatPreview(state.historicalChatPreview);
   setHistoricalChatStep(2);
@@ -5223,6 +5261,9 @@ function applyHistoricalChatSuggestions() {
 function historicalChatImportPayload({ requireConfirmation = true } = {}) {
   const preview = state.historicalChatPreview;
   if (!preview) throw new Error("请先生成导入预览");
+  if (state.historicalChatPreviewSource !== conversationImportSource()) {
+    throw new Error("当前预览来自其他导入来源，请切回原来源或重新生成预览");
+  }
   const suggestions = Array.isArray(preview.speaker_suggestions) ? preview.speaker_suggestions : [];
   const userId = String($("#chatImportUserId")?.value || "").trim();
   const botId = String($("#chatImportBotId")?.value || "").trim();
@@ -5254,6 +5295,11 @@ function historicalChatImportPayload({ requireConfirmation = true } = {}) {
 }
 
 function historicalChatValidationMessage() {
+  const preview = state.historicalChatPreview;
+  const chatType = String(preview?.source_metadata?.chat_type || "").toLowerCase();
+  if (preview?.source_kind === "qq_chat_exporter" && chatType && chatType !== "private") {
+    return { valid: false, message: "该 JSON 是群聊记录，当前不能导入单用户私聊记忆" };
+  }
   let payload;
   try {
     payload = historicalChatImportPayload({ requireConfirmation: false });
@@ -5486,6 +5532,7 @@ function renderHistoricalChatStatus(result) {
 function resetHistoricalChatImportView() {
   stopHistoricalChatPoll();
   state.historicalChatPreview = null;
+  state.historicalChatPreviewSource = "";
   state.historicalChatBatchId = "";
   clearConversationImportResult();
   renderHistoricalChatPreview(null);

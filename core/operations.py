@@ -601,6 +601,21 @@ class PortableMemoryArchive:
         size = resolved.stat().st_size
         if size <= 0 or size > MAX_PORTABLE_BYTES:
             raise ValueError("portable archive must be between 1 byte and 64 MiB")
+        if resolved.suffix.lower() == ".json":
+            try:
+                candidate = json.loads(resolved.read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                candidate = None
+            metadata = candidate.get("metadata") if isinstance(candidate, dict) else None
+            if (
+                isinstance(metadata, dict)
+                and clean_text(metadata.get("name"), 80) == "QQChatExporter"
+                and isinstance(candidate.get("messages"), list)
+            ):
+                raise ValueError(
+                    "QQChatExporter 聊天记录 JSON 请在“历史聊天导入 → 文件导入”中选择；"
+                    "可移植数据只用于本插件导出的 JSONL 档案"
+                )
         records: list[dict[str, Any]] = []
         header: dict[str, Any] = {}
         with resolved.open("r", encoding="utf-8-sig") as handle:
@@ -623,6 +638,21 @@ class PortableMemoryArchive:
                 records.append(item)
         if not header:
             raise ValueError("portable archive header is missing")
+        declared_counts = header.get("counts")
+        if isinstance(declared_counts, dict):
+            actual_counts = Counter(str(item.get("record_type") or "unknown") for item in records)
+            supported_types = {"memory", "identity", "relationship", "timeline", "acl_rule", "acl_policy"}
+            for kind in supported_types.intersection(declared_counts):
+                try:
+                    expected = int(declared_counts[kind])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"portable archive count for {kind} is invalid") from exc
+                actual = int(actual_counts.get(kind) or 0)
+                if expected < 0 or actual != expected:
+                    raise ValueError(
+                        f"portable archive record count mismatch for {kind}: expected {expected}, got {actual}; "
+                        "archive may be truncated"
+                    )
         return header, records
 
 

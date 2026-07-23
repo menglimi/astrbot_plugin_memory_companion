@@ -176,6 +176,48 @@ class PortableArchiveTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 store.close()
 
+    async def test_qq_chat_exporter_json_is_directed_to_historical_chat_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            store = MemoryStore(base / "memory.db")
+            store.initialize()
+            try:
+                exported_chat = base / "qq-export.json"
+                exported_chat.write_text('{"metadata":{"name":"QQChatExporter"},"messages":[]}', encoding="utf-8")
+
+                archive = PortableMemoryArchive(store, base / "data")
+                with self.assertRaisesRegex(ValueError, "历史聊天导入"):
+                    archive.preview(str(exported_chat))
+            finally:
+                store.close()
+
+    async def test_portable_jsonl_keeps_working_when_file_uses_json_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            archive_path = base / "renamed.json"
+            archive_path.write_text(
+                '{"record_type":"header","format":"astrbot-memory-jsonl","version":1}\n',
+                encoding="utf-8",
+            )
+
+            header, records = PortableMemoryArchive._read(str(archive_path))
+
+        self.assertEqual(PORTABLE_FORMAT, header["format"])
+        self.assertEqual([], records)
+
+    async def test_truncated_portable_archive_is_rejected_by_declared_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            archive_path = Path(temp) / "truncated.jsonl"
+            archive_path.write_text(
+                '{"record_type":"header","format":"astrbot-memory-jsonl","version":1,'
+                '"counts":{"memory":2,"timeline":1}}\n',
+                encoding="utf-8",
+            )
+
+            archive = PortableMemoryArchive(object(), Path(temp) / "data")
+            with self.assertRaisesRegex(ValueError, "record count mismatch"):
+                archive.preview(str(archive_path))
+
 
 if __name__ == "__main__":
     unittest.main()

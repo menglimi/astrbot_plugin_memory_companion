@@ -17,7 +17,7 @@
       document.documentElement.dataset.overviewLayout = layout;
     })();
   </script>
-  <link rel="stylesheet" href="./app.css?v=20260723-mobile-polish" />
+  <link rel="stylesheet" href="./app.css?v=1.6.4" />
 </head>
 <body>
   <main id="app" class="film-app">
@@ -289,7 +289,7 @@
                     </section>
                     <section class="maintenance-action">
                       <b>3. 可移植数据</b>
-                      <p class="archive-note">UTF-8 JSONL 包含记忆、身份、关系、时间线与 ACL；不包含凭据、向量和注入日志。</p>
+                      <p class="archive-note">仅用于本插件导出的 UTF-8 JSONL，包含记忆、身份、关系、时间线与 ACL；QQChatExporter 聊天记录 JSON 请使用“历史聊天导入 / 文件导入”。</p>
                       <input id="portableArchivePath" type="text" placeholder="导入时填写 JSONL 路径；导出无需填写" />
                       <div class="inline-actions">
                         <button id="portableExportBtn" type="button">导出</button>
@@ -373,13 +373,13 @@
 
                   <section class="conversation-import-source" data-import-source="file" hidden>
                     <div class="conversation-import-source-head">
-                      <span><b>文件导入</b><small>适合 QQ 接口不可用、历史太久或已经有导出文本的情况。</small></span>
+                      <span><b>文件导入</b><small>适合 QQ 接口不可用、历史太久或已经有导出文件的情况。</small></span>
                     </div>
                     <label id="historicalChatDropzone" class="chat-import-dropzone" for="historicalChatFile" tabindex="0">
-                      <input id="historicalChatFile" class="visually-hidden" type="file" accept=".txt,.log,.md,text/plain,text/markdown" />
+                      <input id="historicalChatFile" class="visually-hidden" type="file" accept=".txt,.log,.md,.json,text/plain,text/markdown,application/json" />
                       <span class="chat-import-drop-icon" aria-hidden="true">＋</span>
                       <b>拖入聊天记录，或点击选择文件</b>
-                      <small id="historicalChatFileMeta">支持 TXT、LOG、Markdown，最大 8 MiB</small>
+                      <small id="historicalChatFileMeta">支持 TXT、LOG、Markdown 和 QQChatExporter 私聊 JSON，最大 8 MiB</small>
                     </label>
                     <div class="chat-import-inline-fields">
                       <label>缺失年份起点
@@ -389,7 +389,7 @@
                       <button id="historicalChatPreviewBtn" type="button" disabled>解析并预览</button>
                     </div>
                     <details class="chat-import-format-help">
-                      <summary>查看支持的文本格式</summary>
+                      <summary>查看支持的文件格式</summary>
                       <pre>烛雨: 2025-12-14 15:10:22
 消息正文，可包含多行
 
@@ -400,6 +400,7 @@ Bot: 12-14 15:10:30
 发送者：烛雨
 时间：2026-07-19 16:55:36
 内容：消息正文</pre>
+                      <p>也支持 <code>QQChatExporter</code> 导出的私聊 JSON。系统会保留原始消息 ID、序号和发送者 QQ，并将图片、语音等非文本消息标为可读占位；群聊包含多位用户，当前不能套入单用户私聊记忆。</p>
                     </details>
                   </section>
 
@@ -451,6 +452,6 @@ Bot: 12-14 15:10:30
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </main>
   <script src="/api/plugin/page/bridge-sdk.js"></script>
-  <script src="./app.js?v=20260723-mobile-polish"></script>
+  <script src="./app.js?v=1.6.4"></script>
 </body>
 </html>

@@ -2008,11 +2008,22 @@ class MemoryStore:
         return row_id
 
     async def add_historical_timeline_events(self, rows: list[dict[str, Any]]) -> dict[str, str]:
+        inserted, _ = await asyncio.to_thread(self._add_historical_timeline_events_sync, rows)
+        return inserted
+
+    async def add_historical_timeline_events_with_status(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> tuple[dict[str, str], set[str]]:
         return await asyncio.to_thread(self._add_historical_timeline_events_sync, rows)
 
-    def _add_historical_timeline_events_sync(self, rows: list[dict[str, Any]]) -> dict[str, str]:
+    def _add_historical_timeline_events_sync(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> tuple[dict[str, str], set[str]]:
         now = utc_now()
         inserted: dict[str, str] = {}
+        newly_inserted: set[str] = set()
         with self._lock:
             with self._transaction_sync():
                 for raw in rows:
@@ -2027,7 +2038,7 @@ class MemoryStore:
                     dedupe_key = stable_fingerprint("timeline", event_type, session_id, subject_id, message_id)
                     row_id = clean_text(raw.get("id"), 120) or new_id("tl")
                     metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
-                    self._conn.execute(
+                    cursor = self._conn.execute(
                         """
                         INSERT OR IGNORE INTO timeline(
                             id, event_type, session_id, scope, subject_id, object_id,
@@ -2055,13 +2066,15 @@ class MemoryStore:
                             max(0, int(raw.get("source_sequence") or 0)),
                         ),
                     )
+                    if cursor.rowcount > 0:
+                        newly_inserted.add(message_id)
                     existing = self._conn.execute(
                         "SELECT id FROM timeline WHERE dedupe_key=?",
                         (dedupe_key,),
                     ).fetchone()
                     if existing:
                         inserted[message_id] = clean_text(existing["id"], 120)
-        return inserted
+        return inserted, newly_inserted
 
     async def upsert_chat_import_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await asyncio.to_thread(self._upsert_chat_import_batch_sync, payload)

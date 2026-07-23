@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 import tempfile
 import unittest
@@ -174,6 +175,116 @@ b: 2026-01-01 09:00:00
         self.assertEqual(2, preview["stats"]["speaker_count"])
         self.assertTrue(any("字段式导出" in warning for warning in preview["warnings"]))
 
+    def test_qq_chat_exporter_json_upload_preserves_metadata_and_message_provenance(self) -> None:
+        payload = {
+            "metadata": {"name": "QQChatExporter", "version": "0.1.0"},
+            "chatInfo": {
+                "name": "山间之茶",
+                "type": "private",
+                "selfUid": "u_self",
+                "selfUin": "2732152361",
+                "selfName": "捕梦猫neko",
+                "peerUid": "u_peer",
+                "peerUin": "1374758454",
+            },
+            "messages": [
+                {
+                    "id": "m-1", "seq": "1", "timestamp": 1783852174000,
+                    "time": "2026-07-12T10:29:34.000Z",
+                    "sender": {"uid": "u_peer", "uin": "1374758454", "name": "山间之茶"},
+                    "type": "text", "content": {"text": "在吗"}, "recalled": False, "system": False,
+                },
+                {
+                    "id": "m-2", "seq": "2", "timestamp": 1783852227000,
+                    "sender": {"uid": "u_self", "uin": "2732152361", "name": "捕梦猫neko"},
+                    "type": "audio", "content": {"text": "", "elements": []}, "recalled": False, "system": False,
+                },
+                {
+                    "id": "m-3", "seq": "3", "timestamp": 1783852367000,
+                    "sender": {"uid": "u_peer", "uin": "1374758454", "name": "山间之茶"},
+                    "type": "image", "content": {"text": "", "elements": [{"type": "image", "data": {}}]},
+                    "recalled": False, "system": False,
+                },
+                {
+                    "id": "m-recalled", "seq": "4", "timestamp": 1783852373000,
+                    "sender": {"uin": "1374758454", "name": "山间之茶"},
+                    "type": "text", "content": {"text": "撤回"}, "recalled": True, "system": False,
+                },
+                {
+                    "id": "m-system", "seq": "5", "timestamp": 1783852374000,
+                    "sender": {"uin": "1374758454", "name": "山间之茶"},
+                    "type": "text", "content": {"text": "系统"}, "recalled": False, "system": True,
+                },
+                {
+                    "id": "m-1", "seq": "6", "timestamp": 1783852374500,
+                    "sender": {"uid": "u_peer", "uin": "1374758454", "name": "山间之茶"},
+                    "type": "text", "content": {"text": "重复导出"}, "recalled": False, "system": False,
+                },
+            ],
+        }
+        source = json.dumps(payload, ensure_ascii=False)
+        with tempfile.TemporaryDirectory() as temp:
+            service = type("Service", (), {"data_dir": Path(temp), "store": object()})()
+            importer = HistoricalChatImporter(service)
+            importer._identity_context = lambda _speakers: {
+                "available": False, "matches": {}, "bot": {}, "target_users": [],
+            }
+            preview = importer.stage_upload(filename="qq-export.json", content=source.encode("utf-8"))
+            upload_dir = Path(temp) / "historical_chat_imports" / "uploads" / preview["upload_id"]
+            parsed = [json.loads(line) for line in (upload_dir / "parsed.jsonl").read_text(encoding="utf-8").splitlines()]
+            archived_source = (upload_dir / "source.txt").read_text(encoding="utf-8")
+            expanded_payload = json.loads(source)
+            expanded_payload["statistics"] = {"totalMessages": 6}
+            expanded_payload["messages"].append(
+                {
+                    "id": "m-6", "seq": "6", "timestamp": 1783852375000,
+                    "sender": {"uid": "u_self", "uin": "2732152361", "name": "旧昵称"},
+                    "type": "text", "content": {"text": "新增消息"}, "recalled": False, "system": False,
+                }
+            )
+            expanded_preview = importer.stage_upload(
+                filename="qq-export-new.json",
+                content=json.dumps(expanded_payload, ensure_ascii=False).encode("utf-8"),
+            )
+            expanded_dir = Path(temp) / "historical_chat_imports" / "uploads" / expanded_preview["upload_id"]
+            expanded_parsed = [
+                json.loads(line)
+                for line in (expanded_dir / "parsed.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual("qq_chat_exporter", preview["source_kind"])
+        self.assertEqual("qq_chat_exporter_json", preview["stats"]["source_format"])
+        self.assertEqual(3, preview["stats"]["message_count"])
+        self.assertEqual(1, preview["stats"]["skipped_recalled_count"])
+        self.assertEqual(1, preview["stats"]["skipped_system_count"])
+        self.assertEqual(1, preview["stats"]["skipped_duplicate_count"])
+        self.assertEqual("0.1.0", preview["source_metadata"]["exporter"]["version"])
+        self.assertEqual("2732152361", preview["identity_context"]["bot"]["self_ids"][0])
+        self.assertEqual("1374758454", preview["identity_context"]["target_users"][0]["user_id"])
+        self.assertEqual("2026-07-12T18:29:34+08:00", parsed[0]["local_time"])
+        self.assertEqual("m-1", parsed[0]["source_message_id"])
+        self.assertEqual(1, parsed[0]["source_message_seq"])
+        self.assertEqual("1374758454", parsed[0]["source_sender_id"])
+        self.assertEqual("[语音]", parsed[1]["content"])
+        self.assertEqual("[图片]", parsed[2]["content"])
+        self.assertEqual(parsed[0]["message_id"], expanded_parsed[0]["message_id"])
+        self.assertEqual(parsed[1]["message_id"], expanded_parsed[1]["message_id"])
+        self.assertEqual(parsed[2]["message_id"], expanded_parsed[2]["message_id"])
+        self.assertEqual("捕梦猫neko [2732152361]", expanded_parsed[3]["speaker"])
+        self.assertEqual(2, expanded_preview["stats"]["speaker_count"])
+        self.assertEqual(source, archived_source)
+        suggestions = {item["speaker"]: item for item in preview["speaker_suggestions"]}
+        self.assertEqual("user", suggestions["山间之茶 [1374758454]"]["suggested_role"])
+        self.assertEqual("bot", suggestions["捕梦猫neko [2732152361]"]["suggested_role"])
+        self.assertTrue(all(item["confidence"] == "high" for item in suggestions.values()))
+
+    def test_non_qq_chat_exporter_json_fails_with_actionable_message(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = type("Service", (), {"data_dir": Path(temp), "store": object()})()
+            importer = HistoricalChatImporter(service)
+            with self.assertRaisesRegex(ValueError, "不是 QQChatExporter"):
+                importer.stage_upload(filename="other.json", content=b'{"messages": []}')
+
 
 class HistoricalChatStoreTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -195,7 +306,10 @@ class HistoricalChatStoreTests(unittest.IsolatedAsyncioTestCase):
         }
         first = await self.store.add_historical_timeline_events([historical])
         second = await self.store.add_historical_timeline_events([historical])
+        third, newly_inserted = await self.store.add_historical_timeline_events_with_status([historical])
         self.assertEqual(first, second)
+        self.assertEqual(first, third)
+        self.assertEqual(set(), newly_inserted)
         timeline_id = first["hist-1"]
         await self.store.mark_timeline_summarized([timeline_id])
         normal_id = await self.store.add_timeline_event(
@@ -310,6 +424,138 @@ class HistoricalChatStoreTests(unittest.IsolatedAsyncioTestCase):
             "bot_id": "b1", "bot_name": "诺星缘",
         })
         self.assertEqual("default:FriendMessage:u1", started["batch"]["session_id"])
+
+    async def test_start_import_rejects_same_user_and_bot_id(self) -> None:
+        service = type("Service", (), {"data_dir": Path(self.temp.name), "store": self.store})()
+        importer = HistoricalChatImporter(service)
+        preview = importer.stage_upload(
+            filename="chat.txt",
+            content="用户: 2026-01-01 10:00:00\n你好\n\nBot: 2026-01-01 10:00:05\n你好呀\n".encode("utf-8"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "用户 ID 和 Bot ID 不能相同"):
+            await importer.start_import(
+                {
+                    "upload_id": preview["upload_id"],
+                    "speaker_map": {
+                        "用户": {"role": "user", "entity_id": "same", "display_name": "用户"},
+                        "Bot": {"role": "bot", "entity_id": "same", "display_name": "Bot"},
+                    },
+                    "user_id": "same",
+                    "bot_id": "same",
+                }
+            )
+
+    async def test_qq_chat_exporter_group_cannot_enter_private_import(self) -> None:
+        service = type("Service", (), {"data_dir": Path(self.temp.name), "store": self.store})()
+        importer = HistoricalChatImporter(service)
+        source = json.dumps(
+            {
+                "metadata": {"name": "QQChatExporter", "version": "0.1.0"},
+                "chatInfo": {"name": "测试群", "type": "group", "selfUin": "10001", "selfName": "Bot"},
+                "messages": [
+                    {
+                        "id": "g-1", "seq": "1", "timestamp": 1783852174000,
+                        "sender": {"uin": "20001", "name": "群成员"},
+                        "type": "text", "content": {"text": "群聊消息"},
+                        "recalled": False, "system": False,
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+        preview = importer.stage_upload(filename="group.json", content=source.encode("utf-8"))
+
+        with self.assertRaisesRegex(ValueError, "群聊记录暂不能按私聊记忆导入"):
+            await importer.start_import({"upload_id": preview["upload_id"]})
+
+    async def test_incremental_qq_export_only_segments_new_messages(self) -> None:
+        class Service:
+            def __init__(self, data_dir, store):
+                self.data_dir, self.store = data_dir, store
+
+            @staticmethod
+            def _spawn_background(coro, *, label):
+                coro.close()
+                return None
+
+        importer = HistoricalChatImporter(Service(Path(self.temp.name), self.store))
+        importer._identity_context = lambda _speakers: {
+            "available": False, "matches": {}, "bot": {}, "target_users": [],
+        }
+        payload = {
+            "metadata": {"name": "QQChatExporter", "version": "0.1.0"},
+            "chatInfo": {
+                "name": "用户", "type": "private", "selfUin": "10001", "selfName": "Bot",
+                "peerUin": "20001", "peerUid": "peer-uid",
+            },
+            "messages": [
+                {
+                    "id": "inc-1", "seq": "1", "timestamp": 1783852174000,
+                    "sender": {"uin": "20001", "name": "用户"},
+                    "type": "text", "content": {"text": "第一条"}, "recalled": False, "system": False,
+                },
+                {
+                    "id": "inc-2", "seq": "2", "timestamp": 1783852175000,
+                    "sender": {"uin": "10001", "name": "Bot"},
+                    "type": "text", "content": {"text": "第二条"}, "recalled": False, "system": False,
+                },
+            ],
+        }
+        mapping = {
+            "用户 [20001]": {"role": "user", "entity_id": "20001", "display_name": "用户"},
+            "Bot [10001]": {"role": "bot", "entity_id": "10001", "display_name": "Bot"},
+        }
+        first_preview = importer.stage_upload(
+            filename="first.json", content=json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        )
+        await importer.start_import(
+            {
+                "upload_id": first_preview["upload_id"], "speaker_map": mapping,
+                "user_id": "20001", "user_name": "用户", "bot_id": "10001", "bot_name": "Bot",
+            }
+        )
+        payload["messages"].append(
+            {
+                "id": "inc-3", "seq": "3", "timestamp": 1783852176000,
+                "sender": {"uin": "20001", "name": "用户"},
+                "type": "text", "content": {"text": "仅新增这一条"}, "recalled": False, "system": False,
+            }
+        )
+        second_preview = importer.stage_upload(
+            filename="second.json", content=json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        )
+        second = await importer.start_import(
+            {
+                "upload_id": second_preview["upload_id"], "speaker_map": mapping,
+                "user_id": "20001", "user_name": "用户", "bot_id": "10001", "bot_name": "Bot",
+            }
+        )
+        segments = await self.store.chat_import_segments(second["batch"]["id"])
+
+        self.assertEqual(1, second["batch"]["stats"]["new_timeline_count"])
+        self.assertEqual(2, second["batch"]["stats"]["reused_timeline_count"])
+        self.assertEqual(1, second["batch"]["stats"]["summarized_source_message_count"])
+        self.assertEqual(1, len(segments))
+        self.assertIn("仅新增这一条", segments[0]["transcript"])
+        self.assertNotIn("第一条", segments[0]["transcript"])
+
+        payload["statistics"] = {"revision": 2}
+        unchanged_preview = importer.stage_upload(
+            filename="unchanged.json", content=json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        )
+        unchanged = await importer.start_import(
+            {
+                "upload_id": unchanged_preview["upload_id"], "speaker_map": mapping,
+                "user_id": "20001", "user_name": "用户", "bot_id": "10001", "bot_name": "Bot",
+            }
+        )
+        await importer._run_batch(unchanged["batch"]["id"])
+        completed = await self.store.get_chat_import_batch(unchanged["batch"]["id"])
+
+        self.assertEqual("completed", completed["state"])
+        self.assertEqual(0, completed["total_segments"])
+        self.assertEqual(0, completed["stats"]["new_timeline_count"])
 
     async def test_existing_import_repairs_alias_entities_and_merges_bucket(self) -> None:
         await self.store.insert_memory(MemoryRecord(

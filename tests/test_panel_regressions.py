@@ -49,6 +49,9 @@ class PanelRegressionTests(unittest.TestCase):
         styles = (ROOT / "pages" / "记忆面板" / "app.css").read_text(encoding="utf-8")
 
         self.assertIn('id="historicalChatDropzone"', page)
+        self.assertIn('.json,text/plain,text/markdown,application/json', page)
+        self.assertIn('QQChatExporter 私聊 JSON', page)
+        self.assertIn('QQChatExporter 聊天记录 JSON 请使用“历史聊天导入 / 文件导入”', page)
         self.assertIn('id="historicalChatRecentTopBtn"', page)
         self.assertIn('class="chat-import-steps"', page)
         self.assertNotIn('id="view-import"', page)
@@ -63,6 +66,11 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn('data-import-source-tab="file"', archive_view)
         self.assertIn('data-import-source-tab="recent"', archive_view)
         self.assertIn("function selectHistoricalChatFile", script)
+        self.assertIn('/\\.(txt|log|md|json)$/i', script)
+        self.assertIn('historicalChatPreviewSource: ""', script)
+        self.assertIn('state.historicalChatPreviewSource !== conversationImportSource()', script)
+        self.assertIn('function showConversationImportError', script)
+        self.assertIn('该 JSON 是群聊记录，当前不能导入单用户私聊记忆', script)
         self.assertIn("function previewQQHistoryImport", script)
         self.assertIn('{ id: "conversation-import", label: "历史聊天导入"', script)
         self.assertIn('section === "conversation-import"', script)
@@ -112,7 +120,7 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn("height:calc(100% - 16px)", image_block.group(1))
         self.assertIn("object-fit:contain", image_block.group(1))
         self.assertIn("height:clamp(480px, 62vh, 820px)", drawer_block.group(1))
-        self.assertIn("app.css?v=20260723-mobile-polish", page)
+        self.assertIn("app.css?v=1.6.4", page)
 
     def test_mobile_workspace_uses_page_scroll_instead_of_clipping_content(self) -> None:
         styles = (ROOT / "pages" / "记忆面板" / "app.css").read_text(encoding="utf-8")
@@ -186,7 +194,7 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn(':root[data-overview-layout="standard"] .projection-stage', styles)
         self.assertIn(".film-app.is-workspace .overview-layout-switch", styles)
         self.assertIn("@media(max-width:760px)", styles)
-        self.assertIn("app.js?v=20260723-mobile-polish", page)
+        self.assertIn("app.js?v=1.6.4", page)
 
         ids = re.findall(r'\bid="([^"]+)"', page)
         self.assertEqual(len(ids), len(set(ids)), "记忆面板不能包含重复 HTML id")
