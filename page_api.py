@@ -134,6 +134,12 @@ UI_ENDPOINT_EXPOSURE = {
     "/profiles": {"exposure": "compat", "reason": "旧 Bot profile 查询兼容入口"},
     "/user-memory-summary": {"exposure": "compat", "reason": "旧用户摘要工作区兼容入口"},
     "/portrait/migration": {"exposure": "internal", "reason": "画像迁移控制，不向普通面板暴露"},
+    "/portrait/backfill/preview": {"exposure": "internal", "reason": "单人历史画像回填只读预览"},
+    "/portrait/backfill/start": {"exposure": "internal", "reason": "单人历史画像回填启动"},
+    "/portrait/backfill/status": {"exposure": "internal", "reason": "单人历史画像回填状态"},
+    "/portrait/backfill/cancel": {"exposure": "internal", "reason": "单人历史画像回填取消"},
+    "/portrait/backfill/rollback": {"exposure": "internal", "reason": "单人历史画像回填回滚"},
+    "/portrait/backfill/render": {"exposure": "internal", "reason": "单人画像只读渲染"},
     "/capabilities/bot-personal": {"exposure": "internal", "reason": "跨插件能力探测"},
     "/companion/personal-photo": {"exposure": "internal", "reason": "图片代理兼容入口"},
     "/companion/personal-photo-data": {"exposure": "visible", "reason": "个人相册按需加载的数据端点"},
@@ -143,6 +149,9 @@ UI_DANGEROUS_ENDPOINTS = frozenset(
     {
         "/memory/delete",
         "/portrait/govern",
+        "/portrait/backfill/start",
+        "/portrait/backfill/cancel",
+        "/portrait/backfill/rollback",
         "/maintenance/audit/apply",
         "/maintenance/audit/rollback",
         "/data/import/run",
@@ -216,6 +225,12 @@ class PluginPageApi:
             ("/portrait/profile", self.portrait_profile, ["GET"], "MemoryCompanion unified portrait governance detail"),
             ("/portrait/govern", self.portrait_govern, ["POST"], "MemoryCompanion unified portrait governance"),
             ("/portrait/migration", self.portrait_migration, ["POST"], "MemoryCompanion portrait migration control"),
+            ("/portrait/backfill/preview", self.portrait_backfill_preview, ["POST"], "MemoryCompanion portrait history backfill preview"),
+            ("/portrait/backfill/start", self.portrait_backfill_start, ["POST"], "MemoryCompanion portrait history backfill start"),
+            ("/portrait/backfill/status", self.portrait_backfill_status, ["GET"], "MemoryCompanion portrait history backfill status"),
+            ("/portrait/backfill/cancel", self.portrait_backfill_cancel, ["POST"], "MemoryCompanion portrait history backfill cancel"),
+            ("/portrait/backfill/rollback", self.portrait_backfill_rollback, ["POST"], "MemoryCompanion portrait history backfill rollback"),
+            ("/portrait/backfill/render", self.portrait_backfill_render, ["POST"], "MemoryCompanion portrait history backfill render"),
             ("/capabilities/bot-personal", self.bot_personal_capabilities, ["GET"], "MemoryCompanion Bot Personal capability"),
             ("/companion/personal-memory", self.companion_personal_memory, ["GET"], "MemoryCompanion Page companion personal memory"),
             ("/companion/personal-photo", self.companion_personal_photo, ["GET"], "MemoryCompanion Page companion personal photo"),
@@ -406,6 +421,135 @@ class PluginPageApi:
         except Exception:
             logger.exception("统一画像迁移操作失败")
             return self._err("统一画像迁移操作失败", 500)
+        return self._ok({"result": result})
+
+    async def _portrait_backfill_service(self):
+        return getattr(getattr(self.plugin, "service", None), "portraits", None)
+
+    def _portrait_backfill_admin_required(self):
+        """Keep historical portrait operations behind the bound Dashboard admin.
+
+        The request body is never treated as an authority claim.  This mirrors
+        the existing diagnostic admin gate, which validates the framework-
+        injected Dashboard username against AstrBot's configured account.
+        """
+        if not self._is_bound_dashboard_admin():
+            return self._err("admin_required", 403)
+        return None
+
+    @staticmethod
+    def _portrait_backfill_actor() -> str:
+        try:
+            return clean_text(getattr(astrbot_web_request, "username", ""), 120) or "dashboard_admin"
+        except Exception:
+            return "dashboard_admin"
+
+    async def portrait_backfill_preview(self):
+        denied = self._portrait_backfill_admin_required()
+        if denied is not None:
+            return denied
+        payload = await self._json()
+        portraits = await self._portrait_backfill_service()
+        if portraits is None:
+            return self._err("统一画像服务不可用", 503)
+        try:
+            result = await portraits.preview_history_backfill(payload)
+        except Exception:
+            logger.exception("历史画像回填预览失败")
+            return self._err("历史画像回填预览失败", 500)
+        return self._ok({"result": result})
+
+    async def portrait_backfill_start(self):
+        denied = self._portrait_backfill_admin_required()
+        if denied is not None:
+            return denied
+        payload = await self._json()
+        portraits = await self._portrait_backfill_service()
+        if portraits is None:
+            return self._err("统一画像服务不可用", 503)
+        try:
+            result = await portraits.start_history_backfill(
+                payload,
+                actor=self._portrait_backfill_actor(),
+            )
+        except Exception:
+            logger.exception("历史画像回填启动失败")
+            return self._err("历史画像回填启动失败", 500)
+        return self._ok({"result": result})
+
+    async def portrait_backfill_status(self):
+        denied = self._portrait_backfill_admin_required()
+        if denied is not None:
+            return denied
+        operation_id = clean_text(request.args.get("operation_id", ""), 120)
+        if not operation_id:
+            return self._err("缺少 operation_id", 400)
+        portraits = await self._portrait_backfill_service()
+        if portraits is None:
+            return self._err("统一画像服务不可用", 503)
+        try:
+            result = await portraits.status_history_backfill(operation_id)
+        except Exception:
+            logger.exception("历史画像回填状态读取失败")
+            return self._err("历史画像回填状态读取失败", 500)
+        return self._ok({"result": result})
+
+    async def portrait_backfill_cancel(self):
+        denied = self._portrait_backfill_admin_required()
+        if denied is not None:
+            return denied
+        payload = await self._json()
+        operation_id = clean_text(payload.get("operation_id"), 120)
+        if not operation_id:
+            return self._err("缺少 operation_id", 400)
+        portraits = await self._portrait_backfill_service()
+        if portraits is None:
+            return self._err("统一画像服务不可用", 503)
+        try:
+            result = await portraits.cancel_history_backfill(operation_id)
+        except Exception:
+            logger.exception("历史画像回填取消失败")
+            return self._err("历史画像回填取消失败", 500)
+        return self._ok({"result": result})
+
+    async def portrait_backfill_rollback(self):
+        denied = self._portrait_backfill_admin_required()
+        if denied is not None:
+            return denied
+        payload = await self._json()
+        operation_id = clean_text(payload.get("operation_id"), 120)
+        if not operation_id:
+            return self._err("缺少 operation_id", 400)
+        portraits = await self._portrait_backfill_service()
+        if portraits is None:
+            return self._err("统一画像服务不可用", 503)
+        try:
+            confirmation = clean_text(
+                payload.get("confirmation_token") or payload.get("confirm"),
+                40,
+            )
+            result = await portraits.rollback_history_backfill(
+                operation_id,
+                confirm=confirmation == "确认回滚",
+            )
+        except Exception:
+            logger.exception("历史画像回填回滚失败")
+            return self._err("历史画像回填回滚失败", 500)
+        return self._ok({"result": result})
+
+    async def portrait_backfill_render(self):
+        denied = self._portrait_backfill_admin_required()
+        if denied is not None:
+            return denied
+        payload = await self._json()
+        portraits = await self._portrait_backfill_service()
+        if portraits is None:
+            return self._err("统一画像服务不可用", 503)
+        try:
+            result = await portraits.render_history_portrait(payload)
+        except Exception:
+            logger.exception("历史画像渲染失败")
+            return self._err("历史画像渲染失败", 500)
         return self._ok({"result": result})
 
     async def bot_personal_capabilities(self):

@@ -893,6 +893,25 @@ class MemoryCompanionService:
     async def run_unified_profile_portrait_batch(self, person_id: str, *, run_day: str = "") -> dict[str, Any]:
         return await self.portraits.run_daily_batch(person_id, run_day=run_day)
 
+    async def preview_portrait_history_backfill(self, request: Any) -> dict[str, Any]:
+        """Preview one explicitly scoped historical portrait operation."""
+        return await self.portraits.preview_history_backfill(request)
+
+    async def start_portrait_history_backfill(self, request: Any) -> dict[str, Any]:
+        return await self.portraits.start_history_backfill(request)
+
+    async def status_portrait_history_backfill(self, operation_id: str) -> dict[str, Any]:
+        return await self.portraits.status_history_backfill(operation_id)
+
+    async def cancel_portrait_history_backfill(self, operation_id: str) -> dict[str, Any]:
+        return await self.portraits.cancel_history_backfill(operation_id)
+
+    async def rollback_portrait_history_backfill(self, operation_id: str, *, confirm: bool = False) -> dict[str, Any]:
+        return await self.portraits.rollback_history_backfill(operation_id, confirm=confirm)
+
+    async def render_portrait_history_backfill(self, request: Any, *, limit: int = 32) -> dict[str, Any]:
+        return await self.portraits.render_history_portrait(request, limit=limit)
+
     def _portrait_window_hours(self) -> tuple[int, int]:
         start = max(0, min(23, self.config.int("portrait.update_window_start_hour", 3)))
         end = max(1, min(24, self.config.int("portrait.update_window_end_hour", 5)))

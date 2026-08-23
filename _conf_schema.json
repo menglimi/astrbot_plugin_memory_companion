@@ -190,6 +190,36 @@
         "type": "int",
         "default": 6000,
         "hint": "上下文仅作当场解释，不写入画像表，也不跨场景拼接。"
+      },
+      "backfill_max_records": {
+        "description": "历史画像回填最大记录数",
+        "type": "int",
+        "default": 5000,
+        "hint": "单次历史回填最多读取的源记录数；达到上限会保留 checkpoint，等待下一次继续。"
+      },
+      "backfill_page_size": {
+        "description": "历史画像回填分页大小",
+        "type": "int",
+        "default": 100,
+        "hint": "历史回填每页读取的源记录数。"
+      },
+      "backfill_max_runtime_seconds": {
+        "description": "历史画像回填单次运行时限",
+        "type": "int",
+        "default": 30,
+        "hint": "单次 start 最长运行秒数；到时暂停并保存 checkpoint，不会丢弃已提交结果。"
+      },
+      "backfill_max_characters": {
+        "description": "历史画像回填单次字符上限",
+        "type": "int",
+        "default": 200000,
+        "hint": "单次 preview/start 最多送入规则提取器的历史字符数；达到上限会保留 checkpoint。"
+      },
+      "backfill_max_dimensions": {
+        "description": "历史画像回填画像维度上限",
+        "type": "int",
+        "default": 32,
+        "hint": "单次历史回填最多接受的稳定画像维度数，超出维度会保留为跳过计数。"
       }
     }
   },

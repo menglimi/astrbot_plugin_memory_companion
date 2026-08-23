@@ -704,6 +704,7 @@ class MemoryStore:
                     message_id TEXT NOT NULL DEFAULT '',
                     statement_fingerprint TEXT NOT NULL DEFAULT '',
                     context_refs TEXT NOT NULL DEFAULT '[]',
+                    operation_id TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL DEFAULT ''
                 );
 
@@ -882,6 +883,9 @@ class MemoryStore:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_portrait_evidence_person ON portrait_evidence(person_id, created_at)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_portrait_evidence_operation ON portrait_evidence(operation_id, person_id)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_portrait_facts_person ON portrait_facts(person_id, status, sensitivity, updated_at DESC)"
@@ -1468,6 +1472,8 @@ class MemoryStore:
         }
         if "statement_fingerprint" not in existing:
             self._conn.execute("ALTER TABLE portrait_evidence ADD COLUMN statement_fingerprint TEXT NOT NULL DEFAULT ''")
+        if "operation_id" not in existing:
+            self._conn.execute("ALTER TABLE portrait_evidence ADD COLUMN operation_id TEXT NOT NULL DEFAULT ''")
 
     async def upsert_portrait_person_projection(
         self,
@@ -1590,6 +1596,49 @@ class MemoryStore:
             return {"ok": False, "code": "bridge_person_mismatch"}
         return {"ok": True, "code": "profile_exact"}
 
+    def _portrait_backfill_write_allowed_sync(self, operation_id: str) -> tuple[bool, str]:
+        """Check a historical operation while holding the store lock.
+
+        The check belongs inside each mutator's transaction.  A service-level
+        read followed by a separate write leaves a cancellation/rollback race
+        in which a terminal operation can still acquire new side effects.
+        Non-backfill operation IDs retain the existing behavior.
+        """
+        operation_id = clean_text(operation_id, 120)
+        if not operation_id:
+            return True, ""
+        row = self._conn.execute(
+            "SELECT operation_kind, state FROM portrait_operations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        if row is None or clean_text(row["operation_kind"], 80) != "historical_portrait_backfill":
+            return True, ""
+        state = clean_text(row["state"], 40)
+        if state != "running":
+            return False, "operation_not_active"
+        return True, ""
+
+    def _portrait_backfill_scope_write_allowed_sync(
+        self, operation_id: str, person_id: str, source_scope: str
+    ) -> tuple[bool, str]:
+        """Apply the operation check plus the current learning capability."""
+        allowed, code = self._portrait_backfill_write_allowed_sync(operation_id)
+        if not allowed:
+            return False, code
+        operation_id = clean_text(operation_id, 120)
+        operation = self._conn.execute(
+            "SELECT operation_kind FROM portrait_operations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone() if operation_id else None
+        if operation is None or clean_text(operation["operation_kind"], 80) != "historical_portrait_backfill":
+            return True, ""
+        capability = self._portrait_scope_capability_sync(
+            clean_text(person_id, 80), clean_text(source_scope, 80)
+        )
+        if not bool(capability.get("portrait_learning_enabled")):
+            return False, "portrait_learning_disabled"
+        return True, ""
+
     async def add_portrait_evidence(self, evidence: dict[str, Any]) -> dict[str, Any]:
         return await asyncio.to_thread(self._add_portrait_evidence_sync, deepcopy(evidence))
 
@@ -1602,13 +1651,20 @@ class MemoryStore:
         if not re.fullmatch(r"[0-9a-f]{64}", statement_key):
             statement_key = evidence_key
         context_refs = evidence.get("context_refs") if isinstance(evidence.get("context_refs"), list) else []
+        operation_id = clean_text(evidence.get("operation_id"), 120)
         now = utc_now()
         with self._lock:
+            allowed, code = self._portrait_backfill_scope_write_allowed_sync(
+                operation_id, person_id, clean_text(evidence.get("scope"), 80)
+            )
+            if not allowed:
+                return {"ok": False, "code": code, "created": False}
             cur = self._conn.execute(
                 """
                 INSERT OR IGNORE INTO portrait_evidence(
-                    evidence_hash, person_id, origin_identity_key, scope, session_id, message_id, statement_fingerprint, context_refs, created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?)
+                    evidence_hash, person_id, origin_identity_key, scope, session_id, message_id,
+                    statement_fingerprint, context_refs, operation_id, created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     evidence_key,
@@ -1619,6 +1675,7 @@ class MemoryStore:
                     clean_text(evidence.get("message_id"), 120),
                     statement_key,
                     json_dumps([clean_text(item, 160) for item in context_refs if clean_text(item, 160)][:8]),
+                    operation_id,
                     now,
                 ),
             )
@@ -1691,6 +1748,7 @@ class MemoryStore:
             return value if isinstance(value, dict) else {}
         if (
             source_scope == "private"
+            or source_scope.startswith("private@")
             or source_scope.startswith("group:")
         ):
             person = self._conn.execute(
@@ -1729,6 +1787,7 @@ class MemoryStore:
             if re.fullmatch(r"[0-9a-f]{64}", clean_text(item, 80))
         ][:16]
         status = clean_text(fact.get("status"), 40) or "active"
+        operation_id = clean_text(fact.get("operation_id"), 120)
         cardinality = clean_text(fact.get("profile_cardinality"), 20).lower()
         single_value = (
             cardinality == "single"
@@ -1736,6 +1795,11 @@ class MemoryStore:
         )
         with self._lock:
             with self._transaction_sync():
+                allowed, code = self._portrait_backfill_scope_write_allowed_sync(
+                    operation_id, person_id, source_scope
+                )
+                if not allowed:
+                    return {"ok": False, "code": code, "created": False}
                 if self._portrait_suppressed_sync(person_id, dimension, claim_hash, source_scope):
                     return {"ok": False, "code": "portrait_suppressed", "created": False}
                 previous = self._conn.execute(
@@ -1745,6 +1809,28 @@ class MemoryStore:
                     """,
                     (person_id, dimension, claim_hash, tier, source_scope),
                 ).fetchone()
+                # Historical backfill is additive.  If an existing official
+                # active fact occupies the same single-value dimension, keep
+                # the migration candidate pending instead of superseding the
+                # official record (which would make rollback non-reversible).
+                if status == "active" and operation_id:
+                    operation = self._conn.execute(
+                        "SELECT operation_kind FROM portrait_operations WHERE operation_id=?",
+                        (operation_id,),
+                    ).fetchone()
+                    if operation is not None and clean_text(operation["operation_kind"], 80) == "historical_portrait_backfill":
+                        external_conflict = self._conn.execute(
+                            """
+                            SELECT 1 FROM portrait_facts
+                            WHERE person_id=? AND dimension=? AND source_scope=?
+                              AND status='active'
+                              AND operation_id!=?
+                            LIMIT 1
+                            """,
+                            (person_id, dimension, source_scope, operation_id),
+                        ).fetchone()
+                        if external_conflict is not None:
+                            status = "candidate"
                 previous_hashes = json_loads(previous["evidence_hashes"], []) if previous is not None else []
                 merged_hashes = list(dict.fromkeys([
                     clean_text(item, 80) for item in previous_hashes + evidence_hashes if clean_text(item, 80)
@@ -1801,7 +1887,7 @@ class MemoryStore:
                         sensitivity, status, json_dumps(merged_hashes),
                         json_dumps([clean_text(item, 160) for item in (fact.get("context_refs") or []) if clean_text(item, 160)][:8]),
                         first_at, now, clean_text(fact.get("expires_at"), 80), clean_text(fact.get("supersedes_id"), 120),
-                        revision, clean_text(fact.get("operation_id"), 120),
+                        revision, operation_id,
                         clean_text(previous["created_at"], 80) if previous is not None else now, now,
                     ),
                 )
@@ -1825,7 +1911,7 @@ class MemoryStore:
                                 operation_id=?, updated_at=?
                             WHERE id IN ({placeholders})
                             """,
-                            [fact_id, clean_text(fact.get("operation_id"), 120), now, *superseded_ids],
+                            [fact_id, operation_id, now, *superseded_ids],
                         )
                         self._conn.execute(
                             f"""
@@ -1841,6 +1927,7 @@ class MemoryStore:
             "code": "portrait_fact_upserted",
             "created": previous is None,
             "fact_id": fact_id,
+            "revision": revision,
             "portrait_revision": portrait_revision,
             "superseded": len(superseded_ids),
         }
@@ -1863,8 +1950,78 @@ class MemoryStore:
             for row in rows
         ]
 
-    async def enqueue_portrait_learning(self, *, person_id: str, fact_id: str, evidence_hash: str) -> dict[str, Any]:
-        return await asyncio.to_thread(self._enqueue_portrait_learning_sync, person_id, fact_id, evidence_hash)
+    async def enqueue_portrait_learning(
+        self, *, person_id: str, fact_id: str, evidence_hash: str, operation_id: str = ""
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._enqueue_portrait_learning_sync,
+            person_id,
+            fact_id,
+            evidence_hash,
+            clean_text(operation_id, 120),
+        )
+
+    async def append_portrait_fact_evidence(
+        self,
+        *,
+        person_id: str,
+        fact_id: str,
+        evidence_hash: str,
+        context_refs: list[str] | tuple[str, ...] = (),
+        operation_id: str = "",
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._append_portrait_fact_evidence_sync,
+            clean_text(person_id, 80), clean_text(fact_id, 120), clean_text(evidence_hash, 80),
+            [clean_text(item, 160) for item in context_refs if clean_text(item, 160)][:8],
+            clean_text(operation_id, 120),
+        )
+
+    def _append_portrait_fact_evidence_sync(
+        self, person_id: str, fact_id: str, evidence_hash: str, context_refs: list[str], operation_id: str = ""
+    ) -> dict[str, Any]:
+        if not person_id or not fact_id or not re.fullmatch(r"[0-9a-f]{64}", evidence_hash):
+            return {"ok": False, "code": "portrait_evidence_invalid", "created": False}
+        with self._lock:
+            allowed, code = self._portrait_backfill_write_allowed_sync(operation_id)
+            if not allowed:
+                return {"ok": False, "code": code, "created": False}
+            row = self._conn.execute(
+                "SELECT * FROM portrait_facts WHERE id=? AND person_id=?", (fact_id, person_id)
+            ).fetchone()
+            if row is None:
+                return {"ok": False, "code": "portrait_fact_not_found", "created": False}
+            if operation_id and clean_text(row["operation_id"], 120) != operation_id:
+                return {"ok": False, "code": "external_fact_protected", "created": False}
+            allowed, code = self._portrait_backfill_scope_write_allowed_sync(
+                operation_id, person_id, clean_text(row["source_scope"], 80)
+            )
+            if not allowed:
+                return {"ok": False, "code": code, "created": False}
+            if self._portrait_suppressed_sync(person_id, row["dimension"], row["normalized_claim_hash"], row["source_scope"]):
+                return {"ok": False, "code": "portrait_suppressed", "created": False}
+            hashes = json_loads(row["evidence_hashes"], [])
+            hashes = [clean_text(item, 80) for item in hashes if clean_text(item, 80)]
+            if evidence_hash in hashes:
+                return {"ok": True, "code": "portrait_evidence_idempotent_replay", "created": False, "fact_id": fact_id}
+            previous = {
+                "evidence_hashes": list(hashes),
+                "context_refs": list(json_loads(row["context_refs"], [])) if isinstance(json_loads(row["context_refs"], []), list) else [],
+                "last_evidence_at": clean_text(row["last_evidence_at"], 80),
+                "revision": int(row["revision"] or 1),
+                "updated_at": clean_text(row["updated_at"], 80),
+            }
+            hashes.append(evidence_hash)
+            refs = json_loads(row["context_refs"], [])
+            refs = list(dict.fromkeys([clean_text(item, 160) for item in refs if clean_text(item, 160)] + context_refs))[:8]
+            now = utc_now()
+            self._conn.execute(
+                "UPDATE portrait_facts SET evidence_hashes=?, context_refs=?, last_evidence_at=?, revision=revision+1, updated_at=? WHERE id=? AND person_id=?",
+                (json_dumps(hashes[:16]), json_dumps(refs), now, now, fact_id, person_id),
+            )
+            self._bump_portrait_revision_sync(person_id)
+            self._conn.commit()
+        return {"ok": True, "code": "portrait_evidence_appended", "created": True, "fact_id": fact_id, "previous": previous}
 
     async def list_pending_portrait_people(self, *, limit: int = 500) -> list[str]:
         return await asyncio.to_thread(self._list_pending_portrait_people_sync, limit)
@@ -1884,7 +2041,9 @@ class MemoryStore:
             ).fetchall()
         return [clean_text(row["person_id"], 80) for row in rows if clean_text(row["person_id"], 80)]
 
-    def _enqueue_portrait_learning_sync(self, person_id: str, fact_id: str, evidence_hash: str) -> dict[str, Any]:
+    def _enqueue_portrait_learning_sync(
+        self, person_id: str, fact_id: str, evidence_hash: str, operation_id: str = ""
+    ) -> dict[str, Any]:
         person_id = clean_text(person_id, 80)
         fact_id = clean_text(fact_id, 120)
         evidence_hash = clean_text(evidence_hash, 80)
@@ -1893,6 +2052,18 @@ class MemoryStore:
         queue_id = f"portrait_queue_{stable_fingerprint(person_id, fact_id, evidence_hash)[:24]}"
         now = utc_now()
         with self._lock:
+            fact_row = self._conn.execute(
+                "SELECT source_scope, operation_id FROM portrait_facts WHERE id=? AND person_id=?",
+                (fact_id, person_id),
+            ).fetchone()
+            source_scope = clean_text(fact_row["source_scope"], 80) if fact_row is not None else ""
+            allowed, code = self._portrait_backfill_scope_write_allowed_sync(
+                operation_id, person_id, source_scope
+            )
+            if not allowed:
+                return {"ok": False, "code": code, "created": False, "queue_id": queue_id}
+            if operation_id and fact_row is not None and clean_text(fact_row["operation_id"], 120) != operation_id:
+                return {"ok": False, "code": "external_fact_protected", "created": False, "queue_id": queue_id}
             cur = self._conn.execute(
                 """
                 INSERT OR IGNORE INTO portrait_learning_queue(queue_id, person_id, fact_id, evidence_hash, state, created_at, updated_at)
@@ -2082,6 +2253,7 @@ class MemoryStore:
         low_only: bool = True,
         usage_min_confidence: float = 0.75,
         inferred_freshness_days: int = 90,
+        include_provenance: bool = False,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
             self._portrait_summary_sync,
@@ -2092,6 +2264,7 @@ class MemoryStore:
             low_only,
             usage_min_confidence,
             inferred_freshness_days,
+            include_provenance,
         )
 
     def _portrait_summary_sync(
@@ -2103,6 +2276,7 @@ class MemoryStore:
         low_only: bool,
         usage_min_confidence: float,
         inferred_freshness_days: int,
+        include_provenance: bool,
     ) -> dict[str, Any]:
         person_id = clean_text(person_id, 80)
         scope = clean_text(scope, 80)
@@ -2151,18 +2325,30 @@ class MemoryStore:
                     continue
                 if row["portrait_tier"] == "intelligent" and not self._portrait_timestamp_is_fresh(row["updated_at"], freshness_days):
                     continue
-                items.append(
-                    {
-                        "dimension": row["dimension"],
-                        "summary": row["claim_summary"],
-                        "portrait_tier": row["portrait_tier"],
-                        "epistemic_status": row["epistemic_status"],
-                        "confidence": confidence,
-                        "sensitivity": row["sensitivity"],
-                        "usable_scope": row["usable_scope"],
-                        "updated_at": row["updated_at"],
+                item = {
+                    "dimension": row["dimension"],
+                    "summary": row["claim_summary"],
+                    "portrait_tier": row["portrait_tier"],
+                    "epistemic_status": row["epistemic_status"],
+                    "confidence": confidence,
+                    "sensitivity": row["sensitivity"],
+                    "usable_scope": row["usable_scope"],
+                    "updated_at": row["updated_at"],
+                }
+                if include_provenance:
+                    evidence_hashes = json_loads(row["evidence_hashes"], [])
+                    item["provenance"] = {
+                        "fact_id": clean_text(row["id"], 120),
+                        "evidence_refs": [
+                            clean_text(value, 80)
+                            for value in evidence_hashes
+                            if re.fullmatch(r"[0-9a-f]{64}", clean_text(value, 80))
+                        ][:16],
+                        "source_scope": clean_text(row["source_scope"], 80),
+                        "first_evidence_at": clean_text(row["first_evidence_at"], 80),
+                        "last_evidence_at": clean_text(row["last_evidence_at"], 80),
                     }
-                )
+                items.append(item)
                 if len(items) >= max(1, min(32, int(limit))):
                     break
         return {
@@ -2377,6 +2563,718 @@ class MemoryStore:
     async def portrait_migration(self, *, operation_id: str, dry_run: bool = True) -> dict[str, Any]:
         return await asyncio.to_thread(self._portrait_migration_sync, operation_id, dry_run)
 
+    async def list_portrait_history_sources(
+        self,
+        *,
+        source_scopes: list[str] | tuple[str, ...],
+        from_time: str = "",
+        to_time: str = "",
+        offset: int = 0,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Read a bounded, metadata-filtered history page for portrait backfill.
+
+        The returned ``content`` is transient input for the rule extractor.  It
+        is intentionally not copied into portrait operations or audit payloads.
+        Identity and author exclusion are finalized by ``PortraitService``
+        because the authenticated identity representation is deployment-specific.
+        """
+        return await asyncio.to_thread(
+            self._list_portrait_history_sources_sync,
+            tuple(clean_text(item, 80) for item in (source_scopes or []) if clean_text(item, 80)),
+            clean_text(from_time, 80),
+            clean_text(to_time, 80),
+            max(0, int(offset or 0)),
+            max(1, min(500, int(limit or 100))),
+        )
+
+    def _list_portrait_history_sources_sync(
+        self,
+        source_scopes: tuple[str, ...],
+        from_time: str,
+        to_time: str,
+        offset: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        scopes = tuple(dict.fromkeys(scope for scope in source_scopes if scope))
+        if not scopes:
+            return []
+        scope_placeholders = ",".join("?" for _ in scopes)
+        time_where = ""
+        if from_time:
+            time_where += " AND occurred_at >= ?"
+        if to_time:
+            time_where += " AND occurred_at <= ?"
+        timeline_metadata_where = """
+          AND (
+                json_valid(metadata)=0
+                OR (
+                    COALESCE(json_extract(metadata, '$.lifecycle'), '') != 'archived'
+                    AND COALESCE(json_extract(metadata, '$.validity_status'), 'active') = 'active'
+                    AND COALESCE(json_extract(metadata, '$.review_status'), '') NOT IN ('pending', 'rejected')
+                    AND LOWER(CAST(COALESCE(json_extract(metadata, '$.visibility'), '') AS TEXT)) NOT IN ('internal', 'bot_self')
+                    AND LOWER(CAST(COALESCE(json_extract(metadata, '$.bot_generated'), '') AS TEXT)) NOT IN ('1', 'true', 'yes', 'on')
+                    AND LOWER(CAST(COALESCE(json_extract(metadata, '$.is_bot'), '') AS TEXT)) NOT IN ('1', 'true', 'yes', 'on')
+                    AND LOWER(CAST(COALESCE(json_extract(metadata, '$.author_role'), '') AS TEXT)) NOT IN ('bot', 'assistant', 'system')
+                    AND LOWER(CAST(COALESCE(json_extract(metadata, '$.sender_role'), '') AS TEXT)) NOT IN ('bot', 'assistant', 'system')
+                    AND LOWER(CAST(COALESCE(json_extract(metadata, '$.sender_kind'), '') AS TEXT)) NOT IN ('bot', 'assistant', 'system')
+                )
+              )
+        """
+        visible_memories = ("private_pair", "shareable", "group_public")
+        visibility_placeholders = ",".join("?" for _ in visible_memories)
+        memory_governance_where = f"""
+                  AND lifecycle != 'archived'
+                  AND validity_status = 'active'
+                  AND review_status NOT IN ('pending', 'rejected')
+                  AND visibility IN ({visibility_placeholders})
+        """
+        # Keep the query shape stable across SQLite versions.  The service
+        # applies the exact identity and quoted/forwarded exclusions below.
+        query = f"""
+            SELECT source_kind, source_id, event_type, scope, session_id,
+                   subject_id, object_id, subject_kind, subject_role,
+                   owner_bot_id, message_id, content, metadata,
+                   occurred_at, created_at
+            FROM (
+                SELECT 'timeline' AS source_kind, id AS source_id, event_type,
+                       scope, session_id, subject_id, object_id,
+                       '' AS subject_kind, '' AS subject_role, '' AS owner_bot_id,
+                       message_id, content, metadata, occurred_at, created_at
+                FROM timeline
+                WHERE scope IN ({scope_placeholders})
+                  {time_where}
+                  {timeline_metadata_where}
+                UNION ALL
+                SELECT 'memory' AS source_kind, id AS source_id, memory_type AS event_type,
+                       scope, session_id, subject_id, object_id,
+                       subject_kind, subject_role, owner_bot_id, message_id,
+                       content, metadata, occurred_at, created_at
+                FROM memories
+                WHERE scope IN ({scope_placeholders})
+                  {time_where}
+                  {memory_governance_where}
+            )
+            ORDER BY occurred_at ASC, created_at ASC, source_id ASC
+            LIMIT ? OFFSET ?
+        """
+        # The UNION has a separate scope/time parameter set for each branch.
+        branch_params = [*scopes]
+        if from_time:
+            branch_params.append(from_time)
+        if to_time:
+            branch_params.append(to_time)
+        branch_params.extend([*scopes])
+        if from_time:
+            branch_params.append(from_time)
+        if to_time:
+            branch_params.append(to_time)
+        branch_params.extend(visible_memories)
+        branch_params.extend([max(1, min(500, int(limit))), max(0, int(offset))])
+        with self._lock:
+            rows = self._conn.execute(query, branch_params).fetchall()
+        return [
+            {
+                "source_kind": clean_text(row["source_kind"], 16),
+                "source_id": clean_text(row["source_id"], 160),
+                "event_type": clean_text(row["event_type"], 80),
+                "scope": clean_text(row["scope"], 80),
+                "session_id": clean_text(row["session_id"], 200),
+                "subject_id": clean_text(row["subject_id"], 160),
+                "object_id": clean_text(row["object_id"], 160),
+                "subject_kind": clean_text(row["subject_kind"], 40),
+                "subject_role": clean_text(row["subject_role"], 40),
+                "owner_bot_id": clean_text(row["owner_bot_id"], 120),
+                "message_id": clean_text(row["message_id"], 160),
+                "content": clean_text(row["content"], 4000),
+                "metadata": json_loads(row["metadata"], {}) if isinstance(row["metadata"], str) else {},
+                "occurred_at": clean_text(row["occurred_at"], 80),
+                "created_at": clean_text(row["created_at"], 80),
+            }
+            for row in rows
+        ]
+
+    async def portrait_backfill_person(self, person_id: str, target_identity: str) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._portrait_backfill_person_sync,
+            clean_text(person_id, 80),
+            clean_text(target_identity, 160),
+        )
+
+    def _portrait_backfill_person_sync(self, person_id: str, target_identity: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM portrait_people WHERE person_id=?", (person_id,)
+            ).fetchone()
+        if row is None:
+            return {"ok": False, "code": "identity_mismatch", "person_id": person_id}
+        identity = clean_text(row["resolved_identity_key"], 160)
+        if not target_identity or identity != target_identity:
+            return {"ok": False, "code": "identity_mismatch", "person_id": person_id}
+        if clean_text(row["profile_status"], 40) != "active" or clean_text(row["identity_assurance"], 40) not in {
+            "observed", "verified", "explicit_linked"
+        }:
+            return {"ok": False, "code": "identity_mismatch", "person_id": person_id}
+        capabilities = json_loads(row["capability_summary"], {})
+        return {
+            "ok": True,
+            "code": "profile_exact",
+            "person_id": person_id,
+            "resolved_identity_key": identity,
+            "projection_revision": int(row["projection_revision"] or 0),
+            "identity_assurance": clean_text(row["identity_assurance"], 40),
+            "profile_status": clean_text(row["profile_status"], 40),
+            "capability_summary": capabilities if isinstance(capabilities, dict) else {},
+        }
+
+    async def portrait_backfill_scope_capability(self, person_id: str, source_scope: str) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._portrait_backfill_scope_capability_sync,
+            clean_text(person_id, 80),
+            clean_text(source_scope, 80),
+        )
+
+    def _portrait_backfill_scope_capability_sync(self, person_id: str, source_scope: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT capability_summary FROM portrait_scope_capabilities WHERE person_id=? AND source_scope=?",
+                (person_id, source_scope),
+            ).fetchone()
+            if row is not None:
+                value = json_loads(row["capability_summary"], {})
+                return {"configured": True, **(value if isinstance(value, dict) else {})}
+            # Private is the legacy/default capability namespace.  Group
+            # scopes are intentionally unconfigured until explicitly projected.
+            if source_scope == "private" or source_scope.startswith("private@"):
+                return {"configured": False, **self._portrait_scope_capability_sync(person_id, source_scope)}
+            return {"configured": False}
+
+    async def get_portrait_backfill_fact(
+        self,
+        *,
+        person_id: str,
+        dimension: str,
+        normalized_claim_hash: str,
+        source_scope: str,
+        portrait_tier: str = "base",
+    ) -> dict[str, Any] | None:
+        return await asyncio.to_thread(
+            self._get_portrait_backfill_fact_sync,
+            clean_text(person_id, 80),
+            clean_text(dimension, 80),
+            clean_text(normalized_claim_hash, 80),
+            clean_text(source_scope, 80),
+            clean_text(portrait_tier, 24) or "base",
+        )
+
+    def _get_portrait_backfill_fact_sync(
+        self, person_id: str, dimension: str, claim_hash: str, source_scope: str, tier: str
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM portrait_facts WHERE person_id=? AND dimension=? AND normalized_claim_hash=? AND source_scope=? AND portrait_tier=?",
+                (person_id, dimension, claim_hash, source_scope, tier),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["evidence_hashes"] = json_loads(result.get("evidence_hashes"), [])
+        return result
+
+    async def create_portrait_backfill_operation(
+        self, *, operation_id: str, payload_hash: str, snapshot: dict[str, Any]
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._create_portrait_backfill_operation_sync,
+            clean_text(operation_id, 120),
+            clean_text(payload_hash, 80),
+            deepcopy(snapshot),
+        )
+
+    def _create_portrait_backfill_operation_sync(
+        self, operation_id: str, payload_hash: str, snapshot: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not operation_id or not payload_hash:
+            return {"ok": False, "code": "invalid_request"}
+        with self._lock:
+            previous = self._conn.execute(
+                "SELECT * FROM portrait_operations WHERE operation_id=?", (operation_id,)
+            ).fetchone()
+            if previous is not None:
+                if clean_text(previous["operation_kind"], 80) != "historical_portrait_backfill":
+                    return {"ok": False, "code": "operation_conflict", "operation_id": operation_id}
+                if clean_text(previous["payload_hash"], 80) != payload_hash:
+                    return {"ok": False, "code": "operation_conflict"}
+                return {
+                    "ok": True,
+                    "code": "backfill_resumed" if previous["state"] in {"running", "paused", "cancelled"} else "backfill_idempotent_replay",
+                    "operation_id": operation_id,
+                    "state": clean_text(previous["state"], 40),
+                    "snapshot": json_loads(previous["snapshot"], {}),
+                }
+            now = utc_now()
+            snapshot = redact_sensitive_value(snapshot)
+            self._conn.execute(
+                "INSERT INTO portrait_operations(operation_id, operation_kind, payload_hash, snapshot, state, created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
+                (operation_id, "historical_portrait_backfill", payload_hash, json_dumps(snapshot), "running", now, now),
+            )
+            self._conn.commit()
+        return {"ok": True, "code": "backfill_started", "operation_id": operation_id, "state": "running", "snapshot": snapshot}
+
+    async def portrait_backfill_operation(self, operation_id: str) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self._portrait_backfill_operation_sync, clean_text(operation_id, 120))
+
+    def _portrait_backfill_operation_sync(self, operation_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM portrait_operations WHERE operation_id=?", (operation_id,)).fetchone()
+        if row is None:
+            return None
+        snapshot = json_loads(row["snapshot"], {})
+        return {
+            "operation_id": clean_text(row["operation_id"], 120),
+            "operation_kind": clean_text(row["operation_kind"], 80),
+            "payload_hash": clean_text(row["payload_hash"], 80),
+            "state": clean_text(row["state"], 40),
+            "snapshot": snapshot if isinstance(snapshot, dict) else {},
+            "created_at": clean_text(row["created_at"], 80),
+            "updated_at": clean_text(row["updated_at"], 80),
+        }
+
+    async def update_portrait_backfill_operation(self, operation_id: str, snapshot: dict[str, Any], *, state: str | None = None) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._update_portrait_backfill_operation_sync,
+            clean_text(operation_id, 120),
+            deepcopy(snapshot),
+            clean_text(state, 40) if state is not None else None,
+        )
+
+    def _update_portrait_backfill_operation_sync(self, operation_id: str, snapshot: dict[str, Any], state: str | None) -> dict[str, Any]:
+        if not operation_id:
+            return {"ok": False, "code": "invalid_request"}
+        with self._lock:
+            row = self._conn.execute("SELECT operation_kind,state FROM portrait_operations WHERE operation_id=?", (operation_id,)).fetchone()
+            if row is None:
+                return {"ok": False, "code": "operation_not_found"}
+            if clean_text(row["operation_kind"], 80) != "historical_portrait_backfill":
+                return {"ok": False, "code": "operation_conflict", "operation_id": operation_id}
+            current_state = clean_text(row["state"], 40)
+            next_state = state if state in {"running", "paused", "cancelled", "complete", "rolled_back", "failed"} else current_state
+            # A cancellation/terminal transition wins over a stale worker
+            # checkpoint.  This prevents an in-flight page from resurrecting
+            # an operation after an administrator has stopped or rolled it back.
+            if current_state in {"cancelled", "complete", "rolled_back"} and next_state != current_state:
+                current_snapshot = json_loads(
+                    self._conn.execute(
+                        "SELECT snapshot FROM portrait_operations WHERE operation_id=?",
+                        (operation_id,),
+                    ).fetchone()["snapshot"],
+                    {},
+                )
+                return {
+                    "ok": True,
+                    "code": "backfill_terminal_checkpoint_ignored",
+                    "operation_id": operation_id,
+                    "state": current_state,
+                    "snapshot": current_snapshot if isinstance(current_snapshot, dict) else {},
+                }
+            self._conn.execute(
+                "UPDATE portrait_operations SET snapshot=?, state=?, updated_at=? WHERE operation_id=?",
+                (json_dumps(redact_sensitive_value(snapshot)), next_state, utc_now(), operation_id),
+            )
+            self._conn.commit()
+        return {"ok": True, "code": "backfill_status_updated", "operation_id": operation_id, "state": next_state, "snapshot": snapshot}
+
+    async def cancel_portrait_backfill_operation(self, operation_id: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._cancel_portrait_backfill_operation_sync, clean_text(operation_id, 120))
+
+    def _cancel_portrait_backfill_operation_sync(self, operation_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute("SELECT operation_kind,state,snapshot FROM portrait_operations WHERE operation_id=?", (operation_id,)).fetchone()
+            if row is None:
+                return {"ok": False, "code": "operation_not_found"}
+            if clean_text(row["operation_kind"], 80) != "historical_portrait_backfill":
+                return {"ok": False, "code": "operation_conflict", "operation_id": operation_id}
+            state = clean_text(row["state"], 40)
+            if state == "rolled_back":
+                return {"ok": False, "code": "operation_already_rolled_back"}
+            if state == "complete":
+                return {"ok": False, "code": "operation_complete"}
+            self._conn.execute("UPDATE portrait_operations SET state='cancelled', updated_at=? WHERE operation_id=?", (utc_now(), operation_id))
+            self._conn.commit()
+        return {"ok": True, "code": "backfill_cancelled", "operation_id": operation_id, "state": "cancelled"}
+
+    async def rollback_portrait_backfill_operation(self, operation_id: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._rollback_portrait_backfill_operation_sync, clean_text(operation_id, 120))
+
+    def _rollback_portrait_backfill_operation_sync(self, operation_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute("SELECT operation_kind,state,snapshot FROM portrait_operations WHERE operation_id=?", (operation_id,)).fetchone()
+            if row is None:
+                return {"ok": False, "code": "operation_not_found"}
+            if clean_text(row["operation_kind"], 80) != "historical_portrait_backfill":
+                return {"ok": False, "code": "operation_conflict", "operation_id": operation_id}
+            current_state = clean_text(row["state"], 40)
+            if current_state == "rolled_back":
+                snapshot = json_loads(row["snapshot"], {})
+                rollback = snapshot.get("rollback") if isinstance(snapshot, dict) else None
+                return {
+                    "ok": True,
+                    "code": "backfill_already_rolled_back",
+                    "operation_id": operation_id,
+                    "deleted": rollback if isinstance(rollback, dict) else {},
+                }
+            if current_state in {"running", "paused"}:
+                return {"ok": False, "code": "operation_active", "operation_id": operation_id, "state": current_state}
+            snapshot = json_loads(row["snapshot"], {})
+            if not isinstance(snapshot, dict):
+                snapshot = {}
+            fact_ids = [clean_text(item, 120) for item in snapshot.get("created_fact_ids", []) if clean_text(item, 120)]
+            created_fact_snapshots = snapshot.get("created_fact_snapshots")
+            if not isinstance(created_fact_snapshots, dict):
+                created_fact_snapshots = {}
+            # The checkpoint is advisory.  A worker may have committed a fact
+            # immediately before a process crash, before its ID reached the
+            # operation snapshot.  Ownership in the fact row is authoritative
+            # for rollback recovery.
+            owned_fact_rows = self._conn.execute(
+                "SELECT id FROM portrait_facts WHERE person_id=? AND operation_id=?",
+                (clean_text(snapshot.get("target_person_id"), 80), operation_id),
+            ).fetchall()
+            fact_ids.extend(
+                clean_text(item["id"], 120)
+                for item in owned_fact_rows
+                if clean_text(item["id"], 120)
+            )
+            fact_ids = list(dict.fromkeys(fact_ids))
+            evidence_hashes = [clean_text(item, 80) for item in snapshot.get("created_evidence_hashes", []) if clean_text(item, 80)]
+            queue_ids = [clean_text(item, 120) for item in snapshot.get("created_queue_ids", []) if clean_text(item, 120)]
+            if fact_ids:
+                placeholders = ",".join("?" for _ in fact_ids)
+                owned_queue_rows = self._conn.execute(
+                    f"SELECT queue_id FROM portrait_learning_queue WHERE person_id=? AND fact_id IN ({placeholders})",
+                    [clean_text(snapshot.get("target_person_id"), 80), *fact_ids],
+                ).fetchall()
+                queue_ids.extend(
+                    clean_text(item["queue_id"], 120)
+                    for item in owned_queue_rows
+                    if clean_text(item["queue_id"], 120)
+                )
+                queue_ids = list(dict.fromkeys(queue_ids))
+            owned_evidence_rows = self._conn.execute(
+                "SELECT evidence_hash FROM portrait_evidence WHERE person_id=? AND operation_id=?",
+                (clean_text(snapshot.get("target_person_id"), 80), operation_id),
+            ).fetchall()
+            evidence_hashes.extend(
+                clean_text(item["evidence_hash"], 80)
+                for item in owned_evidence_rows
+                if clean_text(item["evidence_hash"], 80)
+            )
+            evidence_hashes = list(dict.fromkeys(evidence_hashes))
+            deleted = {"facts": 0, "evidence": 0, "queue": 0, "facts_restored": 0, "rollback_stale": 0}
+            if queue_ids:
+                placeholders = ",".join("?" for _ in queue_ids)
+                cur = self._conn.execute(f"DELETE FROM portrait_learning_queue WHERE queue_id IN ({placeholders}) AND person_id=?", [*queue_ids, clean_text(snapshot.get("target_person_id"), 80)])
+                deleted["queue"] = int(cur.rowcount or 0)
+            if fact_ids:
+                for fact_id in fact_ids:
+                    expected = created_fact_snapshots.get(fact_id)
+                    if isinstance(expected, dict):
+                        current = self._conn.execute(
+                            "SELECT operation_id, revision, evidence_hashes FROM portrait_facts WHERE id=? AND person_id=?",
+                            (fact_id, clean_text(snapshot.get("target_person_id"), 80)),
+                        ).fetchone()
+                        current_hashes = json_loads(current["evidence_hashes"], []) if current is not None else []
+                        expected_hashes = [
+                            clean_text(item, 80)
+                            for item in expected.get("evidence_hashes", [])
+                            if clean_text(item, 80)
+                        ]
+                        if (
+                            current is not None
+                            and clean_text(current["operation_id"], 120) == operation_id
+                            and int(current["revision"] or 0) == int(expected.get("revision") or 1)
+                            and current_hashes == expected_hashes
+                        ):
+                            self._conn.execute(
+                                "DELETE FROM portrait_facts WHERE id=? AND person_id=? AND operation_id=?",
+                                (fact_id, clean_text(snapshot.get("target_person_id"), 80), operation_id),
+                            )
+                            deleted["facts"] += 1
+                        else:
+                            deleted["rollback_stale"] += 1
+                    else:
+                        cur = self._conn.execute(
+                            "DELETE FROM portrait_facts WHERE id=? AND person_id=? AND operation_id=?",
+                            (fact_id, clean_text(snapshot.get("target_person_id"), 80), operation_id),
+                        )
+                        deleted["facts"] += int(cur.rowcount or 0)
+            touched = snapshot.get("touched_fact_snapshots")
+            if isinstance(touched, dict):
+                for fact_id, previous in touched.items():
+                    fact_key = clean_text(fact_id, 120)
+                    if not fact_key or not isinstance(previous, dict):
+                        continue
+                    before_hashes = [clean_text(item, 80) for item in previous.get("evidence_hashes", []) if clean_text(item, 80)]
+                    added_hashes = [clean_text(item, 80) for item in previous.get("added_evidence_hashes", []) if clean_text(item, 80)]
+                    current = self._conn.execute(
+                        "SELECT evidence_hashes, revision FROM portrait_facts WHERE id=? AND person_id=?",
+                        (fact_key, clean_text(snapshot.get("target_person_id"), 80)),
+                    ).fetchone()
+                    current_hashes = json_loads(current["evidence_hashes"], []) if current is not None else []
+                    expected_hashes = before_hashes + added_hashes
+                    if (
+                        current is not None
+                        and int(current["revision"] or 0) == int(previous.get("revision") or 0) + len(added_hashes)
+                        and current_hashes == expected_hashes
+                    ):
+                        self._conn.execute(
+                            """
+                            UPDATE portrait_facts
+                            SET evidence_hashes=?, context_refs=?, last_evidence_at=?,
+                                revision=?, updated_at=?
+                            WHERE id=? AND person_id=?
+                            """,
+                            (
+                                json_dumps(before_hashes),
+                                json_dumps(previous.get("context_refs", [])),
+                                clean_text(previous.get("last_evidence_at"), 80),
+                                int(previous.get("revision") or 1),
+                                clean_text(previous.get("updated_at"), 80),
+                                fact_key,
+                                clean_text(snapshot.get("target_person_id"), 80),
+                            ),
+                        )
+                        deleted["facts_restored"] += 1
+                    else:
+                        deleted["rollback_stale"] += 1
+            if evidence_hashes:
+                placeholders = ",".join("?" for _ in evidence_hashes)
+                # Evidence can be reused by a later operation.  Remove only
+                # orphaned rows so rollback never deletes another operation's
+                # provenance.
+                cur = self._conn.execute(
+                    f"""
+                    DELETE FROM portrait_evidence
+                    WHERE evidence_hash IN ({placeholders}) AND person_id=?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM portrait_facts f
+                          WHERE f.person_id=portrait_evidence.person_id
+                            AND EXISTS (
+                                SELECT 1 FROM json_each(f.evidence_hashes)
+                                WHERE json_each.value=portrait_evidence.evidence_hash
+                            )
+                      )
+                    """,
+                    [*evidence_hashes, clean_text(snapshot.get("target_person_id"), 80)],
+                )
+                deleted["evidence"] = int(cur.rowcount or 0)
+            if any(deleted.values()):
+                self._bump_portrait_revision_sync(clean_text(snapshot.get("target_person_id"), 80))
+            snapshot["rollback"] = deleted
+            self._conn.execute(
+                "UPDATE portrait_operations SET snapshot=?, state='rolled_back', updated_at=? WHERE operation_id=?",
+                (json_dumps(redact_sensitive_value(snapshot)), utc_now(), operation_id),
+            )
+            self._conn.commit()
+        return {"ok": True, "code": "backfill_rolled_back", "operation_id": operation_id, "deleted": deleted}
+
+    async def run_portrait_backfill_aggregation(
+        self, *, operation_id: str, person_id: str, min_independent_evidence: int = 3,
+        fact_ids: list[str] | tuple[str, ...] = (), queue_ids: list[str] | tuple[str, ...] = ()
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._run_portrait_backfill_aggregation_sync,
+            clean_text(operation_id, 120), clean_text(person_id, 80), max(1, min(16, int(min_independent_evidence or 3))),
+            tuple(clean_text(item, 120) for item in (fact_ids or ()) if clean_text(item, 120)),
+            tuple(clean_text(item, 120) for item in (queue_ids or ()) if clean_text(item, 120)),
+        )
+
+    def _run_portrait_backfill_aggregation_sync(
+        self, operation_id: str, person_id: str, min_independent_evidence: int,
+        fact_ids: tuple[str, ...], queue_ids: tuple[str, ...]
+    ) -> dict[str, Any]:
+        created_ids: list[str] = []
+        created_snapshots: dict[str, dict[str, Any]] = {}
+        insufficient = 0
+        suppressed = 0
+        if not operation_id or not person_id:
+            return {"ok": False, "code": "invalid_request", "created": 0, "insufficient": 0, "created_fact_ids": []}
+        with self._lock:
+            allowed, code = self._portrait_backfill_write_allowed_sync(operation_id)
+            if not allowed:
+                return {"ok": False, "code": code, "created": 0, "insufficient": 0, "created_fact_ids": []}
+            if fact_ids:
+                placeholders = ",".join("?" for _ in fact_ids)
+                rows = self._conn.execute(
+                    f"SELECT * FROM portrait_facts WHERE person_id=? AND id IN ({placeholders}) AND portrait_tier='base' AND status IN ('active', 'candidate') ORDER BY created_at ASC",
+                    [person_id, *fact_ids],
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                "SELECT * FROM portrait_facts WHERE person_id=? AND operation_id=? AND portrait_tier='base' AND status IN ('active', 'candidate') ORDER BY created_at ASC",
+                    (person_id, operation_id),
+                ).fetchall()
+            for row in rows:
+                source_scope = clean_text(row["source_scope"], 80)
+                capabilities = self._portrait_scope_capability_sync(person_id, source_scope)
+                if not bool(capabilities.get("portrait_learning_enabled")):
+                    continue
+                evidence_hashes = json_loads(row["evidence_hashes"], [])
+                if self._portrait_distinct_statement_count_sync(evidence_hashes) < min_independent_evidence:
+                    insufficient += 1
+                    continue
+                if self._portrait_suppressed_sync(person_id, row["dimension"], row["normalized_claim_hash"], source_scope):
+                    suppressed += 1
+                    if queue_ids:
+                        placeholders = ",".join("?" for _ in queue_ids)
+                        self._conn.execute(
+                            f"UPDATE portrait_learning_queue SET state='suppressed', updated_at=? WHERE fact_id=? AND queue_id IN ({placeholders}) AND state='pending'",
+                            [utc_now(), row["id"], *queue_ids],
+                    )
+                    continue
+                external_conflict = self._conn.execute(
+                    """
+                    SELECT 1 FROM portrait_facts
+                    WHERE person_id=? AND dimension=? AND source_scope=?
+                      AND status='active'
+                      AND operation_id!=?
+                    LIMIT 1
+                    """,
+                    (person_id, row["dimension"], source_scope, operation_id),
+                ).fetchone()
+                if external_conflict is not None:
+                    # Keep the candidate pending for normal governance rather
+                    # than allowing a historical run to replace an official
+                    # fact in a single-value dimension.
+                    insufficient += 1
+                    continue
+                existing = self._conn.execute(
+                    "SELECT id FROM portrait_facts WHERE person_id=? AND dimension=? AND normalized_claim_hash=? AND portrait_tier='intelligent' AND source_scope=?",
+                    (person_id, row["dimension"], row["normalized_claim_hash"], source_scope),
+                ).fetchone()
+                if existing is not None:
+                    # Existing official/inferred facts are authoritative; do not
+                    # rewrite them merely because a migration saw the same claim.
+                    continue
+                inferred = {
+                    "person_id": person_id,
+                    "dimension": row["dimension"],
+                    "normalized_claim_hash": row["normalized_claim_hash"],
+                    "claim_summary": clean_text(f"可能{row['claim_summary']}", 180),
+                    "portrait_tier": "intelligent",
+                    "producer_kind": "historical_backfill",
+                    "producer_version": "req036.backfill.v1",
+                    "derivation_kind": "independent_evidence_aggregate",
+                    "epistemic_status": "inferred",
+                    "source_scope": source_scope,
+                    "usable_scope": row["usable_scope"],
+                    "confidence": min(0.95, max(0.75, float(row["confidence"] or 0.0))),
+                    "sensitivity": row["sensitivity"],
+                    "evidence_hashes": evidence_hashes,
+                    "context_refs": json_loads(row["context_refs"], []),
+                    "operation_id": operation_id,
+                }
+                result = self._upsert_portrait_fact_sync(inferred)
+                if result.get("ok") and result.get("created"):
+                    created_id = clean_text(result.get("fact_id"), 120)
+                    created_ids.append(created_id)
+                    created_snapshots[created_id] = {
+                        "revision": int(result.get("revision") or 1),
+                        "evidence_hashes": list(evidence_hashes),
+                        "operation_id": operation_id,
+                    }
+                    if queue_ids:
+                        placeholders = ",".join("?" for _ in queue_ids)
+                        self._conn.execute(
+                            f"UPDATE portrait_learning_queue SET state='processed', updated_at=? WHERE fact_id=? AND queue_id IN ({placeholders}) AND state='pending'",
+                            [utc_now(), row["id"], *queue_ids],
+                        )
+            self._conn.commit()
+        return {
+            "ok": True, "code": "backfill_aggregated", "created": len(created_ids),
+            "created_fact_ids": created_ids, "created_fact_snapshots": created_snapshots,
+            "insufficient": insufficient, "suppressed": suppressed,
+        }
+
+    async def render_portrait_facts(
+        self,
+        *,
+        person_id: str,
+        source_scopes: list[str] | tuple[str, ...],
+        limit: int = 32,
+        usage_min_confidence: float = 0.75,
+        inferred_freshness_days: int = 90,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._render_portrait_facts_sync,
+            clean_text(person_id, 80), tuple(clean_text(item, 80) for item in (source_scopes or []) if clean_text(item, 80)),
+            max(1, min(64, int(limit or 32))),
+            max(0.0, min(1.0, float(usage_min_confidence or 0.75))),
+            max(1, min(3650, int(inferred_freshness_days or 90))),
+        )
+
+    def _render_portrait_facts_sync(
+        self,
+        person_id: str,
+        source_scopes: tuple[str, ...],
+        limit: int,
+        usage_min_confidence: float,
+        inferred_freshness_days: int,
+    ) -> dict[str, Any]:
+        with self._lock:
+            person = self._conn.execute("SELECT * FROM portrait_people WHERE person_id=?", (person_id,)).fetchone()
+            if person is None:
+                return {"ok": False, "code": "bridge_unavailable", "items": [], "portrait_revision": 0}
+            if clean_text(person["profile_status"], 40) != "active":
+                return {"ok": False, "code": "bridge_person_mismatch", "items": [], "portrait_revision": int(person["portrait_revision"] or 0)}
+            rows = self._conn.execute(
+                "SELECT * FROM portrait_facts WHERE person_id=? AND status='active' AND sensitivity='low' ORDER BY confidence DESC, updated_at DESC LIMIT ?",
+                (person_id, max(64, limit * 8)),
+            ).fetchall()
+            items: list[dict[str, Any]] = []
+            allowed = tuple(source_scopes)
+            for row in rows:
+                source_scope = clean_text(row["source_scope"], 80)
+                if allowed and not any(self._portrait_scope_allows_row(row, requested) for requested in allowed):
+                    continue
+                if self._portrait_suppressed_sync(person_id, row["dimension"], row["normalized_claim_hash"], source_scope):
+                    continue
+                confidence = float(row["confidence"] or 0.0)
+                if confidence < usage_min_confidence:
+                    continue
+                if row["portrait_tier"] == "intelligent" and not self._portrait_timestamp_is_fresh(row["updated_at"], inferred_freshness_days):
+                    continue
+                evidence_hashes = json_loads(row["evidence_hashes"], [])
+                evidence_refs = [clean_text(item, 80) for item in evidence_hashes if clean_text(item, 80)][:16]
+                items.append({
+                    "fact_id": clean_text(row["id"], 120),
+                    "dimension": clean_text(row["dimension"], 80),
+                    "summary": clean_text(row["claim_summary"], 180),
+                    "confidence": confidence,
+                    "sensitivity": clean_text(row["sensitivity"], 24),
+                    "portrait_tier": clean_text(row["portrait_tier"], 24),
+                    "epistemic_status": clean_text(row["epistemic_status"], 40),
+                    "source_scope": source_scope,
+                    "evidence_refs": evidence_refs,
+                    "updated_at": clean_text(row["updated_at"], 80),
+                    "provenance": {
+                        "fact_id": clean_text(row["id"], 120),
+                        "evidence_refs": evidence_refs,
+                        "source_scope": source_scope,
+                        "first_evidence_at": clean_text(row["first_evidence_at"], 80),
+                        "last_evidence_at": clean_text(row["last_evidence_at"], 80),
+                    },
+                })
+                if len(items) >= limit:
+                    break
+        return {
+            "ok": True,
+            "code": "profile_exact",
+            "items": items,
+            "portrait_revision": int(person["portrait_revision"] or 0),
+            "last_synced_at": clean_text(person["last_synced_at"], 80),
+        }
+
     def _portrait_migration_sync(self, operation_id: str, dry_run: bool) -> dict[str, Any]:
         operation_id = clean_text(operation_id, 120)
         if not operation_id:
@@ -2389,6 +3287,8 @@ class MemoryStore:
                 return {"ok": True, "code": "migration_dry_run", "write_count": 0, "legacy_candidate_count": count}
             prior = self._conn.execute("SELECT * FROM portrait_operations WHERE operation_id=?", (operation_id,)).fetchone()
             if prior is not None:
+                if clean_text(prior["operation_kind"], 80) != "legacy_portrait_projection":
+                    return {"ok": False, "code": "operation_conflict", "operation_id": operation_id}
                 return {"ok": True, "code": "migration_idempotent_replay", "operation_id": operation_id}
             now = utc_now()
             self._conn.execute(
@@ -2404,9 +3304,11 @@ class MemoryStore:
     def _rollback_portrait_migration_sync(self, operation_id: str) -> dict[str, Any]:
         operation_id = clean_text(operation_id, 120)
         with self._lock:
-            row = self._conn.execute("SELECT snapshot FROM portrait_operations WHERE operation_id=?", (operation_id,)).fetchone()
+            row = self._conn.execute("SELECT operation_kind, snapshot FROM portrait_operations WHERE operation_id=?", (operation_id,)).fetchone()
             if row is None:
                 return {"ok": False, "code": "migration_not_found"}
+            if clean_text(row["operation_kind"], 80) != "legacy_portrait_projection":
+                return {"ok": False, "code": "operation_conflict", "operation_id": operation_id}
             snapshot = json_loads(row["snapshot"], {})
             fact_ids = snapshot.get("fact_ids") if isinstance(snapshot, dict) and isinstance(snapshot.get("fact_ids"), list) else []
             if fact_ids:
