@@ -121,6 +121,36 @@ class ScopedBridgeTests(unittest.TestCase):
             record_kind="memory", record_id="x",
         ))
 
+    def test_scoped_operations_report_store_initialization_failure(self) -> None:
+        failed_service = SimpleNamespace(
+            scoped_store=None,
+            scoped_store_status={
+                "state": "degraded",
+                "error_code": "namespace_scoped_store_initialize_failed",
+            },
+            context=self.context,
+        )
+        bridge = MemoryCompanionBridge(failed_service)
+        capability = bridge.register_private_companion(self.companion)
+        self.assertIsNotNone(capability)
+
+        bind = bridge.bind_namespace_migration_epoch(
+            capability,
+            operation_id="bind-unavailable",
+            expected_previous_epoch="",
+            migration_epoch=EPOCH,
+            policy_version=POLICY,
+        )
+        read = bridge.read_scoped_record(
+            capability,
+            _context(),
+            record_kind="memory",
+            record_id="unavailable",
+        )
+
+        self.assertEqual("namespace_scoped_store_initialize_failed", bind["code"])
+        self.assertEqual("namespace_scoped_store_initialize_failed", read["code"])
+
     def test_deactivate_revokes_old_capability_and_probe_immediately(self) -> None:
         self._bind()
         self.assertTrue(self.bridge.bridge_lifecycle_status()["active"])

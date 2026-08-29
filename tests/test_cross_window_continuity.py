@@ -58,6 +58,8 @@ class CrossWindowContinuityTests(unittest.IsolatedAsyncioTestCase):
         service = self.make_service()
         now = datetime.now(timezone.utc)
         await service.store.add_timeline_event(
+            owner_bot_id="b1",
+            persona_id="default",
             event_type="user_message",
             session_id="qq:GroupMessage:g1",
             scope="group",
@@ -68,6 +70,8 @@ class CrossWindowContinuityTests(unittest.IsolatedAsyncioTestCase):
             occurred_at=(now - timedelta(minutes=4)).isoformat(timespec="seconds"),
         )
         await service.store.add_timeline_event(
+            owner_bot_id="b1",
+            persona_id="default",
             event_type="bot_response",
             session_id="qq:GroupMessage:g1",
             scope="group",
@@ -78,6 +82,8 @@ class CrossWindowContinuityTests(unittest.IsolatedAsyncioTestCase):
             occurred_at=(now - timedelta(minutes=3)).isoformat(timespec="seconds"),
         )
         await service.store.add_timeline_event(
+            owner_bot_id="b1",
+            persona_id="default",
             event_type="user_message",
             session_id="qq:GroupMessage:g1",
             scope="group",
@@ -88,6 +94,8 @@ class CrossWindowContinuityTests(unittest.IsolatedAsyncioTestCase):
             occurred_at=(now - timedelta(minutes=2)).isoformat(timespec="seconds"),
         )
         await service.store.add_timeline_event(
+            owner_bot_id="b2",
+            persona_id="default",
             event_type="user_message",
             session_id="qq:GroupMessage:g2",
             scope="group",
@@ -116,6 +124,8 @@ class CrossWindowContinuityTests(unittest.IsolatedAsyncioTestCase):
     async def test_expired_group_context_is_not_returned(self) -> None:
         service = self.make_service()
         await service.store.add_timeline_event(
+            owner_bot_id="b1",
+            persona_id="default",
             event_type="user_message",
             session_id="qq:GroupMessage:g1",
             scope="group",
@@ -141,6 +151,8 @@ class CrossWindowContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(service._message_explicitly_shares_private_context("告诉我群里谁知道我的私聊内容？"))
         self.assertTrue(service._message_explicitly_shares_private_context("可以在群里继续说我们刚才私聊的话题。"))
         await service.store.add_timeline_event(
+            owner_bot_id="b1",
+            persona_id="default",
             event_type="user_message",
             session_id="qq:FriendMessage:u1",
             scope="private",
@@ -186,6 +198,8 @@ class CrossWindowContinuityTests(unittest.IsolatedAsyncioTestCase):
     async def test_main_injection_receives_semantic_cross_window_capsule(self) -> None:
         service = self.make_service()
         await service.store.add_timeline_event(
+            owner_bot_id="b1",
+            persona_id="default",
             event_type="user_message",
             session_id="qq:GroupMessage:g1",
             scope="group",

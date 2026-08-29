@@ -956,6 +956,12 @@
         "type": "bool",
         "default": true
       },
+      "external_memory_producer_allowlist": {
+        "description": "外部长期记忆写入插件",
+        "hint": "默认为空。填写允许调用 record_external_memory 的 AstrBot 插件 root_dir_name，多项用英文逗号分隔；PrivateCompanion 仍按内置严格身份规则协商。",
+        "type": "string",
+        "default": ""
+      },
       "enable_p5_b1_recall_gate": {
         "description": "启用 P5-B1 召回闸门",
         "hint": "默认关闭。开启后普通记忆注入和主动 recall 需要陪伴侧当前请求的一次性 attestation；无效时返回明确 degraded。",

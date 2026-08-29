@@ -150,14 +150,13 @@ class CaptureAsyncRegistrationTests(unittest.IsolatedAsyncioTestCase):
     """F1: 采集写入任务经 _spawn_background 注册，terminate 后可被取消。"""
 
     def setUp(self) -> None:
-        self._store, self._temp_dir = make_store()
+        self._temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._temp_dir.cleanup)
         self._service = make_service(Path(self._temp_dir.name))
 
     def tearDown(self) -> None:
         self._service._closed = True
         self._service.store.close()
-        self._store.close()
 
     async def test_spawn_background_registers_and_cleans(self) -> None:
         async def noop() -> None:
@@ -184,14 +183,13 @@ class AcloseSummaryWorkerTests(unittest.IsolatedAsyncioTestCase):
     """F3: aclose 显式等待 _summary_workers 归零。"""
 
     def setUp(self) -> None:
-        self._store, self._temp_dir = make_store()
+        self._temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._temp_dir.cleanup)
         self._service = make_service(Path(self._temp_dir.name))
 
     def tearDown(self) -> None:
         self._service._closed = True
         self._service.store.close()
-        self._store.close()
 
     async def test_aclose_waits_summary_workers(self) -> None:
         async def never_finishes() -> None:
@@ -208,14 +206,13 @@ class ShutdownEvidenceTests(unittest.IsolatedAsyncioTestCase):
     """F4: shutdown_evidence / shutdown_complete 结构化证据。"""
 
     def setUp(self) -> None:
-        self._store, self._temp_dir = make_store()
+        self._temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._temp_dir.cleanup)
         self._service = make_service(Path(self._temp_dir.name))
 
     def tearDown(self) -> None:
         self._service._closed = True
         self._service.store.close()
-        self._store.close()
 
     async def test_shutdown_evidence_shape(self) -> None:
         await self._service.aclose()

@@ -185,6 +185,23 @@ class Req028ExpressionSyncTests(unittest.TestCase):
             service._memory_expression_decision(relaxed, memory, item, "user_profile", route, TimeIntent()),
         )
 
+    def test_tone_abstraction_can_be_disabled_without_changing_the_default(self) -> None:
+        service = MemoryCompanionService.__new__(MemoryCompanionService)
+        memory, item = memory_item()
+        route = MemoryRouteDecision()
+        ctx = SessionContext(scope="private", message_text="随便聊聊")
+
+        self.assertEqual(
+            ("mention", "stable_user_fact"),
+            service._memory_expression_decision(ctx, memory, item, "user_profile", route, TimeIntent()),
+        )
+
+        service.config = SimpleNamespace(bool=lambda _key, _default: False)
+        self.assertEqual(
+            ("candidate", "tone_abstraction_disabled"),
+            service._memory_expression_decision(ctx, memory, item, "user_profile", route, TimeIntent()),
+        )
+
     def test_paired_mode_does_not_inject_second_tone_or_write_legacy_state(self) -> None:
         service = MemoryCompanionService.__new__(MemoryCompanionService)
         ctx = SessionContext(

@@ -4413,16 +4413,43 @@ async function saveSchemaConfigModule(form, schemaData = {}) {
   const advancedModule = form.dataset.configAdvancedModule || "";
   const data = new FormData(form);
   const values = schemaValuesFromForm(data, schemaData.schema?.[module]?.items || {});
-  await apiPost("/config/module/update", { module, values });
+  const requests = [{ module, values }];
   if (advancedModule) {
     const advancedValues = schemaValuesFromForm(data, schemaData.schema?.[advancedModule]?.items || {});
-    await apiPost("/config/module/update", { module: advancedModule, values: advancedValues });
+    requests.push({ module: advancedModule, values: advancedValues });
   }
-  if (module === "appearance") {
+  const succeeded = [];
+  const failed = [];
+  for (const item of requests) {
+    const label = schemaData.schema?.[item.module]?.description || item.module;
+    try {
+      const result = await apiPost("/config/module/update", item);
+      succeeded.push({ ...item, label, result });
+    } catch (error) {
+      failed.push({ label, message: error?.message || "请求失败" });
+    }
+  }
+  if (module === "appearance" && succeeded.some((item) => item.module === module)) {
     applyTheme(values.theme);
   }
-  showToast("配置模块已保存");
-  await loadArchive();
+  if (succeeded.length) {
+    try {
+      await loadArchive();
+    } catch (error) {
+      failed.push({ label: "配置页刷新", message: error?.message || "刷新失败" });
+    }
+  }
+  const restartKeys = [...new Set(succeeded.flatMap((item) => item.result?.restart_required || []))];
+  if (failed.length) {
+    const failedDetail = failed.map((item) => `${item.label}（${item.message}）`).join("、");
+    const savedDetail = succeeded.length ? `；已保存：${succeeded.map((item) => item.label).join("、")}` : "";
+    const restartDetail = restartKeys.length ? `；需重载生效：${restartKeys.join("、")}` : "";
+    showToast(`${failedDetail}保存失败${savedDetail}${restartDetail}`, "error");
+  } else if (restartKeys.length) {
+    showToast(`配置已保存；需重载生效：${restartKeys.join("、")}`, "error");
+  } else {
+    showToast("配置模块已保存并立即生效");
+  }
 }
 
 function schemaValuesFromForm(data, schema = {}) {
@@ -4783,7 +4810,12 @@ async function saveRetrievalConfig(form) {
   };
   const result = await apiPost("/retrieval/config/update", payload);
   if (!result?.retrieval) throw new Error("检索配置未返回确认结果");
-  showToast("检索配置已保存");
+  const restartKeys = Array.isArray(result?.restart_required) ? result.restart_required : [];
+  if (restartKeys.length) {
+    showToast(`检索配置已保存；需重载生效：${restartKeys.join("、")}`, "error");
+  } else {
+    showToast("检索配置已保存并立即生效");
+  }
   try {
     await loadArchive();
   } catch (error) {
@@ -6680,7 +6712,14 @@ async function executeClearAllMemoryData() {
   clearDetail();
   await refreshAll();
   showArchiveResult(data.result);
-  showToast("全部记忆已清空");
+  if (data.result?.ok === false) {
+    const failed = Object.entries(data.result?.databases || {})
+      .filter(([, value]) => value?.ok === false)
+      .map(([name, value]) => `${name}: ${value?.error_code || "clear_failed"}`);
+    showToast(`全库清理未完整成功（${data.result?.state || "degraded"}）：${failed.join("、") || "附属数据清理失败"}`, "error");
+  } else {
+    showToast("全部记忆已清空");
+  }
 }
 
 function scopedClearPayload(scope) {
@@ -6722,6 +6761,11 @@ function clearScopeCountsText(counts = {}) {
     injection_logs: "注入日志",
     summary_failures: "总结失败记录",
     cross_window_threads: "跨窗口线程",
+    profile_fact: "REQ-041 画像事实",
+    memory: "REQ-041 记忆",
+    rule: "REQ-041 规则",
+    evidence: "REQ-041 证据",
+    summary: "REQ-041 摘要",
   };
   return Object.entries(labels)
     .map(([key, label]) => `${label} ${Number(counts[key] || 0)}`)
@@ -6775,7 +6819,14 @@ async function executeScopedClearMemory(payload) {
   state.activeBucketId = "all";
   await refreshAll();
   showGenericDetail("范围清理结果", data.result);
-  showToast("范围记忆已清空");
+  if (data.result?.ok === false) {
+    const failed = Object.entries(data.result?.databases || {})
+      .filter(([, value]) => value?.ok === false)
+      .map(([name, value]) => `${name}: ${value?.error_code || "clear_failed"}`);
+    showToast(`范围清理未完整成功（${data.result?.state || "degraded"}）：${failed.join("、")}`, "error");
+  } else {
+    showToast("范围记忆已清空");
+  }
 }
 
 async function clearCurrentScopedMemory(scope) {
@@ -6787,7 +6838,11 @@ async function clearCurrentScopedMemory(scope) {
   }
   const preview = await apiPost("/maintenance/clear_scope", { ...payload, preview: true });
   const counts = preview.result?.counts || {};
-  const total = Object.values(counts).reduce((sum, value) => sum + Number(value || 0), 0);
+  const total = Number.isFinite(Number(counts.total))
+    ? Number(counts.total)
+    : Object.entries(counts)
+      .filter(([key]) => key !== "total")
+      .reduce((sum, [, value]) => sum + Number(value || 0), 0);
   if (total <= 0) {
     showToast("这个范围内没有可清理的数据");
     return;

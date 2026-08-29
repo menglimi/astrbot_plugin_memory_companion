@@ -10,6 +10,22 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PanelRegressionTests(unittest.TestCase):
+    def test_config_and_clear_partial_failures_remain_visible(self) -> None:
+        script = (ROOT / "pages" / "记忆面板" / "app.js").read_text(encoding="utf-8")
+        config_start = script.index("async function saveSchemaConfigModule")
+        config_end = script.index("function schemaValuesFromForm", config_start)
+        config_block = script[config_start:config_end]
+        self.assertIn("const succeeded = []", config_block)
+        self.assertIn("const failed = []", config_block)
+        self.assertIn("已保存：", config_block)
+        self.assertIn("需重载生效：", config_block)
+        self.assertIn("配置页刷新", config_block)
+        self.assertIn("全库清理未完整成功", script)
+        self.assertIn("范围清理未完整成功", script)
+        self.assertIn("data.result?.databases", script)
+        self.assertIn("Number(counts.total)", script)
+        self.assertIn('memory: "REQ-041 记忆"', script)
+
     def test_summary_models_have_private_and_group_configuration(self) -> None:
         schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
         summary_items = schema["memory_summary"]["items"]
@@ -68,7 +84,10 @@ class PanelRegressionTests(unittest.TestCase):
 
         self.assertIn('const result = await apiPost("/retrieval/config/update", payload);', block)
         self.assertIn('if (!result?.retrieval) throw new Error("检索配置未返回确认结果");', block)
-        self.assertIn('showToast("检索配置已保存")', block)
+        self.assertIn("result?.restart_required", block)
+        self.assertIn("检索配置已保存；需重载生效", block)
+        self.assertIn('showToast("检索配置已保存并立即生效")', block)
+        self.assertIn("检索配置已保存，但刷新页面数据失败", block)
 
     def test_non_qq_private_sessions_are_not_labeled_as_qq_users(self) -> None:
         script = (ROOT / "pages" / "记忆面板" / "app.js").read_text(encoding="utf-8")

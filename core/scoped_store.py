@@ -9,10 +9,14 @@ from __future__ import annotations
 from contextlib import contextmanager
 import hashlib
 import json
+import os
 from pathlib import Path
+import re
+import shutil
 import sqlite3
 import threading
 import time
+import uuid
 from typing import Any, Iterator
 
 from .namespace import AssurancePolicy, NamespaceContext
@@ -75,15 +79,47 @@ def _payload(value: Any) -> tuple[str, str]:
 
 
 class ScopedStore:
-    def __init__(self, path: str | Path, *, clock: Any = None) -> None:
+    IDENTITY_SCHEMA_VERSION = "req041-scoped-store-v1"
+    IDENTITY_MARKER_NAME = ".req041-scoped-identity.json"
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        installation_id: str = "",
+        clock: Any = None,
+    ) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.installation_id = _token(installation_id, 80).lower()
+        if self.installation_id and not re.fullmatch(r"[0-9a-f]{32}", self.installation_id):
+            raise ScopedStoreError("scoped_installation_identity_invalid")
+        self.identity_marker_path = self.path.with_name(self.IDENTITY_MARKER_NAME)
         self._clock = clock if callable(clock) else time.time
         self._lock = threading.RLock()
+        self._writes_admitted = True
+        self._write_generation = 0
         self._active_epoch = ""
         self._active_policy_version = ""
         self._epoch_revision = 0
-        self._initialize()
+        self.last_identity_backup_path = ""
+        startup = self._identity_startup_state() if self.installation_id else {
+            "mode": "compat",
+            "marker": None,
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._initialize()
+            if self.installation_id:
+                self._bind_installation_identity(startup)
+        except BaseException:
+            if self.installation_id:
+                try:
+                    self._rollback_identity_initialization(startup)
+                except Exception as rollback_error:
+                    raise ScopedStoreError(
+                        "scoped_identity_binding_rollback_failed"
+                    ) from rollback_error
+            raise
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.path), timeout=15.0, isolation_level=None)
@@ -106,8 +142,12 @@ class ScopedStore:
             conn.close()
 
     @contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
+    def _transaction(
+        self, *, allow_fenced_maintenance: bool = False
+    ) -> Iterator[sqlite3.Connection]:
         with self._lock:
+            if not allow_fenced_maintenance and not self._writes_admitted:
+                raise ScopedStoreError("scoped_write_fenced")
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -120,6 +160,21 @@ class ScopedStore:
                 raise
             finally:
                 conn.close()
+
+    def begin_write_fence(self) -> int:
+        """Atomically reject new business mutations before maintenance runs."""
+
+        with self._lock:
+            self._write_generation += 1
+            self._writes_admitted = False
+            return self._write_generation
+
+    def resume_writes(self, expected_generation: int) -> bool:
+        with self._lock:
+            if expected_generation != self._write_generation:
+                return False
+            self._writes_admitted = True
+            return True
 
     def _initialize(self) -> None:
         with self._connection() as conn:
@@ -171,6 +226,13 @@ class ScopedStore:
                     created_at REAL NOT NULL,
                     PRIMARY KEY(operation_id,migration_epoch)
                 );
+                CREATE TABLE IF NOT EXISTS scoped_store_identity (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                    installation_id TEXT NOT NULL,
+                    database_name TEXT NOT NULL,
+                    schema_version TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
                 """
             )
             state = conn.execute(
@@ -180,6 +242,239 @@ class ScopedStore:
                 self._active_epoch = state["migration_epoch"]
                 self._active_policy_version = state["policy_version"]
                 self._epoch_revision = int(state["revision"])
+
+    def _identity_startup_state(self) -> dict[str, Any]:
+        if self.path.is_symlink() or (self.path.exists() and not self.path.is_file()):
+            raise ScopedStoreError("scoped_database_path_invalid")
+        marker_exists = self.identity_marker_path.exists() or self.identity_marker_path.is_symlink()
+        if marker_exists and (
+            self.identity_marker_path.is_symlink() or not self.identity_marker_path.is_file()
+        ):
+            raise ScopedStoreError("scoped_identity_marker_invalid")
+        marker: dict[str, Any] | None = None
+        if marker_exists:
+            try:
+                value = json.loads(self.identity_marker_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                raise ScopedStoreError("scoped_identity_marker_corrupt") from exc
+            if not isinstance(value, dict):
+                raise ScopedStoreError("scoped_identity_marker_invalid")
+            marker = value
+            if (
+                value.get("version") != 1
+                or value.get("database") != self.path.name
+                or value.get("schema_version") != self.IDENTITY_SCHEMA_VERSION
+                or not re.fullmatch(r"[0-9a-f]{32}", str(value.get("installation_id") or ""))
+            ):
+                raise ScopedStoreError("scoped_identity_marker_invalid")
+            if value["installation_id"] != self.installation_id:
+                raise ScopedStoreError("scoped_installation_identity_mismatch")
+
+        database_exists = self.path.is_file()
+        if marker is not None and not database_exists:
+            raise ScopedStoreError("scoped_database_missing_after_identity_established")
+        if not database_exists:
+            return {"mode": "new", "marker": None}
+
+        self._validate_existing_database_schema(require_identity=marker is not None)
+        if marker is not None:
+            return {"mode": "established", "marker": marker}
+        self.last_identity_backup_path = str(self._backup_existing_database(".before_identity_adoption"))
+        return {"mode": "adopt", "marker": None}
+
+    def _validate_existing_database_schema(self, *, require_identity: bool) -> None:
+        try:
+            conn = sqlite3.connect(
+                f"{self.path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=3.0,
+            )
+        except sqlite3.Error as exc:
+            raise ScopedStoreError("scoped_database_unreadable") from exc
+        try:
+            conn.row_factory = sqlite3.Row
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            }
+            required = {
+                "scoped_records",
+                "scoped_operations",
+                "scoped_epoch_state",
+                "scoped_epoch_operations",
+                "scoped_namespace_operations",
+            }
+            if not required.issubset(tables):
+                raise ScopedStoreError("scoped_legacy_schema_unrecognized")
+            record_columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(scoped_records)").fetchall()
+            }
+            if not {
+                "namespace_scope", "record_kind", "record_id", "revision",
+                "payload_json", "payload_hash", "deleted",
+            }.issubset(record_columns):
+                raise ScopedStoreError("scoped_legacy_schema_unrecognized")
+            identity_row = None
+            if "scoped_store_identity" in tables:
+                identity_row = conn.execute(
+                    "SELECT installation_id,database_name,schema_version "
+                    "FROM scoped_store_identity WHERE singleton=1"
+                ).fetchone()
+            if require_identity:
+                if identity_row is None:
+                    raise ScopedStoreError("scoped_database_identity_missing")
+                if (
+                    identity_row["installation_id"] != self.installation_id
+                    or identity_row["database_name"] != self.path.name
+                    or identity_row["schema_version"] != self.IDENTITY_SCHEMA_VERSION
+                ):
+                    raise ScopedStoreError("scoped_database_identity_mismatch")
+            if not require_identity and identity_row is not None:
+                # A bound database without its marker is a torn identity pair,
+                # not a legacy database that may be silently adopted.
+                raise ScopedStoreError("scoped_identity_marker_missing")
+            if not require_identity:
+                populated = any(
+                    conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
+                    for table in required
+                )
+                if not populated:
+                    raise ScopedStoreError("scoped_legacy_database_empty")
+        except sqlite3.DatabaseError as exc:
+            if isinstance(exc, ScopedStoreError):
+                raise
+            raise ScopedStoreError("scoped_database_unreadable") from exc
+        finally:
+            conn.close()
+
+    def _backup_existing_database(self, suffix: str) -> Path:
+        stamp = str(int(float(self._clock()) * 1000))
+        target = self.path.with_name(
+            f"{self.path.stem}.backup.{stamp}.{uuid.uuid4().hex}{suffix}.db"
+        )
+        try:
+            source_uri = f"{self.path.resolve().as_uri()}?mode=ro"
+            with sqlite3.connect(source_uri, uri=True) as source, sqlite3.connect(
+                str(target)
+            ) as destination:
+                source.backup(destination)
+            target.chmod(0o600)
+        except (sqlite3.Error, OSError) as exc:
+            target.unlink(missing_ok=True)
+            raise ScopedStoreError("scoped_backup_failed") from exc
+        return target
+
+    def backup(self, suffix: str = "") -> Path:
+        with self._lock:
+            self._truncate_wal()
+            return self._backup_existing_database(suffix)
+
+    def _bind_installation_identity(self, startup: dict[str, Any]) -> None:
+        mode = str(startup.get("mode") or "")
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT installation_id,database_name,schema_version FROM scoped_store_identity WHERE singleton=1"
+            ).fetchone()
+            if mode == "established":
+                if row is None:
+                    raise ScopedStoreError("scoped_database_identity_missing")
+                if (
+                    row["installation_id"] != self.installation_id
+                    or row["database_name"] != self.path.name
+                    or row["schema_version"] != self.IDENTITY_SCHEMA_VERSION
+                ):
+                    raise ScopedStoreError("scoped_database_identity_mismatch")
+                return
+            if row is not None and (
+                row["installation_id"] != self.installation_id
+                or row["database_name"] != self.path.name
+                or row["schema_version"] != self.IDENTITY_SCHEMA_VERSION
+            ):
+                raise ScopedStoreError("scoped_database_identity_mismatch")
+            if row is None:
+                conn.execute(
+                    "INSERT INTO scoped_store_identity(singleton,installation_id,database_name,schema_version,created_at) "
+                    "VALUES(1,?,?,?,?)",
+                    (
+                        self.installation_id,
+                        self.path.name,
+                        self.IDENTITY_SCHEMA_VERSION,
+                        float(self._clock()),
+                    ),
+                )
+        if not self.identity_marker_path.exists():
+            self._write_identity_marker()
+
+    def _rollback_identity_initialization(self, startup: dict[str, Any]) -> None:
+        """Restore the exact pre-construction DB/marker pairing on failure."""
+
+        mode = str(startup.get("mode") or "")
+        if mode == "established":
+            return
+        try:
+            self.identity_marker_path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise ScopedStoreError("scoped_identity_marker_rollback_failed") from exc
+        for suffix in ("-wal", "-shm", "-journal"):
+            try:
+                Path(str(self.path) + suffix).unlink(missing_ok=True)
+            except OSError as exc:
+                raise ScopedStoreError("scoped_identity_sidecar_rollback_failed") from exc
+        if mode == "new":
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError as exc:
+                raise ScopedStoreError("scoped_identity_database_rollback_failed") from exc
+            return
+        if mode != "adopt":
+            return
+        backup = Path(self.last_identity_backup_path)
+        if not backup.is_file():
+            raise ScopedStoreError("scoped_identity_adoption_backup_missing")
+        temp = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.rollback.tmp")
+        try:
+            shutil.copy2(backup, temp)
+            with temp.open("rb") as handle:
+                os.fsync(handle.fileno())
+            os.replace(temp, self.path)
+            directory_fd = os.open(str(self.path.parent), os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError as exc:
+            raise ScopedStoreError("scoped_identity_adoption_restore_failed") from exc
+        finally:
+            temp.unlink(missing_ok=True)
+
+    def _write_identity_marker(self) -> None:
+        payload = {
+            "version": 1,
+            "database": self.path.name,
+            "schema_version": self.IDENTITY_SCHEMA_VERSION,
+            "installation_id": self.installation_id,
+        }
+        temp = self.identity_marker_path.with_name(
+            f".{self.identity_marker_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with temp.open("x", encoding="utf-8") as handle:
+                os.chmod(temp, 0o600)
+                json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, self.identity_marker_path)
+            directory_fd = os.open(str(self.identity_marker_path.parent), os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if temp.exists():
+                temp.unlink()
 
     def _authorize(self, context: NamespaceContext | None, record_kind: str, *, write: bool) -> None:
         if record_kind not in RECORD_KINDS:
@@ -811,6 +1106,192 @@ class ScopedStore:
             )
         self._truncate_wal()
         return result
+
+    @staticmethod
+    def _maintenance_scope_matches(
+        owner: dict[str, Any],
+        *,
+        target_type: str,
+        identity_id: str,
+        group_id: str,
+        persona_id: str,
+    ) -> bool:
+        kind = _token(owner.get("kind"), 40)
+        owner_identity = _token(owner.get("identity_id"))
+        owner_group = _token(owner.get("group_id"))
+        owner_persona = _token(owner.get("persona_id"))
+        if target_type == "private":
+            return kind == "private" and owner_identity == identity_id
+        if target_type == "group":
+            return kind in {"group_shared", "group_member"} and owner_group == group_id
+        if target_type == "group_member":
+            return (
+                kind == "group_member"
+                and owner_group == group_id
+                and owner_identity == identity_id
+            )
+        return bool(owner_persona) and owner_persona == persona_id
+
+    def clear_all_records(self) -> dict[str, Any]:
+        """Tombstone every business record while retaining control/audit ledgers."""
+
+        with self._lock:
+            backup = self.backup(".before_clear_all")
+            now = float(self._clock())
+            with self._transaction(allow_fenced_maintenance=True) as conn:
+                rows = conn.execute(
+                    "SELECT record_kind,COUNT(*) AS count FROM scoped_records "
+                    "WHERE deleted=0 GROUP BY record_kind"
+                ).fetchall()
+                counts = {
+                    str(row["record_kind"]): int(row["count"] or 0)
+                    for row in rows
+                }
+                cursor = conn.execute(
+                    "UPDATE scoped_records SET revision=revision+1,payload_json=?,payload_hash=?,deleted=1,updated_at=? "
+                    "WHERE deleted=0",
+                    (_ERASED_PAYLOAD_JSON, _ERASED_PAYLOAD_HASH, now),
+                )
+            self._truncate_wal()
+        return {
+            "backup": str(backup),
+            "counts": {**counts, "total": sum(counts.values())},
+            "deleted": int(cursor.rowcount or 0),
+            "control_data_retained": True,
+        }
+
+    def clear_scoped_records(
+        self,
+        *,
+        target_type: str,
+        identity_id: str = "",
+        group_id: str = "",
+        persona_id: str = "",
+    ) -> dict[str, Any]:
+        target = _token(target_type, 40).lower()
+        identity = _token(identity_id)
+        group = _token(group_id)
+        persona = _token(persona_id)
+        if target not in {"private", "group", "group_member", "persona"}:
+            raise ScopedStoreError("scoped_clear_target_invalid")
+        if target == "private" and not identity:
+            raise ScopedStoreError("scoped_clear_identity_required")
+        if target == "group" and not group:
+            raise ScopedStoreError("scoped_clear_group_required")
+        if target == "group_member" and (not identity or not group):
+            raise ScopedStoreError("scoped_clear_group_member_required")
+        if target == "persona" and not persona:
+            raise ScopedStoreError("scoped_clear_persona_required")
+
+        matched: list[tuple[str, str, str]] = []
+        counts: dict[str, int] = {}
+        with self._lock:
+            backup = self.backup(f".before_clear_{target}")
+            now = float(self._clock())
+            with self._transaction(allow_fenced_maintenance=True) as conn:
+                rows = conn.execute(
+                    "SELECT namespace_scope,record_kind,record_id FROM scoped_records WHERE deleted=0"
+                ).fetchall()
+                for row in rows:
+                    try:
+                        owner = json.loads(str(row["namespace_scope"]))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(owner, dict) or not self._maintenance_scope_matches(
+                        owner,
+                        target_type=target,
+                        identity_id=identity,
+                        group_id=group,
+                        persona_id=persona,
+                    ):
+                        continue
+                    key = (
+                        str(row["namespace_scope"]),
+                        str(row["record_kind"]),
+                        str(row["record_id"]),
+                    )
+                    matched.append(key)
+                    counts[key[1]] = counts.get(key[1], 0) + 1
+                for namespace_scope, record_kind, record_id in matched:
+                    conn.execute(
+                        "UPDATE scoped_records SET revision=revision+1,payload_json=?,payload_hash=?,deleted=1,updated_at=? "
+                        "WHERE namespace_scope=? AND record_kind=? AND record_id=? AND deleted=0",
+                        (
+                            _ERASED_PAYLOAD_JSON,
+                            _ERASED_PAYLOAD_HASH,
+                            now,
+                            namespace_scope,
+                            record_kind,
+                            record_id,
+                        ),
+                    )
+            self._truncate_wal()
+        return {
+            "target_type": target,
+            "identity_id": identity,
+            "group_id": group,
+            "persona_id": persona,
+            "backup": str(backup),
+            "counts": {**counts, "total": len(matched)},
+            "deleted": len(matched),
+            "control_data_retained": True,
+        }
+
+    def preview_scoped_records(
+        self,
+        *,
+        target_type: str,
+        identity_id: str = "",
+        group_id: str = "",
+        persona_id: str = "",
+    ) -> dict[str, Any]:
+        """Count one maintenance scope without backup or record mutation."""
+
+        target = _token(target_type, 40).lower()
+        identity = _token(identity_id)
+        group = _token(group_id)
+        persona = _token(persona_id)
+        if target not in {"private", "group", "group_member", "persona"}:
+            raise ScopedStoreError("scoped_clear_target_invalid")
+        if target == "private" and not identity:
+            raise ScopedStoreError("scoped_clear_identity_required")
+        if target == "group" and not group:
+            raise ScopedStoreError("scoped_clear_group_required")
+        if target == "group_member" and (not identity or not group):
+            raise ScopedStoreError("scoped_clear_group_member_required")
+        if target == "persona" and not persona:
+            raise ScopedStoreError("scoped_clear_persona_required")
+
+        counts: dict[str, int] = {}
+        total = 0
+        with self._lock, self._connection() as conn:
+            rows = conn.execute(
+                "SELECT namespace_scope,record_kind FROM scoped_records WHERE deleted=0"
+            ).fetchall()
+            for row in rows:
+                try:
+                    owner = json.loads(str(row["namespace_scope"]))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(owner, dict) or not self._maintenance_scope_matches(
+                    owner,
+                    target_type=target,
+                    identity_id=identity,
+                    group_id=group,
+                    persona_id=persona,
+                ):
+                    continue
+                kind = str(row["record_kind"])
+                counts[kind] = counts.get(kind, 0) + 1
+                total += 1
+        return {
+            "target_type": target,
+            "identity_id": identity,
+            "group_id": group,
+            "persona_id": persona,
+            "preview": True,
+            "counts": {**counts, "total": total},
+        }
 
 
 __all__ = [

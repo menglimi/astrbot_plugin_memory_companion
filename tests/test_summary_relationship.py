@@ -473,6 +473,8 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
         await service.store.add_timeline_event(
             event_type="user_message",
             session_id=ctx.session_id,
+            owner_bot_id=ctx.bot_id,
+            persona_id="default",
             scope=ctx.scope,
             subject_id=ctx.user_id,
             object_id=ctx.user_id,
@@ -482,6 +484,8 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
         await service.store.add_timeline_event(
             event_type="bot_response",
             session_id=ctx.session_id,
+            owner_bot_id=ctx.bot_id,
+            persona_id="default",
             scope=ctx.scope,
             subject_id=ctx.bot_id,
             object_id=ctx.user_id,
@@ -1156,6 +1160,8 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
         timeline_id = await service.store.add_timeline_event(
             event_type="user_message",
             session_id=ctx.session_id,
+            owner_bot_id=ctx.bot_id,
+            persona_id="default",
             scope=ctx.scope,
             subject_id=ctx.user_id,
             object_id=ctx.bot_id,
@@ -1164,6 +1170,8 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
         )
         await service.store.record_summary_failure(
             session_id=ctx.session_id,
+            owner_bot_id=ctx.bot_id,
+            persona_id="default",
             scope=ctx.scope,
             start_timeline_id=timeline_id,
             end_timeline_id=timeline_id,
@@ -1188,13 +1196,23 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
 
         service._summary_provider_attempts = attempts
         self.assertEqual("", await service.maybe_summarize_session(ctx))
-        failure = await service.store.get_summary_failure(ctx.session_id)
+        failure = await service.store.get_summary_failure(
+            ctx.session_id,
+            owner_bot_id=ctx.bot_id,
+            persona_id="default",
+        )
         self.assertEqual("transient_cooldown", failure["metadata"]["state"])
 
         memory_id = await service.maybe_summarize_session(ctx)
 
         self.assertTrue(memory_id)
-        self.assertIsNone(await service.store.get_summary_failure(ctx.session_id))
+        self.assertIsNone(
+            await service.store.get_summary_failure(
+                ctx.session_id,
+                owner_bot_id=ctx.bot_id,
+                persona_id="default",
+            )
+        )
         row = service.store._conn.execute(
             "SELECT summarized_at FROM timeline WHERE id=?", (timeline_id,)
         ).fetchone()

@@ -13,6 +13,7 @@ import sqlite3
 import threading
 import time
 import traceback
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,7 @@ _ACL_UNSET = object()
 class MemoryStore:
     EMBEDDING_CANDIDATE_CACHE_MAX = 64
     SCHEMA_VERSION = "memory-atom-v2"
+    SCHEMA_MIGRATION_REVISION = 2
 
     PROFILE_MEMORY_TYPES = frozenset({"user_profile", "user_preference", "user_habit"})
 
@@ -66,15 +68,26 @@ class MemoryStore:
         }
     )
 
-    def __init__(self, db_path: Path, *, read_only: bool = False):
+    def __init__(
+        self,
+        db_path: Path,
+        *,
+        read_only: bool = False,
+        allow_create: bool = True,
+    ):
         self.db_path = Path(db_path)
         self._read_only = bool(read_only)
+        self._existed_at_open = self.db_path.is_file()
         if self._read_only:
-            if not self.db_path.is_file():
+            if not self._existed_at_open:
                 raise FileNotFoundError(
                     f"memory database does not exist: {self.db_path}"
                 )
         else:
+            if not self._existed_at_open and not allow_create:
+                raise FileNotFoundError(
+                    f"memory database does not exist: {self.db_path}"
+                )
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = self._open_connection()
         self._lock = threading.RLock()
@@ -86,9 +99,11 @@ class MemoryStore:
         self._active_tracked_operations = 0
         self._operation_waiters = 0
         self._operation_owner_stack = ""
-        # 置 True 时 _guard_operation_sync 记录在飞操作的调用栈，供关闭超时取证
-        # （EXIT_139_FIX_PLAN.md F2「记录未归零的操作栈」）。
+        # Optional close-time diagnostics for operations admitted through the
+        # official shutdown barrier.
         self._record_operation_stacks = False
+        self._writes_admitted = True
+        self._write_generation = 0
         self._closing = False
         self._closed = False
         self._fts_enabled = False
@@ -121,9 +136,8 @@ class MemoryStore:
             uri=uri,
         )
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=3000")
         if not self._read_only:
+            connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("PRAGMA wal_autocheckpoint=500")
         return connection
 
@@ -149,7 +163,6 @@ class MemoryStore:
                         uri=True,
                     )
                     conn.row_factory = sqlite3.Row
-                    conn.execute("PRAGMA busy_timeout=3000")
                     self._read_conn = conn
         return conn
 
@@ -234,6 +247,19 @@ class MemoryStore:
             *args,
         )
 
+    async def _run_tracked_recoverable_write(
+        self,
+        operation: Any,
+        *args: Any,
+        closed_result: Any = None,
+    ) -> Any:
+        return await self._run_tracked_operation(
+            self._run_with_database_recovery_sync,
+            operation,
+            *args,
+            closed_result=closed_result,
+        )
+
     async def _run_tracked_operation(
         self,
         operation: Any,
@@ -243,12 +269,21 @@ class MemoryStore:
         """Keep a queued executor write alive until store shutdown can flush it."""
 
         with self._operation_condition:
-            if self._closing or self._closed:
+            if self._closing or self._closed or not self._writes_admitted:
                 return closed_result
             self._active_tracked_operations += 1
+            generation = self._write_generation
 
         def run() -> Any:
             try:
+                with self._operation_condition:
+                    if (
+                        self._closing
+                        or self._closed
+                        or not self._writes_admitted
+                        or generation != self._write_generation
+                    ):
+                        return closed_result
                 return operation(*args)
             finally:
                 with self._operation_condition:
@@ -265,6 +300,44 @@ class MemoryStore:
                     self._operation_condition.notify_all()
             raise
         return await asyncio.shield(future)
+
+    def begin_write_fence(self, *, permanent: bool = False) -> int:
+        """Synchronously close admission before a waiter enters the executor.
+
+        ``asyncio`` cancellation cannot stop work already queued with
+        ``run_in_executor``.  The store-owned fence therefore invalidates
+        queued generations before the executor may schedule either those
+        writers or the maintenance waiter.
+        """
+
+        with self._operation_condition:
+            self._writes_admitted = False
+            self._write_generation += 1
+            if permanent:
+                self._closing = True
+            return self._write_generation
+
+    def wait_for_writes(self) -> None:
+        """Wait until every operation admitted before the fence has exited."""
+
+        with self._operation_condition:
+            while self._active_tracked_operations:
+                self._operation_condition.wait()
+
+    def pause_writes_and_wait(self, *, permanent: bool = False) -> int:
+        """Compatibility wrapper for synchronous callers such as ``close``."""
+
+        generation = self.begin_write_fence(permanent=permanent)
+        self.wait_for_writes()
+        return generation
+
+    def resume_writes(self, generation: int) -> bool:
+        with self._operation_condition:
+            if self._closing or self._closed or generation != self._write_generation:
+                return False
+            self._writes_admitted = True
+            self._operation_condition.notify_all()
+            return True
 
     def _database_file_snapshot(self) -> dict[str, Any]:
         def size(path: Path) -> int:
@@ -389,9 +462,10 @@ class MemoryStore:
         else:
             self._conn.commit()
 
-    def initialize(self) -> None:
+    def initialize(self, *, allow_empty_schema: bool = True) -> None:
         if self._read_only:
             with self._lock:
+                self._schema_migration_preflight_sync()
                 memories = self._conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories'"
                 ).fetchone()
@@ -406,10 +480,89 @@ class MemoryStore:
                 )
             return
         with self._lock:
+            if self._existed_at_open and not allow_empty_schema:
+                existing_tables = {
+                    str(row[0])
+                    for row in self._conn.execute(
+                        """
+                        SELECT name FROM sqlite_master
+                        WHERE type='table' AND name NOT LIKE 'sqlite_%'
+                        """
+                    ).fetchall()
+                }
+                if not existing_tables:
+                    raise sqlite3.DatabaseError(
+                        "existing memory database has no application schema; restore the primary store instead of initializing it"
+                    )
+                recognized_tables = {
+                    "memories",
+                    "timeline",
+                    "identities",
+                    "relationship_edges",
+                    "schema_metadata",
+                    "schema_migration_ledger",
+                }
+                if existing_tables.isdisjoint(recognized_tables):
+                    raise sqlite3.DatabaseError(
+                        "existing memory database has no recognized application schema; restore the primary store instead of adopting it"
+                    )
+            previous_revision = self._schema_migration_preflight_sync()
+            if previous_revision > self.SCHEMA_MIGRATION_REVISION:
+                raise sqlite3.DatabaseError(
+                    "future schema migration revision: "
+                    f"database={previous_revision} supported={self.SCHEMA_MIGRATION_REVISION}"
+                )
+            upgrade_required = previous_revision < self.SCHEMA_MIGRATION_REVISION
+            self.last_schema_backup_path = (
+                self._backup_before_schema_upgrade_sync(force=True)
+                if upgrade_required
+                else ""
+            )
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
-            self.last_schema_backup_path = self._backup_before_schema_upgrade_sync()
-            self._conn.executescript(
+            with self._transaction_sync():
+                self._initialize_schema_sync(previous_revision)
+
+    def ensure_installation_identity(self, expected_identity: str = "") -> str:
+        """Bind the database to its sidecar marker and reject mismatches."""
+
+        expected = clean_text(expected_identity, 80).lower()
+        if expected and not re.fullmatch(r"[0-9a-f]{32}", expected):
+            raise sqlite3.DatabaseError("invalid expected memory installation identity")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM schema_metadata WHERE key='installation_id'"
+            ).fetchone()
+            current = clean_text(row[0] if row is not None else "", 80).lower()
+            if current and not re.fullmatch(r"[0-9a-f]{32}", current):
+                raise sqlite3.DatabaseError("invalid memory installation identity in database")
+            if current and expected and current != expected:
+                raise sqlite3.DatabaseError(
+                    "memory installation identity does not match the data-directory marker"
+                )
+            if current:
+                return current
+            if self._read_only:
+                raise sqlite3.DatabaseError("memory installation identity is missing")
+            current = expected or uuid.uuid4().hex
+            with self._transaction_sync():
+                self._conn.execute(
+                    """
+                    INSERT INTO schema_metadata(key,value,updated_at)
+                    VALUES('installation_id',?,?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value=excluded.value,
+                        updated_at=excluded.updated_at
+                    """,
+                    (current, utc_now()),
+                )
+            return current
+
+    def _initialize_schema_sync(self, previous_revision: int) -> None:
+        """Apply one migration while the caller-owned transaction is active."""
+
+        with self._lock:
+            self._execute_schema_script_sync(
                 """
                 CREATE TABLE IF NOT EXISTS schema_metadata (
                     key TEXT PRIMARY KEY,
@@ -497,6 +650,8 @@ class MemoryStore:
 
                 CREATE TABLE IF NOT EXISTS timeline (
                     id TEXT PRIMARY KEY,
+                    owner_bot_id TEXT NOT NULL DEFAULT '',
+                    persona_id TEXT NOT NULL DEFAULT '',
                     event_type TEXT NOT NULL DEFAULT '',
                     session_id TEXT NOT NULL DEFAULT '',
                     scope TEXT NOT NULL DEFAULT '',
@@ -515,7 +670,9 @@ class MemoryStore:
                 );
 
                 CREATE TABLE IF NOT EXISTS summary_failures (
-                    session_id TEXT PRIMARY KEY,
+                    owner_bot_id TEXT NOT NULL DEFAULT '',
+                    persona_id TEXT NOT NULL DEFAULT '',
+                    session_id TEXT NOT NULL DEFAULT '',
                     scope TEXT NOT NULL DEFAULT '',
                     start_timeline_id TEXT NOT NULL DEFAULT '',
                     end_timeline_id TEXT NOT NULL DEFAULT '',
@@ -523,7 +680,8 @@ class MemoryStore:
                     last_error TEXT NOT NULL DEFAULT '',
                     metadata TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL DEFAULT '',
-                    updated_at TEXT NOT NULL DEFAULT ''
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(owner_bot_id, persona_id, session_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS chat_import_batches (
@@ -900,6 +1058,7 @@ class MemoryStore:
             self._repair_internal_control_tables_sync()
             self._ensure_memory_columns_sync()
             self._ensure_timeline_columns_sync()
+            self._ensure_summary_failure_namespace_sync()
             self._ensure_acl_columns_sync()
             self._ensure_portrait_columns_sync()
             self._ensure_memory_fts_sync()
@@ -924,19 +1083,23 @@ class MemoryStore:
                 "CREATE INDEX IF NOT EXISTS idx_memories_candidate "
                 "ON memories(importance DESC, occurred_at DESC, id)"
             )
+            self._conn.execute("DROP INDEX IF EXISTS idx_timeline_summary")
+            self._conn.execute("DROP INDEX IF EXISTS idx_timeline_subject_recent")
+            self._conn.execute("DROP INDEX IF EXISTS idx_timeline_object_recent")
             self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_timeline_summary ON timeline(session_id, summarized_at, occurred_at)"
+                "CREATE INDEX IF NOT EXISTS idx_timeline_summary "
+                "ON timeline(owner_bot_id, persona_id, session_id, summarized_at, occurred_at)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_timeline_scope_recent ON timeline(scope, occurred_at DESC)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_timeline_subject_recent "
-                "ON timeline(scope, session_id, subject_id, occurred_at DESC, created_at DESC)"
+                "ON timeline(owner_bot_id, persona_id, scope, session_id, subject_id, occurred_at DESC, created_at DESC)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_timeline_object_recent "
-                "ON timeline(scope, session_id, object_id, occurred_at DESC, created_at DESC)"
+                "ON timeline(owner_bot_id, persona_id, scope, session_id, object_id, occurred_at DESC, created_at DESC)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_timeline_retention ON timeline(occurred_at, created_at) WHERE summarized_at!=''"
@@ -947,8 +1110,10 @@ class MemoryStore:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_injection_logs_created ON injection_logs(created_at)"
             )
+            self._conn.execute("DROP INDEX IF EXISTS idx_timeline_dedupe_key")
             self._conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_timeline_dedupe_key ON timeline(dedupe_key) WHERE dedupe_key!=''"
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_timeline_namespace_dedupe "
+                "ON timeline(owner_bot_id, persona_id, dedupe_key) WHERE dedupe_key!=''"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_summary_failures_updated ON summary_failures(updated_at)"
@@ -1008,14 +1173,178 @@ class MemoryStore:
                 "CREATE INDEX IF NOT EXISTS idx_portrait_learning_queue_person ON portrait_learning_queue(person_id, state, updated_at)"
             )
             self._redact_existing_sensitive_rows_sync()
+            self._ensure_schema_migration_ledger_sync()
+            applied_at = utc_now()
             self._conn.execute(
                 """INSERT INTO schema_metadata(key,value,updated_at) VALUES('schema_version',?,?)
                    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
-                (self.SCHEMA_VERSION, utc_now()),
+                (self.SCHEMA_VERSION, applied_at),
             )
-            self._conn.commit()
+            if previous_revision < self.SCHEMA_MIGRATION_REVISION:
+                schema_fingerprint = self._schema_fingerprint_sync()
+                self._conn.execute(
+                    """
+                    INSERT INTO schema_migration_ledger(
+                        from_revision,to_revision,state,backup_path,
+                        schema_fingerprint,applied_at
+                    ) VALUES(?,?,?,?,?,?)
+                    """,
+                    (
+                        previous_revision,
+                        self.SCHEMA_MIGRATION_REVISION,
+                        "applied",
+                        self.last_schema_backup_path,
+                        schema_fingerprint,
+                        applied_at,
+                    ),
+                )
+                self._conn.execute(
+                    """INSERT INTO schema_metadata(key,value,updated_at)
+                       VALUES('migration_revision',?,?)
+                       ON CONFLICT(key) DO UPDATE
+                       SET value=excluded.value, updated_at=excluded.updated_at""",
+                    (str(self.SCHEMA_MIGRATION_REVISION), applied_at),
+                )
 
-    def _backup_before_schema_upgrade_sync(self) -> str:
+    def _execute_schema_script_sync(self, script: str) -> None:
+        """Execute a multi-statement schema script without implicit commits."""
+
+        statement = ""
+        for character in script:
+            statement += character
+            if character != ";" or not sqlite3.complete_statement(statement):
+                continue
+            sql = statement.strip()
+            statement = ""
+            if sql:
+                self._conn.execute(sql)
+        if statement.strip():
+            raise sqlite3.DatabaseError("incomplete schema migration statement")
+
+    @staticmethod
+    def _parse_schema_migration_revision(value: Any, *, source: str) -> int:
+        try:
+            revision = int(str(value).strip())
+        except (TypeError, ValueError) as exc:
+            raise sqlite3.DatabaseError(
+                f"invalid schema migration revision in {source}"
+            ) from exc
+        if revision < 0:
+            raise sqlite3.DatabaseError(
+                f"invalid schema migration revision in {source}"
+            )
+        return revision
+
+    def _schema_migration_preflight_sync(self) -> int:
+        """Read and validate the monotonic revision before any database write."""
+
+        metadata_revision: int | None = None
+        metadata_columns = self._table_column_names_sync("schema_metadata")
+        if {"key", "value"}.issubset(metadata_columns):
+            row = self._conn.execute(
+                "SELECT value FROM schema_metadata WHERE key='migration_revision'"
+            ).fetchone()
+            if row is not None:
+                metadata_revision = self._parse_schema_migration_revision(
+                    row["value"],
+                    source="schema_metadata",
+                )
+                if metadata_revision > self.SCHEMA_MIGRATION_REVISION:
+                    raise sqlite3.DatabaseError(
+                        "future schema migration revision: "
+                        f"database={metadata_revision} supported={self.SCHEMA_MIGRATION_REVISION}"
+                    )
+
+        ledger_revision: int | None = None
+        ledger_columns = self._table_column_names_sync("schema_migration_ledger")
+        if ledger_columns:
+            required = {
+                "from_revision",
+                "to_revision",
+                "state",
+                "backup_path",
+                "schema_fingerprint",
+                "applied_at",
+            }
+            if not required.issubset(ledger_columns):
+                raise sqlite3.DatabaseError("invalid schema migration ledger")
+            rows = self._conn.execute(
+                """SELECT from_revision,to_revision,state,backup_path,
+                          schema_fingerprint,applied_at
+                   FROM schema_migration_ledger
+                   ORDER BY to_revision"""
+            ).fetchall()
+            expected_from = 0
+            for row in rows:
+                from_revision = self._parse_schema_migration_revision(
+                    row["from_revision"],
+                    source="schema_migration_ledger.from_revision",
+                )
+                to_revision = self._parse_schema_migration_revision(
+                    row["to_revision"],
+                    source="schema_migration_ledger.to_revision",
+                )
+                if to_revision > self.SCHEMA_MIGRATION_REVISION:
+                    raise sqlite3.DatabaseError(
+                        "future schema migration revision: "
+                        f"database={to_revision} supported={self.SCHEMA_MIGRATION_REVISION}"
+                    )
+                if (
+                    from_revision != expected_from
+                    or to_revision <= from_revision
+                    or clean_text(row["state"], 40) != "applied"
+                    or re.fullmatch(r"[0-9a-f]{64}", clean_text(row["schema_fingerprint"], 80))
+                    is None
+                    or not clean_text(row["applied_at"], 80)
+                ):
+                    raise sqlite3.DatabaseError("non-monotonic schema migration ledger")
+                expected_from = to_revision
+            ledger_revision = expected_from
+
+        if metadata_revision is None and ledger_revision is None:
+            return 0
+        if metadata_revision is None or ledger_revision is None:
+            raise sqlite3.DatabaseError("incomplete schema migration ledger")
+        if metadata_revision != ledger_revision:
+            raise sqlite3.DatabaseError("schema migration revision mismatch")
+        return metadata_revision
+
+    def _ensure_schema_migration_ledger_sync(self) -> None:
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_migration_ledger (
+                to_revision INTEGER PRIMARY KEY,
+                from_revision INTEGER NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('applied')),
+                backup_path TEXT NOT NULL DEFAULT '',
+                schema_fingerprint TEXT NOT NULL,
+                applied_at TEXT NOT NULL,
+                CHECK(from_revision >= 0),
+                CHECK(to_revision > from_revision)
+            )
+            """
+        )
+
+    def _schema_fingerprint_sync(self) -> str:
+        rows = self._conn.execute(
+            """SELECT type,name,tbl_name,sql
+               FROM sqlite_master
+               WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+               ORDER BY type,name,tbl_name"""
+        ).fetchall()
+        canonical = [
+            (
+                clean_text(row["type"], 40),
+                clean_text(row["name"], 200),
+                clean_text(row["tbl_name"], 200),
+                re.sub(r"\s+", " ", str(row["sql"] or "")).strip(),
+            )
+            for row in rows
+        ]
+        payload = json.dumps(canonical, ensure_ascii=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _backup_before_schema_upgrade_sync(self, *, force: bool = False) -> str:
         """Create a consistent, private rollback copy before mutating an existing schema."""
 
         tables = {
@@ -1027,7 +1356,7 @@ class MemoryStore:
         if not tables:
             return ""
         schema_columns = self._table_column_names_sync("schema_metadata")
-        if schema_columns == {"key", "value", "updated_at"}:
+        if not force and schema_columns == {"key", "value", "updated_at"}:
             row = self._conn.execute(
                 "SELECT value FROM schema_metadata WHERE key='schema_version'"
             ).fetchone()
@@ -1223,7 +1552,7 @@ class MemoryStore:
 
 
     def _ensure_retrieval_revision_sync(self) -> None:
-        self._conn.executescript(
+        self._execute_schema_script_sync(
             """
             CREATE TABLE IF NOT EXISTS retrieval_revision (
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -1370,7 +1699,7 @@ class MemoryStore:
                 USING fts5(label, node_id UNINDEXED, tokenize='trigram')
                 """
             )
-            self._conn.executescript(
+            self._execute_schema_script_sync(
                 """
                 CREATE TRIGGER IF NOT EXISTS trg_knowledge_label_trgm_ai
                 AFTER INSERT ON knowledge_nodes
@@ -1419,7 +1748,10 @@ class MemoryStore:
 
     async def rebuild_memory_indexes(self) -> dict[str, Any]:
         """Ensure local lexical indexes exist after an external database import."""
-        return await asyncio.to_thread(self._rebuild_memory_indexes_sync)
+        return await self._run_tracked_operation(
+            self._rebuild_memory_indexes_sync,
+            closed_result={"fts": 0, "trigram": 0, "state": "fenced"},
+        )
 
     def _rebuild_memory_indexes_sync(self) -> dict[str, Any]:
         with self._lock:
@@ -1602,6 +1934,8 @@ class MemoryStore:
             for row in self._conn.execute("PRAGMA table_info(timeline)").fetchall()
         }
         additions = {
+            "owner_bot_id": "TEXT NOT NULL DEFAULT ''",
+            "persona_id": "TEXT NOT NULL DEFAULT ''",
             "summarized_at": "TEXT NOT NULL DEFAULT ''",
             "message_id": "TEXT NOT NULL DEFAULT ''",
             "dedupe_key": "TEXT NOT NULL DEFAULT ''",
@@ -1612,6 +1946,64 @@ class MemoryStore:
         for name, ddl in additions.items():
             if name not in existing:
                 self._conn.execute(f"ALTER TABLE timeline ADD COLUMN {name} {ddl}")
+
+    def _ensure_summary_failure_namespace_sync(self) -> None:
+        """Rebuild the legacy session-only failure ledger without guessing owners."""
+
+        columns = {
+            row["name"]: row
+            for row in self._conn.execute("PRAGMA table_info(summary_failures)").fetchall()
+        }
+        primary_key = [
+            name
+            for name, row in sorted(columns.items(), key=lambda item: int(item[1]["pk"] or 0))
+            if int(row["pk"] or 0) > 0
+        ]
+        if {"owner_bot_id", "persona_id"}.issubset(columns) and primary_key == [
+            "owner_bot_id",
+            "persona_id",
+            "session_id",
+        ]:
+            return
+
+        owner_expr = "owner_bot_id" if "owner_bot_id" in columns else "''"
+        persona_expr = "persona_id" if "persona_id" in columns else "''"
+        self._conn.execute("DROP TABLE IF EXISTS summary_failures_namespace_migration")
+        self._conn.execute(
+            """
+            CREATE TABLE summary_failures_namespace_migration (
+                owner_bot_id TEXT NOT NULL DEFAULT '',
+                persona_id TEXT NOT NULL DEFAULT '',
+                session_id TEXT NOT NULL DEFAULT '',
+                scope TEXT NOT NULL DEFAULT '',
+                start_timeline_id TEXT NOT NULL DEFAULT '',
+                end_timeline_id TEXT NOT NULL DEFAULT '',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(owner_bot_id, persona_id, session_id)
+            )
+            """
+        )
+        self._conn.execute(
+            f"""
+            INSERT INTO summary_failures_namespace_migration(
+                owner_bot_id, persona_id, session_id, scope,
+                start_timeline_id, end_timeline_id, retry_count,
+                last_error, metadata, created_at, updated_at
+            )
+            SELECT {owner_expr}, {persona_expr}, session_id, scope,
+                   start_timeline_id, end_timeline_id, retry_count,
+                   last_error, metadata, created_at, updated_at
+            FROM summary_failures
+            """
+        )
+        self._conn.execute("DROP TABLE summary_failures")
+        self._conn.execute(
+            "ALTER TABLE summary_failures_namespace_migration RENAME TO summary_failures"
+        )
 
     def _ensure_acl_columns_sync(self) -> None:
         existing = {
@@ -1648,11 +2040,12 @@ class MemoryStore:
         *,
         source_scope: str = "",
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._upsert_portrait_person_projection_sync,
+        return await self._run_tracked_operation(
+            self._upsert_portrait_person_projection_sync,
             deepcopy(person_ref),
             deepcopy(capability_summary),
             source_scope,
+            closed_result={"ok": False, "code": "store_write_fenced", "state": "degraded"},
         )
 
     def _upsert_portrait_person_projection_sync(
@@ -1763,7 +2156,11 @@ class MemoryStore:
         return {"ok": True, "code": "profile_exact"}
 
     async def add_portrait_evidence(self, evidence: dict[str, Any]) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._add_portrait_evidence_sync, deepcopy(evidence))
+        return await self._run_tracked_operation(
+            self._add_portrait_evidence_sync,
+            deepcopy(evidence),
+            closed_result={"ok": False, "code": "store_write_fenced", "created": False},
+        )
 
     def _add_portrait_evidence_sync(self, evidence: dict[str, Any]) -> dict[str, Any]:
         person_id = clean_text(evidence.get("person_id"), 80)
@@ -1882,7 +2279,11 @@ class MemoryStore:
         return int(row["portrait_revision"] or 0) if row is not None else 0
 
     async def upsert_portrait_fact(self, fact: dict[str, Any]) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._upsert_portrait_fact_sync, deepcopy(fact))
+        return await self._run_tracked_operation(
+            self._upsert_portrait_fact_sync,
+            deepcopy(fact),
+            closed_result={"ok": False, "code": "store_write_fenced", "created": False},
+        )
 
     def _upsert_portrait_fact_sync(self, fact: dict[str, Any]) -> dict[str, Any]:
         fact = redact_sensitive_value(fact)
@@ -2036,7 +2437,13 @@ class MemoryStore:
         ]
 
     async def enqueue_portrait_learning(self, *, person_id: str, fact_id: str, evidence_hash: str) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._enqueue_portrait_learning_sync, person_id, fact_id, evidence_hash)
+        return await self._run_tracked_operation(
+            self._enqueue_portrait_learning_sync,
+            person_id,
+            fact_id,
+            evidence_hash,
+            closed_result={"ok": False, "code": "store_write_fenced"},
+        )
 
     async def list_pending_portrait_people(self, *, limit: int = 500) -> list[str]:
         return await asyncio.to_thread(self._guard_operation_sync, self._list_pending_portrait_people_sync, limit)
@@ -2084,13 +2491,14 @@ class MemoryStore:
         success_limit: int = 1,
         attempt_limit: int = 2,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._run_portrait_daily_batch_sync,
+        return await self._run_tracked_operation(
+            self._run_portrait_daily_batch_sync,
             person_id,
             run_day,
             min_independent_evidence,
             success_limit,
             attempt_limit,
+            closed_result={"ok": False, "code": "store_write_fenced", "created": 0},
         )
 
     def _portrait_distinct_statement_count_sync(self, evidence_hashes: list[Any]) -> int:
@@ -2346,7 +2754,11 @@ class MemoryStore:
         }
 
     async def upsert_portrait_suppression(self, marker: dict[str, Any]) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._upsert_portrait_suppression_sync, deepcopy(marker))
+        return await self._run_tracked_operation(
+            self._upsert_portrait_suppression_sync,
+            deepcopy(marker),
+            closed_result={"ok": False, "code": "store_write_fenced"},
+        )
 
     def _upsert_portrait_suppression_sync(self, marker: dict[str, Any]) -> dict[str, Any]:
         key = clean_text(marker.get("suppression_key"), 80)
@@ -2488,14 +2900,15 @@ class MemoryStore:
         operation_id: str,
         expires_at: str = "",
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._govern_portrait_fact_sync,
+        return await self._run_tracked_operation(
+            self._govern_portrait_fact_sync,
             person_id,
             fact_id,
             action,
             actor,
             operation_id,
             expires_at,
+            closed_result={"ok": False, "code": "store_write_fenced"},
         )
 
     def _govern_portrait_fact_sync(
@@ -2547,7 +2960,12 @@ class MemoryStore:
         return {**result, "fact_id": fact_id, "action": action}
 
     async def portrait_migration(self, *, operation_id: str, dry_run: bool = True) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._portrait_migration_sync, operation_id, dry_run)
+        return await self._run_tracked_operation(
+            self._portrait_migration_sync,
+            operation_id,
+            dry_run,
+            closed_result={"ok": False, "code": "store_write_fenced"},
+        )
 
     def _portrait_migration_sync(self, operation_id: str, dry_run: bool) -> dict[str, Any]:
         operation_id = clean_text(operation_id, 120)
@@ -2571,7 +2989,11 @@ class MemoryStore:
         return {"ok": True, "code": "migration_applied", "operation_id": operation_id, "legacy_candidate_count": count}
 
     async def rollback_portrait_migration(self, *, operation_id: str) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._rollback_portrait_migration_sync, operation_id)
+        return await self._run_tracked_operation(
+            self._rollback_portrait_migration_sync,
+            operation_id,
+            closed_result={"ok": False, "code": "store_write_fenced"},
+        )
 
     def _rollback_portrait_migration_sync(self, operation_id: str) -> dict[str, Any]:
         operation_id = clean_text(operation_id, 120)
@@ -2598,6 +3020,69 @@ class MemoryStore:
         with self._lock:
             with self._transaction_sync():
                 return self._normalize_internal_bot_self_scopes_sync()
+
+    def normalize_legacy_rule_profile_states(self) -> int:
+        """Activate only legacy rule profiles whose evidence already proves it."""
+
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM memories
+                WHERE memory_type IN ('user_profile', 'user_preference', 'user_habit')
+                  AND json_valid(metadata)
+                  AND LOWER(COALESCE(CAST(json_extract(metadata, '$.extractor') AS TEXT), ''))
+                      IN ('rule_v1', 'rule_v2')
+                ORDER BY created_at, id
+                """
+            ).fetchall()
+            updates: list[tuple[str, str, str]] = []
+            now = utc_now()
+            for row in rows:
+                record = MemoryRecord.from_row(row)
+                metadata = dict(record.metadata) if isinstance(record.metadata, dict) else {}
+                if clean_text(
+                    metadata.get("profile_state")
+                    or metadata.get("profile_status")
+                    or metadata.get("status"),
+                    40,
+                ):
+                    continue
+                if (
+                    clean_text(record.lifecycle, 40).lower() == "archived"
+                    or clean_text(record.review_status, 40).lower()
+                    in {"pending", "rejected"}
+                    or clean_text(record.validity_status, 40).lower() != "active"
+                    or metadata.get("quality_gate_passed") is not True
+                    or clean_text(metadata.get("extraction_quality"), 40).lower()
+                    not in {"explicit", "confirmed"}
+                    or clean_text(metadata.get("evidence_strength"), 60).lower()
+                    not in {"direct_statement", "user_confirmed"}
+                ):
+                    continue
+                patched = dict(metadata)
+                patched["profile_state"] = "active"
+                patched["profile_status"] = "active"
+                patched["profile_state_backfilled_at"] = now
+                patched["profile_state_backfill_rule"] = (
+                    "legacy_rule_strong_evidence_v1"
+                )
+                record.metadata = patched
+                allowed, _reason = profile_quality_decision(
+                    record,
+                    require_active=True,
+                )
+                if allowed:
+                    updates.append((json_dumps(patched), now, record.id))
+            if not updates:
+                return 0
+            with self._transaction_sync():
+                self._conn.executemany(
+                    "UPDATE memories SET metadata=?, updated_at=? WHERE id=?",
+                    updates,
+                )
+            self._embedding_candidate_cache.clear()
+            self._embedding_candidate_cache_revision = ""
+            return len(updates)
 
     def _normalize_legacy_manual_visibility_sync(self) -> int:
         private_cur = self._conn.execute(
@@ -2709,6 +3194,10 @@ class MemoryStore:
         with self._operation_condition:
             if self._closed:
                 return
+            # Invalidate queued writers before waiting, while retaining the
+            # official bounded close barrier for every tracked operation.
+            self._writes_admitted = False
+            self._write_generation += 1
             self._closing = True
             if self._active_tracked_operations:
                 self._operation_waiters += 1
@@ -2804,12 +3293,14 @@ class MemoryStore:
         target_type: str,
         group_id: str = "",
         user_id: str = "",
+        persona_id: str = "",
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
             self._guard_operation_sync, self._scoped_memory_clear_sync,
             target_type,
             group_id,
             user_id,
+            persona_id,
             False,
         )
 
@@ -2819,12 +3310,14 @@ class MemoryStore:
         target_type: str,
         group_id: str = "",
         user_id: str = "",
+        persona_id: str = "",
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
             self._guard_operation_sync, self._scoped_memory_clear_sync,
             target_type,
             group_id,
             user_id,
+            persona_id,
             True,
         )
 
@@ -2833,27 +3326,43 @@ class MemoryStore:
         target_type: str,
         group_id: str,
         user_id: str,
+        persona_id: str,
         execute: bool,
     ) -> dict[str, Any]:
         target_type = clean_text(target_type, 40).lower()
         group_id = clean_text(group_id, 120)
         user_id = clean_text(user_id, 120)
-        if target_type not in {"group", "private", "group_member"}:
-            raise ValueError("target_type must be group, private or group_member")
+        persona_id = clean_text(persona_id, 96)
+        if target_type not in {"group", "private", "group_member", "persona"}:
+            raise ValueError("target_type must be group, private, group_member or persona")
         if target_type == "group" and not group_id:
             raise ValueError("group_id is required")
         if target_type == "private" and not user_id:
             raise ValueError("user_id is required")
         if target_type == "group_member" and (not group_id or not user_id):
             raise ValueError("group_id and user_id are required")
+        if target_type == "persona" and not persona_id:
+            raise ValueError("persona_id is required")
 
-        memory_where, memory_params = self._scoped_memory_where(target_type, group_id, user_id)
-        timeline_where, timeline_params = self._scoped_timeline_where(target_type, group_id, user_id)
-        relation_where, relation_params = self._scoped_relation_where(target_type, group_id, user_id)
-        knowledge_node_where, knowledge_node_params = self._scoped_knowledge_node_where(target_type, group_id, user_id)
-        knowledge_edge_where, knowledge_edge_params = self._scoped_knowledge_edge_where(target_type, group_id, user_id)
-        injection_where, injection_params = self._scoped_session_log_where(target_type, group_id, user_id)
-        thread_where, thread_params = self._scoped_thread_where(target_type, group_id, user_id)
+        if target_type == "persona":
+            metadata_persona_where = "COALESCE(CAST(json_extract(metadata,'$.persona_id') AS TEXT),'')=?"
+            memory_where, memory_params = metadata_persona_where, [persona_id]
+            timeline_where, timeline_params = "persona_id=?", [persona_id]
+            relation_where, relation_params = metadata_persona_where, [persona_id]
+            knowledge_node_where, knowledge_node_params = metadata_persona_where, [persona_id]
+            knowledge_edge_where, knowledge_edge_params = metadata_persona_where, [persona_id]
+            injection_where, injection_params = "1=0", []
+            failure_where, failure_params = "persona_id=?", [persona_id]
+            thread_where, thread_params = metadata_persona_where, [persona_id]
+        else:
+            memory_where, memory_params = self._scoped_memory_where(target_type, group_id, user_id)
+            timeline_where, timeline_params = self._scoped_timeline_where(target_type, group_id, user_id)
+            relation_where, relation_params = self._scoped_relation_where(target_type, group_id, user_id)
+            knowledge_node_where, knowledge_node_params = self._scoped_knowledge_node_where(target_type, group_id, user_id)
+            knowledge_edge_where, knowledge_edge_params = self._scoped_knowledge_edge_where(target_type, group_id, user_id)
+            injection_where, injection_params = self._scoped_session_log_where(target_type, group_id, user_id)
+            failure_where, failure_params = injection_where, injection_params
+            thread_where, thread_params = self._scoped_thread_where(target_type, group_id, user_id)
 
         with self._lock:
             memory_ids = [
@@ -2874,7 +3383,7 @@ class MemoryStore:
                     memory_ids,
                 ),
                 "injection_logs": self._count_where("injection_logs", injection_where, injection_params),
-                "summary_failures": self._count_where("summary_failures", injection_where, injection_params),
+                "summary_failures": self._count_where("summary_failures", failure_where, failure_params),
                 "cross_window_threads": self._count_where("cross_window_threads", thread_where, thread_params),
             }
             if not execute:
@@ -2882,6 +3391,7 @@ class MemoryStore:
                     "target_type": target_type,
                     "group_id": group_id,
                     "user_id": user_id,
+                    "persona_id": persona_id,
                     "preview": True,
                     "counts": counts,
                 }
@@ -2908,12 +3418,13 @@ class MemoryStore:
                 )
                 deleted["knowledge_nodes"] = self._delete_where("knowledge_nodes", knowledge_node_where, knowledge_node_params)
                 deleted["injection_logs"] = self._delete_where("injection_logs", injection_where, injection_params)
-                deleted["summary_failures"] = self._delete_where("summary_failures", injection_where, injection_params)
+                deleted["summary_failures"] = self._delete_where("summary_failures", failure_where, failure_params)
                 deleted["cross_window_threads"] = self._delete_where("cross_window_threads", thread_where, thread_params)
         return {
             "target_type": target_type,
             "group_id": group_id,
             "user_id": user_id,
+            "persona_id": persona_id,
             "preview": False,
             "backup": str(backup),
             "counts": counts,
@@ -3424,9 +3935,11 @@ class MemoryStore:
         return "active"
 
     async def upsert_profile_candidate(self, record: MemoryRecord) -> dict[str, Any]:
-        return await self._run_recoverable_database_operation(
+        return await self._run_tracked_operation(
+            self._run_with_database_recovery_sync,
             self._upsert_profile_candidate_sync,
             deepcopy(record),
+            closed_result={"ok": False, "code": "store_write_fenced", "memory_id": ""},
         )
 
     def _upsert_profile_candidate_sync(self, record: MemoryRecord) -> dict[str, Any]:
@@ -4221,12 +4734,13 @@ class MemoryStore:
         actions: list[dict[str, Any]],
         backup_path: str,
     ) -> dict[str, Any]:
-        return await self._run_recoverable_database_operation(
+        return await self._run_tracked_recoverable_write(
             self._apply_profile_repairs_sync,
             operation_id,
             rule_version,
             deepcopy(actions),
             backup_path,
+            closed_result={"ok": False, "code": "store_write_fenced"},
         )
 
     def _apply_profile_repairs_sync(
@@ -4918,10 +5432,11 @@ class MemoryStore:
         operation_id: str,
         rollback_backup_path: str = "",
     ) -> dict[str, Any]:
-        return await self._run_recoverable_database_operation(
+        return await self._run_tracked_recoverable_write(
             self._rollback_profile_repairs_sync,
             operation_id,
             rollback_backup_path,
+            closed_result={"ok": False, "code": "store_write_fenced"},
         )
 
     def _rollback_profile_repairs_sync(
@@ -5239,10 +5754,12 @@ class MemoryStore:
         return MemoryRecord.from_row(payload)
 
     async def insert_memory(self, record: MemoryRecord, review_reason: str = "") -> str:
-        return await self._run_recoverable_database_operation(
+        return await self._run_tracked_operation(
+            self._run_with_database_recovery_sync,
             self._insert_memory_sync,
             record,
             review_reason,
+            closed_result="",
         )
 
     def _insert_memory_sync(self, record: MemoryRecord, review_reason: str = "") -> str:
@@ -5390,13 +5907,14 @@ class MemoryStore:
         profile: dict[str, Any] | None = None,
         confidence: float = 0.6,
     ) -> str:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._upsert_identity_sync,
+        return await self._run_tracked_operation(
+            self._upsert_identity_sync,
             platform,
             entity,
             aliases or [],
             profile or {},
             confidence,
+            closed_result="",
         )
 
     def _upsert_identity_sync(
@@ -5665,8 +6183,8 @@ class MemoryStore:
         confidence: float = 0.6,
         metadata: dict[str, Any] | None = None,
     ) -> str:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._upsert_knowledge_node_sync,
+        return await self._run_tracked_operation(
+            self._upsert_knowledge_node_sync,
             node_type,
             label,
             scope,
@@ -5674,6 +6192,7 @@ class MemoryStore:
             group_id,
             confidence,
             metadata or {},
+            closed_result="",
         )
 
     def _upsert_knowledge_node_sync(
@@ -5751,8 +6270,8 @@ class MemoryStore:
         review_status: str = "auto",
         metadata: dict[str, Any] | None = None,
     ) -> str:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._upsert_knowledge_edge_sync,
+        return await self._run_tracked_operation(
+            self._upsert_knowledge_edge_sync,
             source_node_id,
             target_node_id,
             relation_type,
@@ -5764,6 +6283,7 @@ class MemoryStore:
             confidence,
             review_status,
             metadata or {},
+            closed_result="",
         )
 
     def _upsert_knowledge_edge_sync(
@@ -6181,6 +6701,8 @@ class MemoryStore:
     async def add_timeline_event(
         self,
         *,
+        owner_bot_id: str = "",
+        persona_id: str = "",
         event_type: str,
         session_id: str,
         scope: str,
@@ -6190,9 +6712,10 @@ class MemoryStore:
         metadata: dict[str, Any] | None = None,
         occurred_at: str = "",
     ) -> str:
-        return await asyncio.to_thread(
-            self._guard_operation_sync,
+        return await self._run_tracked_operation(
             self._add_timeline_event_sync,
+            owner_bot_id,
+            persona_id,
             event_type,
             session_id,
             scope,
@@ -6201,10 +6724,13 @@ class MemoryStore:
             content,
             metadata or {},
             occurred_at,
+            closed_result="",
         )
 
     def _add_timeline_event_sync(
         self,
+        owner_bot_id: str,
+        persona_id: str,
         event_type: str,
         session_id: str,
         scope: str,
@@ -6219,11 +6745,16 @@ class MemoryStore:
         metadata = redact_sensitive_value(metadata)
         row_id = new_id("tl")
         event_type = clean_text(event_type, 80)
+        owner_bot_id = clean_text(owner_bot_id, 120)
+        persona_id = clean_text(persona_id, 96)
         session_id = clean_text(session_id, 200)
         subject_id = clean_text(subject_id, 120)
         message_id = clean_text(metadata.get("message_id"), 120)
         dedupe_key = (
-            stable_fingerprint("timeline", event_type, session_id, subject_id, message_id)
+            stable_fingerprint(
+                "timeline", owner_bot_id, persona_id, event_type,
+                session_id, subject_id, message_id,
+            )
             if message_id
             else ""
         )
@@ -6232,15 +6763,17 @@ class MemoryStore:
                 cur = self._conn.execute(
                     """
                     INSERT OR IGNORE INTO timeline(
-                        id, event_type, session_id, scope, subject_id, object_id,
+                        id, owner_bot_id, persona_id, event_type, session_id, scope, subject_id, object_id,
                         content, metadata, message_id, dedupe_key,
                         occurred_at, created_at, summarized_at,
                         retention_class, import_batch_id, source_sequence
                     )
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?, '',?,?,?)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, '',?,?,?)
                     """,
                     (
                         row_id,
+                        owner_bot_id,
+                        persona_id,
                         event_type,
                         session_id,
                         clean_text(scope, 40),
@@ -6259,22 +6792,31 @@ class MemoryStore:
                 )
                 if cur.rowcount == 0 and dedupe_key:
                     existing = self._conn.execute(
-                        "SELECT id FROM timeline WHERE dedupe_key=?",
-                        (dedupe_key,),
+                        "SELECT id FROM timeline WHERE owner_bot_id=? AND persona_id=? AND dedupe_key=?",
+                        (owner_bot_id, persona_id, dedupe_key),
                     ).fetchone()
                     if existing:
                         return clean_text(existing["id"], 120)
         return row_id
 
     async def add_historical_timeline_events(self, rows: list[dict[str, Any]]) -> dict[str, str]:
-        inserted, _ = await asyncio.to_thread(self._guard_operation_sync, self._add_historical_timeline_events_sync, rows)
+        result = await self._run_tracked_operation(
+            self._add_historical_timeline_events_sync,
+            rows,
+            closed_result=({}, set()),
+        )
+        inserted, _ = result
         return inserted
 
     async def add_historical_timeline_events_with_status(
         self,
         rows: list[dict[str, Any]],
     ) -> tuple[dict[str, str], set[str]]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._add_historical_timeline_events_sync, rows)
+        return await self._run_tracked_operation(
+            self._add_historical_timeline_events_sync,
+            rows,
+            closed_result=({}, set()),
+        )
 
     def _add_historical_timeline_events_sync(
         self,
@@ -6294,21 +6836,32 @@ class MemoryStore:
                     message_id = clean_text(raw.get("message_id"), 120)
                     if not event_type or not session_id or not subject_id or not message_id:
                         continue
-                    dedupe_key = stable_fingerprint("timeline", event_type, session_id, subject_id, message_id)
                     row_id = clean_text(raw.get("id"), 120) or new_id("tl")
                     metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+                    owner_bot_id = clean_text(
+                        raw.get("owner_bot_id") or metadata.get("owner_bot_id"), 120
+                    )
+                    persona_id = clean_text(
+                        raw.get("persona_id") or metadata.get("persona_id"), 96
+                    )
+                    dedupe_key = stable_fingerprint(
+                        "timeline", owner_bot_id, persona_id, event_type,
+                        session_id, subject_id, message_id,
+                    )
                     cursor = self._conn.execute(
                         """
                         INSERT OR IGNORE INTO timeline(
-                            id, event_type, session_id, scope, subject_id, object_id,
+                            id, owner_bot_id, persona_id, event_type, session_id, scope, subject_id, object_id,
                             content, metadata, message_id, dedupe_key,
                             occurred_at, created_at, summarized_at,
                             retention_class, import_batch_id, source_sequence
                         )
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?, '',?,?,?)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, '',?,?,?)
                         """,
                         (
                             row_id,
+                            owner_bot_id,
+                            persona_id,
                             event_type,
                             session_id,
                             clean_text(raw.get("scope"), 40),
@@ -6328,15 +6881,19 @@ class MemoryStore:
                     if cursor.rowcount > 0:
                         newly_inserted.add(message_id)
                     existing = self._conn.execute(
-                        "SELECT id FROM timeline WHERE dedupe_key=?",
-                        (dedupe_key,),
+                        "SELECT id FROM timeline WHERE owner_bot_id=? AND persona_id=? AND dedupe_key=?",
+                        (owner_bot_id, persona_id, dedupe_key),
                     ).fetchone()
                     if existing:
                         inserted[message_id] = clean_text(existing["id"], 120)
         return inserted, newly_inserted
 
     async def upsert_chat_import_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._upsert_chat_import_batch_sync, payload)
+        return await self._run_tracked_operation(
+            self._upsert_chat_import_batch_sync,
+            payload,
+            closed_result={"ok": False, "code": "store_write_fenced"},
+        )
 
     def _upsert_chat_import_batch_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
         batch_id = clean_text(payload.get("id"), 120)
@@ -6423,7 +6980,12 @@ class MemoryStore:
         return results
 
     async def update_chat_import_batch(self, batch_id: str, **changes: Any) -> dict[str, Any] | None:
-        return await asyncio.to_thread(self._guard_operation_sync, self._update_chat_import_batch_sync, batch_id, changes)
+        return await self._run_tracked_operation(
+            self._update_chat_import_batch_sync,
+            batch_id,
+            changes,
+            closed_result=None,
+        )
 
     def _update_chat_import_batch_sync(self, batch_id: str, changes: dict[str, Any]) -> dict[str, Any] | None:
         allowed = {
@@ -6447,7 +7009,12 @@ class MemoryStore:
         return self._get_chat_import_batch_sync(batch_id)
 
     async def replace_chat_import_segments(self, batch_id: str, segments: list[dict[str, Any]]) -> int:
-        return await asyncio.to_thread(self._guard_operation_sync, self._replace_chat_import_segments_sync, batch_id, segments)
+        return await self._run_tracked_operation(
+            self._replace_chat_import_segments_sync,
+            batch_id,
+            segments,
+            closed_result=0,
+        )
 
     def _replace_chat_import_segments_sync(self, batch_id: str, segments: list[dict[str, Any]]) -> int:
         batch_id = clean_text(batch_id, 120)
@@ -6501,7 +7068,12 @@ class MemoryStore:
         return results
 
     async def update_chat_import_segment(self, segment_id: str, **changes: Any) -> bool:
-        return await asyncio.to_thread(self._guard_operation_sync, self._update_chat_import_segment_sync, segment_id, changes)
+        return await self._run_tracked_operation(
+            self._update_chat_import_segment_sync,
+            segment_id,
+            changes,
+            closed_result=False,
+        )
 
     def _update_chat_import_segment_sync(self, segment_id: str, changes: dict[str, Any]) -> bool:
         allowed = {"status", "attempts", "result", "summary_memory_id", "error"}
@@ -6520,7 +7092,11 @@ class MemoryStore:
         return cur.rowcount > 0
 
     async def rollback_chat_import_batch(self, batch_id: str) -> dict[str, int]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._rollback_chat_import_batch_sync, batch_id)
+        return await self._run_tracked_operation(
+            self._rollback_chat_import_batch_sync,
+            batch_id,
+            closed_result={},
+        )
 
     async def chat_import_memory_counts(self, batch_id: str) -> dict[str, int]:
         return await asyncio.to_thread(self._guard_operation_sync, self._chat_import_memory_counts_sync, batch_id)
@@ -6641,8 +7217,8 @@ class MemoryStore:
         bot_name: str = "",
         backup_path: str = "",
     ) -> dict[str, int]:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._rebind_chat_import_batch_sync,
+        return await self._run_tracked_operation(
+            self._rebind_chat_import_batch_sync,
             batch_id,
             session_id,
             platform,
@@ -6651,6 +7227,7 @@ class MemoryStore:
             bot_id,
             bot_name,
             backup_path,
+            closed_result={},
         )
 
     def _rebind_chat_import_batch_sync(
@@ -7090,11 +7667,12 @@ class MemoryStore:
         session_id: str,
         entity_links: dict[str, dict[str, dict[str, str]]] | None = None,
     ) -> dict[str, int]:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._repair_chat_import_identity_links_sync,
+        return await self._run_tracked_operation(
+            self._repair_chat_import_identity_links_sync,
             batch_id,
             session_id,
             entity_links or {},
+            closed_result={},
         )
 
     def _repair_chat_import_identity_links_sync(
@@ -7200,7 +7778,11 @@ class MemoryStore:
         }
 
     async def neutralize_chat_import_summary_perspective(self, batch_id: str) -> dict[str, int]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._neutralize_chat_import_summary_perspective_sync, batch_id)
+        return await self._run_tracked_operation(
+            self._neutralize_chat_import_summary_perspective_sync,
+            batch_id,
+            closed_result={},
+        )
 
     def _neutralize_chat_import_summary_perspective_sync(self, batch_id: str) -> dict[str, int]:
         batch_id = clean_text(batch_id, 120)
@@ -7280,12 +7862,13 @@ class MemoryStore:
         canonical_summary: str,
         detail_schema_version: int,
     ) -> dict[str, int]:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._update_chat_import_summary_detail_sync,
+        return await self._run_tracked_operation(
+            self._update_chat_import_summary_detail_sync,
             memory_id,
             detailed_summary,
             canonical_summary,
             detail_schema_version,
+            closed_result={},
         )
 
     def _update_chat_import_summary_detail_sync(
@@ -7363,14 +7946,15 @@ class MemoryStore:
         source_message_ids: list[str],
         detail_schema_version: int,
     ) -> dict[str, int]:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._update_chat_import_daily_digest_sync,
+        return await self._run_tracked_operation(
+            self._update_chat_import_daily_digest_sync,
             batch_id,
             date,
             detailed_summary,
             segment_ids,
             source_message_ids,
             detail_schema_version,
+            closed_result={},
         )
 
     def _update_chat_import_daily_digest_sync(
@@ -7545,6 +8129,8 @@ class MemoryStore:
         entity_id: str = "",
         *,
         offset: int = 0,
+        owner_bot_id: str | None = None,
+        persona_id: str | None = None,
     ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
             self._guard_operation_sync, self._recent_timeline_sync,
@@ -7553,6 +8139,8 @@ class MemoryStore:
             session_id,
             entity_id,
             offset,
+            owner_bot_id,
+            persona_id,
         )
 
     def _recent_timeline_sync(
@@ -7562,15 +8150,24 @@ class MemoryStore:
         session_id: str,
         entity_id: str,
         offset: int,
+        owner_bot_id: str | None,
+        persona_id: str | None,
     ) -> list[dict[str, Any]]:
         safe_limit = max(1, int(limit))
         safe_offset = max(0, int(offset))
         if scope and session_id and entity_id:
             return self._recent_timeline_entity_split_sync(
-                safe_limit, scope, session_id, entity_id, safe_offset
+                safe_limit, scope, session_id, entity_id, safe_offset,
+                owner_bot_id, persona_id,
             )
         params: list[Any] = []
         where = "1=1"
+        if owner_bot_id is not None:
+            where += " AND owner_bot_id=?"
+            params.append(clean_text(owner_bot_id, 120))
+        if persona_id is not None:
+            where += " AND persona_id=?"
+            params.append(clean_text(persona_id, 96))
         if scope:
             where += " AND scope=?"
             params.append(scope)
@@ -7599,6 +8196,8 @@ class MemoryStore:
         session_id: str,
         entity_id: str,
         offset: int,
+        owner_bot_id: str | None,
+        persona_id: str | None,
     ) -> list[dict[str, Any]]:
         """Read the subject/object branches through dedicated indexes and merge.
 
@@ -7609,16 +8208,24 @@ class MemoryStore:
         """
         branch_size = limit + offset
         merged: dict[str, dict[str, Any]] = {}
+        namespace_where = ""
+        namespace_params: list[Any] = []
+        if owner_bot_id is not None:
+            namespace_where += " AND owner_bot_id=?"
+            namespace_params.append(clean_text(owner_bot_id, 120))
+        if persona_id is not None:
+            namespace_where += " AND persona_id=?"
+            namespace_params.append(clean_text(persona_id, 96))
         with self._lock:
             for column in ("subject_id", "object_id"):
                 rows = self._conn.execute(
                     f"""
                     SELECT * FROM timeline
-                    WHERE scope=? AND session_id=? AND {column}=?
+                    WHERE scope=? AND session_id=? AND {column}=? {namespace_where}
                     ORDER BY occurred_at DESC, created_at DESC
                     LIMIT ?
                     """,
-                    (scope, session_id, entity_id, branch_size),
+                    [scope, session_id, entity_id, *namespace_params, branch_size],
                 ).fetchall()
                 for row in rows:
                     merged.setdefault(str(row["id"]), dict(row))
@@ -7632,6 +8239,8 @@ class MemoryStore:
     async def recent_cross_window_timeline(
         self,
         *,
+        owner_bot_id: str | None = None,
+        persona_id: str | None = None,
         source_scope: str,
         current_session_id: str,
         since_at: str,
@@ -7643,6 +8252,8 @@ class MemoryStore:
             current_session_id,
             since_at,
             limit,
+            owner_bot_id,
+            persona_id,
         )
 
     def _recent_cross_window_timeline_sync(
@@ -7651,24 +8262,32 @@ class MemoryStore:
         current_session_id: str,
         since_at: str,
         limit: int,
+        owner_bot_id: str | None,
+        persona_id: str | None,
     ) -> list[dict[str, Any]]:
         scope = clean_text(source_scope, 40)
         session_id = clean_text(current_session_id, 200)
         cutoff = clean_text(since_at, 80)
         if scope not in {"private", "group"} or not session_id or not cutoff:
             return []
+        where = "scope=? AND session_id!=? AND occurred_at>=?"
+        params: list[Any] = [scope, session_id, cutoff]
+        if owner_bot_id is not None:
+            where += " AND owner_bot_id=?"
+            params.append(clean_text(owner_bot_id, 120))
+        if persona_id is not None:
+            where += " AND persona_id=?"
+            params.append(clean_text(persona_id, 96))
         with self._lock:
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT * FROM timeline
-                WHERE scope=?
-                  AND session_id!=?
-                  AND occurred_at>=?
+                WHERE {where}
                   AND event_type IN ('user_message', 'bot_response')
                 ORDER BY occurred_at DESC, created_at DESC
                 LIMIT ?
                 """,
-                (scope, session_id, cutoff, max(1, min(240, int(limit or 48)))),
+                params + [max(1, min(240, int(limit or 48)))],
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -7681,6 +8300,8 @@ class MemoryStore:
         scope: str = "",
         session_id: str = "",
         entity_id: str = "",
+        owner_bot_id: str | None = None,
+        persona_id: str | None = None,
     ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
             self._guard_operation_sync, self._timeline_window_sync,
@@ -7690,6 +8311,8 @@ class MemoryStore:
             scope,
             session_id,
             entity_id,
+            owner_bot_id,
+            persona_id,
         )
 
     def _timeline_window_sync(
@@ -7700,9 +8323,17 @@ class MemoryStore:
         scope: str,
         session_id: str,
         entity_id: str,
+        owner_bot_id: str | None,
+        persona_id: str | None,
     ) -> list[dict[str, Any]]:
         params: list[Any] = [clean_text(start_at, 80), clean_text(end_at, 80)]
         where = "occurred_at >= ? AND occurred_at < ?"
+        if owner_bot_id is not None:
+            where += " AND owner_bot_id=?"
+            params.append(clean_text(owner_bot_id, 120))
+        if persona_id is not None:
+            where += " AND persona_id=?"
+            params.append(clean_text(persona_id, 96))
         if scope:
             where += " AND scope=?"
             params.append(clean_text(scope, 40))
@@ -7725,10 +8356,26 @@ class MemoryStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    async def get_timeline_by_ids(self, event_ids: list[str]) -> dict[str, dict[str, Any]]:
-        return await self._run_recoverable_database_operation(self._get_timeline_by_ids_sync, event_ids)
+    async def get_timeline_by_ids(
+        self,
+        event_ids: list[str],
+        *,
+        owner_bot_id: str | None = None,
+        persona_id: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        return await self._run_recoverable_database_operation(
+            self._get_timeline_by_ids_sync,
+            event_ids,
+            owner_bot_id,
+            persona_id,
+        )
 
-    def _get_timeline_by_ids_sync(self, event_ids: list[str]) -> dict[str, dict[str, Any]]:
+    def _get_timeline_by_ids_sync(
+        self,
+        event_ids: list[str],
+        owner_bot_id: str | None,
+        persona_id: str | None,
+    ) -> dict[str, dict[str, Any]]:
         ids = list(
             dict.fromkeys(
                 clean_text(event_id, 160)
@@ -7739,14 +8386,22 @@ class MemoryStore:
         if not ids:
             return {}
         rows: list[Any] = []
+        namespace_where = ""
+        namespace_params: list[Any] = []
+        if owner_bot_id is not None:
+            namespace_where += " AND owner_bot_id=?"
+            namespace_params.append(clean_text(owner_bot_id, 120))
+        if persona_id is not None:
+            namespace_where += " AND persona_id=?"
+            namespace_params.append(clean_text(persona_id, 96))
         with self._lock:
             for index in range(0, len(ids), 500):
                 chunk = ids[index:index + 500]
                 placeholders = ",".join("?" for _ in chunk)
                 rows.extend(
                     self._conn.execute(
-                        f"SELECT * FROM timeline WHERE id IN ({placeholders})",
-                        chunk,
+                        f"SELECT * FROM timeline WHERE id IN ({placeholders}){namespace_where}",
+                        [*chunk, *namespace_params],
                     ).fetchall()
                 )
         return {clean_text(row["id"], 160): dict(row) for row in rows}
@@ -7758,6 +8413,8 @@ class MemoryStore:
         scope: str = "",
         limit: int = 40,
         after_timeline_id: str = "",
+        owner_bot_id: str | None = "",
+        persona_id: str | None = "",
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
             self._guard_operation_sync, self._unsummarized_timeline_window_sync,
@@ -7765,6 +8422,8 @@ class MemoryStore:
             scope,
             limit,
             after_timeline_id,
+            owner_bot_id,
+            persona_id,
         )
 
     def _unsummarized_timeline_window_sync(
@@ -7773,18 +8432,27 @@ class MemoryStore:
         scope: str,
         limit: int,
         after_timeline_id: str = "",
+        owner_bot_id: str | None = None,
+        persona_id: str | None = None,
     ) -> dict[str, Any]:
         params: list[Any] = [clean_text(session_id, 200)]
         where = "session_id=? AND summarized_at=''"
+        if owner_bot_id is not None:
+            where += " AND owner_bot_id=?"
+            params.append(clean_text(owner_bot_id, 120))
+        if persona_id is not None:
+            where += " AND persona_id=?"
+            params.append(clean_text(persona_id, 96))
         if scope:
             where += " AND scope=?"
             params.append(clean_text(scope, 40))
+        cursor_where = where.replace(" AND summarized_at=''", "")
         with self._lock:
             cursor = None
             if clean_text(after_timeline_id, 160):
                 cursor = self._conn.execute(
-                    "SELECT occurred_at, created_at FROM timeline WHERE id=? AND session_id=?",
-                    (clean_text(after_timeline_id, 160), clean_text(session_id, 200)),
+                    f"SELECT occurred_at, created_at FROM timeline WHERE id=? AND {cursor_where}",
+                    [clean_text(after_timeline_id, 160), *params],
                 ).fetchone()
             if cursor:
                 where += " AND (occurred_at > ? OR (occurred_at = ? AND created_at > ?))"
@@ -7825,30 +8493,75 @@ class MemoryStore:
             "rows": [dict(row) for row in rows],
         }
 
-    async def mark_timeline_summarized(self, event_ids: list[str]) -> int:
-        return await asyncio.to_thread(self._guard_operation_sync, self._mark_timeline_summarized_sync, event_ids)
+    async def mark_timeline_summarized(
+        self,
+        event_ids: list[str],
+        *,
+        owner_bot_id: str | None = None,
+        persona_id: str | None = None,
+    ) -> int:
+        return await self._run_tracked_operation(
+            self._mark_timeline_summarized_sync,
+            event_ids,
+            owner_bot_id,
+            persona_id,
+            closed_result=0,
+        )
 
-    def _mark_timeline_summarized_sync(self, event_ids: list[str]) -> int:
+    def _mark_timeline_summarized_sync(
+        self,
+        event_ids: list[str],
+        owner_bot_id: str | None,
+        persona_id: str | None,
+    ) -> int:
         ids = [clean_text(event_id, 120) for event_id in event_ids if clean_text(event_id, 120)]
         if not ids:
             return 0
         placeholders = ",".join("?" for _ in ids)
+        namespace_where = ""
+        params: list[Any] = [utc_now(), *ids]
+        if owner_bot_id is not None:
+            namespace_where += " AND owner_bot_id=?"
+            params.append(clean_text(owner_bot_id, 120))
+        if persona_id is not None:
+            namespace_where += " AND persona_id=?"
+            params.append(clean_text(persona_id, 96))
         with self._lock:
             cur = self._conn.execute(
-                f"UPDATE timeline SET summarized_at=? WHERE id IN ({placeholders})",
-                [utc_now()] + ids,
+                f"UPDATE timeline SET summarized_at=? WHERE id IN ({placeholders}){namespace_where}",
+                params,
             )
             self._conn.commit()
         return int(cur.rowcount or 0)
 
-    async def get_summary_failure(self, session_id: str) -> dict[str, Any] | None:
-        return await asyncio.to_thread(self._guard_operation_sync, self._get_summary_failure_sync, session_id)
+    async def get_summary_failure(
+        self,
+        session_id: str,
+        *,
+        owner_bot_id: str | None = "",
+        persona_id: str | None = "",
+    ) -> dict[str, Any] | None:
+        return await asyncio.to_thread(
+            self._guard_operation_sync,
+            self._get_summary_failure_sync,
+            session_id,
+            owner_bot_id,
+            persona_id,
+        )
 
-    def _get_summary_failure_sync(self, session_id: str) -> dict[str, Any] | None:
+    def _get_summary_failure_sync(
+        self,
+        session_id: str,
+        owner_bot_id: str | None,
+        persona_id: str | None,
+    ) -> dict[str, Any] | None:
+        where, params = self._summary_failure_namespace_where(
+            session_id, owner_bot_id, persona_id
+        )
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM summary_failures WHERE session_id=?",
-                (clean_text(session_id, 200),),
+                f"SELECT * FROM summary_failures WHERE {where}",
+                params,
             ).fetchone()
         if not row:
             return None
@@ -7865,19 +8578,26 @@ class MemoryStore:
         end_timeline_id: str,
         error: str,
         metadata: dict[str, Any] | None = None,
+        owner_bot_id: str = "",
+        persona_id: str = "",
     ) -> int:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._record_summary_failure_sync,
+        return await self._run_tracked_operation(
+            self._record_summary_failure_sync,
+            owner_bot_id,
+            persona_id,
             session_id,
             scope,
             start_timeline_id,
             end_timeline_id,
             error,
             metadata or {},
+            closed_result=0,
         )
 
     def _record_summary_failure_sync(
         self,
+        owner_bot_id: str,
+        persona_id: str,
         session_id: str,
         scope: str,
         start_timeline_id: str,
@@ -7890,11 +8610,11 @@ class MemoryStore:
             self._conn.execute(
                 """
                 INSERT INTO summary_failures(
-                    session_id, scope, start_timeline_id, end_timeline_id,
+                    owner_bot_id, persona_id, session_id, scope, start_timeline_id, end_timeline_id,
                     retry_count, last_error, metadata, created_at, updated_at
                 )
-                VALUES(?, ?, ?, ?, 1, ?, ?, ?, ?)
-                ON CONFLICT(session_id) DO UPDATE SET
+                VALUES(?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                ON CONFLICT(owner_bot_id, persona_id, session_id) DO UPDATE SET
                     scope=excluded.scope,
                     start_timeline_id=excluded.start_timeline_id,
                     end_timeline_id=excluded.end_timeline_id,
@@ -7904,6 +8624,8 @@ class MemoryStore:
                     updated_at=excluded.updated_at
                 """,
                 (
+                    clean_text(owner_bot_id, 120),
+                    clean_text(persona_id, 96),
                     clean_text(session_id, 200),
                     clean_text(scope, 40),
                     clean_text(start_timeline_id, 120),
@@ -7915,20 +8637,47 @@ class MemoryStore:
                 ),
             )
             row = self._conn.execute(
-                "SELECT retry_count FROM summary_failures WHERE session_id=?",
-                (clean_text(session_id, 200),),
+                "SELECT retry_count FROM summary_failures "
+                "WHERE owner_bot_id=? AND persona_id=? AND session_id=?",
+                (
+                    clean_text(owner_bot_id, 120),
+                    clean_text(persona_id, 96),
+                    clean_text(session_id, 200),
+                ),
             ).fetchone()
             self._conn.commit()
         return int(row["retry_count"] if row else 1)
 
-    async def clear_summary_failure(self, session_id: str) -> bool:
-        return await asyncio.to_thread(self._guard_operation_sync, self._clear_summary_failure_sync, session_id)
+    async def clear_summary_failure(
+        self,
+        session_id: str,
+        *,
+        owner_bot_id: str | None = "",
+        persona_id: str | None = "",
+    ) -> bool:
+        return await self._run_tracked_operation(
+            self._clear_summary_failure_sync,
+            session_id,
+            owner_bot_id,
+            persona_id,
+            closed_result=False,
+        )
 
-    async def mark_summary_failure_dead_letter(self, session_id: str, max_retries: int) -> bool:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._mark_summary_failure_dead_letter_sync,
+    async def mark_summary_failure_dead_letter(
+        self,
+        session_id: str,
+        max_retries: int,
+        *,
+        owner_bot_id: str | None = "",
+        persona_id: str | None = "",
+    ) -> bool:
+        return await self._run_tracked_operation(
+            self._mark_summary_failure_dead_letter_sync,
             session_id,
             max_retries,
+            owner_bot_id,
+            persona_id,
+            closed_result=False,
         )
 
     async def mark_summary_failure_cooldown(
@@ -7937,9 +8686,12 @@ class MemoryStore:
         max_retries: int,
         cooldown_seconds: int,
         state: str = "transient_cooldown",
+        *,
+        owner_bot_id: str | None = "",
+        persona_id: str | None = "",
     ) -> bool:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._mark_summary_failure_state_sync,
+        return await self._run_tracked_operation(
+            self._mark_summary_failure_state_sync,
             session_id,
             clean_text(state, 40) or "transient_cooldown",
             {
@@ -7947,9 +8699,18 @@ class MemoryStore:
                 "cooldown_seconds": max(0, int(cooldown_seconds or 0)),
                 "cooldown_at": utc_now(),
             },
+            owner_bot_id,
+            persona_id,
+            closed_result=False,
         )
 
-    def _mark_summary_failure_dead_letter_sync(self, session_id: str, max_retries: int) -> bool:
+    def _mark_summary_failure_dead_letter_sync(
+        self,
+        session_id: str,
+        max_retries: int,
+        owner_bot_id: str | None,
+        persona_id: str | None,
+    ) -> bool:
         return self._mark_summary_failure_state_sync(
             session_id,
             "dead_letter",
@@ -7957,6 +8718,8 @@ class MemoryStore:
                 "max_retries": max(1, int(max_retries or 1)),
                 "dead_letter_at": utc_now(),
             },
+            owner_bot_id,
+            persona_id,
         )
 
     def _mark_summary_failure_state_sync(
@@ -7964,13 +8727,18 @@ class MemoryStore:
         session_id: str,
         state: str,
         extra_metadata: dict[str, Any],
+        owner_bot_id: str | None,
+        persona_id: str | None,
     ) -> bool:
         session_id = clean_text(session_id, 200)
+        where, params = self._summary_failure_namespace_where(
+            session_id, owner_bot_id, persona_id
+        )
         with self._lock:
             with self._transaction_sync():
                 row = self._conn.execute(
-                    "SELECT metadata FROM summary_failures WHERE session_id=?",
-                    (session_id,),
+                    f"SELECT metadata FROM summary_failures WHERE {where}",
+                    params,
                 ).fetchone()
                 if not row:
                     return False
@@ -7980,16 +8748,40 @@ class MemoryStore:
                 metadata.update(extra_metadata or {})
                 metadata["state"] = clean_text(state, 40)
                 cur = self._conn.execute(
-                    "UPDATE summary_failures SET metadata=?, updated_at=? WHERE session_id=?",
-                    (json_dumps(metadata), utc_now(), session_id),
+                    f"UPDATE summary_failures SET metadata=?, updated_at=? WHERE {where}",
+                    [json_dumps(metadata), utc_now(), *params],
                 )
                 return cur.rowcount > 0
 
-    def _clear_summary_failure_sync(self, session_id: str) -> bool:
+    @staticmethod
+    def _summary_failure_namespace_where(
+        session_id: str,
+        owner_bot_id: str | None,
+        persona_id: str | None,
+    ) -> tuple[str, list[Any]]:
+        where = "session_id=?"
+        params: list[Any] = [clean_text(session_id, 200)]
+        if owner_bot_id is not None:
+            where += " AND owner_bot_id=?"
+            params.append(clean_text(owner_bot_id, 120))
+        if persona_id is not None:
+            where += " AND persona_id=?"
+            params.append(clean_text(persona_id, 96))
+        return where, params
+
+    def _clear_summary_failure_sync(
+        self,
+        session_id: str,
+        owner_bot_id: str | None,
+        persona_id: str | None,
+    ) -> bool:
+        where, params = self._summary_failure_namespace_where(
+            session_id, owner_bot_id, persona_id
+        )
         with self._lock:
             cur = self._conn.execute(
-                "DELETE FROM summary_failures WHERE session_id=?",
-                (clean_text(session_id, 200),),
+                f"DELETE FROM summary_failures WHERE {where}",
+                params,
             )
             self._conn.commit()
         return int(cur.rowcount or 0) > 0
@@ -8004,14 +8796,15 @@ class MemoryStore:
         visibility: str = "shareable",
         metadata: dict[str, Any] | None = None,
     ) -> str:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._create_cross_window_thread_sync,
+        return await self._run_tracked_operation(
+            self._create_cross_window_thread_sync,
             from_session,
             to_session,
             topic,
             content,
             visibility,
             metadata or {},
+            closed_result="",
         )
 
     def _create_cross_window_thread_sync(
@@ -8088,7 +8881,12 @@ class MemoryStore:
         return [dict(row) for row in rows]
 
     async def update_cross_window_thread_status(self, thread_id: str, status: str) -> bool:
-        return await asyncio.to_thread(self._guard_operation_sync, self._update_cross_window_thread_status_sync, thread_id, status)
+        return await self._run_tracked_operation(
+            self._update_cross_window_thread_status_sync,
+            thread_id,
+            status,
+            closed_result=False,
+        )
 
     def _update_cross_window_thread_status_sync(self, thread_id: str, status: str) -> bool:
         with self._lock:
@@ -8109,14 +8907,15 @@ class MemoryStore:
         blocked_reasons: list[dict[str, Any]],
         injection_chars: int,
     ) -> str:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._add_injection_log_sync,
+        return await self._run_tracked_operation(
+            self._add_injection_log_sync,
             session_id,
             scope,
             query,
             selected_memory_ids,
             blocked_reasons,
             injection_chars,
+            closed_result="",
         )
 
     def _add_injection_log_sync(
@@ -8255,10 +9054,11 @@ class MemoryStore:
         *,
         expected_revision: int | None = None,
     ) -> dict[str, Any]:
-        return await self._run_recoverable_database_operation(
+        return await self._run_tracked_recoverable_write(
             self._save_core_memory_sync,
             record,
             expected_revision,
+            closed_result={"ok": False, "code": "store_write_fenced"},
         )
 
     def _save_core_memory_sync(
@@ -8433,8 +9233,6 @@ class MemoryStore:
         uri = self.db_path.resolve().as_uri() + "?mode=ro"
         with closing(sqlite3.connect(uri, uri=True, timeout=0.35, check_same_thread=False)) as connection:
             connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA query_only=ON")
-            connection.execute("PRAGMA busy_timeout=350")
             type_count = max(1, len(bot_types) + (len(profile_types) if user_id else 0))
             per_type_limit = max(2, min(12, (max(1, int(limit or 36)) + type_count - 1) // type_count))
             rows = connection.execute(
@@ -8887,6 +9685,9 @@ class MemoryStore:
         session_id: str = "",
         group_id: str = "",
         entity_id: str = "",
+        owner_bot_id: str | None = None,
+        persona_id: str | None = None,
+        legacy_namespace_only: bool = False,
     ) -> list[MemoryRecord]:
         return await self._run_recoverable_database_operation(
             self._list_memories_sync,
@@ -8902,6 +9703,9 @@ class MemoryStore:
             session_id,
             group_id,
             entity_id,
+            owner_bot_id,
+            persona_id,
+            legacy_namespace_only,
         )
 
     def _list_memories_sync(
@@ -8918,9 +9722,30 @@ class MemoryStore:
         session_id: str,
         group_id: str,
         entity_id: str,
+        owner_bot_id: str | None,
+        persona_id: str | None,
+        legacy_namespace_only: bool,
     ) -> list[MemoryRecord]:
         params: list[Any] = []
         where = "1=1"
+        if legacy_namespace_only:
+            where += (
+                " AND owner_bot_id='' "
+                "AND CASE WHEN json_valid(metadata) "
+                "THEN COALESCE(CAST(json_extract(metadata,'$.persona_id') AS TEXT),'') "
+                "ELSE '' END IN ('','legacy')"
+            )
+        else:
+            if owner_bot_id is not None:
+                where += " AND owner_bot_id=?"
+                params.append(clean_text(owner_bot_id, 120))
+            if persona_id is not None:
+                where += (
+                    " AND CASE WHEN json_valid(metadata) "
+                    "THEN COALESCE(CAST(json_extract(metadata,'$.persona_id') AS TEXT),'') "
+                    "ELSE '' END=?"
+                )
+                params.append(clean_text(persona_id, 96))
         if not include_pending:
             where += " AND review_status != 'pending'"
         if query:
@@ -9635,8 +10460,8 @@ class MemoryStore:
         enabled: bool = True,
         note: str = "",
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._upsert_acl_rule_sync,
+        return await self._run_tracked_operation(
+            self._upsert_acl_rule_sync,
             owner_scope,
             owner_id,
             reader_scope,
@@ -9644,6 +10469,7 @@ class MemoryStore:
             effect,
             enabled,
             note,
+            closed_result={"ok": False, "code": "store_write_fenced"},
         )
 
     def _upsert_acl_rule_sync(
@@ -9700,7 +10526,11 @@ class MemoryStore:
         return self._acl_rule_from_row(row) if row else data
 
     async def delete_acl_rule(self, rule_id: str) -> bool:
-        return await asyncio.to_thread(self._guard_operation_sync, self._delete_acl_rule_sync, rule_id)
+        return await self._run_tracked_operation(
+            self._delete_acl_rule_sync,
+            rule_id,
+            closed_result=False,
+        )
 
     def _delete_acl_rule_sync(self, rule_id: str) -> bool:
         with self._lock:
@@ -9751,14 +10581,15 @@ class MemoryStore:
         capture_enabled: Any = _ACL_UNSET,
         recall_enabled: Any = _ACL_UNSET,
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._upsert_acl_policy_sync,
+        return await self._run_tracked_operation(
+            self._upsert_acl_policy_sync,
             window_scope,
             window_id,
             read_mode,
             share_mode,
             capture_enabled,
             recall_enabled,
+            closed_result={"ok": False, "code": "store_write_fenced"},
         )
 
     def _upsert_acl_policy_sync(
@@ -9949,7 +10780,7 @@ class MemoryStore:
         durability: str | None = None,
         sensitivity: str | None = None,
     ) -> bool:
-        return await self._run_recoverable_database_operation(
+        return await self._run_tracked_recoverable_write(
             self._update_memory_payload_sync,
             memory_id,
             memory_type,
@@ -9967,6 +10798,7 @@ class MemoryStore:
             salience,
             durability,
             sensitivity,
+            closed_result=False,
         )
 
     def _update_memory_payload_sync(
@@ -10148,8 +10980,8 @@ class MemoryStore:
         confidence_delta: float = 0.0,
         emotional_delta: float = 0.0,
     ) -> bool:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._update_memory_reaction_feedback_sync,
+        return await self._run_tracked_operation(
+            self._update_memory_reaction_feedback_sync,
             memory_id,
             reaction,
             evidence,
@@ -10157,6 +10989,7 @@ class MemoryStore:
             mention_delta,
             confidence_delta,
             emotional_delta,
+            closed_result=False,
         )
 
     def _update_memory_reaction_feedback_sync(
@@ -10244,7 +11077,11 @@ class MemoryStore:
             return cur.rowcount > 0
 
     async def delete_memory(self, memory_id: str) -> bool:
-        return await asyncio.to_thread(self._guard_operation_sync, self._delete_memory_sync, memory_id)
+        return await self._run_tracked_operation(
+            self._delete_memory_sync,
+            memory_id,
+            closed_result=False,
+        )
 
     def _delete_memory_sync(self, memory_id: str) -> bool:
         memory_id = clean_text(memory_id, 120)
@@ -10259,7 +11096,12 @@ class MemoryStore:
                 return cur.rowcount > 0
 
     async def update_review_status(self, memory_id: str, status: str) -> bool:
-        return await asyncio.to_thread(self._guard_operation_sync, self._update_review_status_sync, memory_id, status)
+        return await self._run_tracked_operation(
+            self._update_review_status_sync,
+            memory_id,
+            status,
+            closed_result=False,
+        )
 
     def _update_review_status_sync(self, memory_id: str, status: str) -> bool:
         memory_id = clean_text(memory_id, 120)
@@ -10423,7 +11265,10 @@ class MemoryStore:
                 return True
 
     async def approve_livingmemory_imports(self) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._approve_livingmemory_imports_sync)
+        return await self._run_tracked_operation(
+            self._approve_livingmemory_imports_sync,
+            closed_result={"updated": 0, "review_queue_updated": 0},
+        )
 
     def _approve_livingmemory_imports_sync(self) -> dict[str, Any]:
         now = utc_now()
@@ -10484,7 +11329,12 @@ class MemoryStore:
         return candidates
 
     async def update_livingmemory_import_payload(self, memory_id: str, payload: dict[str, Any]) -> bool:
-        return await asyncio.to_thread(self._guard_operation_sync, self._update_livingmemory_import_payload_sync, memory_id, payload)
+        return await self._run_tracked_operation(
+            self._update_livingmemory_import_payload_sync,
+            memory_id,
+            payload,
+            closed_result=False,
+        )
 
     def _update_livingmemory_import_payload_sync(self, memory_id: str, payload: dict[str, Any]) -> bool:
         with self._lock:
@@ -10526,7 +11376,12 @@ class MemoryStore:
             return cur.rowcount > 0
 
     async def update_memory_visibility(self, memory_id: str, visibility: str) -> bool:
-        return await asyncio.to_thread(self._guard_operation_sync, self._update_memory_visibility_sync, memory_id, visibility)
+        return await self._run_tracked_operation(
+            self._update_memory_visibility_sync,
+            memory_id,
+            visibility,
+            closed_result=False,
+        )
 
     def _update_memory_visibility_sync(self, memory_id: str, visibility: str) -> bool:
         memory_id = clean_text(memory_id, 120)
@@ -10554,7 +11409,12 @@ class MemoryStore:
                 return cur.rowcount > 0
 
     async def update_memory_lifecycle(self, memory_id: str, lifecycle: str) -> bool:
-        return await asyncio.to_thread(self._guard_operation_sync, self._update_memory_lifecycle_sync, memory_id, lifecycle)
+        return await self._run_tracked_operation(
+            self._update_memory_lifecycle_sync,
+            memory_id,
+            lifecycle,
+            closed_result=False,
+        )
 
     def _update_memory_lifecycle_sync(self, memory_id: str, lifecycle: str) -> bool:
         lifecycle = clean_text(lifecycle, 40)
@@ -10572,7 +11432,10 @@ class MemoryStore:
             return cur.rowcount > 0
 
     async def maintenance_repair(self) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._maintenance_repair_sync)
+        return await self._run_tracked_operation(
+            self._maintenance_repair_sync,
+            closed_result={"state": "fenced"},
+        )
 
     def _maintenance_repair_sync(self) -> dict[str, Any]:
         with self._lock:
@@ -10680,7 +11543,12 @@ class MemoryStore:
         return [MemoryRecord.from_row(row) for row in rows]
 
     async def archive_raw_events_older_than(self, cutoff_at: str, limit: int = 1000) -> int:
-        return await asyncio.to_thread(self._guard_operation_sync, self._archive_raw_events_older_than_sync, cutoff_at, limit)
+        return await self._run_tracked_operation(
+            self._archive_raw_events_older_than_sync,
+            cutoff_at,
+            limit,
+            closed_result=0,
+        )
 
     def _archive_raw_events_older_than_sync(self, cutoff_at: str, limit: int) -> int:
         cutoff_at = clean_text(cutoff_at, 80)
@@ -10731,11 +11599,12 @@ class MemoryStore:
         injection_log_cutoff: str = "",
         limit: int = 2000,
     ) -> dict[str, int]:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._prune_retained_rows_sync,
+        return await self._run_tracked_operation(
+            self._prune_retained_rows_sync,
             summarized_timeline_cutoff,
             injection_log_cutoff,
             limit,
+            closed_result={"timeline": 0, "injection_logs": 0},
         )
 
     def _prune_retained_rows_sync(
@@ -10793,11 +11662,12 @@ class MemoryStore:
         reason: str,
         supersedes_id: str = "",
     ) -> int:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._archive_memories_sync,
+        return await self._run_tracked_operation(
+            self._archive_memories_sync,
             memory_ids,
             reason,
             supersedes_id,
+            closed_result=0,
         )
 
     def _archive_memories_sync(self, memory_ids: list[str], reason: str, supersedes_id: str) -> int:
@@ -10891,7 +11761,7 @@ class MemoryStore:
         text_hash: str,
         vector: list[float],
     ) -> None:
-        await self._run_recoverable_database_operation(
+        await self._run_tracked_recoverable_write(
             self._upsert_memory_embedding_sync,
             memory_id,
             provider_id,
@@ -11119,7 +11989,11 @@ class MemoryStore:
         return result, next_offset, exhausted
 
     async def mark_accessed(self, memory_ids: list[str]) -> None:
-        await asyncio.to_thread(self._guard_operation_sync, self._mark_accessed_sync, memory_ids)
+        await self._run_tracked_operation(
+            self._mark_accessed_sync,
+            memory_ids,
+            closed_result=None,
+        )
 
     def _mark_accessed_sync(self, memory_ids: list[str]) -> None:
         ids = [memory_id for memory_id in memory_ids if memory_id]
@@ -11141,7 +12015,12 @@ class MemoryStore:
     async def mark_injected(self, memory_ids: list[str], when: str = "") -> int:
         """Record only memories that reached the final injected context."""
 
-        return await asyncio.to_thread(self._guard_operation_sync, self._mark_injected_sync, memory_ids, when)
+        return await self._run_tracked_operation(
+            self._mark_injected_sync,
+            memory_ids,
+            when,
+            closed_result=0,
+        )
 
     def _mark_injected_sync(self, memory_ids: list[str], when: str = "") -> int:
         ids = list(
@@ -11246,8 +12125,13 @@ class MemoryStore:
         mode: str,
         stats: dict[str, Any],
     ) -> str:
-        return await asyncio.to_thread(
-            self._guard_operation_sync, self._add_import_batch_sync, source_plugin, source_path, mode, stats
+        return await self._run_tracked_operation(
+            self._add_import_batch_sync,
+            source_plugin,
+            source_path,
+            mode,
+            stats,
+            closed_result="",
         )
 
     def _add_import_batch_sync(
@@ -11266,7 +12150,11 @@ class MemoryStore:
         return row_id
 
     async def upsert_emotion_event(self, value: Any) -> dict[str, Any]:
-        return await self._run_recoverable_database_operation(self._upsert_emotion_event_sync, value)
+        return await self._run_tracked_recoverable_write(
+            self._upsert_emotion_event_sync,
+            value,
+            closed_result={"ok": False, "state": "degraded", "error_code": "store_write_fenced"},
+        )
 
     def _upsert_emotion_event_sync(self, value: Any) -> dict[str, Any]:
         from .emotion_event_contract import normalize_emotion_event
@@ -11532,7 +12420,7 @@ class MemoryStore:
         cursor: str = "",
         limit: int = 10,
     ) -> dict[str, Any]:
-        return await self._run_recoverable_database_operation(
+        return await self._run_tracked_recoverable_write(
             self._list_emotion_event_deliveries_sync,
             consumer_id,
             bot_id,
@@ -11543,6 +12431,7 @@ class MemoryStore:
             allow_cross_window,
             cursor,
             limit,
+            closed_result=self._empty_emotion_delivery("store_write_fenced"),
         )
 
     def _list_emotion_event_deliveries_sync(
@@ -11695,7 +12584,7 @@ class MemoryStore:
         session_id: str,
         allow_cross_window: bool = False,
     ) -> dict[str, Any]:
-        return await self._run_recoverable_database_operation(
+        return await self._run_tracked_recoverable_write(
             self._ack_emotion_event_deliveries_sync,
             consumer_id,
             event_refs,
@@ -11705,6 +12594,7 @@ class MemoryStore:
             user_id,
             session_id,
             allow_cross_window,
+            closed_result={"acked": 0, "state": "degraded", "error_code": "store_write_fenced"},
         )
 
     def _ack_emotion_event_deliveries_sync(

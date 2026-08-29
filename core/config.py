@@ -1,6 +1,42 @@
 from __future__ import annotations
 
+from copy import deepcopy
+import json
+from pathlib import Path
 from typing import Any
+
+
+def _load_schema_defaults() -> dict[str, Any]:
+    path = Path(__file__).resolve().parents[1] / "_conf_schema.json"
+    schema = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(schema, dict):
+        raise RuntimeError("memory_config_schema_invalid")
+    defaults: dict[str, Any] = {}
+
+    def visit(values: dict[str, Any], prefix: str = "") -> None:
+        for key, entry in values.items():
+            if not isinstance(key, str) or not isinstance(entry, dict):
+                continue
+            dotted = f"{prefix}.{key}" if prefix else key
+            if "type" in entry and "default" in entry:
+                defaults[dotted] = deepcopy(entry["default"])
+            items = entry.get("items")
+            if isinstance(items, dict):
+                visit(items, dotted)
+
+    visit(schema)
+    return defaults
+
+
+_SCHEMA_DEFAULTS = _load_schema_defaults()
+
+
+def schema_default(dotted: str, fallback: Any = None) -> Any:
+    """Return a detached public default; unknown internal keys keep fallback."""
+
+    if dotted in _SCHEMA_DEFAULTS:
+        return deepcopy(_SCHEMA_DEFAULTS[dotted])
+    return fallback
 
 
 class ConfigView:
@@ -81,6 +117,7 @@ class ConfigView:
         self.raw = raw or {}
 
     def get(self, dotted: str, default: Any = None) -> Any:
+        effective_default = schema_default(dotted, default)
         marker = object()
         value = self._get_exact(dotted, marker)
         if value is not marker:
@@ -89,7 +126,7 @@ class ConfigView:
             value = self._get_exact(alias, marker)
             if value is not marker:
                 return value
-        return default
+        return effective_default
 
     def _get_exact(self, dotted: str, default: Any = None) -> Any:
         cur: Any = self.raw
@@ -117,13 +154,15 @@ class ConfigView:
         return bool(value)
 
     def int(self, dotted: str, default: int) -> int:
+        effective_default = schema_default(dotted, default)
         try:
-            return int(self.get(dotted, default))
+            return int(self.get(dotted, effective_default))
         except Exception:
-            return default
+            return int(effective_default)
 
     def float(self, dotted: str, default: float) -> float:
+        effective_default = schema_default(dotted, default)
         try:
-            return float(self.get(dotted, default))
+            return float(self.get(dotted, effective_default))
         except Exception:
-            return default
+            return float(effective_default)

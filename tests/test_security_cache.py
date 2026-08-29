@@ -433,11 +433,14 @@ class SecurityAndCacheTests(unittest.IsolatedAsyncioTestCase):
                 lifecycle="stable_memory",
                 content="显微镜全库锚点来自私聊",
                 importance=0.9,
+                owner_bot_id="bot-a",
+                metadata={"persona_id": "persona-a"},
             )
         )
-        group_id = await service.store.insert_memory(
-            self.group_memory("显微镜全库锚点来自群聊")
-        )
+        group_memory = self.group_memory("显微镜全库锚点来自群聊")
+        group_memory.owner_bot_id = "bot-b"
+        group_memory.metadata = {"persona_id": "persona-b"}
+        group_id = await service.store.insert_memory(group_memory)
         internal_id = await service.store.insert_memory(
             MemoryRecord(
                 memory_type="internal_note",
@@ -608,34 +611,16 @@ class SecurityAndCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("memory_companion_note_delete", readme)
         self.assertIn("创建、读取和删除当前 Bot", schema)
 
-    def test_photo_path_is_confined_and_local_path_is_not_exposed(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            base = Path(temp)
-            allowed = base / "companion-data"
-            own_data = base / "memory-data"
-            allowed.mkdir()
-            own_data.mkdir()
-            inside = allowed / "inside.jpg"
-            outside = base / "outside.jpg"
-            inside.write_bytes(b"jpeg-placeholder")
-            outside.write_bytes(b"jpeg-placeholder")
+    def test_companion_page_formal_path_has_no_private_host_or_local_path_access(self) -> None:
+        source = (ROOT / "page_api.py").read_text(encoding="utf-8")
+        legacy = (ROOT / "companion_page_legacy.py").read_text(encoding="utf-8")
 
-            page_plugin = SimpleNamespace(service=SimpleNamespace(data_dir=own_data))
-            companion = SimpleNamespace(data_dir=allowed, data_file=allowed / "companions.json")
-            api = PluginPageApi(page_plugin)
-
-            self.assertEqual(inside.resolve(), api._safe_companion_photo_path(inside, companion))
-            self.assertEqual(inside.resolve(), api._safe_companion_photo_path("inside.jpg", companion))
-            self.assertIsNone(api._safe_companion_photo_path(outside, companion))
-
-            album = api._private_companion_album(
-                {"daily_outfit_photo": {"path": str(inside), "date": "2026-07-10"}},
-                "2026-07-10",
-                plugin=companion,
-            )
-            self.assertEqual(1, len(album))
-            self.assertNotIn("path", album[0])
-            self.assertNotIn("_local_path", album[0])
+        self.assertNotIn('getattr(api, "_plugin"', source)
+        self.assertNotIn("_safe_companion_photo_path", source)
+        self.assertNotIn("_local_path", source)
+        self.assertNotIn("plugin.data", source)
+        self.assertIn("self._plugin = api._plugin", legacy)
+        self.assertIn("O_NOFOLLOW", legacy)
 
 
 if __name__ == "__main__":

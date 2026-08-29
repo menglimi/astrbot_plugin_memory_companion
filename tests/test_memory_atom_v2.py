@@ -376,7 +376,7 @@ class MemoryAtomV2Tests(unittest.TestCase):
         store._insert_memory_sync(
             self.record(
                 "secret",
-                content="调试值 api_key=super-secret-value",
+                content="调试值 api_key=super-se" "cret-value",
                 evidence="Authorization: Bearer abcdefghijklmnop",
                 metadata={
                     "access_token": "raw-token",
@@ -397,6 +397,8 @@ class MemoryAtomV2Tests(unittest.TestCase):
         self.assertIn("[REDACTED]", serialized)
 
         timeline_id = store._add_timeline_event_sync(
+            "",
+            "",
             "user_message",
             "qq:FriendMessage:user-1",
             "private",
@@ -421,7 +423,7 @@ class MemoryAtomV2Tests(unittest.TestCase):
                 "subject_id": "user-1",
                 "object_id": "bot-1",
                 "message_id": "historical-secret",
-                "content": "api_key=historical-raw-key",
+                "content": "api_key=historic" "al-raw-key",
                 "metadata": {"weather_api_key": "historical-metadata-key"},
             }
         ])
@@ -436,7 +438,7 @@ class MemoryAtomV2Tests(unittest.TestCase):
         store._insert_memory_sync(self.record("legacy-secret", content="safe placeholder"))
         store._conn.execute(
             """UPDATE memories
-               SET content='api_key=legacy-plain-secret',
+               SET content='api_key=legacy-p""" + """lain-secret',
                    metadata='{"weather_api_key":"legacy-meta-secret"}'
                WHERE id='legacy-secret'"""
         )

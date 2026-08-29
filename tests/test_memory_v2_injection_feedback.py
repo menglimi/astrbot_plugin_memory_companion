@@ -122,6 +122,55 @@ class MemoryV2InjectionFeedbackTests(unittest.TestCase):
         self.assertEqual("persona_mismatch", wrong.reason)
         self.assertTrue(matching.eligible)
 
+    def test_admin_read_all_bypasses_namespace_but_not_safety_lifecycle(self) -> None:
+        ctx = SessionContext(
+            scope="unknown",
+            bot_id="admin-bot",
+            persona_id="admin-persona",
+        )
+        foreign = MemoryRecord(
+            id="foreign",
+            content="other bot",
+            owner_bot_id="bot-b",
+            metadata={"persona_id": "persona-b"},
+        )
+        restricted = MemoryRecord(
+            id="restricted",
+            content="secret",
+            owner_bot_id="bot-b",
+            sensitivity="restricted",
+        )
+        expired = MemoryRecord(
+            id="expired",
+            content="old",
+            owner_bot_id="bot-b",
+            valid_to="2020-01-01T00:00:00+00:00",
+        )
+
+        self.assertTrue(
+            evaluate_memory_lifecycle(
+                foreign,
+                ctx,
+                admin_read_all=True,
+            ).eligible
+        )
+        self.assertEqual(
+            "sensitivity=restricted",
+            evaluate_memory_lifecycle(
+                restricted,
+                ctx,
+                admin_read_all=True,
+            ).reason,
+        )
+        self.assertEqual(
+            "validity=expired",
+            evaluate_memory_lifecycle(
+                expired,
+                ctx,
+                admin_read_all=True,
+            ).reason,
+        )
+
     def test_rrf_rewards_candidates_found_by_multiple_routes(self) -> None:
         shared = MemoryRecord(id="shared", content="same")
         single = MemoryRecord(id="single", content="one route")

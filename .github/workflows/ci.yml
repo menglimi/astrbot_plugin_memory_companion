@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core-only:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test runner
+        run: python -m pip install pytest
+      - name: Collect core-only suite
+        run: python -m pytest --collect-only -q tests/test_c1_contract.py tests/test_c1_bridge_probe.py tests/test_bridge_lifecycle_publication.py
+      - name: Run core-only suite
+        run: python -m pytest -q tests/test_c1_contract.py tests/test_c1_bridge_probe.py tests/test_bridge_lifecycle_publication.py
+
+  contracts-and-migrations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test runner
+        run: python -m pip install pytest
+      - name: Collect contract and migration suite
+        run: python -m pytest --collect-only -q tests/test_bridge_contract_split.py tests/test_c6_dual_plugin_boundary.py tests/test_external_memory_bridge.py tests/test_schema_migration_ledger.py tests/test_req041_migration_recovery.py
+      - name: Run contract and migration suite
+        run: python -m pytest -q tests/test_bridge_contract_split.py tests/test_c6_dual_plugin_boundary.py tests/test_external_memory_bridge.py tests/test_schema_migration_ledger.py tests/test_req041_migration_recovery.py
+
+  architecture-and-artifact:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Check imports, duplicate symbols, MRO and artifact import
+        run: >-
+          python scripts/ci_static_checks.py
+          --package astrbot_plugin_memory_companion
+          --import-module core.bot_personal_contract
+      - name: Check patch whitespace
+        shell: bash
+        run: |
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [[ -z "$base" || "$base" =~ ^0+$ ]] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD^ 2>/dev/null || true)"
+          fi
+          if [[ -n "$base" ]]; then
+            git diff --check "$base" HEAD
+          else
+            git show --check --oneline HEAD
+          fi
