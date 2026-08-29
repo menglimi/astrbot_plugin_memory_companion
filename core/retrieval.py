@@ -1469,7 +1469,13 @@ class RetrievalEngine:
                 memory, ctx, acl_state
             )
             if visibility_reason:
-                lifecycle = evaluate_memory_lifecycle(memory, ctx)
+                lifecycle = evaluate_memory_lifecycle(
+                    memory,
+                    ctx,
+                    admin_read_all=bool(
+                        getattr(self.policy, "admin_read_all", False)
+                    ),
+                )
                 if not lifecycle.eligible:
                     key = clean_text(lifecycle.reason or "lifecycle_ineligible", 180)
                     prefiltered[key] = prefiltered.get(key, 0) + 1
@@ -3180,7 +3186,11 @@ class RetrievalEngine:
         score = lexical + scope_bonus + memory.importance * importance_weight + memory.confidence * 0.25 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus + route_bonus + rrf_bonus
         if not terms:
             score = scope_bonus + memory.importance * 0.8 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus + route_bonus + rrf_bonus
-        lifecycle = evaluate_memory_lifecycle(memory, ctx)
+        lifecycle = evaluate_memory_lifecycle(
+            memory,
+            ctx,
+            admin_read_all=bool(getattr(self.policy, "admin_read_all", False)),
+        )
         score = apply_lifecycle_score(score, lifecycle)
         # relax：proactive_message（主动消息原文）类记忆评分降权（默认 1.0 不降权，行为与历史版本一致）。
         if self.proactive_message_score_penalty < 1.0 and clean_text(memory.memory_type, 120).lower() == "proactive_message":

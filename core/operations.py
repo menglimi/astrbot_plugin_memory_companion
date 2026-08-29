@@ -268,6 +268,11 @@ async def build_operational_report(service: Any) -> dict[str, Any]:
         warnings.append("当前强制 rerank 但未指定 Provider；失败时会回退 basic。")
     if embedding_enabled and not clean_text(service.config.get("retrieval.embedding_provider_id", ""), 160):
         warnings.append("Embedding 已启用但未指定 Provider，将依赖自动发现。")
+    summary_timeout = service.summary_timeout_status()
+    if summary_timeout.get("below_recommendation"):
+        warnings.append(
+            "摘要模型超时低于建议的 180 秒；当前配置会保留，超时任务会保留待总结时间线并在后续触发时重试。"
+        )
     if calls <= 0:
         warnings.append("还没有模型调用统计，Token 与耗时结论暂无样本。")
     return {
@@ -297,6 +302,7 @@ async def build_operational_report(service: Any) -> dict[str, Any]:
             "by_task": token.get("by_task") if isinstance(token.get("by_task"), dict) else {},
         },
         "memory": stats,
+        "summary_timeout": summary_timeout,
         "conflicts": conflicts,
         "warnings": warnings,
         "benchmark_note": "不同插件尚未在同一模型、数据集和硬件下比较。",
@@ -448,7 +454,11 @@ class PortableMemoryArchive:
                     metadata = self._dict(data.get("metadata"))
                     metadata.setdefault("message_id", clean_text(data.get("message_id") or data.get("id"), 120))
                     metadata["portable_import_batch_id"] = batch_id
+                    owner_bot_id = clean_text(data.get("owner_bot_id"), 120)
+                    persona_id = clean_text(data.get("persona_id"), 96)
                     timeline_id = await self.store.add_timeline_event(
+                        owner_bot_id=owner_bot_id,
+                        persona_id=persona_id,
                         event_type=clean_text(data.get("event_type"), 80),
                         session_id=clean_text(data.get("session_id"), 200),
                         scope=clean_text(data.get("scope"), 40),
@@ -459,7 +469,11 @@ class PortableMemoryArchive:
                         occurred_at=clean_text(data.get("occurred_at"), 80),
                     )
                     if clean_text(data.get("summarized_at"), 80):
-                        await self.store.mark_timeline_summarized([timeline_id])
+                        await self.store.mark_timeline_summarized(
+                            [timeline_id],
+                            owner_bot_id=owner_bot_id,
+                            persona_id=persona_id,
+                        )
                 elif kind == "acl_rule":
                     await self.store.upsert_acl_rule(
                         owner_scope=clean_text(data.get("owner_scope"), 40),

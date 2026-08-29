@@ -9,7 +9,9 @@ from dataclasses import dataclass, field
 import json
 import hashlib
 import inspect
+import os
 import re
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -27,6 +29,7 @@ from .astrbot_compat import (
 from .audit import MemoryAuditManager
 from .bridge import (
     consume_authenticated_companion_projection,
+    consume_external_memory_producer_context,
     serialize_memory,
 )
 from .bot_personal_dto import (
@@ -99,6 +102,7 @@ _RULE_PROFILE_MEMORY_TYPES = frozenset(
 _USER_MEMORY_CONVERSATION_TYPES = frozenset(
     {"conversation_event", "conversation_summary", "important_event", "memory_decay_summary", "self_action"}
 )
+_TIMELINE_DEFAULT_PERSONA = "default"
 
 
 _RECENT_FACT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -237,28 +241,153 @@ class _HookStageTimer:
 
 class MemoryCompanionService:
     _SCOPE_CONTROL_FEATURES = frozenset({"capture", "recall", "topology"})
+    _PRIMARY_STORE_MARKER = ".memory-store-identity.json"
+    _RUNTIME_RESTART_KEYS = frozenset(
+        {
+            "memory_summary.max_concurrent_calls",
+            "retrieval.embedding_background_concurrency",
+            "retrieval_advanced.embedding_background_concurrency",
+        }
+    )
+
+    @classmethod
+    def _primary_store_startup_state(cls, data_dir: Path) -> dict[str, Any]:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        db_path = data_dir / "memory_companion.db"
+        marker_path = data_dir / cls._PRIMARY_STORE_MARKER
+        if db_path.is_symlink() or (db_path.exists() and not db_path.is_file()):
+            raise RuntimeError("记忆主库路径不是普通文件，拒绝启动")
+        db_existed = db_path.is_file()
+        marker_present = marker_path.exists() or marker_path.is_symlink()
+        expected_identity = ""
+        if marker_present:
+            if marker_path.is_symlink() or not marker_path.is_file():
+                raise RuntimeError("记忆主库身份标记不是普通文件，拒绝启动")
+            try:
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                raise RuntimeError("记忆主库身份标记损坏，拒绝自动重建") from exc
+            if (
+                not isinstance(marker, dict)
+                or marker.get("version") != 1
+                or marker.get("database") != "memory_companion.db"
+            ):
+                raise RuntimeError("记忆主库身份标记格式无效，拒绝自动重建")
+            expected_identity = clean_text(
+                marker.get("installation_id"),
+                80,
+            ).lower()
+            if not re.fullmatch(r"[0-9a-f]{32}", expected_identity):
+                raise RuntimeError("记忆主库身份标记无效，拒绝自动重建")
+
+        evidence = []
+        for path in data_dir.iterdir():
+            if path.name == db_path.name or path.name.startswith(".nfs"):
+                continue
+            evidence.append(path.name)
+        if not db_existed and (marker_present or evidence):
+            raise RuntimeError(
+                "检测到既有记忆数据痕迹但主库缺失；请恢复 memory_companion.db，拒绝创建空库"
+            )
+        return {
+            "db_path": db_path,
+            "marker_path": marker_path,
+            "db_existed": db_existed,
+            "marker_present": marker_present,
+            "expected_identity": expected_identity,
+        }
+
+    @staticmethod
+    def _write_primary_store_marker(marker_path: Path, installation_id: str) -> None:
+        payload = {
+            "version": 1,
+            "database": "memory_companion.db",
+            "installation_id": installation_id,
+        }
+        temp_path = marker_path.with_name(
+            f".{marker_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with temp_path.open("x", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, marker_path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
 
     def __init__(self, *, context: Any, config: Any, plugin_root: Path, data_dir: Path):
         self.context = context
         self.config = ConfigView(config)
         self.plugin_root = Path(plugin_root)
         self.data_dir = Path(data_dir)
+        self.lab_fixture_adapter: Any = None
 
-        self.store = MemoryStore(self.data_dir / "memory_companion.db")
         try:
-            self.store.initialize()
+            primary_state = self._primary_store_startup_state(self.data_dir)
         except Exception as exc:
-            self.store.close()
+            raise RuntimeError(
+                f"记忆主库启动检查失败 [primary_store.preflight]: {type(exc).__name__}: {exc}"
+            ) from exc
+        store: MemoryStore | None = None
+        try:
+            store = MemoryStore(
+                primary_state["db_path"],
+                allow_create=not primary_state["db_existed"],
+            )
+            store.initialize(
+                allow_empty_schema=not primary_state["db_existed"],
+            )
+            installation_id = store.ensure_installation_identity(
+                primary_state["expected_identity"]
+            )
+            if not primary_state["marker_present"]:
+                self._write_primary_store_marker(
+                    primary_state["marker_path"],
+                    installation_id,
+                )
+        except Exception as exc:
+            if store is not None:
+                store.close()
             raise RuntimeError(
                 f"记忆主库初始化失败 [primary_store.initialize]: {type(exc).__name__}: {exc}"
             ) from exc
+        self.store = store
+        self.installation_id = installation_id
+        self.primary_store_status = {
+            "state": "ready",
+            "identity_verified": True,
+            "marker_present": True,
+            "adopted_legacy_store": bool(
+                primary_state["db_existed"] and not primary_state["marker_present"]
+            ),
+        }
+        self.scoped_store: ScopedStore | None = None
+        self.scoped_store_status = {"state": "ready", "error_code": ""}
         try:
-            self.scoped_store = ScopedStore(self.data_dir / "req041_scoped.db")
+            self.scoped_store = ScopedStore(
+                self.data_dir / "req041_scoped.db",
+                installation_id=installation_id,
+            )
+            self.scoped_store_status.update(
+                {
+                    "identity_verified": True,
+                    "identity_backup": self.scoped_store.last_identity_backup_path,
+                }
+            )
         except Exception as exc:
-            self.store.close()
-            raise RuntimeError(
-                f"作用域记忆库初始化失败 [scoped_store.initialize]: {type(exc).__name__}: {exc}"
-            ) from exc
+            self.scoped_store_status = {
+                "state": "degraded",
+                "error_code": "namespace_scoped_store_initialize_failed",
+            }
+            logger.warning(
+                "[MemoryCompanion] 作用域记忆库初始化失败，已降级为仅主记忆库运行: %s: %s",
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
         self.portraits = PortraitService(self.store, self.config)
         try:
             normalized = self.store.normalize_legacy_manual_visibility()
@@ -267,6 +396,12 @@ class MemoryCompanionService:
             internal_normalized = self.store.normalize_internal_bot_self_scopes()
             if internal_normalized:
                 logger.info("[MemoryCompanion] 已将内部 Bot 梦境移出私聊用户范围: count=%s", internal_normalized)
+            profile_state_normalized = self.store.normalize_legacy_rule_profile_states()
+            if profile_state_normalized:
+                logger.info(
+                    "[MemoryCompanion] 已为强证据旧版规则画像补齐 active 状态: count=%s",
+                    profile_state_normalized,
+                )
         except Exception as exc:
             self.store.close()
             raise RuntimeError(
@@ -282,10 +417,25 @@ class MemoryCompanionService:
         self.injection = InjectionComposer(
             instruction_relax=self.config.bool("memory_injection.relax_instruction", False)
         )
+        self.summary_provider_timeout_seconds = max(
+            0,
+            self.config.int(
+                "memory_summary.provider_timeout_seconds",
+                180,
+            ),
+        )
+        self.summary_timeout_warning = bool(
+            0 < self.summary_provider_timeout_seconds < 180
+        )
+        if self.summary_timeout_warning:
+            logger.warning(
+                "[MemoryCompanion] 摘要模型超时配置为 %s 秒，低于建议值 180 秒；当前值会原样生效，超时后待总结时间线将保留并在后续触发时重试",
+                self.summary_provider_timeout_seconds,
+            )
         self.summarizer = MemorySummarizer(
             max_input_chars=self.config.int("memory_summary.max_input_chars", 6000),
             max_summary_chars=self.config.int("memory_summary.max_summary_chars", 1200),
-            provider_timeout_seconds=self.config.int("memory_summary.provider_timeout_seconds", 180),
+            provider_timeout_seconds=self.summary_provider_timeout_seconds,
         )
         self.importance = ImportanceEvaluator(
             mention_policy_relax=self.config.bool("memory_capture.relax_mention_policy", False)
@@ -299,7 +449,9 @@ class MemoryCompanionService:
         self._summary_lock_last_cleanup: float = time.monotonic()
         self._SUMMARY_LOCK_TTL: float = 600.0  # 10 minutes
         self._decay_lock = asyncio.Lock()
+        self._clear_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._capture_admission_open = True
         self._portrait_dispatch_task: asyncio.Task[Any] | None = None
         self._maintenance_dispatch_task: asyncio.Task[Any] | None = None
         self._maintenance_dispatch_status: dict[str, Any] = {
@@ -370,6 +522,66 @@ class MemoryCompanionService:
         self._load_relationship_phase_state()
         self.provenance_ledger = ProvenanceLedger(self.data_dir / "provenance_ledger.json")
         self._last_p5_gate_status: dict[str, Any] = {"state": "disabled", "enabled": False}
+
+    def apply_runtime_config_changes(self, changed_keys: list[str]) -> dict[str, list[str]]:
+        """Apply config fields held by long-lived runtime objects.
+
+        Most configuration is read through :class:`ConfigView` at the point of
+        use.  The classifier and summarizer keep local scalar snapshots, so
+        those are refreshed explicitly.  Existing semaphores may have active
+        waiters and are intentionally left in place until plugin reload.
+        """
+
+        keys = sorted(
+            {
+                clean_text(key, 160)
+                for key in changed_keys
+                if clean_text(key, 160)
+            }
+        )
+        restart_required = [
+            key for key in keys if key in self._RUNTIME_RESTART_KEYS
+        ]
+        applied_now = [key for key in keys if key not in self._RUNTIME_RESTART_KEYS]
+
+        if "memory_capture.capture_min_chars" in keys:
+            self.classifier.capture_min_chars = max(
+                1,
+                self.config.int("memory_capture.capture_min_chars", 2),
+            )
+
+        summary_keys = {
+            "memory_summary.max_input_chars",
+            "memory_summary.max_summary_chars",
+            "memory_summary.provider_timeout_seconds",
+        }
+        if summary_keys.intersection(keys):
+            self.summarizer.max_input_chars = max(
+                1000,
+                self.config.int("memory_summary.max_input_chars", 6000),
+            )
+            self.summarizer.max_summary_chars = max(
+                300,
+                self.config.int("memory_summary.max_summary_chars", 1200),
+            )
+            self.summary_provider_timeout_seconds = max(
+                0,
+                self.config.int("memory_summary.provider_timeout_seconds", 180),
+            )
+            self.summarizer.provider_timeout_seconds = float(
+                self.summary_provider_timeout_seconds
+            )
+            self.summary_timeout_warning = bool(
+                0 < self.summary_provider_timeout_seconds < 180
+            )
+
+        if keys:
+            self._retrieval_result_cache.clear()
+            self._injection_cache.clear()
+        return {
+            "applied_now": applied_now,
+            "restart_required": restart_required,
+        }
 
     def _p5_gate_enabled(self, sink: str) -> bool:
         key = (
@@ -715,6 +927,27 @@ class MemoryCompanionService:
         )
 
     async def handle_llm_request(self, event: Any, req: Any) -> None:
+        """Serialize request-path state writes with destructive maintenance.
+
+        A request can await identity, reply-chain, or feedback work before it
+        mutates the relationship-state file.  Holding the clear lock for the
+        hook makes the clear operation linearizable: an already-running hook
+        finishes before the backup/delete boundary, while a later hook starts
+        only after writes are admitted again.
+        """
+
+        if bool(getattr(event, "private_companion_req036_denied", False)):
+            # This fixed-reply gate must remain the very first boundary: it
+            # also supports the minimal service shell used by the gate's
+            # contract test, before lifecycle locks or identity exist.
+            return
+
+        async with self._clear_lock:
+            if self._closing or self._closed:
+                return
+            await self._handle_llm_request_unfenced(event, req)
+
+    async def _handle_llm_request_unfenced(self, event: Any, req: Any) -> None:
         if bool(getattr(event, "private_companion_req036_denied", False)):
             # Companion owns the fixed-reply branch. Do not resolve identity,
             # read memory, write evidence, or enter any LLM path here.
@@ -751,7 +984,7 @@ class MemoryCompanionService:
         stage_timer.mark("decorate")
 
         capture_enabled = self._scope_feature_enabled(ctx, "capture")
-        if capture_enabled:
+        if capture_enabled and self._capture_admission_open:
             await self.note_identity(ctx)
         stage_timer.mark("note_identity")
         reply_chain = await self._reply_chain_for_event(event)
@@ -778,7 +1011,7 @@ class MemoryCompanionService:
 
         self._apply_reconstruction_contract(req, ctx, event=event)
 
-        if capture_enabled:
+        if capture_enabled and self._capture_admission_open:
             # 关于本轮回复的采集写入（写时间线、写关系、抽取事实、调度向量化等）
             # 对"本轮要不要出回复"毫无贡献，移入后台执行，不阻塞请求关键路径。
             # 对应 optimization_plan.md §3.2「把写操作移出请求关键路径」。
@@ -786,7 +1019,7 @@ class MemoryCompanionService:
             # 无法 cancel 该任务，会在 store 半关闭状态下继续写 DB（exit=139 根因之一）。
             self._spawn_background(
                 self._capture_async(ctx, event, req, reply_chain),
-                label="capture-async",
+                label=f"capture:{clean_text(ctx.session_id, 80)}",
             )
         stage_timer.mark("finalize")
         self._emit_hook_stage_timing(stage_timer, ctx, note="ok")
@@ -833,6 +1066,8 @@ class MemoryCompanionService:
         所有异常在此被捕获并记录日志，不会传播到请求路径。
         """
         try:
+            if not self._capture_admission_open or self._closing or self._closed:
+                return
             if not self.config.bool("memory_capture.enabled", True):
                 return
             if not self.config.bool("memory_capture.capture_user_messages", True):
@@ -847,6 +1082,7 @@ class MemoryCompanionService:
                     scope=ctx.scope,
                     session_id=ctx.session_id,
                     entity_id=ctx.current_target_id,
+                    **self._timeline_namespace_kwargs(ctx),
                 )
             memory_id = await self._existing_timeline_message_id(
                 ctx,
@@ -870,6 +1106,7 @@ class MemoryCompanionService:
                         recent_rows=recent_timeline_rows,
                     ))
                 memory_id = await self.store.add_timeline_event(
+                    **self._timeline_namespace_kwargs(ctx),
                     event_type="user_message",
                     session_id=ctx.session_id,
                     scope=ctx.scope,
@@ -1008,6 +1245,7 @@ class MemoryCompanionService:
         event_metadata.update(self._cross_window_event_metadata(ctx))
         event_metadata.update(self._reply_chain_metadata(reply_chain))
         await self.store.add_timeline_event(
+            **self._timeline_namespace_kwargs(ctx),
             event_type="user_message",
             session_id=ctx.session_id,
             scope=ctx.scope,
@@ -1257,6 +1495,7 @@ class MemoryCompanionService:
         memory_id = ""
         injection_state = self._memory_companion_injection_payload(event)
         await self.store.add_timeline_event(
+            **self._timeline_namespace_kwargs(ctx),
             event_type="bot_response",
             session_id=ctx.session_id,
             scope=ctx.scope,
@@ -1293,6 +1532,7 @@ class MemoryCompanionService:
                 scope=ctx.scope,
                 session_id=ctx.session_id,
                 entity_id=ctx.current_target_id,
+                **self._timeline_namespace_kwargs(ctx),
             )
         text = clean_text(content or ctx.message_text, 1000)
         subject_id = clean_text(
@@ -1340,6 +1580,7 @@ class MemoryCompanionService:
                 scope=ctx.scope,
                 session_id=ctx.session_id,
                 entity_id=ctx.current_target_id,
+                **self._timeline_namespace_kwargs(ctx),
             )
         previous = rows[0] if rows else None
         idle_limit = max(1, self.config.int("conversation_memory.idle_gap_minutes", 20))
@@ -1623,6 +1864,7 @@ class MemoryCompanionService:
         if not self._scope_feature_enabled(scope_ctx, "capture"):
             return ""
         event_id = await self.store.add_timeline_event(
+            **self._timeline_namespace_kwargs(scope_ctx),
             event_type=event_type,
             session_id=normalized_session_id,
             scope=normalized_scope,
@@ -1676,6 +1918,7 @@ class MemoryCompanionService:
             if not timeline_content:
                 timeline_content = self._sanitize_visible_timeline_text(record.content)
             await self.store.add_timeline_event(
+                **self._timeline_namespace_kwargs(self._context_from_memory_record(record)),
                 event_type=record.memory_type,
                 session_id=record.session_id,
                 scope=record.scope,
@@ -1703,14 +1946,13 @@ class MemoryCompanionService:
         tags: list[str] | None = None,
         metadata: Mapping[str, Any] | None = None,
         long_term: bool = True,
+        producer_context: Any = None,
     ) -> dict[str, Any]:
-        """Store a user-scoped memory supplied by another plugin or app.
+        """Store a user-scoped memory supplied by another live AstrBot plugin.
 
-        This is deliberately narrower than ``record_external_event``: callers
-        do not choose a group/session scope, and the record is always attached
-        to the supplied user so it can be recalled from that user's private
-        conversations.  High-frequency integrations can pass ``long_term``
-        false until they have produced a useful summary.
+        Producer identity, user ownership, and the private session namespace
+        come from an opaque live-plugin context.  Legacy identity keywords are
+        accepted only as non-authoritative compatibility inputs.
         """
         result = {
             "ok": False,
@@ -1722,14 +1964,27 @@ class MemoryCompanionService:
             "visibility": "private_pair",
             "error_code": None,
         }
+        authority = consume_external_memory_producer_context(producer_context)
+        if authority is None:
+            return {
+                **result,
+                "state": "forbidden",
+                "error_code": "producer_capability_required",
+            }
         if not self.config.bool("private_companion_bridge.accept_external_records", True):
             return {**result, "error_code": "external_records_disabled"}
 
-        normalized_user_id = clean_text(user_id, 160)
-        if not normalized_user_id:
-            return {**result, "error_code": "user_id_required"}
+        normalized_user_id = authority["user_id"]
+        supplied_user_id = clean_text(user_id, 160)
+        if supplied_user_id and supplied_user_id != normalized_user_id:
+            return {
+                **result,
+                "state": "forbidden",
+                "error_code": "producer_context_mismatch",
+            }
 
-        normalized_source = clean_text(source_plugin, 100) or "external"
+        normalized_source = authority["producer_id"]
+        normalized_session_id = authority["session_id"]
         normalized_type = clean_text(memory_type, 80) or "external_memory"
         normalized_content = clean_text(content or summary, 4000)
         if payload is not None and not isinstance(payload, Mapping):
@@ -1763,15 +2018,14 @@ class MemoryCompanionService:
 
         normalized_key = clean_text(idempotency_key, 180)
         normalized_occurred_at = clean_text(occurred_at, 80)
-        stable_memory_id = clean_text(memory_id, 120)
-        if not stable_memory_id:
-            stable_memory_id = self.stable_id(
-                "external_memory",
-                normalized_source,
-                normalized_user_id,
-                normalized_key or normalized_content,
-                normalized_occurred_at,
-            )
+        caller_memory_key = clean_text(memory_id, 120)
+        stable_memory_id = self.stable_id(
+            "external_memory",
+            normalized_source,
+            normalized_user_id,
+            normalized_key or caller_memory_key or normalized_content,
+            normalized_occurred_at,
+        )
         existing = None
         getter = getattr(self.store, "get_memory", None)
         if callable(getter):
@@ -1790,13 +2044,29 @@ class MemoryCompanionService:
         if bool(long_term) and "long_term" not in safe_tags:
             safe_tags.append("long_term")
 
+        for reserved_key in (
+            "group_id",
+            "owner_user_id",
+            "producer_id",
+            "scope",
+            "server_id",
+            "session_id",
+            "source_plugin",
+            "user_id",
+            "visibility",
+        ):
+            safe_metadata.pop(reserved_key, None)
         safe_metadata.update({
             "external_memory": True,
             "source_plugin": normalized_source,
+            "producer_id": normalized_source,
             "idempotency_key": normalized_key,
             "long_term": bool(long_term),
             "memory_type": normalized_type,
             "owner_user_id": normalized_user_id,
+            "scope": "private",
+            "session_id": normalized_session_id,
+            "visibility": "private_pair",
         })
         if safe_payload:
             safe_metadata.setdefault("structured_data", safe_payload)
@@ -1809,7 +2079,7 @@ class MemoryCompanionService:
             # Keep this independent of the source platform so a memory
             # reported by an app can be recalled in QQ, web, or phone chats.
             scope="private",
-            session_id=f"external:{normalized_source}:{normalized_user_id}",
+            session_id=normalized_session_id,
             platform="",
             visibility="private_pair",
             sayability="direct",
@@ -2018,6 +2288,9 @@ class MemoryCompanionService:
                 query="",
                 scope="private",
                 visibility="bot_self",
+                owner_bot_id=clean_text(owner_bot_id, 120) if (owner_bot_id or persona_id) else None,
+                persona_id=clean_text(persona_id, 96) if (owner_bot_id or persona_id) else None,
+                legacy_namespace_only=not bool(owner_bot_id or persona_id),
             )
         except Exception:
             return {"ok": False, "read_only": True, "state": "degraded", "degraded": True, "pending": True, "items": [], "error_code": "store_unavailable"}
@@ -2210,6 +2483,9 @@ class MemoryCompanionService:
         current_date: str = "",
         current_window: str = "",
         authorized: bool = False,
+        owner_bot_id: str | None = None,
+        persona_id: str | None = None,
+        legacy_namespace_only: bool = False,
     ) -> dict[str, Any]:
         """Read a C4 Bot Profile after hard domain and storage filtering."""
 
@@ -2240,6 +2516,9 @@ class MemoryCompanionService:
                 query="",
                 scope="private",
                 visibility="bot_self",
+                owner_bot_id=owner_bot_id,
+                persona_id=persona_id,
+                legacy_namespace_only=legacy_namespace_only,
             )
         except Exception:
             return {
@@ -3075,11 +3354,173 @@ class MemoryCompanionService:
             cache.pop(key, None)
         self._retrieval_result_cache_stats["evictions"] = self._retrieval_result_cache_stats.get("evictions", 0) + remove_count
 
+    def _lab_fixture_active_for_context(self, ctx: SessionContext) -> bool:
+        adapter = getattr(self, "lab_fixture_adapter", None)
+        active = getattr(adapter, "active_for_context", None)
+        if not callable(active):
+            return False
+        try:
+            return bool(active(ctx))
+        except Exception as exc:
+            logger.warning(
+                "[MemoryCompanion] LAB fixture 作用域检查失败，已保守关闭本轮持久化旁路: %s",
+                type(exc).__name__,
+            )
+            return adapter is not None
+
+    @staticmethod
+    def _lab_fixture_slot_for_memory(memory: MemoryRecord) -> str:
+        if clean_text(memory.memory_type, 80).lower() in {
+            "user_profile",
+            "user_preference",
+            "user_habit",
+        }:
+            return "user_profile"
+        if clean_text(memory.memory_type, 80).lower() == "conversation_summary":
+            return "conversation_summary"
+        return "stable_memory"
+
+    async def _merge_lab_fixture_context_slots(
+        self,
+        retrieval_text: str,
+        ctx: SessionContext,
+        top_k: int,
+        results: list[SearchResult],
+        blocked: list[dict[str, Any]],
+        slot_map: dict[str, list[SearchResult]],
+        *,
+        admin_read_all: bool = False,
+    ) -> tuple[list[SearchResult], list[dict[str, Any]], dict[str, list[SearchResult]]]:
+        adapter = getattr(self, "lab_fixture_adapter", None)
+        candidates_for_context = getattr(adapter, "candidates_for_context", None)
+        if not callable(candidates_for_context):
+            return results, blocked, slot_map
+        try:
+            candidates = candidates_for_context(ctx, retrieval_text)
+        except Exception as exc:
+            logger.warning(
+                "[MemoryCompanion] LAB fixture 候选生成失败，已保持生产召回结果: %s",
+                type(exc).__name__,
+            )
+            return results, blocked, slot_map
+        if not isinstance(candidates, list):
+            return results, blocked, slot_map
+
+        visible: list[SearchResult] = []
+        fixture_blocked: list[dict[str, Any]] = []
+        if candidates:
+            try:
+                validation_engine = self._retrieval_validation_engine(
+                    admin_read_all=admin_read_all
+                )
+                visible, fixture_blocked = await validation_engine.filter_visible_candidates(
+                    candidates,
+                    ctx,
+                    reason="lab_fixture_candidate",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[MemoryCompanion] LAB fixture 候选 ACL 校验失败，已拒绝本轮合成候选: %s",
+                    type(exc).__name__,
+                )
+                visible = []
+                fixture_blocked = [
+                    {
+                        "id": clean_text(getattr(item, "id", ""), 120),
+                        "reason": "lab_fixture_validation_failed",
+                        "content": "",
+                    }
+                    for item in candidates
+                    if clean_text(getattr(item, "id", ""), 120)
+                ]
+
+        merged_slots = {
+            clean_text(slot, 60): list(items)
+            for slot, items in (slot_map or {}).items()
+            if clean_text(slot, 60) and isinstance(items, list)
+        }
+        existing_ids = {
+            clean_text(getattr(getattr(item, "memory", None), "id", ""), 120)
+            for item in results or []
+        }
+        fixture_visible: list[SearchResult] = []
+        for item in visible:
+            memory_id = clean_text(getattr(item.memory, "id", ""), 120)
+            if not memory_id or memory_id in existing_ids:
+                continue
+            existing_ids.add(memory_id)
+            slot = self._lab_fixture_slot_for_memory(item.memory)
+            item.reason = f"{clean_text(item.reason, 900)};slot={slot}"
+            merged_slots.setdefault(slot, []).insert(0, item)
+            fixture_visible.append(item)
+
+        limit = max(1, int(top_k or 1))
+        combined: list[SearchResult] = []
+        seen_ids: set[str] = set()
+        for item in [*fixture_visible, *(results or [])]:
+            memory_id = clean_text(getattr(getattr(item, "memory", None), "id", ""), 120)
+            if not memory_id or memory_id in seen_ids:
+                continue
+            seen_ids.add(memory_id)
+            combined.append(item)
+            if len(combined) >= limit:
+                break
+        selected_ids = {
+            clean_text(getattr(getattr(item, "memory", None), "id", ""), 120)
+            for item in combined
+        }
+        selected_fixture_visible = [
+            item
+            for item in fixture_visible
+            if clean_text(getattr(getattr(item, "memory", None), "id", ""), 120)
+            in selected_ids
+        ]
+        merged_slots = {
+            slot: [
+                item
+                for item in items
+                if clean_text(getattr(getattr(item, "memory", None), "id", ""), 120)
+                in selected_ids
+            ]
+            for slot, items in merged_slots.items()
+        }
+        merged_slots = {slot: items for slot, items in merged_slots.items() if items}
+        merged_blocked = [*(blocked or []), *fixture_blocked]
+
+        cache_state = clean_text(self._last_retrieval_path_info.get("cache"), 24) or "unknown"
+        observe = getattr(adapter, "record_selection", None)
+        if callable(observe):
+            try:
+                observe(
+                    ctx,
+                    selected_fixture_visible,
+                    fixture_blocked,
+                    cache_state=cache_state,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[MemoryCompanion] LAB fixture 脱敏观测更新失败，已保留召回结果: %s",
+                    type(exc).__name__,
+                )
+        if candidates:
+            self._last_retrieval_path_info.update(
+                {
+                    "fixture_candidate_count": len(candidates),
+                    "fixture_visible_count": len(selected_fixture_visible),
+                    "fixture_blocked_count": len(fixture_blocked),
+                }
+            )
+        return combined, merged_blocked, merged_slots
+
     async def _mark_injected_memories(self, memory_ids: list[str]) -> None:
         """Reinforce only records that were present in the final request context."""
         unique_ids: list[str] = []
+        adapter = getattr(self, "lab_fixture_adapter", None)
+        is_fixture_id = getattr(adapter, "is_fixture_memory_id", None)
         for value in memory_ids or []:
             memory_id = clean_text(value, 120)
+            if memory_id and callable(is_fixture_id) and is_fixture_id(memory_id):
+                continue
             if memory_id and memory_id not in unique_ids:
                 unique_ids.append(memory_id)
         marker = getattr(self.store, "mark_injected", None)
@@ -3238,7 +3679,15 @@ class MemoryCompanionService:
             slot_map = {slot: items for slot, items in slot_map.items() if items}
             self._last_retrieval_path_info = dict(cached.get("path_info") or {})
             self._last_retrieval_path_info["cache"] = "hit"
-            return results, blocked, slot_map
+            return await self._merge_lab_fixture_context_slots(
+                slot_query,
+                ctx,
+                top_k,
+                results,
+                blocked,
+                slot_map,
+                admin_read_all=admin_read_all,
+            )
         engine = await self._retrieval_engine(ctx, admin_read_all=admin_read_all)
         if not self.config.bool("context_orchestration.enabled", True):
             results, blocked = await engine.search_with_diagnostics(query, ctx, top_k, time_intent=time_intent)
@@ -3254,7 +3703,15 @@ class MemoryCompanionService:
                     "path_info": dict(self._last_retrieval_path_info),
                 },
             )
-            return results, blocked, slot_map
+            return await self._merge_lab_fixture_context_slots(
+                slot_query,
+                ctx,
+                top_k,
+                results,
+                blocked,
+                slot_map,
+                admin_read_all=admin_read_all,
+            )
         results, blocked, slot_map = await engine.search_by_slots(
             query,
             ctx,
@@ -3274,7 +3731,15 @@ class MemoryCompanionService:
                 "path_info": dict(self._last_retrieval_path_info),
             },
         )
-        return results, blocked, slot_map
+        return await self._merge_lab_fixture_context_slots(
+            slot_query,
+            ctx,
+            top_k,
+            results,
+            blocked,
+            slot_map,
+            admin_read_all=admin_read_all,
+        )
 
     def _retrieval_validation_engine(self, *, admin_read_all: bool = False) -> RetrievalEngine:
         return RetrievalEngine(
@@ -4104,6 +4569,25 @@ class MemoryCompanionService:
     def _bot_subject_id(self, ctx: SessionContext | None = None) -> str:
         return self._bot_entity(ctx).id
 
+    def _timeline_namespace(self, ctx: SessionContext | None) -> tuple[str, str]:
+        """Return the explicit namespace for every newly captured event."""
+
+        owner_bot_id = clean_text(getattr(ctx, "bot_id", "") if ctx else "", 120)
+        if not owner_bot_id:
+            # Pre-namespace callers remain in the explicit legacy partition;
+            # never guess their owner from a generic ``self`` entity.
+            return "", ""
+        persona_id = clean_text(getattr(ctx, "persona_id", ""), 96)
+        return owner_bot_id, persona_id or _TIMELINE_DEFAULT_PERSONA
+
+    def _timeline_namespace_kwargs(self, ctx: SessionContext | None) -> dict[str, str]:
+        owner_bot_id, persona_id = self._timeline_namespace(ctx)
+        return {"owner_bot_id": owner_bot_id, "persona_id": persona_id}
+
+    def _summary_namespace_key(self, ctx: SessionContext) -> str:
+        owner_bot_id, persona_id = self._timeline_namespace(ctx)
+        return f"{owner_bot_id}\x1f{persona_id}\x1f{clean_text(ctx.session_id, 200)}"
+
     def _schedule_session_summary(self, ctx: SessionContext, *, reason: str) -> None:
         if not self.config.bool("memory_summary.enabled", True):
             return
@@ -4115,11 +4599,12 @@ class MemoryCompanionService:
             logger.debug("[MemoryCompanion] 跳过阶段性总结调度: reason=%s cause=empty_session", reason)
             return
 
-        worker = self._summary_workers.get(session_id)
+        namespace_key = self._summary_namespace_key(snapshot)
+        worker = self._summary_workers.get(namespace_key)
         if worker is not None and not worker.done():
-            self._summary_pending.add(session_id)
-            self._summary_pending_contexts[session_id] = snapshot
-            self._summary_pending_reasons[session_id] = reason
+            self._summary_pending.add(namespace_key)
+            self._summary_pending_contexts[namespace_key] = snapshot
+            self._summary_pending_reasons[namespace_key] = reason
             logger.debug(
                 "[MemoryCompanion] 阶段性总结任务忙，已合并为一次补偿执行: session=%s reason=%s",
                 session_id,
@@ -4140,11 +4625,12 @@ class MemoryCompanionService:
                 self._closed,
             )
             return
-        self._summary_workers[session_id] = task
+        self._summary_workers[namespace_key] = task
         logger.debug("[MemoryCompanion] 阶段性总结任务已启动: session=%s reason=%s", session_id, reason)
 
     async def _background_summarize_session(self, ctx: SessionContext, reason: str) -> None:
         session_id = ctx.session_id
+        namespace_key = self._summary_namespace_key(ctx)
         current_ctx = ctx
         current_reason = reason
         if not self._scope_feature_enabled(ctx, "capture"):
@@ -4159,23 +4645,23 @@ class MemoryCompanionService:
                         current_reason,
                         memory_id,
                     )
-                if session_id not in self._summary_pending:
+                if namespace_key not in self._summary_pending:
                     break
-                self._summary_pending.discard(session_id)
-                current_ctx = self._summary_pending_contexts.pop(session_id, current_ctx)
-                current_reason = self._summary_pending_reasons.pop(session_id, "coalesced_trigger")
+                self._summary_pending.discard(namespace_key)
+                current_ctx = self._summary_pending_contexts.pop(namespace_key, current_ctx)
+                current_reason = self._summary_pending_reasons.pop(namespace_key, "coalesced_trigger")
                 logger.debug(
                     "[MemoryCompanion] 开始阶段性总结补偿执行: session=%s reason=%s",
                     session_id,
                     current_reason,
                 )
         finally:
-            self._summary_pending.discard(session_id)
-            self._summary_pending_contexts.pop(session_id, None)
-            self._summary_pending_reasons.pop(session_id, None)
+            self._summary_pending.discard(namespace_key)
+            self._summary_pending_contexts.pop(namespace_key, None)
+            self._summary_pending_reasons.pop(namespace_key, None)
             current_task = asyncio.current_task()
-            if self._summary_workers.get(session_id) is current_task:
-                self._summary_workers.pop(session_id, None)
+            if self._summary_workers.get(namespace_key) is current_task:
+                self._summary_workers.pop(namespace_key, None)
             logger.debug("[MemoryCompanion] 阶段性总结任务已结束: session=%s", session_id)
 
     def _cleanup_stale_summary_locks(self) -> None:
@@ -4289,6 +4775,7 @@ class MemoryCompanionService:
             scope=ctx.scope,
             limit=self.config.int("memory_summary.max_events_per_summary", 40),
             after_timeline_id=clean_text(failure.get("end_timeline_id"), 160),
+            **self._timeline_namespace_kwargs(ctx),
         )
 
     async def _acquire_summary_call_slot(self, *, force: bool) -> bool:
@@ -4316,8 +4803,9 @@ class MemoryCompanionService:
         if not ctx.session_id:
             return ""
 
-        lock = self._summary_locks.setdefault(ctx.session_id, asyncio.Lock())
-        self._summary_lock_ts[ctx.session_id] = time.monotonic()
+        namespace_key = self._summary_namespace_key(ctx)
+        lock = self._summary_locks.setdefault(namespace_key, asyncio.Lock())
+        self._summary_lock_ts[namespace_key] = time.monotonic()
         self._cleanup_stale_summary_locks()
         if lock.locked():
             logger.debug(
@@ -4330,13 +4818,17 @@ class MemoryCompanionService:
                 session_id=ctx.session_id,
                 scope=ctx.scope,
                 limit=self.config.int("memory_summary.max_events_per_summary", 40),
+                **self._timeline_namespace_kwargs(ctx),
             )
             rows = list(window.get("rows") or [])
             total = int(window.get("total") or 0)
             if not self._summary_window_ready(window, force=force):
                 return ""
 
-            failure = await self.store.get_summary_failure(ctx.session_id)
+            failure = await self.store.get_summary_failure(
+                ctx.session_id,
+                **self._timeline_namespace_kwargs(ctx),
+            )
             bypassed_failed_batch = False
             max_retries = max(1, self.config.int("memory_summary.max_retries", 3))
             if failure and not force:
@@ -4355,6 +4847,7 @@ class MemoryCompanionService:
                             max_retries,
                             cooldown_seconds,
                             state=cooldown_state,
+                            **self._timeline_namespace_kwargs(ctx),
                         )
                         logger.warning(
                             "[MemoryCompanion] 阶段性总结连续失败，已隔离当前批次并进入 %s 分钟冷却；后续新批次仍可继续总结: session=%s retries=%s last_error=%s",
@@ -4469,6 +4962,7 @@ class MemoryCompanionService:
                 failure_error = self._describe_exception(last_error) if last_error is not None else "summary failed"
                 transient_failure = self._summary_failure_is_transient(failure_error)
                 retries = await self.store.record_summary_failure(
+                    **self._timeline_namespace_kwargs(ctx),
                     session_id=ctx.session_id,
                     scope=ctx.scope,
                     start_timeline_id=str(rows[0].get("id") if rows else ""),
@@ -4490,6 +4984,7 @@ class MemoryCompanionService:
                         max_retries,
                         cooldown_seconds,
                         state=cooldown_state,
+                        **self._timeline_namespace_kwargs(ctx),
                     )
                     logger.warning(
                         "[MemoryCompanion] 阶段性总结失败达到上限，已隔离当前批次并进入 %s 分钟冷却；后续消息不受阻塞，冷却结束后会自动重试: session=%s retry=%s/%s error=%s",
@@ -4539,8 +5034,12 @@ class MemoryCompanionService:
                 if not evidence_gate_passed
                 else ""
             )
+            summary_owner_bot_id, summary_persona_id = self._timeline_namespace(ctx)
             record = MemoryRecord(
-                id=self.stable_id("summary", ctx.session_id, start_at, end_at, content),
+                id=self.stable_id(
+                    "summary", summary_owner_bot_id, summary_persona_id,
+                    ctx.session_id, start_at, end_at, content,
+                ),
                 memory_type="conversation_summary",
                 subject=self._bot_entity(ctx) if ctx.scope == "group" else EntityRef(kind="user", id=ctx.user_id, name=ctx.user_name, role="conversation_partner"),
                 object=EntityRef(kind="group", id=ctx.group_id, name=ctx.group_name, role="group") if ctx.scope == "group" else self._bot_entity(ctx),
@@ -4562,7 +5061,7 @@ class MemoryCompanionService:
                     "long_term" if evidence_gate_passed else "evidence_candidate",
                     ctx.scope,
                 ] + [clean_text(topic, 80) for topic in (payload or {}).get("topics", [])[:5]],
-                owner_bot_id=self._bot_subject_id(ctx),
+                owner_bot_id=summary_owner_bot_id,
                 valid_to=candidate_valid_to,
                 durability="normal" if evidence_gate_passed else "short",
                 sensitivity="internal",
@@ -4576,7 +5075,8 @@ class MemoryCompanionService:
                     "timezone": "Asia/Shanghai",
                     "summarizer": "companion_memory_schema_v1",
                     "summary_schema_version": "companion_memory_v1",
-                    "owner_bot_id": self._bot_subject_id(ctx),
+                    "owner_bot_id": summary_owner_bot_id,
+                    "persona_id": summary_persona_id,
                     "summary_quality": summary_quality,
                     "evidence_gate_passed": evidence_gate_passed,
                     "raw_timeline_preserved": not evidence_gate_passed,
@@ -4598,6 +5098,7 @@ class MemoryCompanionService:
             memory_id = await self.store.insert_memory(record)
             if not evidence_gate_passed:
                 retries = await self.store.record_summary_failure(
+                    **self._timeline_namespace_kwargs(ctx),
                     session_id=ctx.session_id,
                     scope=ctx.scope,
                     start_timeline_id=str(rows[0].get("id") or ""),
@@ -4620,9 +5121,15 @@ class MemoryCompanionService:
             self._schedule_memory_embedding(memory_id, record)
             await self._record_verified_group_bot_self_facts(ctx, rows, payload or {}, memory_id)
             await self._index_summary_knowledge_graph(ctx, record, payload or {}, memory_id)
-            marked = await self.store.mark_timeline_summarized([str(row.get("id") or "") for row in rows])
+            marked = await self.store.mark_timeline_summarized(
+                [str(row.get("id") or "") for row in rows],
+                **self._timeline_namespace_kwargs(ctx),
+            )
             if not bypassed_failed_batch:
-                await self.store.clear_summary_failure(ctx.session_id)
+                await self.store.clear_summary_failure(
+                    ctx.session_id,
+                    **self._timeline_namespace_kwargs(ctx),
+                )
             logger.info(
                 "[MemoryCompanion] 已生成阶段性长期记忆: session=%s memory=%s events=%s marked=%s",
                 ctx.session_id,
@@ -6449,6 +6956,17 @@ class MemoryCompanionService:
         preset = detect_preset(self.config)
         return {"preset": preset, "label": PRESET_LABELS[preset]}
 
+    def summary_timeout_status(self) -> dict[str, Any]:
+        configured = int(self.summary_provider_timeout_seconds)
+        return {
+            "configured_seconds": configured,
+            "recommended_minimum_seconds": 180,
+            "below_recommendation": bool(self.summary_timeout_warning),
+            "configured_value_respected": True,
+            "timeout_preserves_pending_timeline": True,
+            "retry_on_later_trigger": True,
+        }
+
     def apply_operation_preset(self, name: str) -> dict[str, Any]:
         raw = self.config.raw
         if not isinstance(raw, dict):
@@ -6486,20 +7004,98 @@ class MemoryCompanionService:
         return await self.memory_audit.rollback(batch_id, confirm)
 
     async def clear_all_memory_data(self) -> dict[str, Any]:
-        await self._cancel_background_tasks_for_clear()
-        relationship_observations = await self.chat_importer.clear_relationship_observations()
-        result = await self.store.clear_all_memory_data()
-        result["historical_chat_archives"] = await asyncio.to_thread(self.chat_importer.clear_archives)
-        result["historical_relationship_observations"] = relationship_observations
-        self._relationship_phase_state.clear()
-        self._save_relationship_phase_state()
-        self._emotional_event_queue.clear()
-        self._retrieval_result_cache.clear()
-        self._reconstruction_states.clear()
-        self._embedding_backfill_inflight.clear()
-        self._embedding_memory_inflight.clear()
-        self._embedding_backfill_last_run.clear()
-        return result
+        generation = await self._begin_clear_fence()
+        databases: dict[str, dict[str, Any]] = {}
+        ancillary: dict[str, Any] = {}
+        try:
+            await self._cancel_background_tasks_for_clear()
+            try:
+                primary = await self.store.clear_all_memory_data()
+                databases["primary"] = {
+                    "ok": True,
+                    "counts": dict(primary.get("deleted") or {}),
+                    "deleted": dict(primary.get("deleted") or {}),
+                    "backup": clean_text(primary.get("backup"), 1000),
+                    "error_code": "",
+                }
+            except Exception as exc:
+                databases["primary"] = {
+                    "ok": False,
+                    "counts": {},
+                    "deleted": {},
+                    "backup": "",
+                    "error_code": "primary_clear_failed",
+                    "error_type": type(exc).__name__,
+                }
+            if self.scoped_store is None:
+                databases["scoped"] = {
+                    "ok": False,
+                    "counts": {},
+                    "deleted": 0,
+                    "backup": "",
+                    "error_code": clean_text(
+                        self.scoped_store_status.get("error_code"), 120
+                    ) or "namespace_scoped_store_unavailable",
+                }
+            else:
+                try:
+                    scoped = await asyncio.to_thread(self.scoped_store.clear_all_records)
+                    databases["scoped"] = {
+                        "ok": True,
+                        "counts": dict(scoped.get("counts") or {}),
+                        "deleted": int(scoped.get("deleted") or 0),
+                        "backup": clean_text(scoped.get("backup"), 1000),
+                        "error_code": "",
+                        "control_data_retained": True,
+                    }
+                except Exception as exc:
+                    databases["scoped"] = {
+                        "ok": False,
+                        "counts": {},
+                        "deleted": 0,
+                        "backup": "",
+                        "error_code": "scoped_clear_failed",
+                        "error_type": type(exc).__name__,
+                    }
+            try:
+                ancillary["historical_relationship_observations"] = (
+                    await self.chat_importer.clear_relationship_observations()
+                )
+                ancillary["historical_chat_archives"] = await asyncio.to_thread(
+                    self.chat_importer.clear_archives
+                )
+            except Exception as exc:
+                ancillary["error_code"] = "historical_archive_clear_failed"
+                ancillary["error_type"] = type(exc).__name__
+            self._relationship_phase_state.clear()
+            self._save_relationship_phase_state()
+            self._emotional_event_queue.clear()
+            self._retrieval_result_cache.clear()
+            self._reconstruction_states.clear()
+            self._embedding_backfill_inflight.clear()
+            self._embedding_memory_inflight.clear()
+            self._embedding_backfill_last_run.clear()
+        finally:
+            self._end_clear_fence(generation)
+        ok_count = sum(1 for item in databases.values() if item.get("ok"))
+        all_ok = ok_count == len(databases) and not ancillary.get("error_code")
+        primary_result = databases.get("primary") or {}
+        return {
+            "ok": all_ok,
+            "state": "ready" if all_ok else ("partial" if ok_count else "degraded"),
+            # Public v1 compatibility projection.  These fields report only
+            # the primary database; per-database truth lives in ``databases``.
+            "backup": clean_text(primary_result.get("backup"), 1000),
+            "deleted": dict(primary_result.get("deleted") or {}),
+            "historical_relationship_observations": int(
+                ancillary.get("historical_relationship_observations") or 0
+            ),
+            "historical_chat_archives": dict(
+                ancillary.get("historical_chat_archives") or {}
+            ),
+            "databases": databases,
+            "ancillary": ancillary,
+        }
 
     async def clear_scoped_memory(
         self,
@@ -6507,19 +7103,217 @@ class MemoryCompanionService:
         target_type: str,
         group_id: str = "",
         user_id: str = "",
+        persona_id: str = "",
     ) -> dict[str, Any]:
-        await self._cancel_background_tasks_for_clear()
-        result = await self.store.clear_scoped_memory(
-            target_type=target_type,
-            group_id=group_id,
-            user_id=user_id,
-        )
-        self._clear_scoped_runtime_state(
-            target_type=target_type,
-            group_id=group_id,
-            user_id=user_id,
-        )
-        return result
+        generation = await self._begin_clear_fence()
+        databases: dict[str, dict[str, Any]] = {}
+        try:
+            await self._cancel_background_tasks_for_clear()
+            try:
+                primary = await self.store.clear_scoped_memory(
+                    target_type=target_type,
+                    group_id=group_id,
+                    user_id=user_id,
+                    persona_id=persona_id,
+                )
+                databases["primary"] = {
+                    "ok": True,
+                    "counts": dict(primary.get("counts") or {}),
+                    "deleted": dict(primary.get("deleted") or {}),
+                    "backup": clean_text(primary.get("backup"), 1000),
+                    "error_code": "",
+                }
+            except ValueError:
+                raise
+            except Exception as exc:
+                databases["primary"] = {
+                    "ok": False,
+                    "counts": {},
+                    "deleted": {},
+                    "backup": "",
+                    "error_code": "primary_clear_scope_failed",
+                    "error_type": type(exc).__name__,
+                }
+            if self.scoped_store is None:
+                databases["scoped"] = {
+                    "ok": False,
+                    "counts": {},
+                    "deleted": 0,
+                    "backup": "",
+                    "error_code": clean_text(
+                        self.scoped_store_status.get("error_code"), 120
+                    ) or "namespace_scoped_store_unavailable",
+                }
+            else:
+                try:
+                    scoped = await asyncio.to_thread(
+                        self.scoped_store.clear_scoped_records,
+                        target_type=target_type,
+                        identity_id=user_id,
+                        group_id=group_id,
+                        persona_id=persona_id,
+                    )
+                    databases["scoped"] = {
+                        "ok": True,
+                        "counts": dict(scoped.get("counts") or {}),
+                        "deleted": int(scoped.get("deleted") or 0),
+                        "backup": clean_text(scoped.get("backup"), 1000),
+                        "error_code": "",
+                        "control_data_retained": True,
+                    }
+                except Exception as exc:
+                    databases["scoped"] = {
+                        "ok": False,
+                        "counts": {},
+                        "deleted": 0,
+                        "backup": "",
+                        "error_code": "scoped_clear_scope_failed",
+                        "error_type": type(exc).__name__,
+                    }
+            self._clear_scoped_runtime_state(
+                target_type=target_type,
+                group_id=group_id,
+                user_id=user_id,
+                persona_id=persona_id,
+            )
+        finally:
+            self._end_clear_fence(generation)
+        ok_count = sum(1 for item in databases.values() if item.get("ok"))
+        all_ok = ok_count == len(databases)
+        primary_result = databases.get("primary") or {}
+        return {
+            "ok": all_ok,
+            "state": "ready" if all_ok else ("partial" if ok_count else "degraded"),
+            "target_type": clean_text(target_type, 40),
+            "group_id": clean_text(group_id, 120),
+            "user_id": clean_text(user_id, 120),
+            "persona_id": clean_text(persona_id, 96),
+            "backup": clean_text(primary_result.get("backup"), 1000),
+            "counts": dict(primary_result.get("counts") or {}),
+            "deleted": dict(primary_result.get("deleted") or {}),
+            "databases": databases,
+        }
+
+    async def preview_scoped_memory_clear(
+        self,
+        *,
+        target_type: str,
+        group_id: str = "",
+        user_id: str = "",
+        persona_id: str = "",
+    ) -> dict[str, Any]:
+        """Preview primary and req041-scoped effects without creating backups."""
+
+        databases: dict[str, dict[str, Any]] = {}
+        try:
+            primary = await self.store.preview_scoped_memory_clear(
+                target_type=target_type,
+                group_id=group_id,
+                user_id=user_id,
+                persona_id=persona_id,
+            )
+            databases["primary"] = {
+                "ok": True,
+                "counts": dict(primary.get("counts") or {}),
+                "error_code": "",
+            }
+        except ValueError:
+            raise
+        except Exception as exc:
+            databases["primary"] = {
+                "ok": False,
+                "counts": {},
+                "error_code": "primary_clear_scope_preview_failed",
+                "error_type": type(exc).__name__,
+            }
+        if self.scoped_store is None:
+            databases["scoped"] = {
+                "ok": False,
+                "counts": {},
+                "error_code": clean_text(
+                    self.scoped_store_status.get("error_code"), 120
+                ) or "namespace_scoped_store_unavailable",
+            }
+        else:
+            try:
+                scoped = await asyncio.to_thread(
+                    self.scoped_store.preview_scoped_records,
+                    target_type=target_type,
+                    identity_id=user_id,
+                    group_id=group_id,
+                    persona_id=persona_id,
+                )
+                databases["scoped"] = {
+                    "ok": True,
+                    "counts": dict(scoped.get("counts") or {}),
+                    "error_code": "",
+                }
+            except Exception as exc:
+                databases["scoped"] = {
+                    "ok": False,
+                    "counts": {},
+                    "error_code": "scoped_clear_scope_preview_failed",
+                    "error_type": type(exc).__name__,
+                }
+        counts: dict[str, int] = {}
+        for database in databases.values():
+            if not database.get("ok"):
+                continue
+            for key, value in (database.get("counts") or {}).items():
+                if key == "total":
+                    continue
+                counts[key] = counts.get(key, 0) + int(value or 0)
+        counts["total"] = sum(counts.values())
+        ok_count = sum(1 for item in databases.values() if item.get("ok"))
+        all_ok = ok_count == len(databases)
+        return {
+            "ok": all_ok,
+            "state": "ready" if all_ok else ("partial" if ok_count else "degraded"),
+            "target_type": clean_text(target_type, 40),
+            "group_id": clean_text(group_id, 120),
+            "user_id": clean_text(user_id, 120),
+            "persona_id": clean_text(persona_id, 96),
+            "preview": True,
+            "counts": counts,
+            "databases": databases,
+        }
+
+    async def _begin_clear_fence(self) -> tuple[int, int]:
+        await self._clear_lock.acquire()
+        primary_generation = 0
+        scoped_generation = 0
+        try:
+            self._capture_admission_open = False
+            primary_generation = self.store.begin_write_fence()
+            if self.scoped_store is not None:
+                scoped_generation = self.scoped_store.begin_write_fence()
+            await asyncio.to_thread(self.store.wait_for_writes)
+            return primary_generation, scoped_generation
+        except BaseException:
+            if scoped_generation and self.scoped_store is not None:
+                self.scoped_store.resume_writes(scoped_generation)
+            if primary_generation:
+                self.store.resume_writes(primary_generation)
+            if not self._closing and not self._closed:
+                self._capture_admission_open = True
+            self._clear_lock.release()
+            raise
+
+    def _end_clear_fence(self, generation: tuple[int, int]) -> None:
+        try:
+            if self._closing or self._closed:
+                return
+            primary_generation, scoped_generation = generation
+            scoped_resumed = (
+                not scoped_generation
+                or self.scoped_store is not None
+                and self.scoped_store.resume_writes(scoped_generation)
+            )
+            if self.store.resume_writes(primary_generation) and scoped_resumed:
+                self._capture_admission_open = True
+        finally:
+            if self._clear_lock.locked():
+                self._clear_lock.release()
 
     async def _cancel_background_tasks_for_clear(self) -> None:
         current = asyncio.current_task()
@@ -6532,10 +7326,18 @@ class MemoryCompanionService:
         self._embedding_memory_inflight.clear()
         self._embedding_backfill_last_run.clear()
 
-    def _clear_scoped_runtime_state(self, *, target_type: str, group_id: str, user_id: str) -> None:
+    def _clear_scoped_runtime_state(
+        self,
+        *,
+        target_type: str,
+        group_id: str,
+        user_id: str,
+        persona_id: str = "",
+    ) -> None:
         target_type = clean_text(target_type, 40).lower()
         group_id = clean_text(group_id, 120)
         user_id = clean_text(user_id, 120)
+        persona_id = clean_text(persona_id, 96)
 
         def identity_matches(identity: Any) -> bool:
             if not isinstance(identity, dict):
@@ -6543,6 +7345,9 @@ class MemoryCompanionService:
             scope = clean_text(identity.get("scope"), 40)
             target_id = clean_text(identity.get("target_id"), 200)
             member_id = clean_text(identity.get("member_id"), 120)
+            identity_persona = clean_text(identity.get("persona_id"), 96)
+            if target_type == "persona":
+                return identity_persona == persona_id
             if target_type == "group":
                 return scope == "group" and target_id == group_id
             if target_type == "private":
@@ -7298,6 +8103,7 @@ class MemoryCompanionService:
         companion_bot_energy: float = 0.0,
     ) -> str:
         ctx = self._normalized_session_context(ctx)
+        lab_fixture_active = self._lab_fixture_active_for_context(ctx)
         core_memories = await self.core_memories_for_context(ctx)
         core_memory_max_chars = self.config.int("core_memory.max_chars", 800)
         recent_fact_context = await self._recent_fact_guard_context(ctx)
@@ -7367,7 +8173,11 @@ class MemoryCompanionService:
                 note=f"{note}:route_suppressed",
                 retrieval_info=retrieval_path_info,
             )
-            if write_log and self.config.bool("memory_injection.enable_injection_logs", True):
+            if (
+                write_log
+                and not lab_fixture_active
+                and self.config.bool("memory_injection.enable_injection_logs", True)
+            ):
                 await self.store.add_injection_log(
                     session_id=ctx.session_id,
                     scope=ctx.scope,
@@ -7403,7 +8213,11 @@ class MemoryCompanionService:
                 note="empty_retrieval_query",
                 retrieval_info=retrieval_path_info,
             )
-            if write_log and self.config.bool("memory_injection.enable_injection_logs", True):
+            if (
+                write_log
+                and not lab_fixture_active
+                and self.config.bool("memory_injection.enable_injection_logs", True)
+            ):
                 await self.store.add_injection_log(
                     session_id=ctx.session_id,
                     scope=ctx.scope,
@@ -7523,8 +8337,10 @@ class MemoryCompanionService:
             note=note if injection else f"{note}:no_injection_body",
             retrieval_info=retrieval_path_info,
         )
-        if write_log and self.config.bool(
-            "memory_injection.enable_injection_logs", True
+        if (
+            write_log
+            and not lab_fixture_active
+            and self.config.bool("memory_injection.enable_injection_logs", True)
         ):
             await self.store.add_injection_log(
                 session_id=ctx.session_id,
@@ -7551,10 +8367,11 @@ class MemoryCompanionService:
                 event, req, injected=False, conversation_memory=False, slot_map={}
             )
             return
+        lab_fixture_active = self._lab_fixture_active_for_context(ctx)
         # 注入结果 TTL 缓存：同一会话短时间连续提问的注入包变化很小，
         # 命中缓存可毫秒级注入，避免重复检索与编排（optimization_plan.md §3.5）。
         _cache_ttl = self.config.float("injection_cache_ttl_seconds", 0.0)
-        if _cache_ttl > 0 and ctx.session_id:
+        if not lab_fixture_active and _cache_ttl > 0 and ctx.session_id:
             _cached = self._injection_cache.get(ctx.session_id)
             if _cached:
                 _ts, _cached_inj, _cached_scope = _cached
@@ -7619,6 +8436,7 @@ class MemoryCompanionService:
                 scope=ctx.scope,
                 session_id=ctx.session_id,
                 entity_id=ctx.current_target_id,
+                **self._timeline_namespace_kwargs(ctx),
             )
             if not self._message_requests_personalized_context(ctx.message_text):
                 topic_shift_reason = self._topic_shift_guard_reason(turn_signal, recent_rows)
@@ -7708,7 +8526,10 @@ class MemoryCompanionService:
                 note="empty_retrieval_query",
                 retrieval_info=retrieval_path_info,
             )
-            if self.config.bool("memory_injection.enable_injection_logs", True):
+            if (
+                not lab_fixture_active
+                and self.config.bool("memory_injection.enable_injection_logs", True)
+            ):
                 await self.store.add_injection_log(
                     session_id=ctx.session_id,
                     scope=ctx.scope,
@@ -7727,13 +8548,13 @@ class MemoryCompanionService:
                 )
                 if append_temp_text(req, injection):
                     await self._mark_injected_memories(actual_injected_memory_ids)
-                    if _cache_ttl > 0 and ctx.session_id:
+                    if not lab_fixture_active and _cache_ttl > 0 and ctx.session_id:
                         self._injection_cache[ctx.session_id] = (time.monotonic(), injection, ctx.scope)
                     return
                 prompt = clean_text(getattr(req, "prompt", "") or "", 8000)
                 req.prompt = f"{prompt}\n\n{injection}" if prompt else injection
                 await self._mark_injected_memories(actual_injected_memory_ids)
-                if _cache_ttl > 0 and ctx.session_id:
+                if not lab_fixture_active and _cache_ttl > 0 and ctx.session_id:
                     self._injection_cache[ctx.session_id] = (time.monotonic(), injection, ctx.scope)
             return
         blocked: list[dict[str, Any]] = []
@@ -7891,7 +8712,10 @@ class MemoryCompanionService:
             note="composed" if injection else "no_injection_body",
             retrieval_info=retrieval_path_info,
         )
-        if self.config.bool("memory_injection.enable_injection_logs", True):
+        if (
+            not lab_fixture_active
+            and self.config.bool("memory_injection.enable_injection_logs", True)
+        ):
             await self.store.add_injection_log(
                 session_id=ctx.session_id,
                 scope=ctx.scope,
@@ -7915,7 +8739,7 @@ class MemoryCompanionService:
         )
         if append_temp_text(req, injection):
             await self._mark_injected_memories(actual_injected_memory_ids)
-            if _cache_ttl > 0 and ctx.session_id:
+            if not lab_fixture_active and _cache_ttl > 0 and ctx.session_id:
                 self._injection_cache[ctx.session_id] = (time.monotonic(), injection, ctx.scope)
             logger.info(
                 "[MemoryCompanion] 已临时注入结构化记忆: session=%s source=%s count=%s chars=%s",
@@ -7929,7 +8753,7 @@ class MemoryCompanionService:
         prompt = clean_text(getattr(req, "prompt", "") or "", 8000)
         req.prompt = f"{prompt}\n\n{injection}" if prompt else injection
         await self._mark_injected_memories(actual_injected_memory_ids)
-        if _cache_ttl > 0 and ctx.session_id:
+        if not lab_fixture_active and _cache_ttl > 0 and ctx.session_id:
             self._injection_cache[ctx.session_id] = (time.monotonic(), injection, ctx.scope)
         logger.warning("[MemoryCompanion] TextPart 不可用，已回退到 prompt 注入: session=%s", ctx.session_id)
 
@@ -8076,6 +8900,7 @@ class MemoryCompanionService:
             scope=ctx.scope,
             session_id=ctx.session_id,
             entity_id=ctx.current_target_id,
+            **self._timeline_namespace_kwargs(ctx),
         )
         if not rows:
             return None
@@ -8191,6 +9016,7 @@ class MemoryCompanionService:
         event_limit = max(1, min(12, self._context_int(ctx, "cross_window_recent_event_limit", 6)))
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=ttl_minutes)
         rows = await self.store.recent_cross_window_timeline(
+            **self._timeline_namespace_kwargs(ctx),
             source_scope=source_scope,
             current_session_id=current_session_id,
             since_at=cutoff.isoformat(timespec="seconds"),
@@ -8267,6 +9093,7 @@ class MemoryCompanionService:
             scope=ctx.scope,
             session_id=ctx.session_id,
             entity_id=ctx.user_id,
+            **self._timeline_namespace_kwargs(ctx),
         )
         if not rows:
             return ""
@@ -8518,6 +9345,7 @@ class MemoryCompanionService:
             scope=ctx.scope,
             session_id=ctx.session_id,
             entity_id=ctx.current_target_id,
+            **self._timeline_namespace_kwargs(ctx),
         )
         if not self._recent_context_supports_memory_expansion(query, rows, turn_signal):
             return intent
@@ -9906,6 +10734,7 @@ class MemoryCompanionService:
             scope=ctx.scope,
             session_id=ctx.session_id,
             entity_id=ctx.current_target_id,
+            **self._timeline_namespace_kwargs(ctx),
         )
         target_ids: list[str] = []
         source_timeline_id = ""
@@ -10149,7 +10978,8 @@ class MemoryCompanionService:
         # 逃生开关（本地补丁 / PR）：关闭 tone 表达抽象后，所有记忆直接以正文注入。
         # 默认开启保持作者逻辑；关闭后跳过 tone 判定（统一返回 candidate），
         # 避免 conversation_summary 等记忆主力被折叠成「语气提示」占位、模型无法引用。
-        if not self.config.bool("memory_injection.enable_tone_abstraction", True):
+        config = getattr(self, "config", None)
+        if config is not None and not config.bool("memory_injection.enable_tone_abstraction", True):
             return ("candidate", "tone_abstraction_disabled")
         text = clean_text(query_text or ctx.message_text, 800)
         explicit_memory = self._message_is_contextual_memory_request(text) or self._message_requests_temporal_aggregate(text)
@@ -10662,6 +11492,7 @@ class MemoryCompanionService:
             scope=ctx.scope,
             session_id=ctx.session_id,
             entity_id=ctx.current_target_id,
+            **self._timeline_namespace_kwargs(ctx),
         )
         items: list[SearchResult] = []
         for row in reversed(rows):
@@ -11317,6 +12148,10 @@ class MemoryCompanionService:
         if self._closed:
             return
         self._closing = True
+        self._capture_admission_open = False
+        if self.scoped_store is not None:
+            self.scoped_store.begin_write_fence()
+        self.store.begin_write_fence(permanent=True)
         for task in list(self._background_tasks):
             task.cancel()
         self._background_tasks.clear()
@@ -11357,33 +12192,51 @@ class MemoryCompanionService:
         if self._closed:
             return
         self._closing = True
-        current = asyncio.current_task()
-        tasks = [task for task in self._background_tasks if task is not current and not task.done()]
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._background_tasks.clear()
-        # 显式等待总结 worker 归零：_summary_workers 是独立 dict，即使其任务已
-        # 经 _spawn_background 注册，也要确保所有 worker 取消并清理完毕，
-        # 避免 close 后仍有总结任务在 store 半关闭状态下执行（exit=139 根因之一）。
-        summary_tasks = [
-            task
-            for task in self._summary_workers.values()
-            if task is not current and not task.done()
-        ]
-        for task in summary_tasks:
-            task.cancel()
-        if summary_tasks:
-            await asyncio.gather(*summary_tasks, return_exceptions=True)
-        self._summary_workers.clear()
-        self._summary_pending.clear()
-        self._summary_pending_contexts.clear()
-        self._summary_pending_reasons.clear()
-        self._save_token_usage(force=True)
-        try:
-            await asyncio.to_thread(self.store.close)
-        except Exception as exc:
-            logger.warning("[MemoryCompanion] 关闭记忆库连接失败: %s", exc, exc_info=True)
-        finally:
-            self._closed = True
+        self._capture_admission_open = False
+        if self.scoped_store is not None:
+            self.scoped_store.begin_write_fence()
+        # Close admission on the event-loop thread before any cancellation
+        # await can yield to an already queued writer.
+        self.store.begin_write_fence(permanent=True)
+        # Request hooks share this lock with destructive clears. Waiting here
+        # prevents an admitted hook from persisting relationship state after
+        # the stores have closed and aclose() has returned.
+        async with self._clear_lock:
+            current = asyncio.current_task()
+            tasks = [
+                task
+                for task in self._background_tasks
+                if task is not current and not task.done()
+            ]
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            self._background_tasks.clear()
+            # Summary workers are tracked independently even when their task
+            # is also registered as background work.  Explicitly wait for
+            # both registries before closing the main connection.
+            summary_tasks = [
+                task
+                for task in self._summary_workers.values()
+                if task is not current and not task.done()
+            ]
+            for task in summary_tasks:
+                task.cancel()
+            if summary_tasks:
+                await asyncio.gather(*summary_tasks, return_exceptions=True)
+            self._summary_workers.clear()
+            self._summary_pending.clear()
+            self._summary_pending_contexts.clear()
+            self._summary_pending_reasons.clear()
+            self._save_token_usage(force=True)
+            try:
+                await asyncio.to_thread(self.store.close)
+            except Exception as exc:
+                logger.warning(
+                    "[MemoryCompanion] 关闭记忆库连接失败: %s",
+                    exc,
+                    exc_info=True,
+                )
+            finally:
+                self._closed = True

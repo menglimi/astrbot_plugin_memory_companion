@@ -2,6 +2,8 @@
 
 `astrbot_plugin_memory_companion` 是面向 AstrBot 陪伴体系的记忆陪伴中枢。它不把聊天记录粗暴塞回模型，而是把当前消息、连续对话、长期记忆、Bot 自我时间线、群聊/私聊权限和外部陪伴插件线索分层整理，再在每轮 LLM 请求前生成一份临时、可解释、可排查的记忆包。
 
+MemoryCompanion 是可独立安装和运行的记忆核心，不以 PrivateCompanion 或任何内容、图片、ComfyUI 扩展为启动依赖。只安装 Memory 时，采集、召回、权限、迁移、维护、命令和管理页照常工作；缺少 Companion 只会关闭陪伴状态投影与跨插件记忆协同。
+
 - 插件名：`astrbot_plugin_memory_companion`
 - 中文名：`我会牢牢记住你`
 - 版本：`1.10.5`
@@ -28,6 +30,14 @@
 
 - PrivateCompanion：人格状态、日程表现、主动陪伴、环境感知、语气和生活化表达。
 - MemoryCompanion：长期记忆、连续对话记忆、检索注入、权限边界、自然衰减、旧库迁移和调试日志。
+
+## 独立运行、协同与信任边界
+
+- Memory 主库就绪后即可运行核心链；可选 scoped namespace 故障只报告 degraded，不会拖垮普通记忆采集和召回。
+- Companion 协同只通过 AstrBot 当前 active registry 与公开 bridge 协商。registry 明确不存在、实例未激活、generation 已替换或契约不完整时，协同能力关闭，不从残留模块恢复旧实例。
+- 外部插件写入必须先用精确注册身份换取进程内、不可序列化的 producer capability，再由 Memory 服务端钳制用户、会话、scope 和可见性；调用方自报的 `source_plugin` 或 scope 不构成授权。
+- 当前 N/N 契约是推荐组合；N/N-1 只保留已知公共字段的一个发布周期兼容。未知高版本、缺失方法和歧义实例 fail-closed。兼容入口至少经过一个发布周期并确认无使用后才会删除。
+- Memory 不安装 Content、Image 或 ComfyUI 时不会启用任何对应功能，也不会扫描、调用或写入这些扩展的数据。
 
 ## 核心能力
 
@@ -187,20 +197,24 @@ astrbot_plugin_memory_companion
 
 ### 外部插件长期记忆接入口
 
-其他插件或独立 App 可以通过记忆插件公开的 `get_memory_companion_bridge()` 获取桥接对象，并调用 `record_external_memory` 写入一条与用户绑定的长期记忆。上传时只需要指定 `user_id` 和可召回的摘要内容；来源、幂等键、标签和结构化元数据按需提供：
+其他 AstrBot 插件可以通过记忆插件公开的 `get_memory_companion_bridge()` 获取桥接对象。管理员需先把该插件的 `root_dir_name` 加入 `private_companion_bridge.external_memory_producer_allowlist`（默认为空）；PrivateCompanion 仍由内置严格身份规则识别。插件必须用当前活跃实例换取不可序列化的能力，再绑定精确用户：
 
 ```python
 bridge = memory_plugin.get_memory_companion_bridge()
-result = await bridge.record_external_memory(
+capability = bridge.register_external_memory_producer(self)
+producer_context = bridge.create_external_memory_context(
+    capability,
     user_id="用户平台 ID",
+)
+result = await bridge.record_external_memory(
+    producer_context=producer_context,
     content="用户最近开始每周慢跑三次，通常在晚饭后进行。",
-    source_plugin="my_health_app",
     idempotency_key="weekly-summary:2026-08-25",
     payload={"activity": "running", "frequency_per_week": 3},
 )
 ```
 
-该入口会固定写入当前用户的 `private_pair` 私域，不能由调用方改成群聊或公开范围，因此同一用户在 QQ、网页或手机终端的私聊中都能正常召回。重复上传同一 `idempotency_key` 会更新同一条记录，不会无限生成副本。高频原始数据建议先在外部整理成摘要，再上传；若只想暂存候选，可传 `long_term=False`，这类记录默认等待审核，不会直接进入普通召回。
+该入口的来源 ID、用户所有权、会话命名空间和 `private_pair` 可见性全部由 MemoryCompanion 根据注册元数据生成；调用方传入的 `source_plugin`、scope、session 或 server 字段不具有授权效力。无有效能力/上下文的旧调用会返回 `producer_capability_required`。重复上传同一 `idempotency_key` 会更新同一条记录；若只想暂存候选，可传 `long_term=False`。
 
 PrivateCompanion 读取日程连续性或每日穿搭时会协商使用 `schedule_fast` / `outfit_fast`：通过短生命周期只读连接，按 Bot 所有者和当前私聊对象隔离后均衡读取相关日程、行动、边界、历史穿搭与自拍，不调用 Embedding、Rerank 或全库候选。两个快速路径可在“陪伴插件协同”中分别关闭并回退完整检索；普通聊天召回始终使用完整检索链。
 

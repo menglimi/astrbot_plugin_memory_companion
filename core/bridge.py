@@ -1,109 +1,41 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
-import hashlib
-import hmac
-import json
 import secrets
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from . import bot_personal_contract
 from .bot_personal_dto import BotPersonalArchiveDTO, build_bot_personal_archive
+from .bridge_external_record import ExternalRecordBridgeFamily as _ExternalRecordBridgeFamily
+from .bridge_maintenance import MaintenanceBridgeFamily as _MaintenanceBridgeFamily
+from .bridge_portrait_emotion import PortraitEmotionBridgeFamily as _PortraitEmotionBridgeFamily
+from .bridge_producer import ProducerBridgeFamily as _ProducerBridgeFamily
+from .bridge_recall import RecallBridgeFamily as _RecallBridgeFamily
+from .bridge_scoped_namespace import ScopedNamespaceBridgeFamily as _ScopedNamespaceBridgeFamily
+from .bridge_contract import (
+    LOCAL_TZ,
+    _AuthenticatedCompanionProjection,
+    _canonical_companion_projection_message,
+    _canonical_companion_projection_signature,
+    _local_time_label,
+    _verify_companion_projection_signature,
+    sanitize_companion_expression_decision,
+    sanitize_companion_relationship_projection,
+    serialize_memory,
+)
 from .capability_probe import CapabilityCache, PROFILE_NAMES as C4_PROFILE_NAMES, build_capability_snapshot
 from .context_consumer import consume_context_projection
-from .models import EntityRef, MemoryRecord, SessionContext, clean_text
+from .models import EntityRef, SessionContext, clean_text
 from .namespace_capability import namespace_capability_descriptor
 from .namespace import build_namespace_context, validate_namespace_context
 from .person_projection import consume_person_projection
 from .scoped_store import ScopedStore, ScopedStoreError
-
-
-LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 _PRIVATE_COMPANION_ROOT = "astrbot_plugin_private_companion"
 _PRIVATE_COMPANION_NAMES = {"PrivateCompanion", "private_companion"}
 _EMOTION_INGRESS_ORIGINS = {"interaction", "system_condition"}
 _EMOTION_DELIVERY_CONSUMER = "private_companion.daily_state"
 _COMPANION_PROJECTION_SECRET = secrets.token_bytes(32)
-
-
-class _AuthenticatedCompanionProjection(dict):
-    """Signed request-scoped dict accepted only after bridge attestation."""
-
-    __slots__ = (
-        "_bot_id",
-        "_kind",
-        "_person_id",
-        "_platform",
-        "_scope",
-        "_session_id",
-        "_signature",
-    )
-
-    def __init__(
-        self,
-        payload: dict[str, Any],
-        *,
-        kind: str,
-        bot_id: str,
-        platform: str,
-        person_id: str,
-        scope: str,
-        session_id: str,
-        signature: str,
-    ) -> None:
-        dict.__init__(self, payload)
-        object.__setattr__(self, "_kind", kind)
-        object.__setattr__(self, "_bot_id", bot_id)
-        object.__setattr__(self, "_platform", platform)
-        object.__setattr__(self, "_person_id", person_id)
-        object.__setattr__(self, "_scope", scope)
-        object.__setattr__(self, "_session_id", session_id)
-        object.__setattr__(self, "_signature", signature)
-
-    @staticmethod
-    def _immutable(*_args: Any, **_kwargs: Any) -> None:
-        raise TypeError("authenticated Companion projections are immutable")
-
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    __setattr__ = _immutable
-    __delattr__ = _immutable
-    clear = _immutable
-    pop = _immutable
-    popitem = _immutable
-    setdefault = _immutable
-    update = _immutable
-    __ior__ = _immutable
-
-
-def _companion_projection_signature(
-    payload: dict[str, Any],
-    *,
-    kind: str,
-    bot_id: str,
-    platform: str,
-    person_id: str,
-    scope: str,
-    session_id: str,
-) -> str:
-    body = json.dumps(
-        {
-            "kind": kind,
-            "bot_id": bot_id,
-            "platform": platform,
-            "person_id": person_id,
-            "scope": scope,
-            "session_id": session_id,
-            "payload": payload,
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hmac.new(_COMPANION_PROJECTION_SECRET, body, hashlib.sha256).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +45,44 @@ class _EmotionProducerCapability:
     _bridge: Any
     _producer: Any
     _token: object
+
+
+@dataclass(frozen=True, slots=True)
+class _ExternalMemoryProducerCapability:
+    """Non-serializable authority bound to one live registered plugin."""
+
+    _bridge: Any
+    _producer: Any
+    _producer_id: str
+    _token: object
+
+
+@dataclass(frozen=True, slots=True)
+class _ExternalMemoryProducerContext:
+    """Opaque authority for one producer and one private user domain."""
+
+    _bridge: Any
+    _capability: _ExternalMemoryProducerCapability
+    producer_id: str
+    scope: str
+    session_id: str
+    user_id: str
+
+
+def consume_external_memory_producer_context(value: Any) -> dict[str, str] | None:
+    """Return server-owned scope fields only for a live opaque context."""
+
+    if type(value) is not _ExternalMemoryProducerContext:
+        return None
+    validator = getattr(value._bridge, "_is_valid_external_memory_producer_context", None)
+    if not callable(validator) or validator(value) is not True:
+        return None
+    return {
+        "producer_id": value.producer_id,
+        "scope": value.scope,
+        "session_id": value.session_id,
+        "user_id": value.user_id,
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,208 +132,6 @@ class _EmotionAdminContext:
     scope: str
     session_id: str
 
-_COMPANION_RELATIONSHIP_PHASES = {
-    "deeply_distant",
-    "strongly_distant",
-    "distant",
-    "acquaintance",
-    "familiar",
-    "close",
-    "intimate",
-    "deeply_bonded",
-}
-_COMPANION_INTERACTION_BANDS = {
-    "avoidant",
-    "hurt",
-    "relaxed",
-    "lively",
-    "warm",
-    "close",
-    "affectionate",
-}
-_COMPANION_EXPRESSION_CONTRACTS = {"companion_interaction_expression.v1", "companion_interaction_expression.v2"}
-_COMPANION_EXPRESSION_PACING = {"slow", "steady", "bright"}
-_COMPANION_EXPRESSION_DIRECTNESS = {"indirect", "natural", "direct"}
-_COMPANION_EXPRESSION_VALIDATION = {"none", "acknowledge", "support_first"}
-_COMPANION_EXPRESSION_DISCLOSURE = {"none", "light", "allowed"}
-_COMPANION_EXPRESSION_HUMOR = {"off", "light", "playful"}
-_COMPANION_EXPRESSION_TOPIC = {"reply_only", "followup", "shared_topic"}
-_COMPANION_EXPRESSION_BEHAVIORS = {
-    "acknowledge",
-    "brief_reply",
-    "give_space",
-    "reply",
-    "clarify",
-    "light_humor",
-    "followup",
-    "support",
-    "shared_ritual",
-    "affectionate_expression",
-}
-_COMPANION_EXPRESSION_SAFETY_MODES = {
-    "normal",
-    "contact_boundary_passive",
-    "contact_boundary",
-    "p4_blocked",
-}
-_COMPANION_EXPRESSION_BLOCKERS = {"contact_boundary", "p4_safety"}
-_COMPANION_EXPRESSION_REASON_CODES = {
-    "relationship_baseline_retained",
-    "interaction_band_applied",
-    "administrator_override_applied",
-    "owner_role_required",
-    "contact_boundary_passive_reengagement",
-    "p4_warmth_cap_applied",
-    "relationship_tone_applied",
-    "relationship_address_applied",
-    "relationship_followup_cap",
-    "intent_followup_suppressed",
-    "low_energy_expression_cap",
-    "down_mood_expression_cap",
-    "up_mood_expression_lift",
-    "affect_modulation_applied",
-    "relationship_proactive_cap",
-    "interaction_proactive_suppressed",
-    "schedule_proactive_suppressed",
-    "p4_blocked",
-    "contact_boundary",
-}
-
-
-def sanitize_companion_expression_decision(value: Any) -> dict[str, Any]:
-    """Accept only the bounded, request-scoped Companion expression contract."""
-
-    fallback = {"status": "invalid", "read_only": True, "decision": {}}
-    if type(value) is not dict or value.get("contract") not in _COMPANION_EXPRESSION_CONTRACTS:
-        return fallback
-    expression_band = value.get("expression_band")
-    if type(expression_band) is not str or expression_band not in _COMPANION_INTERACTION_BANDS:
-        return fallback
-    allowed_behaviors = value.get("allowed_behaviors")
-    if type(allowed_behaviors) not in {list, tuple} or len(allowed_behaviors) > 12:
-        return fallback
-    if any(type(item) is not str or item not in _COMPANION_EXPRESSION_BEHAVIORS for item in allowed_behaviors):
-        return fallback
-    if len(set(allowed_behaviors)) != len(allowed_behaviors):
-        return fallback
-    safety_mode = value.get("safety_mode")
-    if type(safety_mode) is not str or safety_mode not in _COMPANION_EXPRESSION_SAFETY_MODES:
-        return fallback
-    blocker = value.get("blocker")
-    if blocker is not None and (type(blocker) is not str or blocker not in _COMPANION_EXPRESSION_BLOCKERS):
-        return fallback
-    reason_codes = value.get("reason_codes")
-    if type(reason_codes) not in {list, tuple} or len(reason_codes) > 24:
-        return fallback
-    if any(type(item) is not str or item not in _COMPANION_EXPRESSION_REASON_CODES for item in reason_codes):
-        return fallback
-    if type(value.get("followup")) is not bool:
-        return fallback
-    contract = value.get("contract")
-    dimensions: dict[str, str] = {}
-    if contract == "companion_interaction_expression.v2":
-        dimension_specs = {
-            "pacing": _COMPANION_EXPRESSION_PACING,
-            "directness": _COMPANION_EXPRESSION_DIRECTNESS,
-            "validation_style": _COMPANION_EXPRESSION_VALIDATION,
-            "self_disclosure": _COMPANION_EXPRESSION_DISCLOSURE,
-            "humor_mode": _COMPANION_EXPRESSION_HUMOR,
-            "topic_initiative": _COMPANION_EXPRESSION_TOPIC,
-        }
-        for key, allowed in dimension_specs.items():
-            item = value.get(key)
-            if type(item) is not str or item not in allowed:
-                return fallback
-            dimensions[key] = item
-    return {
-        "status": "accepted",
-        "read_only": True,
-        "decision": {
-            "contract": contract,
-            "expression_band": expression_band,
-            "allowed_behaviors": list(allowed_behaviors),
-            "safety_mode": safety_mode,
-            "blocker": blocker,
-            "reason_codes": list(reason_codes),
-            "followup": value["followup"],
-            **dimensions,
-        },
-    }
-
-
-def sanitize_companion_relationship_projection(value: Any) -> dict[str, Any]:
-    fallback = {"status": "invalid", "read_only": True, "projection": {}}
-    if type(value) is not dict:
-        return fallback
-    if value.get("schema_version") != "chat.relationship_projection.v1":
-        return fallback
-    if value.get("authority") != "private_companion.relationship_score" or value.get("read_only") is not True:
-        return fallback
-    phase_key = value.get("phase_key")
-    if type(phase_key) is not str or phase_key not in _COMPANION_RELATIONSHIP_PHASES:
-        return fallback
-    score = value.get("score")
-    if type(score) is not int or not -1200 <= score <= 1200:
-        return fallback
-    soft = value.get("soft_behaviors")
-    if type(soft) is not dict or any(type(item) is not bool for item in soft.values()):
-        return fallback
-    try:
-        proactive_care_limit = int(value.get("proactive_care_limit") or 0)
-    except (TypeError, ValueError):
-        proactive_care_limit = 0
-    projection = {
-        "schema_version": "chat.relationship_projection.v1",
-        "authority": "private_companion.relationship_score",
-        "read_only": True,
-        "score": score,
-        "phase_key": phase_key,
-        "phase_label": clean_text(value.get("phase_label"), 40),
-        "tone": clean_text(value.get("tone"), 160),
-        "address_level": clean_text(value.get("address_level"), 120),
-        "proactive_care_limit": max(0, min(30, proactive_care_limit)),
-        "soft_behaviors": {
-            key: bool(soft.get(key, False))
-            for key in (
-                "allow_playful_jokes",
-                "allow_followup",
-                "allow_memory_mention",
-                "allow_daily_care",
-            )
-        },
-    }
-    relationship_mode = value.get("relationship_mode")
-    if relationship_mode in {"normal", "owner_exclusive"}:
-        projection["relationship_mode"] = relationship_mode
-    current_interaction = value.get("current_interaction")
-    if type(current_interaction) is dict:
-        expression_band = current_interaction.get("expression_band")
-        if type(expression_band) is str and expression_band in _COMPANION_INTERACTION_BANDS:
-            interaction_projection = {
-                "expression_band": expression_band,
-                "label": clean_text(current_interaction.get("label"), 40),
-                "source": clean_text(current_interaction.get("source"), 40),
-                "reason": clean_text(current_interaction.get("reason"), 120),
-                "manual_override": current_interaction.get("manual_override") is True,
-            }
-            dynamics_version = current_interaction.get("dynamics_version")
-            recovery_band = current_interaction.get("recovery_band")
-            expires_at = current_interaction.get("expires_at")
-            projection_revision = current_interaction.get("projection_revision")
-            if dynamics_version == "interaction_dynamics.v1" and recovery_band in {"steady", "recovering", "reinforced"}:
-                if type(expires_at) not in {int, float} or type(expires_at) is bool:
-                    return fallback
-                if type(projection_revision) is not int or not 1 <= projection_revision <= 1000000:
-                    return fallback
-                interaction_projection.update({
-                    "dynamics_version": dynamics_version,
-                    "recovery_band": recovery_band,
-                    "expires_at": max(0.0, min(10**12, float(expires_at))),
-                    "projection_revision": projection_revision,
-                })
-            projection["current_interaction"] = interaction_projection
-    return {"status": "accepted", "read_only": True, "projection": projection}
-
 
 def consume_authenticated_companion_projection(
     value: Any,
@@ -408,7 +176,7 @@ def consume_authenticated_companion_projection(
     ):
         return {**fallback, "error_code": "projection_domain_invalid"}
     try:
-        expected_signature = _companion_projection_signature(
+        _canonical_companion_projection_message(
             dict(value),
             kind=value._kind,
             bot_id=attrs["bot_id"],
@@ -419,26 +187,23 @@ def consume_authenticated_companion_projection(
         )
     except (TypeError, ValueError, OverflowError):
         return {**fallback, "error_code": "projection_signature_invalid"}
-    if not hmac.compare_digest(expected_signature, value._signature):
+    if not _verify_companion_projection_signature(
+        dict(value),
+        value._signature,
+        secret=_COMPANION_PROJECTION_SECRET,
+        kind=value._kind,
+        bot_id=attrs["bot_id"],
+        platform=attrs["platform"],
+        person_id=attrs["person_id"],
+        scope=attrs["scope"],
+        session_id=attrs["session_id"],
+    ):
         return {**fallback, "error_code": "projection_signature_invalid"}
     if kind == "relationship":
         return sanitize_companion_relationship_projection(dict(value))
     if kind == "expression":
         return sanitize_companion_expression_decision(dict(value))
     return {**fallback, "error_code": "projection_kind_invalid"}
-
-
-def _local_time_label(value: Any) -> str:
-    text = clean_text(value, 80)
-    if not text:
-        return ""
-    try:
-        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return text
 
 
 class MemoryCompanionBridge:
@@ -449,14 +214,32 @@ class MemoryCompanionBridge:
     fact, or an imported summary instead of handing over vague prose.
     """
 
-    def __init__(self, plugin: Any):
+    def __init__(
+        self,
+        plugin: Any,
+        *,
+        active: bool = True,
+        instance_generation: int = 0,
+    ):
         self._plugin = plugin
         self.__scoped_store: ScopedStore | None = None
         self.__scoped_store_resolved = False
         self._capability_cache = CapabilityCache()
         self._emotion_producer_token = object()
+        self._external_memory_producer_token = object()
         self._emotion_page_admin_token = object()
-        self._active = True
+        self._active = active is True
+        self._instance_generation = (
+            instance_generation
+            if isinstance(instance_generation, int) and instance_generation > 0
+            else 0
+        )
+        self._recall_family = _RecallBridgeFamily(self)
+        self._external_record_family = _ExternalRecordBridgeFamily(self)
+        self._scoped_namespace_family = _ScopedNamespaceBridgeFamily(self)
+        self._portrait_emotion_family = _PortraitEmotionBridgeFamily(self)
+        self._producer_family = _ProducerBridgeFamily(self)
+        self._maintenance_family = _MaintenanceBridgeFamily(self)
 
     @property
     def _scoped_store(self) -> ScopedStore | None:
@@ -472,14 +255,52 @@ class MemoryCompanionBridge:
             self.__scoped_store_resolved = True
         return self.__scoped_store
 
+    def _scoped_store_initialization_error_code(self) -> str:
+        status = getattr(self._plugin, "scoped_store_status", None)
+        if (
+            isinstance(status, dict)
+            and status.get("state") == "degraded"
+            and status.get("error_code") == "namespace_scoped_store_initialize_failed"
+        ):
+            return "namespace_scoped_store_initialize_failed"
+        return ""
+
+    def _scoped_mutation_denied(self) -> dict[str, Any] | None:
+        service = self._plugin
+        if (
+            getattr(service, "_closing", False)
+            or getattr(service, "_closed", False)
+            or (
+                hasattr(service, "_capture_admission_open")
+                and getattr(service, "_capture_admission_open") is not True
+            )
+        ):
+            return {
+                "ok": False,
+                "state": "degraded",
+                "code": "scoped_write_fenced",
+            }
+        return None
+
     def bridge_lifecycle_status(self) -> dict[str, Any]:
         """Expose only whether this in-process bridge can still serve calls."""
-        return {"active": self._active}
+        return {
+            "active": self._active,
+            "state": "ready" if self._active else "inactive",
+            "instance_generation": self._instance_generation,
+        }
+
+    def _activate(self) -> None:
+        """Make a fully initialized bridge eligible for capability issuance."""
+        self._active = True
+        self._capability_cache.clear()
 
     def deactivate(self) -> None:
         """Revoke all issued capabilities before plugin service shutdown."""
         self._active = False
+        self._capability_cache.clear()
         self._emotion_producer_token = object()
+        self._external_memory_producer_token = object()
         self._emotion_page_admin_token = object()
 
     def register_emotion_producer(self, producer: Any) -> Any | None:
@@ -498,6 +319,44 @@ class MemoryCompanionBridge:
         """Compatibility name for the same scoped Private Companion capability."""
 
         return self.register_emotion_producer(producer)
+
+    def register_external_memory_producer(self, producer: Any) -> Any | None:
+        """Issue an external-memory writer capability to one allowed live plugin."""
+
+        if not self._active:
+            return None
+        producer_id = self._registered_external_memory_producer_id(producer)
+        if not producer_id:
+            return None
+        return _ExternalMemoryProducerCapability(
+            self,
+            producer,
+            producer_id,
+            self._external_memory_producer_token,
+        )
+
+    def create_external_memory_context(
+        self,
+        capability: Any,
+        *,
+        user_id: str,
+    ) -> Any | None:
+        """Bind an external-memory producer to one server-generated private domain."""
+
+        if not self._is_valid_external_memory_producer_capability(capability):
+            return None
+        normalized_user_id = clean_text(user_id, 160)
+        if not normalized_user_id:
+            return None
+        producer_id = capability._producer_id
+        return _ExternalMemoryProducerContext(
+            self,
+            capability,
+            producer_id=producer_id,
+            scope="private",
+            session_id=f"external:{producer_id}:{normalized_user_id}",
+            user_id=normalized_user_id,
+        )
 
     def create_emotion_producer_context(
         self,
@@ -635,6 +494,87 @@ class MemoryCompanionBridge:
             if root == _PRIVATE_COMPANION_ROOT or name in _PRIVATE_COMPANION_NAMES:
                 return True
         return False
+
+    def _external_memory_producer_allowlist(self) -> set[str]:
+        config = getattr(self._plugin, "config", None)
+        getter = getattr(config, "get", None)
+        if not callable(getter):
+            return set()
+        try:
+            configured = getter(
+                "private_companion_bridge.external_memory_producer_allowlist",
+                "",
+            )
+        except Exception:
+            return set()
+        if isinstance(configured, str):
+            values = configured.replace("\n", ",").split(",")
+        elif isinstance(configured, (list, tuple, set, frozenset)):
+            values = configured
+        else:
+            return set()
+        return {
+            producer_id
+            for item in values
+            if (producer_id := clean_text(item, 120))
+        }
+
+    def _registered_external_memory_producer_id(self, producer: Any) -> str:
+        """Resolve one exact live Star instance to its server-owned producer id."""
+
+        context = getattr(self._plugin, "context", None)
+        getter = getattr(context, "get_all_stars", None)
+        if not callable(getter):
+            return ""
+        try:
+            stars = getter()
+        except Exception:
+            return ""
+        if not isinstance(stars, (list, tuple)):
+            return ""
+        allowed = self._external_memory_producer_allowlist()
+        for metadata in stars:
+            registered_instance = getattr(metadata, "star_cls", None)
+            registered_type = getattr(metadata, "star_cls_type", None)
+            if producer is not registered_instance:
+                continue
+            if registered_type is not None and type(registered_instance) is not registered_type:
+                continue
+            if getattr(metadata, "activated", False) is not True:
+                continue
+            root = clean_text(getattr(metadata, "root_dir_name", ""), 120)
+            name = clean_text(getattr(metadata, "name", ""), 120)
+            if root == _PRIVATE_COMPANION_ROOT or name in _PRIVATE_COMPANION_NAMES:
+                return root or _PRIVATE_COMPANION_ROOT
+            if root and root in allowed:
+                return root
+        return ""
+
+    def _is_valid_external_memory_producer_capability(self, capability: Any) -> bool:
+        return (
+            self._active
+            and type(capability) is _ExternalMemoryProducerCapability
+            and capability._bridge is self
+            and capability._token is self._external_memory_producer_token
+            and capability._producer_id
+            == self._registered_external_memory_producer_id(capability._producer)
+        )
+
+    def _is_valid_external_memory_producer_context(self, context: Any) -> bool:
+        if (
+            type(context) is not _ExternalMemoryProducerContext
+            or context._bridge is not self
+            or not self._is_valid_external_memory_producer_capability(context._capability)
+        ):
+            return False
+        user_id = clean_text(context.user_id, 160)
+        producer_id = context._capability._producer_id
+        return (
+            bool(user_id)
+            and context.producer_id == producer_id
+            and context.scope == "private"
+            and context.session_id == f"external:{producer_id}:{user_id}"
+        )
 
     def _is_valid_emotion_producer_capability(self, capability: Any) -> bool:
         return (
@@ -800,8 +740,9 @@ class MemoryCompanionBridge:
         payload = consumed.get(key)
         if not isinstance(payload, dict):
             return {"status": "invalid", "read_only": True, "error_code": "projection_payload_invalid"}
-        signature = _companion_projection_signature(
+        signature = _canonical_companion_projection_signature(
             payload,
+            secret=_COMPANION_PROJECTION_SECRET,
             kind=kind,
             bot_id=domain["bot_id"],
             platform=domain["platform"],
@@ -903,7 +844,7 @@ class MemoryCompanionBridge:
         memory_id: str = "",
         occurred_at: str = "",
     ) -> str:
-        return await self._plugin.record_external_event(
+        return await self._external_record_family.record_event(
             content=content,
             memory_type=memory_type,
             scope=scope,
@@ -911,8 +852,8 @@ class MemoryCompanionBridge:
             platform=platform,
             message_id=message_id,
             group_id=group_id,
-            subject=self._entity(subject) if subject else EntityRef.bot_self(),
-            object=self._entity(object) if object else EntityRef(kind="session", id=session_id, role="target_session"),
+            subject=subject,
+            object=object,
             visibility=visibility,
             sayability=sayability,
             reality_level=reality_level,
@@ -920,8 +861,8 @@ class MemoryCompanionBridge:
             confidence=confidence,
             importance=importance,
             review_status=review_status,
-            tags=tags or [],
-            metadata=metadata or {},
+            tags=tags,
+            metadata=metadata,
             source_plugin=source_plugin,
             memory_id=memory_id,
             occurred_at=occurred_at,
@@ -944,25 +885,47 @@ class MemoryCompanionBridge:
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         long_term: bool = True,
+        producer_capability: Any = None,
+        producer_context: Any = None,
     ) -> dict[str, Any]:
         """Write one user-scoped long-term memory from an external source.
 
-        ``user_id`` is intentionally the only required identity field.  The
-        memory service fixes the record to that user's private scope, so an
-        external plugin cannot accidentally write a group/public memory by
-        passing arbitrary session fields.
+        Legacy keyword fields remain accepted for capability discovery, but
+        producer identity and the private user domain come only from a live
+        server-issued context.
         """
+        base = {
+            "ok": False,
+            "state": "forbidden",
+            "memory_id": "",
+            "deduplicated": False,
+            "long_term": bool(long_term),
+            "scope": "private",
+            "visibility": "private_pair",
+            "error_code": "producer_capability_required",
+        }
+        authority = producer_context if producer_context is not None else producer_capability
+        if type(authority) is _ExternalMemoryProducerContext:
+            bound_context = authority if self._is_valid_external_memory_producer_context(authority) else None
+        elif type(authority) is _ExternalMemoryProducerCapability:
+            bound_context = self.create_external_memory_context(authority, user_id=user_id)
+        else:
+            bound_context = None
+        if bound_context is None:
+            return base
+        supplied_user_id = clean_text(user_id, 160)
+        if supplied_user_id and supplied_user_id != bound_context.user_id:
+            return {**base, "error_code": "producer_context_mismatch"}
+
         writer = getattr(self._plugin, "record_external_memory", None)
         if not callable(writer):
             return {
-                "ok": False,
+                **base,
                 "state": "unsupported",
-                "memory_id": "",
-                "deduplicated": False,
                 "error_code": "record_external_memory_unavailable",
             }
         result = await writer(
-            user_id=user_id,
+            user_id=bound_context.user_id,
             content=content,
             summary=summary,
             payload=payload,
@@ -976,6 +939,7 @@ class MemoryCompanionBridge:
             tags=tags,
             metadata=metadata,
             long_term=long_term,
+            producer_context=bound_context,
         )
         if isinstance(result, dict):
             return dict(result)
@@ -988,30 +952,24 @@ class MemoryCompanionBridge:
         }
 
     async def record_bot_action(self, *, content: str, **kwargs: Any) -> str:
-        kwargs.setdefault("memory_type", "self_action")
-        kwargs.setdefault("visibility", "bot_self")
-        kwargs.setdefault("reality_level", "bot_action")
-        kwargs.setdefault("source_plugin", kwargs.get("source_plugin", "external"))
-        return await self.record_event(content=content, **kwargs)
+        return await self._external_record_family.record_bot_action(content=content, **kwargs)
 
     async def record_persona_life(self, *, content: str, **kwargs: Any) -> str:
-        kwargs.setdefault("memory_type", "persona_life")
-        kwargs.setdefault("visibility", "bot_self")
-        kwargs.setdefault("reality_level", "persona_life")
-        kwargs.setdefault("sayability", "indirect")
-        return await self.record_event(content=content, **kwargs)
+        return await self._external_record_family.record_persona_life(content=content, **kwargs)
 
     async def record_proactive_message(self, *, content: str, **kwargs: Any) -> str:
-        kwargs.setdefault("memory_type", "proactive_message")
-        kwargs.setdefault("visibility", "bot_self")
-        kwargs.setdefault("reality_level", "bot_action")
-        kwargs.setdefault("tags", ["proactive", "bot_action"])
-        kwargs.setdefault("importance", 0.55)
-        return await self.record_event(content=content, **kwargs)
+        return await self._external_record_family.record_proactive_message(
+            content=content,
+            **kwargs,
+        )
 
     async def record_visible_turn(self, *, role: str, content: str, **kwargs: Any) -> str:
         """Record a real visible chat turn into the short-term timeline only."""
-        return await self._plugin.record_visible_turn(role=role, content=content, **kwargs)
+        return await self._external_record_family.record_visible_turn(
+            role=role,
+            content=content,
+            **kwargs,
+        )
 
     async def record_shared_experience(
         self,
@@ -1032,103 +990,43 @@ class MemoryCompanionBridge:
         metadata: dict[str, Any] | None = None,
     ) -> str:
         """Record one distilled call/watch experience with explicit ownership."""
-        normalized_type = clean_text(experience_type, 40).lower()
-        if normalized_type in {"watch", "shared_watch", "video"}:
-            memory_type = "shared_watch"
-            experience_tag = "watch"
-        elif normalized_type in {"call", "shared_call", "voice"}:
-            memory_type = "shared_call"
-            experience_tag = "call"
-        else:
-            memory_type = "shared_experience"
-            experience_tag = normalized_type or "shared"
-        subject = EntityRef.bot_self(bot_id=bot_id, bot_name=bot_name)
-        target = EntityRef(
-            kind="user",
-            id=clean_text(user_id, 120),
-            name=clean_text(user_name, 80),
-            role="shared_experience_partner",
-        )
-        return await self.record_event(
+        return await self._external_record_family.record_shared_experience(
             content=content,
-            memory_type=memory_type,
+            experience_type=experience_type,
+            bot_id=bot_id,
+            bot_name=bot_name,
+            user_id=user_id,
+            user_name=user_name,
             scope=scope,
             session_id=session_id,
             platform=platform,
-            subject={
-                "kind": subject.kind,
-                "id": subject.id,
-                "name": subject.name,
-                "role": subject.role,
-            },
-            object={
-                "kind": target.kind,
-                "id": target.id,
-                "name": target.name,
-                "role": target.role,
-            },
-            visibility="bot_self",
-            sayability="direct",
-            reality_level="bot_action",
-            lifecycle="stable_memory",
-            confidence=confidence,
-            importance=importance,
-            review_status="auto",
-            tags=["shared_experience", experience_tag, "bot_action"],
-            metadata=metadata or {},
             source_plugin=source_plugin,
             memory_id=memory_id,
+            confidence=confidence,
+            importance=importance,
+            metadata=metadata,
         )
 
     async def record_search_action(self, *, content: str, **kwargs: Any) -> str:
-        kwargs.setdefault("memory_type", "search_action")
-        kwargs.setdefault("visibility", "bot_self")
-        kwargs.setdefault("reality_level", "bot_action")
-        kwargs.setdefault("tags", ["search", "bot_action"])
-        kwargs.setdefault("importance", 0.62)
-        return await self.record_event(content=content, **kwargs)
+        return await self._external_record_family.record_search_action(content=content, **kwargs)
 
     async def record_creative_work(self, *, content: str, **kwargs: Any) -> str:
-        kwargs.setdefault("memory_type", "creative_work")
-        kwargs.setdefault("visibility", "bot_self")
-        kwargs.setdefault("reality_level", "fictional_content")
-        kwargs.setdefault("sayability", "direct")
-        kwargs.setdefault("tags", ["creative_work"])
-        kwargs.setdefault("importance", 0.72)
-        return await self.record_event(content=content, **kwargs)
+        return await self._external_record_family.record_creative_work(content=content, **kwargs)
 
     async def record_image_action(self, *, content: str, **kwargs: Any) -> str:
-        kwargs.setdefault("memory_type", "image_action")
-        kwargs.setdefault("visibility", "bot_self")
-        kwargs.setdefault("reality_level", "bot_action")
-        kwargs.setdefault("tags", ["image", "bot_action"])
-        kwargs.setdefault("importance", 0.6)
-        return await self.record_event(content=content, **kwargs)
+        return await self._external_record_family.record_image_action(content=content, **kwargs)
 
     async def record_qzone_action(self, *, content: str, **kwargs: Any) -> str:
-        kwargs.setdefault("memory_type", "qzone_action")
-        kwargs.setdefault("visibility", "bot_self")
-        kwargs.setdefault("reality_level", "bot_action")
-        kwargs.setdefault("tags", ["qzone", "bot_action"])
-        kwargs.setdefault("importance", 0.58)
-        return await self.record_event(content=content, **kwargs)
+        return await self._external_record_family.record_qzone_action(content=content, **kwargs)
 
     async def record_reading(self, *, content: str, **kwargs: Any) -> str:
-        kwargs.setdefault("memory_type", "reading_memory")
-        kwargs.setdefault("visibility", "bot_self")
-        kwargs.setdefault("reality_level", "bot_action")
-        kwargs.setdefault("tags", ["reading", "bot_action"])
-        kwargs.setdefault("importance", 0.55)
-        return await self.record_event(content=content, **kwargs)
+        return await self._external_record_family.record_reading(content=content, **kwargs)
 
     async def record_schedule_fragment(self, *, content: str, **kwargs: Any) -> str:
-        kwargs.setdefault("memory_type", "schedule_fragment")
-        kwargs.setdefault("visibility", "bot_self")
-        kwargs.setdefault("reality_level", "persona_life")
-        kwargs.setdefault("sayability", "indirect")
-        kwargs.setdefault("tags", ["schedule", "persona_life"])
-        kwargs.setdefault("importance", 0.45)
-        return await self.record_event(content=content, **kwargs)
+        return await self._external_record_family.record_schedule_fragment(
+            content=content,
+            **kwargs,
+        )
 
     async def record_bot_personal_archive(
         self,
@@ -1138,62 +1036,11 @@ class MemoryCompanionBridge:
         producer_context: Any = None,
     ) -> dict[str, Any]:
         """Send one validated Bot Personal archive envelope without leaking failures."""
-        base = {
-            "ok": False,
-            "record_id": "",
-            "deduplicated": False,
-            "version": 0,
-            "error_code": None,
-            "state": "degraded",
-        }
-        authority = producer_capability if producer_capability is not None else producer_context
-        if not self._is_valid_private_companion_capability(authority):
-            return {**base, "state": "forbidden", "error_code": "producer_capability_required"}
-        try:
-            dto = build_bot_personal_archive(envelope)
-        except Exception as exc:
-            return {**base, "state": "invalid", "error_code": getattr(exc, "error_code", "invalid")}
-        if dto.canonical_schema_version >= bot_personal_contract.BOT_PERSONAL_CANONICAL_SCHEMA_VERSION:
-            capability = self._producer_capability_from(authority)
-            producer = getattr(capability, "_producer", None)
-            bot_getter = getattr(producer, "_memory_companion_bridge_bot_id", None)
-            persona_getter = getattr(producer, "_memory_companion_archive_persona_id", None)
-            try:
-                expected_bot_id = clean_text(bot_getter(), 120) if callable(bot_getter) else ""
-                expected_persona_id = clean_text(persona_getter(), 96) if callable(persona_getter) else ""
-            except Exception:
-                expected_bot_id = expected_persona_id = ""
-            if (
-                not expected_bot_id
-                or not expected_persona_id
-                or dto.owner_bot_id != expected_bot_id
-                or dto.persona_id != expected_persona_id
-            ):
-                return {**base, "state": "forbidden", "error_code": "producer_namespace_mismatch"}
-        try:
-            recorder = getattr(self._plugin, "record_bot_personal_archive", None)
-        except Exception:
-            recorder = None
-        if not callable(recorder):
-            return {**base, "error_code": "bridge_method_unavailable", "state": "degraded"}
-        try:
-            result = await recorder(dto)
-        except Exception:
-            return {**base, "error_code": "bridge_exception", "state": "degraded"}
-        if not isinstance(result, dict):
-            return {**base, "error_code": "invalid_bridge_response", "state": "degraded"}
-        normalized = dict(base)
-        for key in base:
-            if key in result:
-                normalized[key] = result[key]
-        normalized["ok"] = bool(result.get("ok"))
-        normalized["deduplicated"] = bool(result.get("deduplicated"))
-        normalized["version"] = int(result.get("version") or 0)
-        if normalized["ok"]:
-            normalized["state"] = "deduplicated" if normalized["deduplicated"] else "sent"
-        elif normalized["state"] == "ready":
-            normalized["state"] = "degraded"
-        return normalized
+        return await self._external_record_family.record_bot_personal_archive(
+            envelope,
+            producer_capability=producer_capability,
+            producer_context=producer_context,
+        )
 
     async def record_bot_personal_memory(
         self,
@@ -1205,17 +1052,12 @@ class MemoryCompanionBridge:
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Compatibility alias that still crosses the structured archive boundary."""
-        try:
-            envelope = build_bot_personal_archive(memory_type=memory_type, payload=payload or {}, **kwargs)
-        except Exception as exc:
-            return {
-                "ok": False, "record_id": "", "deduplicated": False, "version": 0,
-                "error_code": getattr(exc, "error_code", "invalid"), "state": "invalid",
-            }
-        return await self.record_bot_personal_archive(
-            envelope,
+        return await self._external_record_family.record_bot_personal_memory(
+            memory_type=memory_type,
+            payload=payload,
             producer_capability=producer_capability,
             producer_context=producer_context,
+            **kwargs,
         )
 
     async def read_bot_personal_profile(
@@ -1226,56 +1068,11 @@ class MemoryCompanionBridge:
         producer_capability: Any = None,
     ) -> dict[str, Any]:
         """Read only safe Bot Personal summaries; never return archive payloads."""
-        base = {"ok": False, "read_only": True, "state": "degraded", "degraded": True, "pending": True, "items": []}
-        owner_bot_id = ""
-        persona_id = ""
-        if producer_capability is not None:
-            if not self._is_valid_private_companion_capability(producer_capability):
-                return {**base, "state": "forbidden", "degraded": False, "pending": False, "error_code": "producer_capability_required"}
-            capability = self._producer_capability_from(producer_capability)
-            producer = getattr(capability, "_producer", None)
-            bot_getter = getattr(producer, "_memory_companion_bridge_bot_id", None)
-            persona_getter = getattr(producer, "_memory_companion_archive_persona_id", None)
-            try:
-                owner_bot_id = clean_text(bot_getter(), 120) if callable(bot_getter) else ""
-                persona_id = clean_text(persona_getter(), 96) if callable(persona_getter) else ""
-            except Exception:
-                owner_bot_id = persona_id = ""
-            if not owner_bot_id or not persona_id:
-                return {**base, "state": "forbidden", "degraded": False, "pending": False, "error_code": "producer_namespace_unavailable"}
-        try:
-            getter = getattr(self._plugin, "read_bot_personal_profile", None)
-        except Exception:
-            getter = None
-        if not callable(getter):
-            return {**base, "error_code": "bridge_method_unavailable"}
-        try:
-            result = await getter(
-                query=query,
-                limit=limit,
-                owner_bot_id=owner_bot_id,
-                persona_id=persona_id,
-            )
-        except Exception:
-            return {**base, "error_code": "bridge_exception"}
-        if not isinstance(result, dict):
-            return {**base, "error_code": "invalid_bridge_response"}
-        safe_keys = {
-            "record_id", "memory_type", "memory_domain", "subject", "date", "window", "occurred_at",
-            "source_kind", "source_refs", "evidence_level", "status", "version", "summary", "reference",
-        }
-        items = result.get("items", result.get("memories", []))
-        safe_items: list[dict[str, Any]] = []
-        for item in items if isinstance(items, list) else []:
-            if not isinstance(item, dict):
-                continue
-            safe_items.append({key: item[key] for key in safe_keys if key in item and key not in {"payload", "content"}})
-        return {
-            "ok": bool(result.get("ok", True)), "read_only": True,
-            "state": "ready" if result.get("state") in (None, "ready") else result.get("state"),
-            "degraded": bool(result.get("degraded", False)), "pending": bool(result.get("pending", False)),
-            "items": safe_items,
-        }
+        return await self._recall_family.read_bot_personal_profile(
+            query,
+            limit=limit,
+            producer_capability=producer_capability,
+        )
 
     async def read_user_memory_summary(
         self,
@@ -1286,173 +1083,30 @@ class MemoryCompanionBridge:
         requester_context: Any = None,
     ) -> dict[str, Any]:
         """Read a strict, exact-user Memory summary without exposing memory text."""
-
-        identity = clean_text(user_id, 120)
-        safe_session = clean_text(session_id, 200)
-        base = {
-            "contract": "memory.user_memory_summary.v1",
-            "ok": False,
-            "read_only": True,
-            "state": "degraded",
-            "degraded": True,
-            "pending": True,
-            "user_id": identity,
-            "session_id": safe_session,
-            "counts": {"profile": 0, "preference": 0, "relationship": 0, "private_conversation": 0, "other": 0, "total": 0},
-            "summaries": [],
-            "workspace": {"kind": "memory_user_workspace", "route_hint": "user_memory", "user_id": identity},
-        }
-        if not identity:
-            return {**base, "error_code": "missing_user_id"}
-        if not self._is_valid_emotion_producer_context(requester_context):
-            return {
-                **base,
-                "state": "forbidden",
-                "degraded": False,
-                "pending": False,
-                "error_code": "requester_context_required",
-            }
-        if requester_context.user_id != identity:
-            return {
-                **base,
-                "state": "forbidden",
-                "degraded": False,
-                "pending": False,
-                "error_code": "requester_identity_mismatch",
-            }
-        if safe_session and requester_context.session_id != safe_session:
-            return {
-                **base,
-                "state": "forbidden",
-                "degraded": False,
-                "pending": False,
-                "error_code": "requester_session_mismatch",
-            }
-        safe_session = requester_context.session_id
-        base["session_id"] = safe_session
-        try:
-            getter = getattr(self._plugin, "read_user_memory_summary", None)
-        except Exception:
-            getter = None
-        if not callable(getter):
-            return {**base, "error_code": "bridge_method_unavailable"}
-        try:
-            result = await getter(identity, session_id=safe_session, limit=limit)
-        except Exception:
-            return {**base, "error_code": "bridge_exception"}
-        if not isinstance(result, dict) or result.get("contract") != base["contract"]:
-            return {**base, "error_code": "invalid_bridge_response"}
-
-        counts = dict(base["counts"])
-        raw_counts = result.get("counts") if isinstance(result.get("counts"), dict) else {}
-        for key in counts:
-            try:
-                counts[key] = max(0, int(raw_counts.get(key, 0)))
-            except (TypeError, ValueError, OverflowError):
-                counts[key] = 0
-        summaries: list[dict[str, Any]] = []
-        for item in result.get("summaries", []) if isinstance(result.get("summaries"), list) else []:
-            if not isinstance(item, dict):
-                continue
-            category = clean_text(item.get("category"), 40)
-            if category not in {"profile", "preference", "relationship", "private_conversation", "other"}:
-                continue
-            summaries.append(
-                {
-                    "category": category,
-                    "memory_type": clean_text(item.get("memory_type"), 80),
-                    "occurred_at": clean_text(item.get("occurred_at"), 80),
-                    "summary": clean_text(item.get("summary"), 100),
-                    "content_redacted": True,
-                    "truncated": True,
-                }
-            )
-            if len(summaries) >= 8:
-                break
-        state = clean_text(result.get("state"), 40)
-        return {
-            **base,
-            "ok": bool(result.get("ok")) and state == "ready",
-            "state": "ready" if state == "ready" else "degraded",
-            "degraded": state != "ready" or bool(result.get("degraded", False)),
-            "pending": state != "ready" or bool(result.get("pending", False)),
-            "user_id": identity,
-            "session_id": safe_session,
-            "counts": counts,
-            "summaries": summaries,
-            "workspace": base["workspace"],
-            **({"error_code": clean_text(result.get("error_code"), 80)} if state != "ready" and clean_text(result.get("error_code"), 80) else {}),
-        }
+        # Keep the façade-level contract marker used by static consumers: content_redacted.
+        return await self._portrait_emotion_family.read_user_memory_summary(
+            user_id,
+            session_id=session_id,
+            limit=limit,
+            requester_context=requester_context,
+        )
 
     async def read_unified_profile_portrait(self, request: dict[str, Any], *, limit: int = 8) -> dict[str, Any]:
         """Return only a pre-authorized low-sensitivity portrait summary."""
-        base = {
-            "ok": False,
-            "read_only": True,
-            "code": "bridge_unavailable",
-            "items": [],
-        }
-        getter = getattr(self._plugin, "read_unified_profile_portrait", None)
-        if not callable(getter):
-            return base
-        try:
-            result = await getter(request if isinstance(request, dict) else {}, limit=max(1, min(16, int(limit))))
-        except Exception:
-            return {**base, "code": "bridge_degraded"}
-        if not isinstance(result, dict):
-            return {**base, "code": "bridge_degraded"}
-        items: list[dict[str, Any]] = []
-        for item in result.get("items", []) if isinstance(result.get("items"), list) else []:
-            if not isinstance(item, dict):
-                continue
-            if clean_text(item.get("sensitivity"), 24) != "low":
-                continue
-            items.append(
-                {
-                    "dimension": clean_text(item.get("dimension"), 80),
-                    "summary": clean_text(item.get("summary"), 180),
-                    "portrait_tier": clean_text(item.get("portrait_tier"), 24),
-                    "epistemic_status": clean_text(item.get("epistemic_status"), 40),
-                    "confidence": float(item.get("confidence") or 0),
-                    "updated_at": clean_text(item.get("updated_at"), 80),
-                }
-            )
-        return {
-            "ok": bool(result.get("ok")),
-            "read_only": True,
-            "code": clean_text(result.get("code"), 80) or "bridge_degraded",
-            "items": items,
-            "portrait_revision": int(result.get("portrait_revision") or 0),
-        }
+        return await self._portrait_emotion_family.read_unified_profile_portrait(
+            request,
+            limit=limit,
+        )
 
     async def unified_profile_portrait_status(self, person_id: str) -> dict[str, Any]:
         """Return only bridge synchronization metadata, never portrait text."""
-        getter = getattr(self._plugin, "unified_profile_portrait_status", None)
-        if not callable(getter):
-            return {"ok": False, "read_only": True, "code": "bridge_unavailable", "last_synced_at": "", "portrait_revision": 0}
-        try:
-            result = await getter(clean_text(person_id, 80))
-        except Exception:
-            return {"ok": False, "read_only": True, "code": "bridge_degraded", "last_synced_at": "", "portrait_revision": 0}
-        if not isinstance(result, dict):
-            return {"ok": False, "read_only": True, "code": "bridge_degraded", "last_synced_at": "", "portrait_revision": 0}
-        return {
-            "ok": bool(result.get("ok")),
-            "read_only": True,
-            "code": clean_text(result.get("code"), 80) or "bridge_degraded",
-            "last_synced_at": clean_text(result.get("last_synced_at"), 80),
-            "portrait_revision": int(result.get("portrait_revision") or 0),
-        }
+        return await self._portrait_emotion_family.unified_profile_portrait_status(person_id)
 
     async def run_unified_profile_portrait_batch(self, person_id: str, *, run_day: str = "") -> dict[str, Any]:
-        getter = getattr(self._plugin, "run_unified_profile_portrait_batch", None)
-        if not callable(getter):
-            return {"ok": False, "code": "bridge_unavailable"}
-        try:
-            result = await getter(clean_text(person_id, 80), run_day=clean_text(run_day, 16))
-        except Exception:
-            return {"ok": False, "code": "bridge_degraded"}
-        return dict(result) if isinstance(result, dict) else {"ok": False, "code": "bridge_degraded"}
+        return await self._portrait_emotion_family.run_unified_profile_portrait_batch(
+            person_id,
+            run_day=run_day,
+        )
 
     async def search_bot_personal_profile(
         self,
@@ -1461,8 +1115,8 @@ class MemoryCompanionBridge:
         limit: int = 10,
         producer_capability: Any = None,
     ) -> dict[str, Any]:
-        return await self.read_bot_personal_profile(
-            query=query,
+        return await self._recall_family.search_bot_personal_profile(
+            query,
             limit=limit,
             producer_capability=producer_capability,
         )
@@ -1480,74 +1134,20 @@ class MemoryCompanionBridge:
         producer_context: Any = None,
     ) -> dict[str, Any]:
         """Read a C4 Bot Profile through a privacy-limited bridge boundary."""
-
-        base = {
-            "ok": False,
-            "read_only": True,
-            "state": "degraded",
-            "degraded": True,
-            "pending": True,
-            "profile": clean_text(profile, 80),
-            "items": [],
-            "warnings": [],
-        }
-        authority = producer_capability if producer_capability is not None else producer_context
-        locked_authorized = self._is_valid_private_companion_capability(authority)
-        if base["profile"] == "locked_frame_personal" and not locked_authorized:
-            return {
-                **base,
-                "state": "forbidden",
-                "degraded": False,
-                "pending": False,
-                "warnings": ["authorization_required"],
-                "error_code": "producer_capability_required",
-            }
-        _ = authorized
-        try:
-            getter = getattr(self._plugin, "read_bot_profile", None)
-        except Exception:
-            getter = None
-        if not callable(getter):
-            return {**base, "error_code": "bridge_method_unavailable"}
-        try:
-            result = await getter(
-                profile,
-                query=query,
-                limit=limit,
-                current_date=current_date,
-                current_window=current_window,
-                authorized=locked_authorized,
-            )
-        except Exception:
-            return {**base, "error_code": "bridge_exception"}
-        if not isinstance(result, dict):
-            return {**base, "error_code": "invalid_bridge_response"}
-        safe_item_keys = {
-            "record_id", "memory_domain", "memory_type", "subject", "date", "window",
-            "occurred_at", "source_kind", "source_refs", "evidence_level", "status",
-            "version", "summary", "reference",
-        }
-        safe_items: list[dict[str, Any]] = []
-        items = result.get("items", [])
-        for item in items if isinstance(items, list) else []:
-            if isinstance(item, dict):
-                safe_items.append({key: item[key] for key in safe_item_keys if key in item})
-        return {
-            "ok": bool(result.get("ok", True)),
-            "read_only": True,
-            "state": clean_text(result.get("state"), 40) or "ready",
-            "degraded": bool(result.get("degraded", False)),
-            "pending": bool(result.get("pending", False)),
-            "profile": clean_text(result.get("profile") or profile, 80),
-            "items": safe_items,
-            "warnings": [clean_text(item, 160) for item in result.get("warnings", []) if clean_text(item, 160)][:8]
-            if isinstance(result.get("warnings"), list) else [],
-        }
+        return await self._recall_family.read_bot_profile(
+            profile,
+            query,
+            limit=limit,
+            current_date=current_date,
+            current_window=current_window,
+            authorized=authorized,
+            producer_capability=producer_capability,
+            producer_context=producer_context,
+        )
 
     async def read_profile(self, profile: str, query: str = "", **kwargs: Any) -> dict[str, Any]:
         """Short alias for callers that use the generic Profile API name."""
-
-        return await self.read_bot_profile(profile, query=query, **kwargs)
+        return await self._recall_family.read_profile(profile, query, **kwargs)
 
     async def search(
         self,
@@ -1558,7 +1158,7 @@ class MemoryCompanionBridge:
         p5_attestation: Any = None,
         p5_attestation_consumer: Any = None,
     ) -> list[dict[str, Any]]:
-        return await self._plugin.bridge_search(
+        return await self._recall_family.search(
             query,
             session_context=session_context,
             top_k=top_k,
@@ -1578,7 +1178,7 @@ class MemoryCompanionBridge:
         p5_attestation: Any = None,
         p5_attestation_consumer: Any = None,
     ) -> str:
-        return await self._plugin.bridge_compose_injection(
+        return await self._recall_family.compose_injection(
             query,
             session_context=session_context,
             top_k=top_k,
@@ -1602,7 +1202,7 @@ class MemoryCompanionBridge:
         p5_attestation: Any = None,
         p5_attestation_consumer: Any = None,
     ) -> str:
-        return await self._plugin.bridge_compose_context(
+        return await self._recall_family.compose_context(
             query=query,
             session_context=session_context,
             top_k=top_k,
@@ -1615,7 +1215,7 @@ class MemoryCompanionBridge:
         )
 
     async def remember(self, *, event: Any, content: str, note_type: str = "memory") -> dict[str, Any]:
-        return await self._plugin.tool_remember(event, content, note_type=note_type)
+        return await self._recall_family.remember(event=event, content=content, note_type=note_type)
 
     async def recall(
         self,
@@ -1626,86 +1226,50 @@ class MemoryCompanionBridge:
         p5_attestation: Any = None,
         p5_attestation_consumer: Any = None,
     ) -> dict[str, Any]:
-        return await self._plugin.tool_recall(
-            event,
-            query,
+        return await self._recall_family.recall(
+            event=event,
+            query=query,
             top_k=top_k,
             p5_attestation=p5_attestation,
             p5_attestation_consumer=p5_attestation_consumer,
         )
 
     def p5_capability_status(self) -> dict[str, Any]:
-        getter = getattr(self._plugin, "p5_capability_status", None)
-        if not callable(getter):
-            return {"state": "degraded", "error_code": "p5_status_unavailable"}
-        try:
-            result = getter()
-        except Exception:
-            return {"state": "degraded", "error_code": "p5_status_exception"}
-        return dict(result) if isinstance(result, dict) else {"state": "degraded", "error_code": "p5_status_invalid"}
+        return self._maintenance_family.p5_capability_status()
 
     def provenance_snapshot(self) -> dict[str, Any]:
-        getter = getattr(self._plugin, "provenance_snapshot", None)
-        if not callable(getter):
-            return {"records": {}, "operation_count": 0, "state": "degraded"}
-        result = getter()
-        return dict(result) if isinstance(result, dict) else {"records": {}, "operation_count": 0, "state": "degraded"}
+        return self._maintenance_family.provenance_snapshot()
 
     def provenance_preview(self, candidates: list[dict[str, Any]], *, operation_ref_hash: str) -> dict[str, Any]:
-        getter = getattr(self._plugin, "provenance_preview", None)
-        if not callable(getter):
-            return {"mode": "preview", "readonly": True, "write_count": 0, "error_codes": ["unavailable"]}
-        result = getter(candidates, operation_ref_hash=operation_ref_hash)
-        return dict(result) if isinstance(result, dict) else {"mode": "preview", "readonly": True, "write_count": 0, "error_codes": ["invalid_result"]}
+        return self._maintenance_family.provenance_preview(
+            candidates,
+            operation_ref_hash=operation_ref_hash,
+        )
 
     async def provenance_apply(self, operation: dict[str, Any]) -> dict[str, Any]:
-        getter = getattr(self._plugin, "provenance_apply", None)
-        if not callable(getter):
-            return {"ok": False, "state": "degraded", "error_code": "unavailable"}
-        result = await getter(operation)
-        return dict(result) if isinstance(result, dict) else {"ok": False, "state": "degraded", "error_code": "invalid_result"}
+        return await self._maintenance_family.provenance_apply(operation)
 
     async def provenance_backup(self) -> dict[str, Any]:
-        getter = getattr(self._plugin, "provenance_backup", None)
-        if not callable(getter):
-            return {"ok": False, "state": "degraded", "error_code": "unavailable"}
-        result = await getter()
-        return dict(result) if isinstance(result, dict) else {"ok": False, "state": "degraded", "error_code": "invalid_result"}
+        return await self._maintenance_family.provenance_backup()
 
     async def provenance_rollback(self, operation: dict[str, Any]) -> dict[str, Any]:
-        getter = getattr(self._plugin, "provenance_rollback", None)
-        if not callable(getter):
-            return {"ok": False, "state": "degraded", "error_code": "unavailable"}
-        result = await getter(operation)
-        return dict(result) if isinstance(result, dict) else {"ok": False, "state": "degraded", "error_code": "invalid_result"}
+        return await self._maintenance_family.provenance_rollback(operation)
 
     async def create_note(self, *, event: Any, title: str, content: str = "") -> dict[str, Any]:
-        return await self._plugin.tool_note_create(event, title, content)
+        return await self._maintenance_family.create_note(event=event, title=title, content=content)
 
     async def read_notes(self, *, event: Any, query: str = "", limit: int = 5) -> dict[str, Any]:
-        return await self._plugin.tool_note_read(event, query, limit=limit)
+        return await self._maintenance_family.read_notes(event=event, query=query, limit=limit)
 
     async def delete_note(self, *, event: Any, memory_id: str = "", title: str = "") -> dict[str, Any]:
-        return await self._plugin.tool_note_delete(event, memory_id, title=title)
+        return await self._maintenance_family.delete_note(
+            event=event,
+            memory_id=memory_id,
+            title=title,
+        )
 
     def coordination_status(self) -> dict[str, Any]:
-        try:
-            getter = getattr(self._plugin, "companion_coordination_status", None)
-        except Exception:
-            return {"available": False, "state": "degraded", "degraded": True, "reason": "bridge_exception"}
-        if not callable(getter):
-            return {"available": False, "state": "degraded", "degraded": True, "reason": "method_missing"}
-        try:
-            result = getter()
-        except Exception as exc:
-            return {"available": False, "state": "degraded", "degraded": True, "reason": "bridge_exception", "error": str(exc)[:160]}
-        if not isinstance(result, dict):
-            return {"available": False, "state": "degraded", "degraded": True, "reason": "invalid_status"}
-        result = dict(result)
-        result.setdefault("available", True)
-        result.setdefault("state", "ready")
-        result.setdefault("degraded", False)
-        return result
+        return self._maintenance_family.coordination_status()
 
     def consume_person_projection(
         self,
@@ -1746,111 +1310,15 @@ class MemoryCompanionBridge:
         must remain safe to call from ordinary chat paths even when the contract
         is stale or the local module is otherwise malformed.
         """
-        if not self._active:
-            return self._negative_personal_capability_probe("bridge_inactive")
-        if self._capability_cache.snapshot().get("state") == "negative":
-            return self.capability_status()
-        try:
-            descriptor = bot_personal_contract.capability_descriptor(
-                available=True,
-                read_only=False,
-            )
-        except Exception:
-            return self._negative_personal_capability_probe("contract_descriptor_exception")
-
-        if not isinstance(descriptor, dict):
-            return self._negative_personal_capability_probe("contract_descriptor_invalid")
-
-        result = dict(descriptor)
-        try:
-            problems = bot_personal_contract.contract_self_check()
-        except Exception:
-            return self._negative_personal_capability_probe(
-                "contract_self_check_exception",
-                base=result,
-            )
-
-        if not isinstance(problems, list):
-            return self._negative_personal_capability_probe(
-                "contract_self_check_invalid",
-                base=result,
-            )
-        if problems:
-            warnings = ["contract_self_check_failed"]
-            known_codes = {
-                "contract_fingerprint_stale",
-                "duplicate_window_slug",
-                "type_contracts_out_of_sync",
-                "window_coverage_gap",
-                "alias_points_to_unknown_window",
-            }
-            for problem in problems:
-                code = str(problem).split(":", 1)[0]
-                if code in known_codes and code not in warnings:
-                    warnings.append(code)
-            return self._negative_personal_capability_probe(
-                "contract_self_check_failed",
-                base=result,
-                warnings=warnings,
-            )
-
-        result["available"] = True
-        result["state"] = "available"
-        result["degraded"] = False
-        self._add_personal_capability_contract_aliases(result)
-        c4_snapshot = build_capability_snapshot(
-            available=True,
-            state="available",
-            contract_module=bot_personal_contract,
-            methods=result.get("methods", []),
-            profiles=C4_PROFILE_NAMES,
-            warnings=result.get("warnings", []),
-        )
-        result.update(c4_snapshot)
-        result["memory_domain"] = bot_personal_contract.BOT_PERSONAL_MEMORY_DOMAIN
-        result["domain"] = bot_personal_contract.BOT_PERSONAL_MEMORY_DOMAIN
-        result["contract_revision"] = bot_personal_contract.CONTRACT_REVISION
-        result["capability_schema_version"] = bot_personal_contract.BOT_PERSONAL_CAPABILITY_SCHEMA_VERSION
-        result["payload_schema_version"] = bot_personal_contract.BOT_PERSONAL_PAYLOAD_SCHEMA_VERSION
-        result["capability_state"] = "available"
-        # Capability discovery must remain static: callers use it before the
-        # plugin service is safe to query, and C1 guarantees no storage access.
-        result["p5"] = {"state": "unprobed", "error_code": "p5_status_not_probed"}
-        self._capability_cache.mark_available(c4_snapshot)
-        result.setdefault("warnings", [])
-        return result
+        return self._producer_family.probe_capability_snapshot()
 
     def probe_bot_personal_memory_capabilities(self) -> dict[str, Any]:
         """Backward-compatible C1 probe; C4 state is exposed as capability_state."""
-
-        result = dict(self.probe_capability_snapshot())
-        if result.get("capability_state") == "available":
-            result["state"] = "ready"
-        result["legacy_state"] = result.get("state", "degraded")
-        return result
+        return self._producer_family.probe_bot_personal_memory_capabilities()
 
     def probe_namespace_context_capabilities(self) -> dict[str, Any]:
         """Advertise ready only after the store and active epoch are bound."""
-        status = self._scoped_store.epoch_status() if self._scoped_store is not None else {"bound": False}
-        ready = self._active and status.get("bound") is True
-        return namespace_capability_descriptor(
-            available=ready,
-            methods=(
-                "list_scoped_records",
-                "read_scoped_record",
-                "erase_scoped_group_scopes",
-                "erase_scoped_persona_scopes",
-                "tombstone_scoped_identity_scopes",
-                "tombstone_scoped_namespace",
-                "tombstone_scoped_record",
-                "upsert_scoped_record",
-            ) if ready else (),
-            error_code=(
-                "" if ready
-                else "bridge_inactive" if not self._active
-                else "namespace_scoped_api_not_bound"
-            ),
-        )
+        return self._scoped_namespace_family.probe_namespace_context_capabilities()
 
     def bind_namespace_migration_epoch(
         self,
@@ -1861,27 +1329,13 @@ class MemoryCompanionBridge:
         migration_epoch: str,
         policy_version: str,
     ) -> dict[str, Any]:
-        if not self._active:
-            return {"ok": False, "state": "degraded", "code": "bridge_inactive"}
-        if not self._is_valid_private_companion_capability(capability):
-            return {"ok": False, "state": "forbidden", "code": "producer_capability_required"}
-        if self._scoped_store is None:
-            return {"ok": False, "state": "degraded", "code": "namespace_scoped_store_unavailable"}
-        try:
-            result = self._scoped_store.bind_epoch(
-                operation_id=operation_id,
-                expected_previous_epoch=expected_previous_epoch,
-                migration_epoch=migration_epoch,
-                policy_version=policy_version,
-            )
-        except ScopedStoreError as exc:
-            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
-        return {
-            "ok": True,
-            "state": "ready",
-            "code": result,
-            "epoch": self._scoped_store.epoch_status(),
-        }
+        return self._scoped_namespace_family.bind_namespace_migration_epoch(
+            capability,
+            operation_id=operation_id,
+            expected_previous_epoch=expected_previous_epoch,
+            migration_epoch=migration_epoch,
+            policy_version=policy_version,
+        )
 
     def _authorized_scoped_context(
         self, capability: Any, namespace: Any
@@ -1891,7 +1345,12 @@ class MemoryCompanionBridge:
         if not self._is_valid_private_companion_capability(capability):
             return None, {"ok": False, "state": "forbidden", "code": "producer_capability_required"}
         if self._scoped_store is None:
-            return None, {"ok": False, "state": "degraded", "code": "namespace_scoped_store_unavailable"}
+            return None, {
+                "ok": False,
+                "state": "degraded",
+                "code": self._scoped_store_initialization_error_code()
+                or "namespace_scoped_store_unavailable",
+            }
         if self._scoped_store.epoch_status().get("bound") is not True:
             return None, {"ok": False, "state": "degraded", "code": "namespace_scoped_api_not_bound"}
         errors = validate_namespace_context(namespace)
@@ -1913,41 +1372,35 @@ class MemoryCompanionBridge:
         payload: dict[str, Any],
         event_id: str,
     ) -> dict[str, Any]:
-        context, denied = self._authorized_scoped_context(capability, namespace)
-        if denied is not None:
-            return denied
-        try:
-            result = self._scoped_store.upsert(
-                context, record_kind=record_kind, record_id=record_id, revision=revision,
-                payload=payload, event_id=event_id,
-            )
-        except ScopedStoreError as exc:
-            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
-        return {"ok": True, "state": "ready", "code": result}
+        return self._scoped_namespace_family.upsert_scoped_record(
+            capability,
+            namespace,
+            record_kind=record_kind,
+            record_id=record_id,
+            revision=revision,
+            payload=payload,
+            event_id=event_id,
+        )
 
     def read_scoped_record(
         self, capability: Any, namespace: Any, *, record_kind: str, record_id: str
     ) -> dict[str, Any]:
-        context, denied = self._authorized_scoped_context(capability, namespace)
-        if denied is not None:
-            return denied
-        try:
-            record = self._scoped_store.read(context, record_kind=record_kind, record_id=record_id)
-        except ScopedStoreError as exc:
-            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
-        return {"ok": True, "state": "ready", "code": "found" if record is not None else "not_found", "record": record}
+        return self._scoped_namespace_family.read_scoped_record(
+            capability,
+            namespace,
+            record_kind=record_kind,
+            record_id=record_id,
+        )
 
     def list_scoped_records(
         self, capability: Any, namespace: Any, *, record_kind: str, limit: int = 100
     ) -> dict[str, Any]:
-        context, denied = self._authorized_scoped_context(capability, namespace)
-        if denied is not None:
-            return denied
-        try:
-            records = self._scoped_store.list_records(context, record_kind=record_kind, limit=limit)
-        except (ScopedStoreError, TypeError, ValueError, OverflowError) as exc:
-            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
-        return {"ok": True, "state": "ready", "code": "listed", "records": records}
+        return self._scoped_namespace_family.list_scoped_records(
+            capability,
+            namespace,
+            record_kind=record_kind,
+            limit=limit,
+        )
 
     def tombstone_scoped_record(
         self,
@@ -1959,16 +1412,14 @@ class MemoryCompanionBridge:
         revision: int,
         event_id: str,
     ) -> dict[str, Any]:
-        context, denied = self._authorized_scoped_context(capability, namespace)
-        if denied is not None:
-            return denied
-        try:
-            result = self._scoped_store.tombstone(
-                context, record_kind=record_kind, record_id=record_id, revision=revision, event_id=event_id,
-            )
-        except ScopedStoreError as exc:
-            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
-        return {"ok": True, "state": "ready", "code": result}
+        return self._scoped_namespace_family.tombstone_scoped_record(
+            capability,
+            namespace,
+            record_kind=record_kind,
+            record_id=record_id,
+            revision=revision,
+            event_id=event_id,
+        )
 
     def tombstone_scoped_namespace(
         self,
@@ -1978,16 +1429,12 @@ class MemoryCompanionBridge:
         operation_id: str,
         reason_code: str,
     ) -> dict[str, Any]:
-        context, denied = self._authorized_scoped_context(capability, namespace)
-        if denied is not None:
-            return denied
-        try:
-            result = self._scoped_store.tombstone_namespace(
-                context, operation_id=operation_id, reason_code=reason_code,
-            )
-        except ScopedStoreError as exc:
-            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
-        return {"ok": True, "state": "ready", **result}
+        return self._scoped_namespace_family.tombstone_scoped_namespace(
+            capability,
+            namespace,
+            operation_id=operation_id,
+            reason_code=reason_code,
+        )
 
     def tombstone_scoped_identity_scopes(
         self,
@@ -1997,16 +1444,12 @@ class MemoryCompanionBridge:
         operation_id: str,
         reason_code: str,
     ) -> dict[str, Any]:
-        context, denied = self._authorized_scoped_context(capability, namespace)
-        if denied is not None:
-            return denied
-        try:
-            result = self._scoped_store.tombstone_identity_scopes(
-                context, operation_id=operation_id, reason_code=reason_code,
-            )
-        except ScopedStoreError as exc:
-            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
-        return {"ok": True, "state": "ready", **result}
+        return self._scoped_namespace_family.tombstone_scoped_identity_scopes(
+            capability,
+            namespace,
+            operation_id=operation_id,
+            reason_code=reason_code,
+        )
 
     def erase_scoped_group_scopes(
         self,
@@ -2016,16 +1459,12 @@ class MemoryCompanionBridge:
         operation_id: str,
         reason_code: str = "group_reset",
     ) -> dict[str, Any]:
-        context, denied = self._authorized_scoped_context(capability, namespace)
-        if denied is not None:
-            return denied
-        try:
-            result = self._scoped_store.erase_group_scopes(
-                context, operation_id=operation_id, reason_code=reason_code,
-            )
-        except ScopedStoreError as exc:
-            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
-        return {"ok": True, "state": "ready", **result}
+        return self._scoped_namespace_family.erase_scoped_group_scopes(
+            capability,
+            namespace,
+            operation_id=operation_id,
+            reason_code=reason_code,
+        )
 
     def erase_scoped_persona_scopes(
         self,
@@ -2035,37 +1474,20 @@ class MemoryCompanionBridge:
         operation_id: str,
         reason_code: str = "persona_reset",
     ) -> dict[str, Any]:
-        context, denied = self._authorized_scoped_context(capability, namespace)
-        if denied is not None:
-            return denied
-        try:
-            result = self._scoped_store.erase_persona_scopes(
-                context, operation_id=operation_id, reason_code=reason_code,
-            )
-        except ScopedStoreError as exc:
-            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
-        return {"ok": True, "state": "ready", **result}
+        return self._scoped_namespace_family.erase_scoped_persona_scopes(
+            capability,
+            namespace,
+            operation_id=operation_id,
+            reason_code=reason_code,
+        )
 
     def capability_status(self) -> dict[str, Any]:
         """Return the bounded C4 cache state without probing storage."""
-
-        snapshot = self._capability_cache.snapshot()
-        snapshot["read_only"] = False
-        snapshot["contract_name"] = bot_personal_contract.CONTRACT_NAME
-        snapshot["max_payload_bytes"] = bot_personal_contract.BOT_PERSONAL_MAX_PAYLOAD_BYTES
-        snapshot["memory_domain"] = bot_personal_contract.BOT_PERSONAL_MEMORY_DOMAIN
-        snapshot["domain"] = snapshot["memory_domain"]
-        snapshot["contract_revision"] = bot_personal_contract.CONTRACT_REVISION
-        snapshot["capability_schema_version"] = bot_personal_contract.BOT_PERSONAL_CAPABILITY_SCHEMA_VERSION
-        snapshot["payload_schema_version"] = bot_personal_contract.BOT_PERSONAL_PAYLOAD_SCHEMA_VERSION
-        snapshot["capability_state"] = snapshot.get("state", "unprobed")
-        return snapshot
+        return self._producer_family.capability_status()
 
     def mark_capability_negative(self, reason: str) -> dict[str, Any]:
         """Temporarily suppress repeated capability failures at the bridge edge."""
-
-        self._capability_cache.mark_negative(clean_text(reason, 120) or "capability_negative")
-        return self.capability_status()
+        return self._producer_family.mark_capability_negative(reason)
 
     @staticmethod
     def _add_personal_capability_contract_aliases(result: dict[str, Any]) -> dict[str, Any]:
@@ -2080,6 +1502,8 @@ class MemoryCompanionBridge:
             [
                 "record_event",
                 "record_external_memory",
+                "register_external_memory_producer",
+                "create_external_memory_context",
                 "record_visible_turn",
                 "register_private_companion",
                 "register_bot_personal_producer",
@@ -2203,17 +1627,10 @@ class MemoryCompanionBridge:
         return result
 
     def get_token_usage_summary(self) -> dict[str, Any]:
-        getter = getattr(self._plugin, "token_usage_summary", None)
-        if callable(getter):
-            result = getter()
-            return result if isinstance(result, dict) else {}
-        return {}
+        return self._recall_family.get_token_usage_summary()
 
     def should_defer_private_companion_section(self, section: str) -> bool:
-        checker = getattr(self._plugin, "should_private_companion_defer_section", None)
-        if callable(checker):
-            return bool(checker(section))
-        return False
+        return self._recall_family.should_defer_private_companion_section(section)
 
     async def create_cross_window_thread(
         self,
@@ -2225,32 +1642,24 @@ class MemoryCompanionBridge:
         visibility: str = "shareable",
         metadata: dict[str, Any] | None = None,
     ) -> str:
-        return await self._plugin.store.create_cross_window_thread(
+        return await self._maintenance_family.create_cross_window_thread(
             from_session=from_session,
             to_session=to_session,
             topic=topic,
             content=content,
             visibility=visibility,
-            metadata=metadata or {},
+            metadata=metadata,
         )
 
     async def mark_visibility(self, memory_id: str, visibility: str) -> bool:
-        return await self._plugin.store.update_memory_visibility(memory_id, visibility)
+        return await self._recall_family.mark_visibility(memory_id, visibility)
 
     def get_emotional_events(self, *, session_id: str = "", limit: int = 5) -> list[dict[str, Any]]:
         """Temporary exact-window compatibility path for pre-capability callers."""
-
-        safe_session = clean_text(session_id, 220)
-        if not safe_session or ":" not in safe_session:
-            return []
-        getter = getattr(self._plugin, "bridge_get_emotional_events", None)
-        if not callable(getter):
-            return []
-        try:
-            events = getter(session_id=safe_session, limit=limit)
-        except Exception:
-            return []
-        return events if isinstance(events, list) else []
+        return self._portrait_emotion_family.get_emotional_events(
+            session_id=session_id,
+            limit=limit,
+        )
 
     async def list_emotion_events(
         self,
@@ -2261,19 +1670,11 @@ class MemoryCompanionBridge:
         **_legacy: Any,
     ) -> dict[str, Any]:
         """List afterglow events only for one opaque Companion delivery context."""
-
-        if not self._is_valid_emotion_delivery_context(delivery_context):
-            return self._emotion_delivery_forbidden_result("delivery_context_required")
-        return await self._plugin.store.list_emotion_event_deliveries(
-            consumer_id=delivery_context.consumer_id,
-            bot_id=delivery_context.bot_id,
-            scope=delivery_context.scope,
-            platform=delivery_context.platform,
-            user_id=delivery_context.user_id,
-            session_id=delivery_context.session_id,
-            allow_cross_window=delivery_context.allow_cross_window,
+        return await self._portrait_emotion_family.list_emotion_events(
+            delivery_context=delivery_context,
             cursor=cursor,
             limit=limit,
+            **_legacy,
         )
 
     async def ack_emotion_events(
@@ -2284,18 +1685,10 @@ class MemoryCompanionBridge:
         **_legacy: Any,
     ) -> dict[str, Any]:
         """Acknowledge only events delivered inside one opaque identity domain."""
-
-        if not self._is_valid_emotion_delivery_context(delivery_context):
-            return self._emotion_ack_forbidden_result("delivery_context_required")
-        return await self._plugin.store.ack_emotion_event_deliveries(
-            consumer_id=delivery_context.consumer_id,
-            event_refs=event_refs,
-            bot_id=delivery_context.bot_id,
-            scope=delivery_context.scope,
-            platform=delivery_context.platform,
-            user_id=delivery_context.user_id,
-            session_id=delivery_context.session_id,
-            allow_cross_window=delivery_context.allow_cross_window,
+        return await self._portrait_emotion_family.ack_emotion_events(
+            event_refs,
+            delivery_context=delivery_context,
+            **_legacy,
         )
 
     async def record_emotion_event(
@@ -2305,11 +1698,9 @@ class MemoryCompanionBridge:
         producer_context: Any = None,
     ) -> dict[str, Any]:
         """Persist a Companion event only inside an attested private user/Bot domain."""
-
-        if not self._is_valid_emotion_producer_context(producer_context):
-            return self._emotion_forbidden_result("producer_context_required")
-        return await self._plugin.store.upsert_emotion_event(
-            self._attested_emotion_event(event, producer_context)
+        return await self._portrait_emotion_family.record_emotion_event(
+            event,
+            producer_context=producer_context,
         )
 
     async def revise_emotion_event(
@@ -2319,11 +1710,9 @@ class MemoryCompanionBridge:
         producer_context: Any = None,
     ) -> dict[str, Any]:
         """Persist a later Companion revision only inside its attested domain."""
-
-        if not self._is_valid_emotion_producer_context(producer_context):
-            return self._emotion_forbidden_result("producer_context_required")
-        return await self._plugin.store.upsert_emotion_event(
-            self._attested_emotion_event(event, producer_context)
+        return await self._portrait_emotion_family.revise_emotion_event(
+            event,
+            producer_context=producer_context,
         )
 
     async def get_emotion_trace(
@@ -2334,10 +1723,9 @@ class MemoryCompanionBridge:
         limit: int = 100,
     ) -> dict[str, Any]:
         """Return only the scoped, redacted diagnostic projection for a trusted admin."""
-
-        return await self.get_emotion_trace_diagnostic(
+        return await self._portrait_emotion_family.get_emotion_trace(
             trace_id,
-            requester_context,
+            requester_context=requester_context,
             limit=limit,
         )
 
@@ -2348,17 +1736,11 @@ class MemoryCompanionBridge:
         *,
         limit: int = 100,
     ) -> dict[str, Any]:
-        context = requester_context
-        if not self._is_valid_emotion_admin_context(context):
-            return {"state": "forbidden", "read_only": True, "items": [], "error_code": "admin_required"}
-        items = await self._plugin.store.get_emotion_trace_diagnostic(
+        return await self._portrait_emotion_family.get_emotion_trace_diagnostic(
             trace_id,
-            bot_id=context.bot_id,
-            scope=context.scope,
-            session_id=context.session_id,
-            limit=max(1, min(100, int(limit or 100))),
+            requester_context,
+            limit=limit,
         )
-        return {"state": "ready", "read_only": True, "items": items}
 
     async def get_emotion_trace_summary(
         self,
@@ -2367,17 +1749,11 @@ class MemoryCompanionBridge:
         cursor: str = "",
         limit: int = 20,
     ) -> dict[str, Any]:
-        context = requester_context
-        if not self._is_valid_emotion_admin_context(context):
-            return {"state": "forbidden", "read_only": True, "items": [], "next_cursor": "", "error_code": "admin_required"}
-        result = await self._plugin.store.get_emotion_trace_summary(
-            bot_id=context.bot_id,
-            scope=context.scope,
-            session_id=context.session_id,
-            cursor=clean_text(cursor, 20),
-            limit=max(1, min(100, int(limit or 20))),
+        return await self._portrait_emotion_family.get_emotion_trace_summary(
+            requester_context,
+            cursor=cursor,
+            limit=limit,
         )
-        return {"state": "ready", "read_only": True, **result}
 
     @staticmethod
     def _emotion_forbidden_result(error_code: str) -> dict[str, Any]:
@@ -2432,7 +1808,7 @@ class MemoryCompanionBridge:
 
     async def search_open_loops(self, *, session_id: str = "", limit: int = 3) -> list[dict[str, Any]]:
         """Search for unresolved open-loop / promise memories for proactive companionship."""
-        return await self._plugin.bridge_search_open_loops(session_id=session_id, limit=limit)
+        return await self._recall_family.search_open_loops(session_id=session_id, limit=limit)
 
     def get_relationship_phase(
         self,
@@ -2445,20 +1821,14 @@ class MemoryCompanionBridge:
         bot_id: str = "",
     ) -> dict[str, Any]:
         """Return current relationship phase state for a session."""
-        getter = getattr(self._plugin, "_get_relationship_phase", None)
-        if not callable(getter):
-            return {"phase": "unknown", "momentum": 0.0}
-        normalizer = getattr(self._plugin, "session_context_from_bridge", None)
-        payload = {
-            "session_id": session_id,
-            "scope": scope,
-            "platform": platform,
-            "user_id": user_id,
-            "group_id": group_id,
-            "bot_id": bot_id,
-        }
-        ctx = normalizer(payload) if callable(normalizer) else SessionContext(**payload)
-        return getter(ctx)
+        return self._portrait_emotion_family.get_relationship_phase(
+            session_id=session_id,
+            scope=scope,
+            platform=platform,
+            user_id=user_id,
+            group_id=group_id,
+            bot_id=bot_id,
+        )
 
     def peek_relationship_phase(
         self,
@@ -2471,54 +1841,14 @@ class MemoryCompanionBridge:
         bot_id: str = "",
     ) -> dict[str, Any]:
         """Read an existing phase projection without creating default state."""
-        fallback = {"observed": False, "phase": "unknown", "momentum_band": "unknown"}
-        payload = {
-            "session_id": session_id,
-            "scope": scope,
-            "platform": platform,
-            "user_id": user_id,
-            "group_id": group_id,
-            "bot_id": bot_id,
-        }
-        if any(type(value) is not str for value in payload.values()):
-            return fallback
-        try:
-            getter = getattr(self._plugin, "_peek_relationship_phase", None)
-            if not callable(getter):
-                return fallback
-            normalizer = getattr(self._plugin, "session_context_from_bridge", None)
-            ctx = normalizer(payload) if callable(normalizer) else SessionContext(**payload)
-            result = getter(ctx)
-        except Exception:
-            return fallback
-        if type(result) is not dict:
-            return fallback
-        for key in result:
-            if type(key) is not str:
-                return fallback
-
-        observed = result.get("observed")
-        phase = result.get("phase")
-        momentum_band = result.get("momentum_band")
-        if type(observed) is not bool or type(phase) is not str or type(momentum_band) is not str:
-            return fallback
-        if phase not in {"acquaintance", "familiar", "close", "intimate", "deeply_bonded"}:
-            return fallback
-        if momentum_band not in {"rising", "cooling", "steady"}:
-            return fallback
-        if not observed:
-            return fallback
-        projection: dict[str, Any] = {
-            "observed": True,
-            "phase": phase,
-            "momentum_band": momentum_band,
-        }
-        touch_count = result.get("touch_count")
-        if touch_count is not None:
-            if type(touch_count) is not int or not 0 <= touch_count <= 256:
-                return fallback
-            projection["touch_count"] = touch_count
-        return projection
+        return self._portrait_emotion_family.peek_relationship_phase(
+            session_id=session_id,
+            scope=scope,
+            platform=platform,
+            user_id=user_id,
+            group_id=group_id,
+            bot_id=bot_id,
+        )
 
     def get_recent_emotional_state(
         self,
@@ -2528,16 +1858,11 @@ class MemoryCompanionBridge:
         limit: int = 5,
     ) -> dict[str, Any]:
         """Explain why the identity-free cross-window aggregate is unavailable."""
-        _ = (exclude_session_id, window_seconds, limit)
-        return {
-            "enabled": False,
-            "state": "migration_required",
-            "error_code": "delivery_context_required",
-            "total": 0,
-            "scar_count": 0,
-            "warm_count": 0,
-            "vulnerable_count": 0,
-        }
+        return self._portrait_emotion_family.get_recent_emotional_state(
+            exclude_session_id=exclude_session_id,
+            window_seconds=window_seconds,
+            limit=limit,
+        )
 
     def _entity(self, payload: dict[str, Any]) -> EntityRef:
         return EntityRef(
@@ -2546,125 +1871,3 @@ class MemoryCompanionBridge:
             name=str(payload.get("name") or ""),
             role=str(payload.get("role") or "unknown"),
         )
-
-def serialize_memory(record: MemoryRecord, score: float | None = None, reason: str = "") -> dict[str, Any]:
-    metadata = record.metadata if isinstance(record.metadata, dict) else {}
-    key_facts = metadata.get("key_facts") if isinstance(metadata.get("key_facts"), list) else []
-    key_facts_with_refs = (
-        metadata.get("key_facts_with_refs")
-        if isinstance(metadata.get("key_facts_with_refs"), list)
-        else []
-    )
-    routine_check_notes = metadata.get("routine_check_notes") if isinstance(metadata.get("routine_check_notes"), list) else []
-    topics = metadata.get("topics") if isinstance(metadata.get("topics"), list) else []
-    participants = metadata.get("participants") if isinstance(metadata.get("participants"), list) else []
-    persona_weight_keys = [
-        "persona_importance",
-        "relationship_weight",
-        "emotional_weight",
-        "promise_weight",
-        "open_loop_weight",
-        "creative_weight",
-        "preference_weight",
-        "self_continuity_weight",
-        "freshness_weight",
-        "scar_weight",
-        "emotional_debt_weight",
-        "intimacy_weight",
-        "vulnerability_weight",
-    ]
-    persona_weights = {
-        key: metadata.get(key)
-        for key in persona_weight_keys
-        if metadata.get(key) is not None
-    }
-    data = {
-        "id": record.id,
-        "memory_type": record.memory_type,
-        "scope": record.scope,
-        "session_id": record.session_id,
-        "group_id": record.group_id,
-        "visibility": record.visibility,
-        "sayability": record.sayability,
-        "reality_level": record.reality_level,
-        "lifecycle": record.lifecycle,
-        "owner_bot_id": record.owner_bot_id,
-        "persona_id": clean_text(metadata.get("persona_id"), 120),
-        "validity_status": record.validity_status,
-        "valid_from": record.valid_from,
-        "valid_to": record.valid_to,
-        "salience": record.salience,
-        "durability": record.durability,
-        "sensitivity": record.sensitivity,
-        "reinforcement_score": record.reinforcement_score,
-        "injection_count": record.injection_count,
-        "last_injected_at": record.last_injected_at,
-        "canonical_key": record.canonical_key,
-        "content": record.content,
-        "evidence_preview": clean_text(record.evidence, 520),
-        "canonical_summary": clean_text(metadata.get("canonical_summary"), 420),
-        "key_facts": [clean_text(item, 180) for item in key_facts if clean_text(item, 180)][:4],
-        "key_facts_with_refs": [
-            {
-                "fact": clean_text(item.get("fact"), 180),
-                "refs": [
-                    clean_text(ref, 160)
-                    for ref in item.get("refs", [])
-                    if clean_text(ref, 160)
-                ][:6],
-            }
-            for item in key_facts_with_refs
-            if isinstance(item, dict) and clean_text(item.get("fact"), 180)
-        ][:8],
-        "routine_check_notes": [clean_text(item, 180) for item in routine_check_notes if clean_text(item, 180)][:4],
-        "topics": [clean_text(item, 80) for item in topics if clean_text(item, 80)][:5],
-        "participants": [clean_text(item, 80) for item in participants if clean_text(item, 80)][:5],
-        "memory_reason": clean_text(metadata.get("memory_reason"), 260),
-        "mention_policy": clean_text(metadata.get("mention_policy"), 60),
-        "mentionability_score": metadata.get("mentionability_score"),
-        "relationship_phase": clean_text(metadata.get("relationship_phase"), 80),
-        "decay_mode": clean_text(metadata.get("decay_mode"), 80),
-        "active_dimensions": [
-            clean_text(item, 80)
-            for item in metadata.get("active_dimensions", [])
-            if clean_text(item, 80)
-        ][:6] if isinstance(metadata.get("active_dimensions"), list) else [],
-        "persona_weights": persona_weights,
-        "mention_feedback": metadata.get("mention_feedback") if isinstance(metadata.get("mention_feedback"), dict) else {},
-        "confidence": record.confidence,
-        "importance": record.importance,
-        "review_status": record.review_status,
-        "tags": record.tags,
-        "source_plugin": record.source_plugin,
-        "import_batch_id": record.import_batch_id,
-        "created_at": record.created_at,
-        "created_at_local": _local_time_label(record.created_at),
-        "updated_at": record.updated_at,
-        "updated_at_local": _local_time_label(record.updated_at),
-        "occurred_at": record.occurred_at,
-        "occurred_at_local": _local_time_label(record.occurred_at),
-        "time_range": {
-            "start_at": clean_text(metadata.get("start_at"), 80),
-            "end_at": clean_text(metadata.get("end_at"), 80),
-            "start_at_local": clean_text(metadata.get("start_at_local"), 80) or _local_time_label(metadata.get("start_at")),
-            "end_at_local": clean_text(metadata.get("end_at_local"), 80) or _local_time_label(metadata.get("end_at")),
-            "timezone": "Asia/Shanghai",
-        },
-        "subject": {
-            "kind": record.subject.kind,
-            "id": record.subject.id,
-            "name": record.subject.name,
-            "role": record.subject.role,
-        },
-        "object": {
-            "kind": record.object.kind,
-            "id": record.object.id,
-            "name": record.object.name,
-            "role": record.object.role,
-        },
-    }
-    if score is not None:
-        data["score"] = score
-    if reason:
-        data["reason"] = reason
-    return data

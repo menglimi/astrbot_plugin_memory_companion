@@ -128,8 +128,23 @@ def test_bridge_profile_and_capability_compatibility(tmp_path):
 def test_bridge_locked_profile_ignores_caller_boolean_and_requires_capability(tmp_path):
     service = make_service(tmp_path)
     try:
-        run(service.record_bot_personal_archive(envelope("bot_creative_work", "locked")))
-        companion = object()
+        class CompanionProducer:
+            @staticmethod
+            def _memory_companion_bridge_bot_id():
+                return "bot-a"
+
+            @staticmethod
+            def _memory_companion_archive_persona_id():
+                return "persona-a"
+
+        companion = CompanionProducer()
+        namespaced = envelope("bot_creative_work", "locked")
+        namespaced.update(
+            canonical_schema_version=3,
+            owner_bot_id="bot-a",
+            persona_id="persona-a",
+        )
+        run(service.record_bot_personal_archive(namespaced))
         service.context = SimpleNamespace(
             get_all_stars=lambda: [
                 SimpleNamespace(
@@ -154,5 +169,76 @@ def test_bridge_locked_profile_ignores_caller_boolean_and_requires_capability(tm
         assert denied["items"] == []
         assert allowed["ok"] is True
         assert allowed["items"]
+    finally:
+        service.store.close()
+
+
+def test_capability_namespace_is_filtered_before_limit_and_legacy_stays_separate(tmp_path):
+    service = make_service(tmp_path)
+    try:
+        class CompanionProducer:
+            @staticmethod
+            def _memory_companion_bridge_bot_id():
+                return "bot-target"
+
+            @staticmethod
+            def _memory_companion_archive_persona_id():
+                return "persona-target"
+
+        def namespaced(key: str, bot: str, persona: str):
+            value = envelope("bot_creative_work", key)
+            value.update(
+                canonical_schema_version=3,
+                owner_bot_id=bot,
+                persona_id=persona,
+            )
+            return value
+
+        target = run(service.record_bot_personal_archive(
+            namespaced("target", "bot-target", "persona-target")
+        ))
+        other_persona = run(service.record_bot_personal_archive(
+            namespaced("other-persona", "bot-target", "persona-other")
+        ))
+        foreign_ids = set()
+        for index in range(12):
+            result = run(service.record_bot_personal_archive(
+                namespaced(f"foreign-{index}", f"bot-foreign-{index}", "persona-target")
+            ))
+            foreign_ids.add(result["record_id"])
+        legacy = run(service.record_bot_personal_archive(
+            envelope("bot_creative_work", "legacy-only")
+        ))
+
+        producer = CompanionProducer()
+        service.context = SimpleNamespace(
+            get_all_stars=lambda: [
+                SimpleNamespace(
+                    star_cls=producer,
+                    root_dir_name="astrbot_plugin_private_companion",
+                    name="PrivateCompanion",
+                    activated=True,
+                )
+            ]
+        )
+        bridge = MemoryCompanionBridge(service)
+        capability = bridge.register_bot_personal_producer(producer)
+        exact = run(bridge.read_bot_profile(
+            "bot_creative", limit=1, producer_capability=capability
+        ))
+        legacy_read = run(bridge.read_bot_profile("bot_creative", limit=20))
+        fake = run(bridge.read_bot_profile(
+            "bot_creative",
+            limit=20,
+            authorized=True,
+            producer_capability=object(),
+        ))
+
+        assert [item["record_id"] for item in exact["items"]] == [target["record_id"]]
+        assert other_persona["record_id"] not in str(exact)
+        assert foreign_ids.isdisjoint({item["record_id"] for item in exact["items"]})
+        assert [item["record_id"] for item in legacy_read["items"]] == [legacy["record_id"]]
+        assert fake["state"] == "forbidden"
+        assert fake["items"] == []
     finally:
         service.store.close()

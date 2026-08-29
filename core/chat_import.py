@@ -651,6 +651,46 @@ class HistoricalChatImporter:
         self.parser = HistoricalChatParser()
         self._tasks: dict[str, asyncio.Task[Any]] = {}
 
+    def _timeline_namespace_kwargs(self, batch: dict[str, Any]) -> dict[str, str]:
+        """Use the service's single canonical owner/persona derivation path."""
+
+        options = batch.get("options") if isinstance(batch.get("options"), dict) else {}
+        persisted = options.get("_timeline_namespace")
+        if isinstance(persisted, dict) and {
+            "owner_bot_id",
+            "persona_id",
+        }.issubset(persisted):
+            return {
+                "owner_bot_id": clean_text(persisted.get("owner_bot_id"), 120),
+                "persona_id": clean_text(persisted.get("persona_id"), 96),
+            }
+        if "options" in batch:
+            # Persisted batches created before timeline namespacing have no
+            # trustworthy persona.  Keep their follow-up work in the explicit
+            # legacy partition instead of guessing from the current Bot.
+            return {"owner_bot_id": "", "persona_id": ""}
+
+        resolver = getattr(self.service, "_timeline_namespace_kwargs", None)
+        if not callable(resolver):
+            # Compatibility for isolated importer consumers that predate
+            # namespaced timelines.  The production service always supplies
+            # the resolver; never guess a persona for an external stub.
+            return {"owner_bot_id": "", "persona_id": ""}
+        context = SessionContext(
+            session_id=clean_text(batch.get("session_id"), 200),
+            scope=clean_text(batch.get("scope"), 40) or "private",
+            platform=clean_text(batch.get("platform"), 40),
+            user_id=clean_text(batch.get("user_id"), 120),
+            user_name=clean_text(batch.get("user_name"), 80),
+            bot_id=clean_text(batch.get("bot_id"), 120),
+            persona_id=clean_text(batch.get("persona_id"), 96),
+        )
+        namespace = resolver(context)
+        return {
+            "owner_bot_id": clean_text(namespace.get("owner_bot_id"), 120),
+            "persona_id": clean_text(namespace.get("persona_id"), 96),
+        }
+
     def _config_int(self, key: str, default: int) -> int:
         config = getattr(self.service, "config", None)
         getter = getattr(config, "int", None)
@@ -661,7 +701,7 @@ class HistoricalChatImporter:
                 pass
         return int(default)
 
-    def _resolved_options(self, raw: dict[str, Any] | None = None) -> dict[str, int]:
+    def _resolved_options(self, raw: dict[str, Any] | None = None) -> dict[str, Any]:
         supplied = raw if isinstance(raw, dict) else {}
 
         def value(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -682,7 +722,7 @@ class HistoricalChatImporter:
         }
 
     @staticmethod
-    def _segmenter_from_options(options: dict[str, int]) -> HistoricalChatSegmenter:
+    def _segmenter_from_options(options: dict[str, Any]) -> HistoricalChatSegmenter:
         return HistoricalChatSegmenter(
             merge_seconds=options["merge_seconds"],
             hard_gap_minutes=options["hard_gap_minutes"],
@@ -1484,6 +1524,18 @@ class HistoricalChatImporter:
         options = self._resolved_options(
             payload.get("options") if isinstance(payload.get("options"), dict) else None
         )
+        timeline_namespace = self._timeline_namespace_kwargs(
+            {
+                "session_id": session_id,
+                "scope": "private",
+                "platform": platform,
+                "user_id": user_id,
+                "user_name": user_name,
+                "bot_id": bot_id,
+                "persona_id": clean_text(payload.get("persona_id"), 96),
+            }
+        )
+        options["_timeline_namespace"] = dict(timeline_namespace)
         identity_fingerprint = {
             speaker: {
                 "role": mapping["role"],
@@ -1494,7 +1546,8 @@ class HistoricalChatImporter:
         fingerprint = stable_fingerprint(
             manifest.get("parse_hash") or manifest.get("source_hash"),
             session_id,
-            bot_id,
+            timeline_namespace["owner_bot_id"],
+            timeline_namespace["persona_id"],
             json.dumps(identity_fingerprint, ensure_ascii=False, sort_keys=True),
         )
         batch_id = "chatimp_" + fingerprint[:24]
@@ -1530,6 +1583,7 @@ class HistoricalChatImporter:
                         "user_name": user_name,
                         "bot_id": bot_id,
                         "bot_name": bot_name,
+                        "persona_id": timeline_namespace["persona_id"],
                     },
                 },
                 ensure_ascii=False,
@@ -1548,6 +1602,7 @@ class HistoricalChatImporter:
                 {
                     "event_type": "bot_response" if is_bot else "user_message",
                     "session_id": session_id,
+                    **timeline_namespace,
                     "scope": "private",
                     "subject_id": subject_id,
                     "object_id": object_id,
@@ -2047,6 +2102,7 @@ class HistoricalChatImporter:
         return package[:1] if not package and segments else package
 
     async def _provider_attempts(self, batch: dict[str, Any]) -> list[dict[str, Any]]:
+        namespace = self._timeline_namespace_kwargs(batch)
         ctx = SessionContext(
             session_id=str(batch.get("session_id") or ""),
             scope=str(batch.get("scope") or "private"),
@@ -2054,6 +2110,7 @@ class HistoricalChatImporter:
             user_id=str(batch.get("user_id") or ""),
             user_name=str(batch.get("user_name") or ""),
             bot_id=str(batch.get("bot_id") or ""),
+            persona_id=namespace["persona_id"],
         )
         return await self.service._summary_provider_attempts(ctx)
 
@@ -2217,7 +2274,10 @@ class HistoricalChatImporter:
                 record = self._summary_record(batch, segment, normalized)
                 summary_memory_id = await self.store.insert_memory(record)
             await self._insert_important_events(batch, segment, normalized, summary_memory_id)
-            await self.store.mark_timeline_summarized([str(item) for item in segment.get("message_ids") or []])
+            await self.store.mark_timeline_summarized(
+                [str(item) for item in segment.get("message_ids") or []],
+                **self._timeline_namespace_kwargs(batch),
+            )
             await self.store.update_chat_import_segment(
                 segment["id"],
                 status="completed" if summary_memory_id else "archived_only",
@@ -2339,6 +2399,7 @@ class HistoricalChatImporter:
         segment: dict[str, Any],
         result: dict[str, Any],
     ) -> MemoryRecord:
+        namespace = self._timeline_namespace_kwargs(batch)
         evidence_lines = []
         for line in str(segment.get("transcript") or "").splitlines()[:12]:
             try:
@@ -2367,6 +2428,7 @@ class HistoricalChatImporter:
             evidence="\n".join(evidence_lines),
             confidence=result["confidence"],
             importance=result["importance"],
+            owner_bot_id=namespace["owner_bot_id"],
             review_status="auto",
             tags=["summary", "historical_chat", "long_term", *result["topics"][:5]],
             metadata={
@@ -2381,7 +2443,8 @@ class HistoricalChatImporter:
                 "summary_event_count": len(segment.get("message_ids") or []),
                 "segment_id": segment["id"],
                 "import_batch_id": batch["id"],
-                "owner_bot_id": batch["bot_id"],
+                "owner_bot_id": namespace["owner_bot_id"],
+                "persona_id": namespace["persona_id"],
                 "historical_archive": True,
             },
             occurred_at=segment["start_at"],
@@ -2605,6 +2668,7 @@ class HistoricalChatImporter:
         summary_memory_id: str,
     ) -> int:
         created = 0
+        namespace = self._timeline_namespace_kwargs(batch)
         for event in result["important_events"]:
             actor = self._entity_for_name(batch, event["actor"])
             object_ref = self._entity_for_name(batch, event["object"])
@@ -2624,6 +2688,7 @@ class HistoricalChatImporter:
                 evidence="；".join(event["source_message_ids"]),
                 confidence=event["confidence"],
                 importance=event["importance"],
+                owner_bot_id=namespace["owner_bot_id"],
                 review_status="auto" if event["confidence"] >= 0.7 else "pending",
                 tags=["important_event", "historical_chat", event["event_type"], event["status"]],
                 metadata={
@@ -2631,7 +2696,8 @@ class HistoricalChatImporter:
                     "source_summary_memory_id": summary_memory_id,
                     "segment_id": segment["id"],
                     "import_batch_id": batch["id"],
-                    "owner_bot_id": batch["bot_id"],
+                    "owner_bot_id": namespace["owner_bot_id"],
+                    "persona_id": namespace["persona_id"],
                     "valid_from": event["start_at"],
                     "valid_until": event["end_at"],
                 },
@@ -3335,6 +3401,7 @@ class HistoricalChatImporter:
         result: dict[str, Any] = {"enabled": enabled, "status": "disabled", "eligible": 0, "indexed": 0}
         if not enabled:
             return result
+        namespace = self._timeline_namespace_kwargs(batch)
         ctx = SessionContext(
             session_id=str(batch.get("session_id") or ""),
             scope=str(batch.get("scope") or "private"),
@@ -3342,6 +3409,7 @@ class HistoricalChatImporter:
             user_id=str(batch.get("user_id") or ""),
             user_name=str(batch.get("user_name") or ""),
             bot_id=str(batch.get("bot_id") or ""),
+            persona_id=namespace["persona_id"],
         )
         try:
             provider, provider_id = await self.service._resolve_embedding_provider(ctx)
@@ -3375,6 +3443,7 @@ class HistoricalChatImporter:
             return result
 
     async def _insert_reconciled_memories(self, batch: dict[str, Any], output: dict[str, Any]) -> None:
+        namespace = self._timeline_namespace_kwargs(batch)
         for raw in output.get("daily_digests") or []:
             if not isinstance(raw, dict):
                 continue
@@ -3398,6 +3467,7 @@ class HistoricalChatImporter:
                 evidence="；".join(raw.get("source_message_ids") or []),
                 confidence=0.72,
                 importance=max(0.0, min(1.0, float(raw.get("importance") or 0.58))),
+                owner_bot_id=namespace["owner_bot_id"],
                 tags=["daily_digest", "historical_chat", date],
                 metadata={
                     "date": date,
@@ -3405,7 +3475,8 @@ class HistoricalChatImporter:
                     "segment_ids": raw.get("segment_ids") or [],
                     "source_message_ids": raw.get("source_message_ids") or [],
                     "import_batch_id": batch["id"],
-                    "owner_bot_id": batch["bot_id"],
+                    "owner_bot_id": namespace["owner_bot_id"],
+                    "persona_id": namespace["persona_id"],
                     "summary_perspective": "neutral_third_person",
                     "detail_schema_version": self.DETAIL_SCHEMA_VERSION,
                 },
@@ -3440,6 +3511,7 @@ class HistoricalChatImporter:
                 evidence="；".join(raw.get("source_message_ids") or []),
                 confidence=confidence,
                 importance=0.7,
+                owner_bot_id=namespace["owner_bot_id"],
                 review_status="auto" if confidence >= 0.75 else "pending",
                 tags=["stable_fact", "historical_chat"],
                 metadata={
@@ -3447,7 +3519,8 @@ class HistoricalChatImporter:
                     "segment_ids": raw.get("segment_ids") or [],
                     "source_message_ids": raw.get("source_message_ids") or [],
                     "import_batch_id": batch["id"],
-                    "owner_bot_id": batch["bot_id"],
+                    "owner_bot_id": namespace["owner_bot_id"],
+                    "persona_id": namespace["persona_id"],
                 },
                 occurred_at=clean_text(raw.get("valid_from"), 80) or utc_now(),
                 source_plugin="historical_chat_import",
@@ -3464,6 +3537,7 @@ class HistoricalChatImporter:
         content = clean_text(content, 1600)
         if not content or not summaries:
             return
+        namespace = self._timeline_namespace_kwargs(batch)
         start_at = clean_text(summaries[0].get("start_at"), 80)
         end_at = clean_text(summaries[-1].get("end_at"), 80)
         record = MemoryRecord(
@@ -3481,13 +3555,15 @@ class HistoricalChatImporter:
             content=content,
             confidence=0.7,
             importance=0.72,
+            owner_bot_id=namespace["owner_bot_id"],
             tags=["relationship_phase", "historical_chat", "long_term"],
             metadata={
                 "start_at": start_at,
                 "end_at": end_at,
                 "segment_ids": [item.get("segment_id") for item in summaries],
                 "import_batch_id": batch["id"],
-                "owner_bot_id": batch["bot_id"],
+                "owner_bot_id": namespace["owner_bot_id"],
+                "persona_id": namespace["persona_id"],
                 "timezone": "Asia/Shanghai",
             },
             occurred_at=start_at or utc_now(),

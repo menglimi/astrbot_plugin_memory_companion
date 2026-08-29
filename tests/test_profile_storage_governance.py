@@ -89,6 +89,50 @@ class ProfileStorageGovernanceTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(store.close)
         return store, path
 
+    async def test_legacy_profile_state_backfill_requires_strong_direct_evidence(self) -> None:
+        store, _path = self.make_store()
+        strong = profile_record(
+            record_id="legacy-strong",
+            value="无糖拿铁",
+            source_id="legacy-strong-source",
+            dimension="drink_preference",
+            cardinality="multi",
+        )
+        weak = profile_record(
+            record_id="legacy-weak",
+            value="燕麦奶",
+            source_id="legacy-weak-source",
+            dimension="drink_preference",
+            cardinality="multi",
+        )
+        strong.metadata.pop("profile_state", None)
+        weak.metadata.pop("profile_state", None)
+        weak.metadata["extraction_quality"] = "inferred"
+        weak.metadata["evidence_strength"] = "independent_evidence"
+        await store.insert_memory(strong)
+        await store.insert_memory(weak)
+
+        normalized = store.normalize_legacy_rule_profile_states()
+
+        self.assertEqual(normalized, 1)
+        strong_after = await store.get_memory("legacy-strong")
+        weak_after = await store.get_memory("legacy-weak")
+        self.assertEqual(strong_after.metadata["profile_state"], "active")
+        self.assertEqual(strong_after.metadata["profile_status"], "active")
+        self.assertEqual(
+            strong_after.metadata["profile_state_backfill_rule"],
+            "legacy_rule_strong_evidence_v1",
+        )
+        self.assertEqual(
+            profile_quality_decision(strong_after, require_active=True),
+            (True, "profile_quality_passed"),
+        )
+        self.assertNotIn("profile_state", weak_after.metadata)
+        self.assertEqual(
+            profile_quality_decision(weak_after, require_active=True),
+            (False, "profile_state_missing"),
+        )
+
     async def add_rule_portrait_fact(
         self,
         store: MemoryStore,
