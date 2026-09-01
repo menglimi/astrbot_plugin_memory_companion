@@ -1879,16 +1879,24 @@ class PluginPageApi:
             return {"error": "memory_page_photo_ref_invalid", "status": 400}
 
         async def refresh_photo_ref() -> str | dict[str, Any]:
-            try:
-                snapshot = await self._companion_page_bridge.export_snapshot(
-                    selected_date,
-                    expected_mode=expected_mode or None,
-                )
-            except CompanionPageBridgeError as exc:
-                return self._companion_photo_error(exc.code)
-            for item in snapshot.payload["day"]["photos"]:
-                if item["id"] == photo_id and item["available"] is True:
-                    return item["photo_ref"]
+            dates = [selected_date]
+            if photo_id and selected_date:
+                dates.append("")
+            last_error = "memory_page_photo_unavailable"
+            for lookup_date in dates:
+                try:
+                    snapshot = await self._companion_page_bridge.export_snapshot(
+                        lookup_date,
+                        expected_mode=expected_mode or None,
+                    )
+                except CompanionPageBridgeError as exc:
+                    last_error = exc.code
+                    continue
+                for item in snapshot.payload["day"]["photos"]:
+                    if item["id"] == photo_id and item["available"] is True:
+                        return item["photo_ref"]
+            if last_error != "memory_page_photo_unavailable":
+                return self._companion_photo_error(last_error)
             return {"error": "memory_page_photo_unavailable", "status": 404}
 
         if not photo_ref and photo_id:
@@ -2289,10 +2297,15 @@ class PluginPageApi:
                 continue
             tags = {clean_text(tag, 80) for tag in (getattr(record, "tags", []) or []) if clean_text(tag, 80)}
             memory_type = clean_text(getattr(record, "memory_type", ""), 80)
-            path = clean_text(metadata.get("image_path") or metadata.get("path"), 500)
+            payload = metadata.get("payload") if isinstance(metadata.get("payload"), dict) else {}
+            path = clean_text(
+                metadata.get("image_path") or metadata.get("path")
+                or payload.get("image_path") or payload.get("path"),
+                500,
+            )
             if not path:
                 continue
-            date = clean_text(metadata.get("date"), 16) or self._memory_date_key(record)
+            date = clean_text(metadata.get("date"), 16) or clean_text(payload.get("date"), 16) or self._memory_date_key(record)
             if selected_date and date and date != selected_date:
                 continue
             source = "memory_photo"
@@ -2320,9 +2333,9 @@ class PluginPageApi:
                     "url": f"{PAGE_API_PREFIXES[0]}/companion/personal-photo?{query}",
                     "image_data_url": f"/companion/personal-photo-data?{query}",
                     "exists": exists,
-                    "backend": clean_text(metadata.get("backend"), 80),
-                    "prompt": clean_text(metadata.get("prompt_preview") or metadata.get("prompt"), 360),
-                    "note": clean_text(metadata.get("note") or getattr(record, "content", ""), 220),
+                    "backend": clean_text(metadata.get("backend") or payload.get("backend"), 80),
+                    "prompt": clean_text(metadata.get("prompt_preview") or metadata.get("prompt") or payload.get("prompt"), 360),
+                    "note": clean_text(metadata.get("note") or payload.get("note") or getattr(record, "content", ""), 220),
                     "error": "" if exists else "图片文件不可用",
                     "generated_at": self._timestamp_label(getattr(record, "occurred_at", "") or getattr(record, "created_at", "")),
                 }
@@ -2639,14 +2652,25 @@ class PluginPageApi:
         if not isinstance(metadata, dict):
             metadata = {}
         content = clean_text(getattr(record, "content", ""), 360)
+        payload = metadata.get("payload") if isinstance(metadata.get("payload"), dict) else {}
+        memory_type = clean_text(getattr(record, "memory_type", ""), 80)
         return (
             getattr(record, "visibility", "") == "bot_self"
             and (
-                getattr(record, "memory_type", "") == "schedule_fragment"
+                memory_type in {"schedule_fragment", "bot_schedule_plan", "bot_detail_fragment", "bot_calendar_event"}
                 or "schedule" in tag_set
                 or "daily_plan" in tag_set
                 or "daily_detail" in tag_set
                 or bool(clean_text(metadata.get("start"), 20) or clean_text(metadata.get("end"), 20))
+                or bool(
+                    clean_text(payload.get("date"), 16)
+                    and (
+                        clean_text(payload.get("summary"), 180)
+                        or isinstance(payload.get("items"), list)
+                        or isinstance(payload.get("events"), list)
+                        or isinstance(payload.get("today_events"), list)
+                    )
+                )
                 or "当日生活日程" in content
                 or "日程细化" in content
             )
@@ -2658,11 +2682,12 @@ class PluginPageApi:
         metadata = getattr(record, "metadata", {}) or {}
         if not isinstance(metadata, dict):
             return False
-        if not clean_text(metadata.get("image_path") or metadata.get("path"), 500):
+        payload = metadata.get("payload") if isinstance(metadata.get("payload"), dict) else {}
+        if not clean_text(metadata.get("image_path") or metadata.get("path") or payload.get("image_path") or payload.get("path"), 500):
             return False
         tags = {clean_text(tag, 80) for tag in (getattr(record, "tags", []) or []) if clean_text(tag, 80)}
         return (
-            getattr(record, "memory_type", "") in {"image_action", "persona_life"}
+            getattr(record, "memory_type", "") in {"image_action", "persona_life", "bot_media_memory"}
             or bool(tags & {"daily_outfit", "outfit", "life_photo", "image", "current_state"})
             or getattr(record, "source_plugin", "") == "private_companion"
         )
@@ -2813,17 +2838,22 @@ class PluginPageApi:
             metadata = getattr(record, "metadata", {}) or {}
             if not isinstance(metadata, dict):
                 metadata = {}
-            date = clean_text(metadata.get("date"), 16) or self._memory_date_key(record)
+            payload = metadata.get("payload") if isinstance(metadata.get("payload"), dict) else {}
+            date = clean_text(metadata.get("date"), 16) or clean_text(payload.get("date"), 16) or self._memory_date_key(record)
             if date != selected_date:
                 continue
-            start = clean_text(metadata.get("start"), 20)
-            end = clean_text(metadata.get("end"), 20)
-            summary = clean_text(metadata.get("summary"), 180)
+            start = clean_text(metadata.get("start"), 20) or clean_text(payload.get("start"), 20)
+            end = clean_text(metadata.get("end"), 20) or clean_text(payload.get("end"), 20)
+            summary = clean_text(metadata.get("summary"), 180) or clean_text(payload.get("summary"), 180)
             content = str(getattr(record, "content", "") or "")[:1600]
             if not summary:
                 summary = self._schedule_detail_summary_from_content(content)
             today_events = self._schedule_detail_lines_from_content(content, "生活片段：")
             proactive_events = self._schedule_detail_lines_from_content(content, "可能主动念头：")
+            if not today_events:
+                today_events = self._schedule_detail_payload_lines(payload.get("events") or payload.get("today_events"))
+            if not proactive_events:
+                proactive_events = self._schedule_detail_payload_lines(payload.get("proactive_events"))
             if not summary and not today_events and not proactive_events:
                 continue
             index = self._schedule_detail_index_for_time(plan, start)
@@ -2842,6 +2872,20 @@ class PluginPageApi:
         rows.sort(key=lambda item: clean_text(item.get("time"), 40))
         return rows[-18:]
 
+    @staticmethod
+    def _schedule_detail_payload_lines(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        rows: list[str] = []
+        for item in value[:8]:
+            if isinstance(item, dict):
+                text = clean_text(item.get("event") or item.get("topic") or item.get("text") or item.get("summary"), 180)
+            else:
+                text = clean_text(item, 180)
+            if text and text not in rows:
+                rows.append(text)
+        return rows[:6]
+
     def _schedule_memory_plan_for_date(self, records: list[Any], selected_date: str) -> dict[str, Any]:
         if not selected_date:
             return {}
@@ -2852,13 +2896,22 @@ class PluginPageApi:
             metadata = getattr(record, "metadata", {}) or {}
             if not isinstance(metadata, dict):
                 metadata = {}
-            date = clean_text(metadata.get("date"), 16) or self._memory_date_key(record)
+            payload = metadata.get("payload") if isinstance(metadata.get("payload"), dict) else {}
+            date = clean_text(metadata.get("date"), 16) or clean_text(payload.get("date"), 16) or self._memory_date_key(record)
             if date != selected_date:
                 continue
             content = str(getattr(record, "content", "") or "")
-            if "当日生活日程" not in content and clean_text(getattr(record, "memory_type", ""), 80) != "schedule_fragment":
+            items = payload.get("items") if isinstance(payload.get("items"), list) else []
+            if "当日生活日程" not in content and not items and clean_text(getattr(record, "memory_type", ""), 80) not in {"schedule_fragment", "bot_schedule_plan"}:
                 continue
-            items = self._schedule_plan_items_from_content(content)
+            if not items:
+                items = self._schedule_plan_items_from_content(content)
+            else:
+                items = [
+                    self._compact_plan_item(item, index=index)
+                    for index, item in enumerate(items)
+                    if isinstance(item, dict)
+                ]
             if len(items) > len(best_items):
                 best_items = items
         if not best_items:
