@@ -597,6 +597,12 @@
         "type": "int",
         "default": 1800
       },
+      "max_item_chars": {
+        "description": "单条记忆内容上限",
+        "hint": "每条注入记忆的内容最多保留多少字符（默认 220）。对话总结等长记忆默认会被截断到该上限、细节需靠 navigate/recall 工具补；若工具使用率低、希望注入里保留更多原文可调大（注入包总长仍受「最大注入字数」限制）。",
+        "type": "int",
+        "default": 220
+      },
       "temporal_aggregate_max_chars": {
         "description": "时间聚合注入字数",
         "hint": "当用户问最近一周、最近几天、本周这类需要汇总多条记忆的问题时使用。默认更宽，且会用精简证据格式注入。",

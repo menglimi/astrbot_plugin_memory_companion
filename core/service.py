@@ -2554,6 +2554,7 @@ class MemoryCompanionService:
                 max_chars or self.config.int("memory_injection.max_chars", 1800),
                 core_memories=core_memories,
                 core_memory_max_chars=core_memory_max_chars,
+                max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
             )
 
         schedule_types = {"schedule_fragment", "persona_life", "companion_note"}
@@ -2691,6 +2692,7 @@ class MemoryCompanionService:
                 max_chars or self.config.int("memory_injection.max_chars", 1800),
                 core_memories=core_memories,
                 core_memory_max_chars=core_memory_max_chars,
+                max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
             )
 
         slot_map: dict[str, list[SearchResult]] = {"self_timeline": [], "user_profile": []}
@@ -2740,6 +2742,7 @@ class MemoryCompanionService:
             address_hint="" if outfit_focus else self._address_hint_for_injection(ctx),
             core_memories=core_memories,
             core_memory_max_chars=core_memory_max_chars,
+            max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
         )
         logger.info(
             "[MemoryCompanion] %s快速上下文已生成: session=%s candidates=%s selected=%s chars=%s elapsed_ms=%s",
@@ -7474,6 +7477,7 @@ class MemoryCompanionService:
                 core_memories=core_memories,
                 core_memory_max_chars=core_memory_max_chars,
                 included_memory_ids=static_included_memory_ids,
+                max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
             )
 
         if decision.suppress_long_memory:
@@ -7633,6 +7637,7 @@ class MemoryCompanionService:
             included_memory_ids=included_memory_ids,
             core_memories=core_memories,
             core_memory_max_chars=core_memory_max_chars,
+            max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
         )
         injection_omissions, _diagnostic_included_memory_ids = self.injection.diagnostic_snapshot()
         blocked.extend(injection_omissions)
@@ -7828,6 +7833,7 @@ class MemoryCompanionService:
                     core_memories=core_memories,
                     core_memory_max_chars=core_memory_max_chars,
                     included_memory_ids=actual_injected_memory_ids,
+                    max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
                 )
             self._log_injection_debug(
                 ctx=ctx,
@@ -7997,6 +8003,7 @@ class MemoryCompanionService:
             included_memory_ids=actual_injected_memory_ids,
             core_memories=core_memories,
             core_memory_max_chars=core_memory_max_chars,
+            max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
         )
         injection_omissions, _diagnostic_included_memory_ids = self.injection.diagnostic_snapshot()
         blocked.extend(injection_omissions)

@@ -44,6 +44,7 @@ class InjectionComposer:
         included_memory_ids: list[str] | None = None,
         core_memories: list[MemoryRecord] | None = None,
         core_memory_max_chars: int = 800,
+        max_item_chars: int = 220,
     ) -> str:
         results, slot_sections = self._filter_injection_results(results, slot_sections)
         core_memories = list(core_memories or [])
@@ -191,6 +192,7 @@ class InjectionComposer:
             inner_limit=inner_limit,
             short_rest_check=bool(rest_check_hint),
             included_memory_ids=included_memory_ids,
+            max_item_chars=max_item_chars,
         )
         if memory_lines:
             lines.extend(memory_lines)
@@ -304,6 +306,7 @@ class InjectionComposer:
         inner_limit: int,
         short_rest_check: bool = False,
         included_memory_ids: list[str] | None = None,
+        max_item_chars: int = 220,
     ) -> list[str]:
         if short_rest_check:
             return self._build_short_rest_memory_lines(
@@ -364,7 +367,10 @@ class InjectionComposer:
         memory_lines: list[str] = []
         total_items = max(1, sum(len(items) for items in grouped.values()))
         available = max(0, inner_limit - len("\n".join([*base_lines, *closing_lines])))
-        detail_limit = max(32, min(220, available // total_items - 42))
+        # 单条记忆内容上限可配置（memory_injection.max_item_chars，默认 220）：
+        # 作者原意是按「内心提示」级信息量截断、细节由 navigate/recall 工具补；
+        # 对 summary 等长记忆，若工具使用率低则截断信息会丢失，调大该上限可减少截断。
+        detail_limit = max(32, min(max(1, max_item_chars), available // total_items - 42))
 
         def fits(candidate: list[str]) -> bool:
             return len("\n".join([*base_lines, *candidate, *closing_lines])) <= inner_limit
