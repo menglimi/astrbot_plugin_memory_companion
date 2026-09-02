@@ -244,6 +244,15 @@ class MemoryCompanionService:
         self.plugin_root = Path(plugin_root)
         self.data_dir = Path(data_dir)
 
+        # 启动宽限期：插件加载后的前 N 秒内暂缓创建任何后台任务，
+        # 避开 AstrBot 核心加载完插件后执行的 SQLAlchemy 连接池迁移窗口，
+        # 防止插件后台线程的高频 DB 并发撞上核心 deque 迭代（RuntimeError: deque mutated during iteration）。
+        self._service_created_at = time.monotonic()
+        self._background_grace_seconds = max(
+            0,
+            self.config.int("startup.background_grace_seconds", 60),
+        )
+
         self.store = MemoryStore(self.data_dir / "memory_companion.db")
         try:
             self.store.initialize()
@@ -3911,6 +3920,20 @@ class MemoryCompanionService:
             if callable(close):
                 close()
             return None
+        # 启动宽限期屏障：核心迁移窗口内不真正创建后台任务，避免并发 DB 风暴。
+        if self._background_grace_seconds > 0:
+            elapsed = time.monotonic() - self._service_created_at
+            if elapsed < self._background_grace_seconds:
+                close = getattr(coro, "close", None)
+                if callable(close):
+                    close()
+                logger.debug(
+                    "[MemoryCompanion] 启动宽限期内暂缓后台任务 %s (%.0fs/%.0fs)",
+                    label,
+                    elapsed,
+                    self._background_grace_seconds,
+                )
+                return None
         try:
             task = asyncio.create_task(coro, name=f"memory_companion:{label}")
         except RuntimeError:
