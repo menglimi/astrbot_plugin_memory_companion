@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -607,4 +608,5 @@ class MemoryAuditManager:
 
     @staticmethod
     def _public_batch(batch: dict[str, Any]) -> dict[str, Any]:
-        return json.loads(json.dumps(batch, ensure_ascii=False))
+        # 深拷贝防止调用方修改原始数据；JSON 往返是多余的序列化开销。
+        return deepcopy(batch)

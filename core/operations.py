@@ -17,6 +17,7 @@ PORTABLE_FORMAT = "astrbot-memory-jsonl"
 PORTABLE_VERSION = 1
 MAX_PORTABLE_BYTES = 64 * 1024 * 1024
 PORTABLE_EXPORT_PAGE_SIZE = 500
+PORTABLE_IMPORT_BATCH_SIZE = 200
 
 
 PRESETS: dict[str, dict[str, Any]] = {
@@ -395,6 +396,7 @@ class PortableMemoryArchive:
         imported: Counter[str] = Counter()
         skipped: Counter[str] = Counter()
         errors: list[str] = []
+        ops: list[dict[str, Any]] = []
         for index, item in enumerate(records, start=2):
             kind = clean_text(item.get("record_type"), 40)
             data = item.get("data")
@@ -402,93 +404,32 @@ class PortableMemoryArchive:
                 skipped[kind or "unknown"] += 1
                 continue
             try:
-                if kind == "memory":
-                    record = self._memory_record(data, batch_id)
-                    if not record.content:
-                        skipped[kind] += 1
-                        continue
-                    await self.store.insert_memory(record)
-                elif kind == "identity":
-                    await self.store.upsert_identity(
-                        platform=clean_text(data.get("platform"), 80),
-                        entity=EntityRef(
-                            kind=clean_text(data.get("entity_kind"), 40) or "user",
-                            id=clean_text(data.get("entity_id"), 120),
-                            name=clean_text(data.get("display_name"), 80),
-                            role=clean_text(data.get("role"), 80) or "unknown",
-                        ),
-                        aliases=self._list(data.get("aliases")),
-                        profile=self._dict(data.get("profile")),
-                        confidence=self._float(data.get("confidence"), 0.6),
-                    )
-                elif kind == "relationship":
-                    await self.store.upsert_relationship(
-                        subject=EntityRef(
-                            kind=clean_text(data.get("subject_kind"), 40),
-                            id=clean_text(data.get("subject_id"), 120),
-                            name=clean_text(data.get("subject_name"), 80),
-                        ),
-                        object=EntityRef(
-                            kind=clean_text(data.get("object_kind"), 40),
-                            id=clean_text(data.get("object_id"), 120),
-                            name=clean_text(data.get("object_name"), 80),
-                        ),
-                        relation_type=clean_text(data.get("relation_type"), 80),
-                        scope=clean_text(data.get("scope"), 40),
-                        session_id=clean_text(data.get("session_id"), 200),
-                        group_id=clean_text(data.get("group_id"), 120),
-                        visibility=clean_text(data.get("visibility"), 40) or "internal",
-                        evidence=clean_text(data.get("evidence"), 1000),
-                        confidence=self._float(data.get("confidence"), 0.6),
-                        review_status=clean_text(data.get("review_status"), 40) or "auto",
-                        source_memory_id=clean_text(data.get("source_memory_id"), 120),
-                        metadata=self._dict(data.get("metadata")),
-                    )
-                elif kind == "timeline":
-                    metadata = self._dict(data.get("metadata"))
-                    metadata.setdefault("message_id", clean_text(data.get("message_id") or data.get("id"), 120))
-                    metadata["portable_import_batch_id"] = batch_id
-                    timeline_id = await self.store.add_timeline_event(
-                        event_type=clean_text(data.get("event_type"), 80),
-                        session_id=clean_text(data.get("session_id"), 200),
-                        scope=clean_text(data.get("scope"), 40),
-                        subject_id=clean_text(data.get("subject_id"), 120),
-                        object_id=clean_text(data.get("object_id"), 120),
-                        content=clean_text(data.get("content"), 4000),
-                        metadata=metadata,
-                        occurred_at=clean_text(data.get("occurred_at"), 80),
-                    )
-                    if clean_text(data.get("summarized_at"), 80):
-                        await self.store.mark_timeline_summarized([timeline_id])
-                elif kind == "acl_rule":
-                    await self.store.upsert_acl_rule(
-                        owner_scope=clean_text(data.get("owner_scope"), 40),
-                        owner_id=clean_text(data.get("owner_id"), 160),
-                        reader_scope=clean_text(data.get("reader_scope"), 40),
-                        reader_id=clean_text(data.get("reader_id"), 160),
-                        effect=clean_text(data.get("effect"), 20) or "allow",
-                        enabled=bool(data.get("enabled", True)),
-                        note=clean_text(data.get("note"), 300),
-                    )
-                elif kind == "acl_policy":
-                    policy_values = {
-                        "window_scope": clean_text(data.get("window_scope"), 40),
-                        "window_id": clean_text(data.get("window_id"), 160),
-                        "read_mode": clean_text(data.get("read_mode"), 20),
-                        "share_mode": clean_text(data.get("share_mode"), 20),
-                    }
-                    for feature in ("capture_enabled", "recall_enabled"):
-                        if feature in data:
-                            policy_values[feature] = data.get(feature)
-                    await self.store.upsert_acl_policy(**policy_values)
-                else:
-                    skipped[kind or "unknown"] += 1
-                    continue
-                imported[kind] += 1
+                op = self._import_operation(kind, data, batch_id)
             except Exception as exc:
                 skipped[kind or "unknown"] += 1
                 if len(errors) < 20:
                     errors.append(f"line {index}: {type(exc).__name__}: {clean_text(exc, 180)}")
+                continue
+            if op is None:
+                skipped[kind or "unknown"] += 1
+                continue
+            op["line"] = index
+            ops.append(op)
+        # 批量写入：分批单事务一次 commit，避免每条记录一个独立事务 + fsync。
+        for start in range(0, len(ops), PORTABLE_IMPORT_BATCH_SIZE):
+            chunk = ops[start : start + PORTABLE_IMPORT_BATCH_SIZE]
+            results = await self.store.import_batch_ops(chunk)
+            for op, result in zip(chunk, results):
+                op_kind = op["kind"]
+                if result.get("ok"):
+                    imported[op_kind] += 1
+                    continue
+                skipped[op_kind] += 1
+                if len(errors) < 20:
+                    code = result.get("code") or "import_op_error"
+                    message = clean_text(result.get("error"), 180)
+                    detail = f": {message}" if message else ""
+                    errors.append(f"line {op.get('line')}: {code}{detail}")
         return {
             "path": str(Path(path).expanduser().resolve()),
             "backup": str(backup),
@@ -497,6 +438,101 @@ class PortableMemoryArchive:
             "skipped": dict(skipped),
             "errors": errors,
         }
+
+    def _import_operation(
+        self, kind: str, data: dict[str, Any], batch_id: str
+    ) -> dict[str, Any] | None:
+        """把一条导入记录转换为批量写入 op；无法导入的记录返回 None。"""
+        if kind == "memory":
+            record = self._memory_record(data, batch_id)
+            if not record.content:
+                return None
+            return {"kind": "memory", "record": record}
+        if kind == "identity":
+            return {
+                "kind": "identity",
+                "params": {
+                    "platform": clean_text(data.get("platform"), 80),
+                    "entity": EntityRef(
+                        kind=clean_text(data.get("entity_kind"), 40) or "user",
+                        id=clean_text(data.get("entity_id"), 120),
+                        name=clean_text(data.get("display_name"), 80),
+                        role=clean_text(data.get("role"), 80) or "unknown",
+                    ),
+                    "aliases": self._list(data.get("aliases")),
+                    "profile": self._dict(data.get("profile")),
+                    "confidence": self._float(data.get("confidence"), 0.6),
+                },
+            }
+        if kind == "relationship":
+            return {
+                "kind": "relationship",
+                "params": {
+                    "subject": EntityRef(
+                        kind=clean_text(data.get("subject_kind"), 40),
+                        id=clean_text(data.get("subject_id"), 120),
+                        name=clean_text(data.get("subject_name"), 80),
+                    ),
+                    "object": EntityRef(
+                        kind=clean_text(data.get("object_kind"), 40),
+                        id=clean_text(data.get("object_id"), 120),
+                        name=clean_text(data.get("object_name"), 80),
+                    ),
+                    "relation_type": clean_text(data.get("relation_type"), 80),
+                    "scope": clean_text(data.get("scope"), 40),
+                    "session_id": clean_text(data.get("session_id"), 200),
+                    "group_id": clean_text(data.get("group_id"), 120),
+                    "visibility": clean_text(data.get("visibility"), 40) or "internal",
+                    "evidence": clean_text(data.get("evidence"), 1000),
+                    "confidence": self._float(data.get("confidence"), 0.6),
+                    "review_status": clean_text(data.get("review_status"), 40) or "auto",
+                    "source_memory_id": clean_text(data.get("source_memory_id"), 120),
+                    "metadata": self._dict(data.get("metadata")),
+                },
+            }
+        if kind == "timeline":
+            metadata = self._dict(data.get("metadata"))
+            metadata.setdefault("message_id", clean_text(data.get("message_id") or data.get("id"), 120))
+            metadata["portable_import_batch_id"] = batch_id
+            return {
+                "kind": "timeline",
+                "params": {
+                    "event_type": clean_text(data.get("event_type"), 80),
+                    "session_id": clean_text(data.get("session_id"), 200),
+                    "scope": clean_text(data.get("scope"), 40),
+                    "subject_id": clean_text(data.get("subject_id"), 120),
+                    "object_id": clean_text(data.get("object_id"), 120),
+                    "content": clean_text(data.get("content"), 4000),
+                    "metadata": metadata,
+                    "occurred_at": clean_text(data.get("occurred_at"), 80),
+                },
+                "summarize": bool(clean_text(data.get("summarized_at"), 80)),
+            }
+        if kind == "acl_rule":
+            return {
+                "kind": "acl_rule",
+                "params": {
+                    "owner_scope": clean_text(data.get("owner_scope"), 40),
+                    "owner_id": clean_text(data.get("owner_id"), 160),
+                    "reader_scope": clean_text(data.get("reader_scope"), 40),
+                    "reader_id": clean_text(data.get("reader_id"), 160),
+                    "effect": clean_text(data.get("effect"), 20) or "allow",
+                    "enabled": bool(data.get("enabled", True)),
+                    "note": clean_text(data.get("note"), 300),
+                },
+            }
+        if kind == "acl_policy":
+            policy_values = {
+                "window_scope": clean_text(data.get("window_scope"), 40),
+                "window_id": clean_text(data.get("window_id"), 160),
+                "read_mode": clean_text(data.get("read_mode"), 20),
+                "share_mode": clean_text(data.get("share_mode"), 20),
+            }
+            for feature in ("capture_enabled", "recall_enabled"):
+                if feature in data:
+                    policy_values[feature] = data.get(feature)
+            return {"kind": "acl_policy", "params": policy_values}
+        return None
 
     @staticmethod
     def _write_line(handle: Any, payload: dict[str, Any]) -> None:

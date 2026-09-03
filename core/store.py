@@ -10,12 +10,14 @@ from copy import deepcopy
 from datetime import datetime, timezone
 import re
 import sqlite3
+import struct
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
 from .identity import parse_scope_from_session
+from .astrbot_compat import logger
 from .memory_atom import (
     DURABILITY_LEVELS,
     SENSITIVITY_LEVELS,
@@ -45,6 +47,40 @@ from .sensitive_data import redact_sensitive_text, redact_sensitive_value
 
 
 _ACL_UNSET = object()
+
+
+# 向量二进制格式常量：little-endian float64 打包，
+# 相比 JSON 文本列可减少约 60% 存储体积并省去 json 解析开销。
+_EMBEDDING_VECTOR_FMT = "<d"
+
+
+def _pack_embedding_vector(values: list[float]) -> bytes:
+    """把向量序列化为二进制 bytes（兼容旧 JSON 文本读取）。"""
+    floats = [float(item) for item in values if isinstance(item, (int, float))]
+    if not floats:
+        return b""
+    return struct.pack(f"<{len(floats)}d", *floats)
+
+
+def _unpack_embedding_vector(raw: Any) -> list[float]:
+    """按二进制格式解析向量；若是旧 JSON 文本则回退 json 解析。"""
+    if isinstance(raw, (bytes, bytearray, memoryview)):
+        payload = bytes(raw)
+        count = len(payload) // 8
+        if count <= 0:
+            return []
+        return list(struct.unpack(f"<{count}d", payload[: count * 8]))
+    if isinstance(raw, str) and raw:
+        payload = json_loads(raw, [])
+        if isinstance(payload, list):
+            vector: list[float] = []
+            for item in payload:
+                try:
+                    vector.append(float(item))
+                except Exception:
+                    return []
+            return vector
+    return []
 
 
 class MemoryStore:
@@ -1017,6 +1053,11 @@ class MemoryStore:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_portrait_learning_queue_person ON portrait_learning_queue(person_id, state, updated_at)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_profile_domain "
+                "ON memories(platform, subject_kind, subject_id, object_kind, "
+                "object_id, scope, group_id, visibility, memory_type, lifecycle)"
             )
             self._redact_existing_sensitive_rows_sync()
             self._cleanup_placeholder_memory_indexes_sync()
@@ -3533,8 +3574,10 @@ class MemoryStore:
         now = utc_now()
 
         with self._lock:  # noqa: SIM117
+            # T3: 画像域扫描为只读查询，前移到写事务外执行（autocommit 读），
+            # 避免在 BEGIN IMMEDIATE 持有写锁期间做全表扫描而阻塞其他写者。
+            domain_rows = self._profile_domain_rows_sync(record)
             with self._transaction_sync():
-                domain_rows = self._profile_domain_rows_sync(record)
                 exact_records: list[MemoryRecord] = []
                 for row in domain_rows:
                     candidate = MemoryRecord.from_row(row)
@@ -4014,6 +4057,14 @@ class MemoryStore:
             "SELECT * FROM memory_embeddings WHERE memory_id=? ORDER BY provider_id",
             (record.id,),
         ).fetchall()
+        embedding_snapshots: list[dict[str, Any]] = []
+        for row in embedding_rows:
+            snapshot = dict(row)
+            raw_vector = snapshot.get("vector")
+            # 二进制向量转回 JSON 文本，保证快照可 json 序列化且恢复路径兼容
+            if isinstance(raw_vector, (bytes, bytearray, memoryview)):
+                snapshot["vector"] = json_dumps(_unpack_embedding_vector(raw_vector))
+            embedding_snapshots.append(snapshot)
         return {
             "record_kind": "memory",
             "record_id": record.id,
@@ -4022,7 +4073,7 @@ class MemoryStore:
             "guard_only": bool(guard_only),
             "before": self._memory_db_snapshot(record),
             "review_queue": [dict(row) for row in review_rows],
-            "embeddings": [dict(row) for row in embedding_rows],
+            "embeddings": embedding_snapshots,
             "after_fingerprint": "",
         }
 
@@ -5297,7 +5348,13 @@ class MemoryStore:
             review_reason,
         )
 
-    def _insert_memory_sync(self, record: MemoryRecord, review_reason: str = "") -> str:
+    def _insert_memory_sync(
+        self,
+        record: MemoryRecord,
+        review_reason: str = "",
+        _commit: bool = True,
+    ) -> str:
+        # _commit=False 用于批量写链：由外层事务统一提交，避免逐次 fsync。
         record.ensure_defaults()
         data = record.to_db()
         columns = ", ".join(data.keys())
@@ -5402,7 +5459,8 @@ class MemoryStore:
                 )
                 row = self._conn.execute("SELECT * FROM memories WHERE id=?", (duplicate["id"],)).fetchone()
                 self._upsert_memory_fts_row(row)
-                self._conn.commit()
+                if _commit:
+                    self._conn.commit()
                 return str(duplicate["id"])
             self._conn.execute(
                 f"INSERT INTO memories ({columns}) VALUES ({placeholders}) "
@@ -5413,7 +5471,8 @@ class MemoryStore:
                 self._upsert_review_sync(record.id, review_reason or "待人工确认")
             row = self._conn.execute("SELECT * FROM memories WHERE id=?", (record.id,)).fetchone()
             self._upsert_memory_fts_row(row)
-            self._conn.commit()
+            if _commit:
+                self._conn.commit()
         return record.id
 
     def _upsert_review_sync(self, memory_id: str, reason: str) -> None:
@@ -5451,7 +5510,13 @@ class MemoryStore:
             confidence,
         )
 
-    def _upsert_identity_sync(
+    async def upsert_identities(
+        self, identities: list[dict[str, Any]]
+    ) -> list[str]:
+        """批量写入多条身份记录，合并为单事务提交（减少独立 commit）。"""
+        return await asyncio.to_thread(self._upsert_identities_sync, identities)
+
+    def _upsert_identity_row_locked(
         self,
         platform: str,
         entity: EntityRef,
@@ -5459,6 +5524,7 @@ class MemoryStore:
         profile: dict[str, Any],
         confidence: float,
     ) -> str:
+        """写入单行身份记录；调用方须已持有 ``self._lock`` 且处于事务中。"""
         now = utc_now()
         entity_id = clean_text(entity.id, 120)
         if not entity_id:
@@ -5467,51 +5533,77 @@ class MemoryStore:
         aliases = [clean_text(alias, 80) for alias in aliases if clean_text(alias, 80)]
         if entity.name and entity.name not in aliases:
             aliases.append(entity.name)
+        old = self._conn.execute(
+            "SELECT aliases, profile, created_at FROM identities WHERE id=?",
+            (row_id,),
+        ).fetchone()
+        created_at = now
+        if old:
+            created_at = old["created_at"] or now
+            merged_aliases = list(dict.fromkeys(json_loads(old["aliases"], []) + aliases))
+            merged_profile = json_loads(old["profile"], {})
+            merged_profile.update(profile)
+        else:
+            merged_aliases = aliases
+            merged_profile = profile
+        self._conn.execute(
+            """
+            INSERT INTO identities(
+                id, platform, entity_kind, entity_id, display_name, role, aliases,
+                profile, confidence, created_at, updated_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(platform, entity_kind, entity_id) DO UPDATE SET
+                display_name=excluded.display_name,
+                role=excluded.role,
+                aliases=excluded.aliases,
+                profile=excluded.profile,
+                confidence=max(identities.confidence, excluded.confidence),
+                updated_at=excluded.updated_at
+            """,
+            (
+                row_id,
+                platform,
+                entity.kind,
+                entity_id,
+                clean_text(entity.name, 80),
+                clean_text(entity.role, 80),
+                json_dumps(merged_aliases),
+                json_dumps(merged_profile),
+                confidence,
+                created_at,
+                now,
+            ),
+        )
+        return row_id
+
+    def _upsert_identity_sync(
+        self,
+        platform: str,
+        entity: EntityRef,
+        aliases: list[str],
+        profile: dict[str, Any],
+        confidence: float,
+    ) -> str:
         with self._lock:
-            old = self._conn.execute(
-                "SELECT aliases, profile, created_at FROM identities WHERE id=?",
-                (row_id,),
-            ).fetchone()
-            created_at = now
-            if old:
-                created_at = old["created_at"] or now
-                merged_aliases = list(dict.fromkeys(json_loads(old["aliases"], []) + aliases))
-                merged_profile = json_loads(old["profile"], {})
-                merged_profile.update(profile)
-            else:
-                merged_aliases = aliases
-                merged_profile = profile
-            self._conn.execute(
-                """
-                INSERT INTO identities(
-                    id, platform, entity_kind, entity_id, display_name, role, aliases,
-                    profile, confidence, created_at, updated_at
-                )
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(platform, entity_kind, entity_id) DO UPDATE SET
-                    display_name=excluded.display_name,
-                    role=excluded.role,
-                    aliases=excluded.aliases,
-                    profile=excluded.profile,
-                    confidence=max(identities.confidence, excluded.confidence),
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    row_id,
-                    platform,
-                    entity.kind,
-                    entity_id,
-                    clean_text(entity.name, 80),
-                    clean_text(entity.role, 80),
-                    json_dumps(merged_aliases),
-                    json_dumps(merged_profile),
-                    confidence,
-                    created_at,
-                    now,
-                ),
+            row_id = self._upsert_identity_row_locked(
+                platform, entity, aliases, profile, confidence
             )
             self._conn.commit()
         return row_id
+
+    def _upsert_identities_sync(
+        self, identities: list[dict[str, Any]]
+    ) -> list[str]:
+        """批量身份写入：单事务（BEGIN IMMEDIATE + 一次 commit）。"""
+        if not identities:
+            return []
+        with self._lock:
+            with self._transaction_sync():
+                return [
+                    self._upsert_identity_row_locked(**identity)
+                    for identity in identities
+                ]
 
     async def list_identities(self, limit: int = 1000, *, offset: int = 0) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self._list_identities_sync, limit, offset)
@@ -5577,6 +5669,7 @@ class MemoryStore:
         review_status: str,
         source_memory_id: str,
         metadata: dict[str, Any],
+        _commit: bool = True,
     ) -> str:
         now = utc_now()
         row_id = new_id("rel")
@@ -5648,8 +5741,97 @@ class MemoryStore:
                     now,
                 ),
             )
-            self._conn.commit()
+            if _commit:
+                self._conn.commit()
         return row_id
+
+    async def capture_write_batch(
+        self, ops: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """批量执行采集写链，合并为单事务一次 commit。
+
+        ops 为有序写操作描述列表，元素形如：
+          - {"kind": "relationship", "source_memory_id": str,
+             "params": {详见 _upsert_relationship_sync 关键字参数}}
+          - {"kind": "profile", "record": MemoryRecord}
+          - {"kind": "memory", "record": MemoryRecord}
+        可附加字段：
+          - "requires_ok": list[int] 仅当这些索引对应的 op 均成功才执行
+          - "source_memory_id_from": int 从该索引 op 的结果中取 memory_id
+        profile 项内部已含 SAVEPOINT（_transaction_sync），在外层事务中自动降级嵌套；
+        memory 项通过 _commit=False 复用内部无 commit 变体。
+        返回与 ops 等长的结果列表；单项失败被 SAVEPOINT 隔离，不拖累整批。
+        """
+        return await asyncio.to_thread(self._capture_write_batch_sync, ops)
+
+    def _capture_write_batch_sync(
+        self, ops: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        if not ops:
+            return results
+        with self._lock:
+            with self._transaction_sync():
+                for index, op in enumerate(ops):
+                    required_indexes = op.get("requires_ok") or []
+                    if any(
+                        i >= len(results) or not results[i].get("ok")
+                        for i in required_indexes
+                    ):
+                        results.append({"ok": False, "code": "skip_required_op_failed"})
+                        continue
+                    kind = op["kind"]
+                    try:
+                        with self._transaction_sync():  # 单项 SAVEPOINT 隔离失败
+                            if kind == "relationship":
+                                params = dict(op["params"])
+                                if op.get("source_memory_id_from") is not None:
+                                    src_index = op["source_memory_id_from"]
+                                    src = (
+                                        results[src_index].get("memory_id") or ""
+                                        if src_index < len(results)
+                                        else ""
+                                    )
+                                    params["source_memory_id"] = src
+                                elif op.get("source_memory_id"):
+                                    params["source_memory_id"] = op["source_memory_id"]
+                                elif "source_memory_id" not in params:
+                                    params["source_memory_id"] = ""
+                                row_id = self._upsert_relationship_sync(
+                                    _commit=False, **params
+                                )
+                                results.append({"ok": True, "row_id": row_id})
+                            elif kind == "profile":
+                                results.append(
+                                    self._upsert_profile_candidate_sync(op["record"])
+                                )
+                            elif kind == "memory":
+                                memory_id = self._insert_memory_sync(
+                                    op["record"],
+                                    op.get("review_reason") or "",
+                                    _commit=False,
+                                )
+                                results.append({"ok": True, "memory_id": memory_id})
+                            else:
+                                results.append(
+                                    {"ok": False, "code": f"unknown_batch_op:{kind}"}
+                                )
+                    except Exception as exc:
+                        logger.warning(
+                            "[MemoryCompanion] 批量写入单项失败 index=%s kind=%s error=%s",
+                            index,
+                            kind,
+                            exc,
+                            exc_info=True,
+                        )
+                        results.append(
+                            {
+                                "ok": False,
+                                "code": "batch_op_error",
+                                "error": clean_text(str(exc), 300),
+                            }
+                        )
+        return results
 
     async def list_relationships(
         self,
@@ -7882,7 +8064,7 @@ class MemoryStore:
     async def mark_timeline_summarized(self, event_ids: list[str]) -> int:
         return await asyncio.to_thread(self._mark_timeline_summarized_sync, event_ids)
 
-    def _mark_timeline_summarized_sync(self, event_ids: list[str]) -> int:
+    def _mark_timeline_summarized_sync(self, event_ids: list[str], _commit: bool = True) -> int:
         ids = [clean_text(event_id, 120) for event_id in event_ids if clean_text(event_id, 120)]
         if not ids:
             return 0
@@ -7892,7 +8074,9 @@ class MemoryStore:
                 f"UPDATE timeline SET summarized_at=? WHERE id IN ({placeholders})",
                 [utc_now()] + ids,
             )
-            self._conn.commit()
+            # _commit=False 用于批量导入：由外层事务统一提交，避免逐次 fsync。
+            if _commit:
+                self._conn.commit()
         return int(cur.rowcount or 0)
 
     async def get_summary_failure(self, session_id: str) -> dict[str, Any] | None:
@@ -9745,6 +9929,7 @@ class MemoryStore:
         effect: str,
         enabled: bool,
         note: str,
+        _commit: bool = True,
     ) -> dict[str, Any]:
         now = utc_now()
         owner_scope = clean_text(owner_scope, 40)
@@ -9786,7 +9971,8 @@ class MemoryStore:
                 """,
                 (owner_scope, owner_id, reader_scope, reader_id),
             ).fetchone()
-            self._conn.commit()
+            if _commit:
+                self._conn.commit()
         return self._acl_rule_from_row(row) if row else data
 
     async def delete_acl_rule(self, rule_id: str) -> bool:
@@ -9857,8 +10043,9 @@ class MemoryStore:
         window_id: str,
         read_mode: str,
         share_mode: str,
-        capture_enabled: Any,
-        recall_enabled: Any,
+        capture_enabled: Any = _ACL_UNSET,
+        recall_enabled: Any = _ACL_UNSET,
+        _commit: bool = True,
     ) -> dict[str, Any]:
         window_scope = clean_text(window_scope, 40)
         window_id = clean_text(window_id, 160)
@@ -9909,7 +10096,8 @@ class MemoryStore:
                 "SELECT * FROM memory_acl_policies WHERE window_scope=? AND window_id=?",
                 (window_scope, window_id),
             ).fetchone()
-            self._conn.commit()
+            if _commit:
+                self._conn.commit()
             self._acl_feature_override_cache[(window_scope, window_id)] = (
                 next_capture,
                 next_recall,
@@ -11060,6 +11248,7 @@ class MemoryStore:
         if not memory_id or not provider_id or not text_hash or not values:
             return
         now = utc_now()
+        packed = _pack_embedding_vector(values)
         with self._lock:
             self._conn.execute(
                 """
@@ -11079,7 +11268,7 @@ class MemoryStore:
                     provider_id,
                     text_hash,
                     len(values),
-                    json_dumps(values),
+                    packed,
                     now,
                     now,
                     memory_id,
@@ -11141,16 +11330,7 @@ class MemoryStore:
             ).fetchall()
         result: list[tuple[MemoryRecord, list[float], str]] = []
         for row in rows:
-            payload = json_loads(row["embedding_vector"], [])
-            if not isinstance(payload, list):
-                continue
-            vector: list[float] = []
-            for item in payload:
-                try:
-                    vector.append(float(item))
-                except Exception:
-                    vector = []
-                    break
+            vector = _unpack_embedding_vector(row["embedding_vector"])
             if not vector:
                 continue
             result.append((MemoryRecord.from_row(row), vector, clean_text(row["embedding_text_hash"], 80)))
@@ -11411,6 +11591,93 @@ class MemoryStore:
             )
             self._conn.commit()
         return row_id
+
+    async def import_batch_ops(self, ops: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """批量导入写入（portable JSONL 导入用），合并为单事务一次 commit。
+
+        ops 为有序写入描述列表，元素形如：
+          - {"kind": "memory", "record": MemoryRecord, "review_reason": str}
+          - {"kind": "identity", "params": {platform, entity, aliases, profile, confidence}}
+          - {"kind": "relationship", "params": {详见 _upsert_relationship_sync 关键字参数}}
+          - {"kind": "timeline", "params": {event_type, session_id, scope, subject_id,
+             object_id, content, metadata, occurred_at}, "summarize": bool}
+          - {"kind": "acl_rule", "params": {owner_scope, owner_id, reader_scope,
+             reader_id, effect, enabled, note}}
+          - {"kind": "acl_policy", "params": {window_scope, window_id, read_mode,
+             share_mode, capture_enabled, recall_enabled}}
+        单项失败被 SAVEPOINT 隔离，不拖累整批；全部完成后一次 commit。
+        返回与 ops 等长的结果列表，每项为 {"ok": bool, ...}。
+        """
+        return await asyncio.to_thread(self._import_batch_ops_sync, ops)
+
+    def _import_batch_ops_sync(
+        self, ops: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        if not ops:
+            return results
+        with self._lock:
+            with self._transaction_sync():
+                for index, op in enumerate(ops):
+                    kind = op["kind"]
+                    try:
+                        with self._transaction_sync():  # 单项 SAVEPOINT 隔离失败
+                            if kind == "memory":
+                                memory_id = self._insert_memory_sync(
+                                    op["record"],
+                                    op.get("review_reason") or "",
+                                    _commit=False,
+                                )
+                                results.append({"ok": True, "memory_id": memory_id})
+                            elif kind == "identity":
+                                row_id = self._upsert_identity_row_locked(
+                                    **op["params"]
+                                )
+                                results.append({"ok": True, "row_id": row_id})
+                            elif kind == "relationship":
+                                row_id = self._upsert_relationship_sync(
+                                    _commit=False, **op["params"]
+                                )
+                                results.append({"ok": True, "row_id": row_id})
+                            elif kind == "timeline":
+                                event_id = self._add_timeline_event_sync(
+                                    **op["params"]
+                                )
+                                if op.get("summarize"):
+                                    self._mark_timeline_summarized_sync(
+                                        [event_id], _commit=False
+                                    )
+                                results.append({"ok": True, "event_id": event_id})
+                            elif kind == "acl_rule":
+                                result = self._upsert_acl_rule_sync(
+                                    _commit=False, **op["params"]
+                                )
+                                results.append({"ok": True, "result": result})
+                            elif kind == "acl_policy":
+                                result = self._upsert_acl_policy_sync(
+                                    _commit=False, **op["params"]
+                                )
+                                results.append({"ok": True, "result": result})
+                            else:
+                                results.append(
+                                    {"ok": False, "code": f"unknown_batch_op:{kind}"}
+                                )
+                    except Exception as exc:
+                        logger.warning(
+                            "[MemoryCompanion] 批量导入单项失败 index=%s kind=%s error=%s",
+                            index,
+                            kind,
+                            exc,
+                            exc_info=True,
+                        )
+                        results.append(
+                            {
+                                "ok": False,
+                                "code": "batch_op_error",
+                                "error": clean_text(str(exc), 300),
+                            }
+                        )
+        return results
 
     async def upsert_emotion_event(self, value: Any) -> dict[str, Any]:
         return await self._run_recoverable_database_operation(self._upsert_emotion_event_sync, value)

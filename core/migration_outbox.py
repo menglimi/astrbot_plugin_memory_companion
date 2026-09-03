@@ -101,6 +101,7 @@ class MigrationOutbox:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock if callable(clock) else time.time
         self._lock = threading.RLock()
+        self._conn: sqlite3.Connection | None = None
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -111,18 +112,22 @@ class MigrationOutbox:
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
+    def _connection_locked(self) -> sqlite3.Connection:
+        # 复用单连接，避免每次操作新建/销毁连接并重复执行 PRAGMA。
+        if self._conn is None:
+            self._conn = self._connect()
+        return self._conn
+
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        conn = self._connect()
-        try:
-            yield conn
-        finally:
-            conn.close()
+        # 复用单连接后读路径也需持锁，防止多线程并发使用同一连接。
+        with self._lock:
+            yield self._connection_locked()
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
-            conn = self._connect()
+            conn = self._connection_locked()
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 yield conn
@@ -132,7 +137,12 @@ class MigrationOutbox:
                 if conn.in_transaction:
                     conn.execute("ROLLBACK")
                 raise
-            finally:
+
+    def close(self) -> None:
+        """释放底层 SQLite 连接（实例不再使用时调用）。"""
+        with self._lock:
+            conn, self._conn = self._conn, None
+            if conn is not None:
                 conn.close()
 
     def _initialize(self) -> None:
