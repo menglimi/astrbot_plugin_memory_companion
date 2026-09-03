@@ -83,6 +83,16 @@ def _unpack_embedding_vector(raw: Any) -> list[float]:
     return []
 
 
+def _normalize_embedding_vector_values(values: list[float]) -> list[float]:
+    """对向量做 L2 归一化，供候选缓存一次性归一化，避免每次召回重复计算。"""
+    if not values:
+        return []
+    norm = math.sqrt(sum(value * value for value in values))
+    if norm <= 0:
+        return []
+    return [value / norm for value in values]
+
+
 class MemoryStore:
     EMBEDDING_CANDIDATE_CACHE_MAX = 64
     SCHEMA_VERSION = "memory-atom-v2"
@@ -1058,6 +1068,43 @@ class MemoryStore:
                 "CREATE INDEX IF NOT EXISTS idx_memories_profile_domain "
                 "ON memories(platform, subject_kind, subject_id, object_kind, "
                 "object_id, scope, group_id, visibility, memory_type, lifecycle)"
+            )
+            # c1: 画像治理/修复按 fact_id 逐条查询，原无索引导致逐 fact 全表扫描
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_portrait_learning_queue_fact "
+                "ON portrait_learning_queue(fact_id, state)"
+            )
+            # c2: 回滚/删除按 source_memory_id 批量 IN 查询，原无索引导致全表扫描
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_relationship_edges_source_memory "
+                "ON relationship_edges(source_memory_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_knowledge_edges_source_memory "
+                "ON knowledge_edges(source_memory_id)"
+            )
+            # c3: 仅按 session_id 过滤 emotion 事件时现有索引（前缀 bot_id）无法命中
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_emotion_events_session "
+                "ON emotion_events(session_id, occurred_at DESC)"
+            )
+            # c4: timeline 仅按 session_id（无 scope）过滤时无索引命中；
+            #     memories 时间窗口查询的 created_at/updated_at 无索引
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_timeline_session_recent "
+                "ON timeline(session_id, occurred_at DESC, created_at DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON memories(updated_at)"
+            )
+            # c5: emotion 投递查询使用 LOWER(scope) 导致 scope 列索引失效，
+            #     用表达式索引精确匹配 LOWER(scope) 谓词
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_emotion_events_delivery_scope "
+                "ON emotion_events(bot_id, LOWER(scope), platform)"
             )
             self._redact_existing_sensitive_rows_sync()
             self._cleanup_placeholder_memory_indexes_sync()
@@ -9065,13 +9112,8 @@ class MemoryStore:
             "content",
             "evidence",
             "tags",
-            "metadata",
-            "subject_id",
             "subject_name",
-            "object_id",
             "object_name",
-            "session_id",
-            "group_id",
         ]
         term_clauses: list[str] = []
         for term in cleaned_terms:
@@ -11330,7 +11372,9 @@ class MemoryStore:
             ).fetchall()
         result: list[tuple[MemoryRecord, list[float], str]] = []
         for row in rows:
-            vector = _unpack_embedding_vector(row["embedding_vector"])
+            vector = _normalize_embedding_vector_values(
+                _unpack_embedding_vector(row["embedding_vector"])
+            )
             if not vector:
                 continue
             result.append((MemoryRecord.from_row(row), vector, clean_text(row["embedding_text_hash"], 80)))
