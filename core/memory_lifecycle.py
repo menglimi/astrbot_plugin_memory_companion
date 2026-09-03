@@ -21,8 +21,8 @@ NON_RETRIEVABLE_STATUSES = frozenset(
 HALF_LIFE_DAYS = {
     "ephemeral": 1.0,
     "short": 14.0,
-    "normal": 120.0,
-    "durable": 730.0,
+    "normal": 365.0,
+    "durable": 1095.0,
     "pinned": math.inf,
 }
 
@@ -143,7 +143,8 @@ def evaluate_memory_lifecycle(
 def apply_lifecycle_score(base_score: float, lifecycle: LifecycleScore) -> float:
     if not lifecycle.eligible:
         return 0.0
-    freshness_multiplier = 0.65 + (0.35 * lifecycle.decay_factor)
+    # 弱化旧记忆的乘性折扣：最低只打 8 折（原 0.65），普通记忆一年内几乎无衰减。
+    freshness_multiplier = 0.8 + (0.2 * lifecycle.decay_factor)
     salience_bonus = lifecycle.salience * 0.12
     reinforcement_bonus = min(0.12, lifecycle.reinforcement * 0.12)
     return max(0.0, (float(base_score) * freshness_multiplier) + salience_bonus + reinforcement_bonus)

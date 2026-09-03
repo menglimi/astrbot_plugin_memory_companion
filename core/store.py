@@ -8495,7 +8495,9 @@ class MemoryStore:
             connection.execute("PRAGMA query_only=ON")
             connection.execute("PRAGMA busy_timeout=350")
             type_count = max(1, len(bot_types) + (len(profile_types) if user_id else 0))
-            per_type_limit = max(2, min(12, (max(1, int(limit or 36)) + type_count - 1) // type_count))
+            # 提高 per-type 上限（默认时间倒序仅取最少 2 条），让跨天记录更容易进入候选；
+            # 上限从 12 提到 20，最终仍受 120 条总量约束。
+            per_type_limit = max(2, min(20, (max(1, int(limit or 36)) + type_count - 1) // type_count))
             rows = connection.execute(
                 f"""
                 WITH ranked AS (

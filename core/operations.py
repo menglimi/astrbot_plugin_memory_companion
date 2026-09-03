@@ -56,7 +56,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "context_orchestration.query_mode": "current_message",
         "context_orchestration_advanced.self_timeline_limit": 2,
         "context_orchestration_advanced.user_profile_limit": 2,
-        "context_orchestration_advanced.current_window_limit": 3,
+        "context_orchestration_advanced.current_window_limit": 2,
         "context_orchestration_advanced.conversation_summary_limit": 2,
         "context_orchestration_advanced.stable_memory_limit": 4,
         "memory_summary.min_events": 8,

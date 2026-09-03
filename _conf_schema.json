@@ -887,7 +887,7 @@
         "description": "当前窗口槽",
         "hint": "每轮最多放入多少条当前私聊或群聊窗口相关记忆。",
         "type": "int",
-        "default": 3
+        "default": 2
       },
       "conversation_summary_limit": {
         "description": "阶段总结槽",
@@ -899,7 +899,7 @@
         "description": "稳定记忆槽",
         "hint": "每轮最多放入多少条其他可见稳定记忆；总数仍受记忆注入 top_k 限制。",
         "type": "int",
-        "default": 3
+        "default": 4
       }
     }
   },

@@ -3295,7 +3295,8 @@ class RetrievalEngine:
         days = self._age_days(iso_text)
         if days is None:
             return 0.0
-        return 0.2 * math.exp(-days / 14.0)
+        # 温和的新近加权：系数减半、半衰期翻倍，让旧记忆相对不再被时间压制。
+        return 0.1 * math.exp(-days / 28.0)
 
     def _age_days(self, iso_text: str) -> float | None:
         if not iso_text:

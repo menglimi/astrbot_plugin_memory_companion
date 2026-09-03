@@ -10609,9 +10609,9 @@ class MemoryCompanionService:
             "open_loop": min(total, open_loop_limit),
             "self_timeline": min(total, self.config.int("context_orchestration.self_timeline_limit", 2)),
             "user_profile": min(total, self.config.int("context_orchestration.user_profile_limit", 2)),
-            "current_window": min(total, self.config.int("context_orchestration.current_window_limit", 3)),
+            "current_window": min(total, self.config.int("context_orchestration.current_window_limit", 2)),
             "conversation_summary": min(total, conversation_limit),
-            "stable_memory": min(total, self.config.int("context_orchestration.stable_memory_limit", 3)),
+            "stable_memory": min(total, self.config.int("context_orchestration.stable_memory_limit", 4)),
         }
 
     def _slot_capped_slots(

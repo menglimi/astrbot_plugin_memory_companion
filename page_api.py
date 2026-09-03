@@ -1571,7 +1571,7 @@ class PluginPageApi:
                     "intent_max_chars": config.int("context_orchestration.intent_max_chars", 520),
                     "self_timeline_limit": config.int("context_orchestration.self_timeline_limit", 2),
                     "user_profile_limit": config.int("context_orchestration.user_profile_limit", 2),
-                    "current_window_limit": config.int("context_orchestration.current_window_limit", 3),
+                    "current_window_limit": config.int("context_orchestration.current_window_limit", 2),
                     "conversation_summary_limit": config.int("context_orchestration.conversation_summary_limit", 2),
                     "stable_memory_limit": config.int("context_orchestration.stable_memory_limit", 3),
                 },
