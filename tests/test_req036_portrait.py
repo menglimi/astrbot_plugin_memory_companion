@@ -632,6 +632,59 @@ class Req036PortraitTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([], blocked)
 
+    async def test_group_moment_portrait_sinks_only_interaction_dimensions(self) -> None:
+        store = self.make_store()
+        service = PortraitService(store, _Config())
+        candidates = [
+            {
+                "dimension": "communication_preference",
+                "claim": "惯用玩梗风格：名场面语境中常用“笑死”这类表达带动气氛。",
+                "claim_summary": "惯用玩梗风格：常用“笑死”带动气氛",
+                "evidence_text": "哈哈笑死我了",
+                "sender": "u1",
+                "score": 3.0,
+            },
+            {
+                "dimension": "boundary",
+                "claim": "玩笑/接梗边界：在群里对\"u2\"开类似玩笑需谨慎。",
+                "claim_summary": "玩笑/接梗边界",
+                "evidence_text": "别拿我开玩笑",
+                "sender": "u2",
+                "score": 2.0,
+            },
+            {
+                "dimension": "occupation",
+                "claim": "职业（不应由名场面推断）",
+                "claim_summary": "职业",
+                "evidence_text": "我是医生",
+                "sender": "u3",
+                "score": 4.0,
+            },
+        ]
+        result = await service.record_group_moment_portrait(
+            PERSON_REF,
+            candidates,
+            scope="group:onebot:group-a",
+            session_id="onebot:GroupMessage:group-a",
+            group_id="group-a",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(2, result["facts"])  # occupation 被拒
+        rows = store._conn.execute(
+            "SELECT dimension, producer_kind, epistemic_status, sensitivity FROM portrait_facts ORDER BY dimension"
+        ).fetchall()
+        dims = {row["dimension"] for row in rows}
+        self.assertEqual({"communication_preference", "boundary"}, dims)
+        for row in rows:
+            self.assertEqual("group_moment", row["producer_kind"])
+            self.assertEqual("observed", row["epistemic_status"])
+        boundary = [row for row in rows if row["dimension"] == "boundary"][0]
+        self.assertEqual("sensitive", boundary["sensitivity"])
+        evidence_count = store._conn.execute("SELECT COUNT(*) FROM portrait_evidence").fetchone()[0]
+        queue_count = store._conn.execute("SELECT COUNT(*) FROM portrait_learning_queue").fetchone()[0]
+        self.assertEqual(2, evidence_count)
+        self.assertEqual(2, queue_count)
+
 
 if __name__ == "__main__":
     unittest.main()

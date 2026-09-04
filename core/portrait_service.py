@@ -13,6 +13,7 @@ from .portrait import (
     build_evidence,
     cross_scene_whitelisted_fact,
     extract_explicit_candidates,
+    normalized_claim_hash,
     portrait_access_decision,
 )
 from .portrait_namespace import portrait_namespace_decision
@@ -155,6 +156,84 @@ class PortraitService:
                     evidence_hash=evidence["evidence_hash"],
                 )
         return {"ok": True, "code": "portrait_evidence_recorded", "facts": created, "person_id": person_ref["person_id"]}
+
+    async def record_group_moment_portrait(
+        self,
+        person_ref: Any,
+        candidates: list[dict[str, Any]],
+        *,
+        scope: str = "",
+        session_id: str = "",
+        group_id: str = "",
+        message_id: str = "",
+    ) -> dict[str, Any]:
+        """把私伴群聊名场面收敛的画像候选沉降到画像车道。
+
+        只接受"群内互动型"维度（communication_preference / boundary），并把
+        事实标记为 ``producer_kind="group_moment"``、``epistemic_status="observed"``，
+        与用户自述（explicit/inferred）车道隔离，避免把名场面当作客观事实。
+        证据与事实照常走 hash 化 + portrait_learning_queue，可参与每日聚合。
+        """
+        ref = build_person_ref(person_ref) if isinstance(person_ref, dict) else {}
+        person_id = clean_text(ref.get("person_id"), 80)
+        if not person_id:
+            return {"ok": False, "code": "bridge_person_mismatch", "facts": 0}
+        if not isinstance(candidates, list) or not candidates:
+            return {"ok": True, "code": "portrait_no_candidate", "facts": 0, "person_id": person_id}
+        allowed_dimensions = {"communication_preference", "boundary"}
+        created = 0
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            dimension = clean_text(candidate.get("dimension"), 80).lower()
+            if dimension not in allowed_dimensions:
+                continue
+            claim_summary = clean_text(candidate.get("claim"), 300)
+            evidence_text = clean_text(candidate.get("evidence_text"), 300)
+            if not claim_summary or not evidence_text:
+                continue
+            normalized_claim = clean_text(candidate.get("claim_summary"), 300) or claim_summary
+            claim_hash = normalized_claim_hash(dimension, f"group_moment:{normalized_claim}")
+            evidence = build_evidence(
+                person_ref=ref,
+                scope=clean_text(scope, 80),
+                session_id=clean_text(session_id, 200),
+                message_id=clean_text(message_id, 120),
+                source_identity_key=ref.get("resolved_identity_key"),
+                text=evidence_text,
+                context_refs=[f"group:{clean_text(group_id, 160)}"] if group_id else [],
+            )
+            evidence_result = await self.store.add_portrait_evidence(evidence)
+            if not evidence_result.get("ok") or not evidence_result.get("created"):
+                continue
+            fact = {
+                "person_id": person_id,
+                "dimension": dimension,
+                "normalized_claim_hash": claim_hash,
+                "claim_summary": normalized_claim,
+                "portrait_tier": "base",
+                "producer_kind": "group_moment",
+                "producer_version": "group_moments.v1",
+                "derivation_kind": "observed",
+                "epistemic_status": "observed",
+                "source_scope": clean_text(scope, 80),
+                "usable_scope": "source_only",
+                "confidence": 0.55,
+                "sensitivity": "low" if dimension != "boundary" else "sensitive",
+                "status": "active",
+                "evidence_hashes": [evidence["evidence_hash"]],
+                "context_refs": evidence["context_refs"],
+                "operation_id": f"portrait.group_moment:{evidence['evidence_hash'][:24]}",
+            }
+            fact_result = await self.store.upsert_portrait_fact(fact)
+            if fact_result.get("ok"):
+                created += 1
+                await self.store.enqueue_portrait_learning(
+                    person_id=person_id,
+                    fact_id=fact_result["fact_id"],
+                    evidence_hash=evidence["evidence_hash"],
+                )
+        return {"ok": True, "code": "portrait_group_moment_recorded", "facts": created, "person_id": person_id}
 
     async def read_summary(self, request: dict[str, Any], *, limit: int = 8) -> dict[str, Any]:
         decision = portrait_access_decision(request)

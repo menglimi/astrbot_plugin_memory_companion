@@ -1218,6 +1218,58 @@ class MemoryCompanionBridge:
             producer_context=producer_context,
         )
 
+    async def record_group_moment_portrait(
+        self,
+        person_ref: dict[str, Any],
+        candidates: list[dict[str, Any]],
+        *,
+        scope: str = "",
+        session_id: str = "",
+        group_id: str = "",
+        message_id: str = "",
+        producer_capability: Any = None,
+        producer_context: Any = None,
+    ) -> dict[str, Any]:
+        """接受私伴群聊名场面收敛的画像候选，沉降到画像车道（group_moment）。
+
+        与自述画像车道隔离：维度仅限 communication_preference / boundary，
+        事实 producer_kind=group_moment、epistemic_status=observed，可参与每日
+        聚合但不被当作客观事实。私有 Companion 能力校验失败时 fail-closed。
+        """
+        base = {
+            "ok": False,
+            "facts": 0,
+            "person_id": "",
+            "state": "degraded",
+            "error_code": None,
+        }
+        authority = producer_capability if producer_capability is not None else producer_context
+        if not self._is_valid_private_companion_capability(authority):
+            return {**base, "state": "forbidden", "error_code": "producer_capability_required"}
+        portraits = getattr(getattr(self._plugin, "service", None), "portraits", None)
+        if portraits is None or not callable(getattr(portraits, "record_group_moment_portrait", None)):
+            return {**base, "error_code": "portrait_service_unavailable"}
+        try:
+            result = await portraits.record_group_moment_portrait(
+                person_ref,
+                candidates,
+                scope=scope,
+                session_id=session_id,
+                group_id=group_id,
+                message_id=message_id,
+            )
+        except Exception as exc:
+            return {**base, "error_code": "portrait_bridge_exception"}
+        if not isinstance(result, dict):
+            return {**base, "error_code": "invalid_portrait_response"}
+        return {
+            "ok": bool(result.get("ok")),
+            "facts": int(result.get("facts") or 0),
+            "person_id": clean_text(result.get("person_id"), 80),
+            "state": "recorded" if result.get("ok") else "degraded",
+            "error_code": result.get("code"),
+        }
+
     async def read_bot_personal_profile(
         self,
         query: str = "",
