@@ -5648,7 +5648,13 @@ class MemoryStore:
         with self._lock:
             with self._transaction_sync():
                 return [
-                    self._upsert_identity_row_locked(**identity)
+                    self._upsert_identity_row_locked(
+                        platform=identity.get("platform") or "",
+                        entity=identity.get("entity") or EntityRef(kind="user", id="unknown"),
+                        aliases=identity.get("aliases") or [],
+                        profile=identity.get("profile") or {},
+                        confidence=float(identity.get("confidence") or 0.0),
+                    )
                     for identity in identities
                 ]
 
