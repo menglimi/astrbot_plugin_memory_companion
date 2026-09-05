@@ -887,8 +887,7 @@ class MemoryCompanionService:
         stage_timer.mark("decorate")
 
         capture_enabled = self._scope_feature_enabled(ctx, "capture")
-        if capture_enabled:
-            await self.note_identity(ctx)
+        # note_identity（身份双写）已移入 _capture_async 后台执行，不阻塞请求关键路径。
         stage_timer.mark("note_identity")
         reply_chain = await self._reply_chain_for_event(event)
         stage_timer.mark("reply_chain")
@@ -964,6 +963,8 @@ class MemoryCompanionService:
         所有异常在此被捕获并记录日志，不会传播到请求路径。
         """
         try:
+            # 身份双写（user+group）合并单事务，随采集链一并移入后台，不阻塞请求关键路径。
+            await self.note_identity(ctx)
             if not self.config.bool("memory_capture.enabled", True):
                 return
             if not self.config.bool("memory_capture.capture_user_messages", True):
@@ -1011,8 +1012,40 @@ class MemoryCompanionService:
                     ),
                     metadata=event_metadata,
                 )
+            # 采集写链收集为批量操作，合并单事务一次 commit，减少独立事务/fsync 次数。
+            write_ops: list[dict[str, Any]] = []
+            derived_jobs: list[tuple[int, MemoryRecord, str]] = []
             if self.config.bool("memory_capture.record_relationship_edges", True):
-                await self.note_relationships(ctx, source_memory_id=memory_id)
+                if ctx.scope == "group" and ctx.user_id and ctx.group_id:
+                    write_ops.append(
+                        {
+                            "kind": "relationship",
+                            "source_memory_id": memory_id,
+                            "params": {
+                                "subject": EntityRef(
+                                    kind="user",
+                                    id=ctx.user_id,
+                                    name=ctx.user_name,
+                                    role="group_member",
+                                ),
+                                "object": EntityRef(
+                                    kind="group",
+                                    id=ctx.group_id,
+                                    name=ctx.group_name,
+                                    role="group",
+                                ),
+                                "relation_type": "member_of_group",
+                                "scope": "group",
+                                "session_id": ctx.session_id,
+                                "group_id": ctx.group_id,
+                                "visibility": "group_public",
+                                "evidence": clean_text(ctx.message_text, 500),
+                                "confidence": 0.8,
+                                "review_status": "auto",
+                                "metadata": {"observed_from": "group_message"},
+                            },
+                        }
+                    )
             if self.config.bool("memory_capture.extract_stable_facts", True):
                 derived_memories = self.classifier.derived_user_memories(
                     ctx,
@@ -1047,47 +1080,69 @@ class MemoryCompanionService:
                         )
                         continue
                     if write_mode == "profile":
-                        profile_result = await self.store.upsert_profile_candidate(derived)
-                        if not profile_result.get("ok"):
-                            self._log_profile_write_gate(
-                                derived,
-                                decision="rejected",
-                                reason=clean_text(profile_result.get("code"), 120),
-                            )
-                            continue
-                        derived_id = clean_text(profile_result.get("memory_id"), 120)
-                        gate_reason = clean_text(profile_result.get("profile_status"), 40)
-                        self._log_profile_write_gate(
-                            derived,
-                            decision="written",
-                            reason=gate_reason,
-                        )
-                        if gate_reason == "active":
-                            stored_profile = await self.store.get_memory(derived_id)
-                            self._schedule_memory_embedding(
-                                derived_id, stored_profile or derived
-                            )
+                        write_ops.append({"kind": "profile", "record": derived})
                     else:
-                        derived_id = await self.store.insert_memory(derived)
-                        self._schedule_memory_embedding(derived_id, derived)
+                        write_ops.append({"kind": "memory", "record": derived})
+                    op_index = len(write_ops) - 1
+                    derived_jobs.append((op_index, derived, write_mode))
                     relation_type = str(derived.metadata.get("relation_type") or "")
                     if relation_type and self.config.bool(
                         "memory_capture.record_relationship_edges", True
                     ):
-                        await self.store.upsert_relationship(
-                            subject=derived.subject,
-                            object=self._bot_entity(ctx),
-                            relation_type=relation_type,
-                            scope=ctx.scope,
-                            session_id=ctx.session_id,
-                            group_id=ctx.group_id,
-                            visibility=derived.visibility,
-                            evidence=derived.evidence,
-                            confidence=derived.confidence,
-                            review_status=derived.review_status,
-                            source_memory_id=derived_id,
-                            metadata={"source": "relationship_claim"},
+                        write_ops.append(
+                            {
+                                "kind": "relationship",
+                                "requires_ok": [op_index],
+                                "source_memory_id_from": op_index,
+                                "params": {
+                                    "subject": derived.subject,
+                                    "object": self._bot_entity(ctx),
+                                    "relation_type": relation_type,
+                                    "scope": ctx.scope,
+                                    "session_id": ctx.session_id,
+                                    "group_id": ctx.group_id,
+                                    "visibility": derived.visibility,
+                                    "evidence": derived.evidence,
+                                    "confidence": derived.confidence,
+                                    "review_status": derived.review_status,
+                                    "metadata": {"source": "relationship_claim"},
+                                },
+                            }
                         )
+            batch_results = await self.store.capture_write_batch(write_ops)
+            # 批量结果后处理：画像门禁日志与 embedding 调度。
+            for op_index, derived, write_mode in derived_jobs:
+                result = batch_results[op_index] if op_index < len(batch_results) else {}
+                if write_mode == "profile":
+                    if not result.get("ok"):
+                        self._log_profile_write_gate(
+                            derived,
+                            decision="rejected",
+                            reason=clean_text(result.get("code"), 120),
+                        )
+                        continue
+                    derived_id = clean_text(result.get("memory_id"), 120)
+                    gate_reason = clean_text(result.get("profile_status"), 40)
+                    self._log_profile_write_gate(
+                        derived,
+                        decision="written",
+                        reason=gate_reason,
+                    )
+                    if gate_reason == "active":
+                        stored_profile = await self.store.get_memory(derived_id)
+                        self._schedule_memory_embedding(
+                            derived_id, stored_profile or derived
+                        )
+                else:
+                    if not result.get("ok"):
+                        logger.warning(
+                            "[MemoryCompanion] 派生记忆批量写入失败: type=%s code=%s",
+                            clean_text(derived.memory_type, 80),
+                            clean_text(result.get("code"), 120),
+                        )
+                        continue
+                    derived_id = clean_text(result.get("memory_id"), 120)
+                    self._schedule_memory_embedding(derived_id, derived)
             await self.portraits.capture_user_message(ctx, event=event, req=req)
             self._ensure_portrait_daily_dispatcher()
             if not self.config.bool("memory_capture.capture_bot_responses", True):
@@ -10923,21 +10978,28 @@ class MemoryCompanionService:
         return "user actively interrupted" in lowered or "partial output before interruption" in lowered
 
     async def note_identity(self, ctx: SessionContext) -> None:
+        identities: list[dict[str, Any]] = []
         if ctx.user_id:
-            await self.store.upsert_identity(
-                platform=ctx.platform,
-                entity=EntityRef(kind="user", id=ctx.user_id, name=ctx.user_name, role="current_sender"),
-                aliases=[ctx.user_name] if ctx.user_name else [],
-                profile={"last_session": ctx.session_id, "last_scope": ctx.scope},
-                confidence=0.7,
+            identities.append(
+                {
+                    "platform": ctx.platform,
+                    "entity": EntityRef(kind="user", id=ctx.user_id, name=ctx.user_name, role="current_sender"),
+                    "aliases": [ctx.user_name] if ctx.user_name else [],
+                    "profile": {"last_session": ctx.session_id, "last_scope": ctx.scope},
+                    "confidence": 0.7,
+                }
             )
         if ctx.group_id:
-            await self.store.upsert_identity(
-                platform=ctx.platform,
-                entity=EntityRef(kind="group", id=ctx.group_id, name=ctx.group_name, role="group"),
-                profile={"last_session": ctx.session_id},
-                confidence=0.7,
+            identities.append(
+                {
+                    "platform": ctx.platform,
+                    "entity": EntityRef(kind="group", id=ctx.group_id, name=ctx.group_name, role="group"),
+                    "profile": {"last_session": ctx.session_id},
+                    "confidence": 0.7,
+                }
             )
+        if identities:
+            await self.store.upsert_identities(identities)
 
     async def note_relationships(self, ctx: SessionContext, source_memory_id: str = "") -> None:
         if ctx.scope == "group" and ctx.user_id and ctx.group_id:

@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import math
 import re
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -103,6 +104,11 @@ class RetrievalEngine:
         # 0.0=关闭（历史行为）；>0 时同主题高相似候选只保留评分最高的一条。
         self.dedupe_content_ratio = max(0.0, min(1.0, float(dedupe_content_ratio or 0.0)))
         self._rank_path_info: dict[str, Any] = {}
+        # haystack 缓存：同一 (memory.id, updated_at) 在一次召回内会被
+        # _term_document_stats/_score/MMR features 多次重建，按键复用可省去
+        # 重复的字段拼接与 lower()。以锁保护以便在线程池中安全访问。
+        self._haystack_cache: dict[tuple[str, str], str] = {}
+        self._haystack_cache_lock = threading.Lock()
         self.last_path_info: dict[str, Any] = {
             "mode": self.retrieval_mode,
             "path": "basic",
@@ -1807,12 +1813,15 @@ class RetrievalEngine:
 
     @staticmethod
     def _cosine_similarity(query_vector: list[float], memory_vector: list[float]) -> float:
+        """余弦相似度。
+
+        查询向量在调用前已由 ``_normalize_vector`` 归一化；库内向量在
+        ``list_embedding_candidate_rows`` 缓存填充时已统一 L2 归一化，
+        因此这里直接做点积即可，避免对每个候选重复归一化遍历。
+        """
         if not query_vector or not memory_vector or len(query_vector) != len(memory_vector):
             return 0.0
-        normalized_memory = RetrievalEngine._normalize_vector(memory_vector)
-        if not normalized_memory:
-            return 0.0
-        score = sum(a * b for a, b in zip(query_vector, normalized_memory))
+        score = sum(a * b for a, b in zip(query_vector, memory_vector))
         return max(-1.0, min(1.0, float(score)))
 
     def _embedding_document_text(self, memory: MemoryRecord) -> str:
@@ -3056,6 +3065,11 @@ class RetrievalEngine:
         }
 
     def _haystack(self, memory: MemoryRecord) -> str:
+        cache_key = (memory.id, memory.updated_at)
+        with self._haystack_cache_lock:
+            cached = self._haystack_cache.get(cache_key)
+            if cached is not None:
+                return cached
         metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
         metadata_text_parts = [
             metadata.get("canonical_summary", ""),
@@ -3073,7 +3087,7 @@ class RetrievalEngine:
             if isinstance(metadata.get("participants"), list)
             else "",
         ]
-        return " ".join(
+        haystack = " ".join(
             [
                 memory.content,
                 memory.evidence,
@@ -3086,6 +3100,11 @@ class RetrievalEngine:
                 memory.group_id,
             ]
         ).lower()
+        with self._haystack_cache_lock:
+            if len(self._haystack_cache) >= 4096:
+                self._haystack_cache.clear()
+            self._haystack_cache[cache_key] = haystack
+        return haystack
 
     @staticmethod
     def _route_families(sources: set[str]) -> frozenset[str]:

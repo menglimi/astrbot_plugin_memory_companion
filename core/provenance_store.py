@@ -35,18 +35,44 @@ class ProvenanceLedger:
     def __init__(self, path: Path):
         self.path = Path(path)
         self._lock = threading.RLock()
+        # mtime/size 缓存：避免每次 mutation 前全量 read_text + json.loads + 逐条校验。
+        # 所有读写均在 self._lock 内进行，缓存无需额外同步。
+        self._cache_document: dict[str, Any] | None = None
+        self._cache_mtime_ns: int | None = None
+        self._cache_size: int | None = None
 
     def _empty(self) -> dict[str, Any]:
         return {"schema_version": LEDGER_SCHEMA_VERSION, "records": {}, "operations": [], "observations": []}
 
     def _load_locked(self) -> dict[str, Any]:
-        if not self.path.is_file():
+        try:
+            stat_result = self.path.stat()
+        except OSError:
+            # 文件缺失或不可访问：清空缓存并返回空文档。
+            self._cache_document = None
+            self._cache_mtime_ns = None
+            self._cache_size = None
             return self._empty()
+        mtime_ns = stat_result.st_mtime_ns
+        size = stat_result.st_size
+        if (
+            self._cache_document is not None
+            and self._cache_mtime_ns == mtime_ns
+            and self._cache_size == size
+        ):
+            # mtime+size 未变化：跳过全量读与逐条校验，直接深拷贝缓存返回。
+            return deepcopy(self._cache_document)
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
+            self._cache_document = None
+            self._cache_mtime_ns = None
+            self._cache_size = None
             return self._empty()
         if not isinstance(raw, dict) or raw.get("schema_version") != LEDGER_SCHEMA_VERSION:
+            self._cache_document = None
+            self._cache_mtime_ns = None
+            self._cache_size = None
             return self._empty()
         records: dict[str, dict[str, Any]] = {}
         raw_records = raw.get("records")
@@ -73,12 +99,18 @@ class ProvenanceLedger:
                 safe = self._safe_observation(value)
                 if safe is not None:
                     observations.append(safe)
-        return {
+        document = {
             "schema_version": LEDGER_SCHEMA_VERSION,
             "records": records,
             "operations": operations,
             "observations": observations,
         }
+        # 记录加载时文件的 mtime/size，并缓存文档（存深拷贝副本，
+        # 避免调用方对返回值的修改污染缓存）。
+        self._cache_mtime_ns = mtime_ns
+        self._cache_size = size
+        self._cache_document = deepcopy(document)
+        return document
 
     @staticmethod
     def _safe_observation(value: Any) -> dict[str, Any] | None:
@@ -147,6 +179,16 @@ class ProvenanceLedger:
             encoding="utf-8",
         )
         temporary.replace(self.path)
+        # 写入成功后刷新缓存，避免下一次 mutation 再全量重读。
+        self._cache_document = dict(document)
+        try:
+            stat_result = self.path.stat()
+        except OSError:
+            self._cache_mtime_ns = None
+            self._cache_size = None
+        else:
+            self._cache_mtime_ns = stat_result.st_mtime_ns
+            self._cache_size = stat_result.st_size
 
     def _backup_locked(self) -> bool:
         if not self.path.is_file():
