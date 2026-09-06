@@ -13,6 +13,7 @@ import sqlite3
 import struct
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -154,6 +155,9 @@ class MemoryStore:
         self._read_lock = threading.RLock()
         self._operation_condition = threading.Condition()
         self._active_tracked_operations = 0
+        self._operation_waiters = 0
+        self._operation_owner_stack = ""
+        self._record_operation_stacks = False
         self._closing = False
         self._closed = False
         self._fts_enabled = False
@@ -290,7 +294,32 @@ class MemoryStore:
             return operation(*args)
 
     async def _run_recoverable_database_operation(self, operation: Any, *args: Any) -> Any:
-        return await asyncio.to_thread(self._run_with_database_recovery_sync, operation, *args)
+        return await asyncio.to_thread(
+            self._guard_operation_sync,
+            self._run_with_database_recovery_sync,
+            operation,
+            *args,
+        )
+
+    def _guard_operation_sync(self, operation: Any, *args: Any) -> Any:
+        """Run a SQLite operation while participating in the close barrier."""
+        with self._operation_condition:
+            if self._closing or self._closed:
+                raise sqlite3.OperationalError("database is closing")
+            self._active_tracked_operations += 1
+            self._operation_owner_stack = (
+                "".join(traceback.format_stack(limit=8))
+                if self._record_operation_stacks
+                else ""
+            )
+        try:
+            return operation(*args)
+        finally:
+            with self._operation_condition:
+                self._active_tracked_operations -= 1
+                self._operation_owner_stack = ""
+                if self._operation_waiters:
+                    self._operation_condition.notify_all()
 
     async def _run_tracked_operation(
         self,
@@ -341,7 +370,7 @@ class MemoryStore:
         }
 
     async def wal_health(self, *, checkpoint: bool = False) -> dict[str, Any]:
-        return await asyncio.to_thread(self._wal_health_sync, checkpoint)
+        return await asyncio.to_thread(self._guard_operation_sync, self._wal_health_sync, checkpoint)
 
     def _wal_health_sync(self, checkpoint: bool = False) -> dict[str, Any]:
         result = self._database_file_snapshot()
@@ -385,7 +414,11 @@ class MemoryStore:
         above ``min_wal_bytes`` and no write transaction is active; a busy
         result is not an error.
         """
-        return await asyncio.to_thread(self._wal_checkpoint_truncate_sync, min_wal_bytes)
+        return await asyncio.to_thread(
+            self._guard_operation_sync,
+            self._wal_checkpoint_truncate_sync,
+            min_wal_bytes,
+        )
 
     def _wal_checkpoint_truncate_sync(self, min_wal_bytes: int) -> dict[str, Any]:
         result = self._database_file_snapshot()
@@ -2862,13 +2895,30 @@ class MemoryStore:
             )
         return len(rows)
 
+    def shutdown_state(self) -> dict[str, Any]:
+        """Return a lightweight snapshot for plugin shutdown diagnostics."""
+        with self._operation_condition:
+            tracked_ops = int(self._active_tracked_operations)
+            owner_stack = self._operation_owner_stack
+        return {
+            "main_conn_closed": bool(self._closed),
+            "read_conn_closed": self._read_conn is None,
+            "tracked_ops": tracked_ops,
+            "operation_owner_stack": owner_stack,
+        }
+
     def close(self) -> None:
         with self._operation_condition:
             if self._closed:
                 return
             self._closing = True
-            while self._active_tracked_operations:
-                self._operation_condition.wait()
+            if self._active_tracked_operations:
+                self._operation_waiters += 1
+                try:
+                    while self._active_tracked_operations:
+                        self._operation_condition.wait()
+                finally:
+                    self._operation_waiters -= 1
         with self._lock:
             if self._closed:
                 return
@@ -5559,7 +5609,11 @@ class MemoryStore:
         self, identities: list[dict[str, Any]]
     ) -> list[str]:
         """批量写入多条身份记录，合并为单事务提交（减少独立 commit）。"""
-        return await asyncio.to_thread(self._upsert_identities_sync, identities)
+        return await asyncio.to_thread(
+            self._guard_operation_sync,
+            self._upsert_identities_sync,
+            identities,
+        )
 
     def _upsert_identity_row_locked(
         self,
@@ -5813,7 +5867,11 @@ class MemoryStore:
         memory 项通过 _commit=False 复用内部无 commit 变体。
         返回与 ops 等长的结果列表；单项失败被 SAVEPOINT 隔离，不拖累整批。
         """
-        return await asyncio.to_thread(self._capture_write_batch_sync, ops)
+        return await asyncio.to_thread(
+            self._guard_operation_sync,
+            self._capture_write_batch_sync,
+            ops,
+        )
 
     def _capture_write_batch_sync(
         self, ops: list[dict[str, Any]]
@@ -6487,6 +6545,7 @@ class MemoryStore:
         occurred_at: str = "",
     ) -> str:
         return await asyncio.to_thread(
+            self._guard_operation_sync,
             self._add_timeline_event_sync,
             event_type,
             session_id,
@@ -7842,6 +7901,7 @@ class MemoryStore:
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
+            self._guard_operation_sync,
             self._recent_timeline_sync,
             limit,
             scope,

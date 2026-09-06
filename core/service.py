@@ -917,7 +917,14 @@ class MemoryCompanionService:
             # 关于本轮回复的采集写入（写时间线、写关系、抽取事实、调度向量化等）
             # 对"本轮要不要出回复"毫无贡献，移入后台执行，不阻塞请求关键路径。
             # 对应 optimization_plan.md §3.2「把写操作移出请求关键路径」。
-            asyncio.create_task(self._capture_async(ctx, event, req, reply_chain))
+            # Register capture work so shutdown can cancel it before closing the
+            # SQLite store.  An untracked task may otherwise continue writing
+            # while the store is being torn down.
+            self._spawn_background(
+                self._capture_async(ctx, event, req, reply_chain),
+                label="capture-async",
+                defer_during_grace=True,
+            )
         stage_timer.mark("finalize")
         self._emit_hook_stage_timing(stage_timer, ctx, note="ok")
 
@@ -3969,7 +3976,14 @@ class MemoryCompanionService:
         store["updated_at"] = now_dt.strftime("%Y-%m-%d %H:%M:%S")
         self._save_token_usage()
 
-    def _spawn_background(self, coro: Any, *, label: str) -> asyncio.Task[Any] | None:
+    def _spawn_background(
+        self,
+        coro: Any,
+        *,
+        label: str,
+        defer_during_grace: bool = False,
+    ) -> asyncio.Task[Any] | None:
+        deferred_pending_coro: Any = None
         if self._closing or self._closed:
             close = getattr(coro, "close", None)
             if callable(close):
@@ -3979,22 +3993,42 @@ class MemoryCompanionService:
         if self._background_grace_seconds > 0:
             elapsed = time.monotonic() - self._service_created_at
             if elapsed < self._background_grace_seconds:
-                close = getattr(coro, "close", None)
-                if callable(close):
-                    close()
-                logger.debug(
-                    "[MemoryCompanion] 启动宽限期内暂缓后台任务 %s (%.0fs/%.0fs)",
-                    label,
-                    elapsed,
-                    self._background_grace_seconds,
-                )
-                return None
+                delay = self._background_grace_seconds - elapsed
+                if not defer_during_grace:
+                    close = getattr(coro, "close", None)
+                    if callable(close):
+                        close()
+                    logger.debug(
+                        "[MemoryCompanion] 启动宽限期内暂缓后台任务 %s (%.0fs/%.0fs)",
+                        label,
+                        elapsed,
+                        self._background_grace_seconds,
+                    )
+                    return None
+
+                pending_coro = coro
+                deferred_pending_coro = pending_coro
+
+                async def _deferred_background() -> None:
+                    try:
+                        await asyncio.sleep(delay)
+                        await pending_coro
+                    except asyncio.CancelledError:
+                        close = getattr(pending_coro, "close", None)
+                        if callable(close):
+                            close()
+                        raise
+
+                coro = _deferred_background()
         try:
             task = asyncio.create_task(coro, name=f"memory_companion:{label}")
         except RuntimeError:
             close = getattr(coro, "close", None)
             if callable(close):
                 close()
+            close_pending = getattr(deferred_pending_coro, "close", None)
+            if callable(close_pending):
+                close_pending()
             logger.warning("[MemoryCompanion] 无运行事件循环，后台任务未启动: %s", label)
             return None
         self._background_tasks.add(task)
@@ -4002,6 +4036,9 @@ class MemoryCompanionService:
         def _done(done_task: asyncio.Task[Any]) -> None:
             self._background_tasks.discard(done_task)
             if done_task.cancelled():
+                close_pending = getattr(deferred_pending_coro, "close", None)
+                if callable(close_pending):
+                    close_pending()
                 return
             try:
                 exc = done_task.exception()
@@ -11545,6 +11582,12 @@ class MemoryCompanionService:
         for task in list(self._background_tasks):
             task.cancel()
         self._background_tasks.clear()
+        for task in list(self._summary_workers.values()):
+            task.cancel()
+        self._summary_workers.clear()
+        self._summary_pending.clear()
+        self._summary_pending_contexts.clear()
+        self._summary_pending_reasons.clear()
         self._save_token_usage(force=True)
         try:
             self.store.close()
@@ -11552,6 +11595,26 @@ class MemoryCompanionService:
             logger.warning("[MemoryCompanion] 关闭记忆库连接失败: %s", exc, exc_info=True)
         finally:
             self._closed = True
+
+    def shutdown_evidence(self) -> dict[str, Any]:
+        """Return structured resource state for the shutdown completion log."""
+        try:
+            store_state = self.store.shutdown_state()
+        except Exception:
+            # Keep plugin termination successful even when an older store object
+            # does not expose the optional diagnostic method.
+            store_state = {
+                "main_conn_closed": bool(getattr(self.store, "_closed", False)),
+                "read_conn_closed": getattr(self.store, "_read_conn", None) is None,
+                "tracked_ops": int(getattr(self.store, "_active_tracked_operations", 0) or 0),
+                "error": "store_shutdown_state_unavailable",
+            }
+        return {
+            "background_tasks": len(self._background_tasks),
+            "summary_workers": len(self._summary_workers),
+            "summary_pending": len(self._summary_pending),
+            "store": store_state,
+        }
 
     async def aclose(self) -> None:
         if self._closed:
@@ -11564,6 +11627,21 @@ class MemoryCompanionService:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._background_tasks.clear()
+        # Summary workers are tracked separately from _background_tasks.
+        # Cancel and await them before closing SQLite connections.
+        summary_tasks = [
+            task
+            for task in self._summary_workers.values()
+            if task is not current and not task.done()
+        ]
+        for task in summary_tasks:
+            task.cancel()
+        if summary_tasks:
+            await asyncio.gather(*summary_tasks, return_exceptions=True)
+        self._summary_workers.clear()
+        self._summary_pending.clear()
+        self._summary_pending_contexts.clear()
+        self._summary_pending_reasons.clear()
         self._save_token_usage(force=True)
         try:
             await asyncio.to_thread(self.store.close)
