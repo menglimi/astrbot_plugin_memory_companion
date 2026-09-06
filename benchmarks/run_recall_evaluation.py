@@ -131,8 +131,9 @@ async def _metrics(
         recall = len(hits) / len(relevant)
         recall_values.append(recall)
         rank = min(hits) + 1 if hits else 0
+        # A complete miss contributes zero to MRR and stays in the denominator.
+        reciprocal_ranks.append(1.0 / rank if rank else 0.0)
         if rank:
-            reciprocal_ranks.append(1.0 / rank)
             if rank == 1:
                 hit1 += 1
         per_query.append(

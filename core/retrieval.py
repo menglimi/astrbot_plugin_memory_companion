@@ -1106,10 +1106,15 @@ class RetrievalEngine:
             owner_key = self._mutable_fact_owner_key(item.memory, ctx)
             subject_key = self._mutable_fact_subject_key(item.memory)
             for key in matched:
-                groups.setdefault((owner_key, subject_key, key), []).append((index, item))
+                # Keep explicitly qualified properties (for example home and
+                # office addresses) in separate assertion slots. A broad
+                # family keyword alone is not evidence that one fact replaces
+                # another.
+                qualifier = self._mutable_fact_qualifier(item.memory, key)
+                groups.setdefault((owner_key, subject_key, key, qualifier), []).append((index, item))
 
         drop_reasons: dict[str, str] = {}
-        for (_owner_key, _subject_key, key), entries in groups.items():
+        for (_owner_key, _subject_key, key, _qualifier), entries in groups.items():
             if len(entries) < 2:
                 continue
             keep_index, keep_item = max(
@@ -1143,6 +1148,21 @@ class RetrievalEngine:
             if item.memory.id in drop_reasons
         ]
         return collapsed, blocked
+
+    def _mutable_fact_qualifier(self, memory: MemoryRecord, key: str) -> str:
+        if key != "address":
+            return ""
+        text = clean_text(
+            " ".join([memory.content, memory.evidence, " ".join(memory.tags or [])]),
+            1200,
+        ).lower()
+        for qualifier, aliases in {
+            "home": ("家庭地址", "家里地址", "住家地址", "住宅地址"),
+            "office": ("公司地址", "办公地址", "工作地址", "单位地址"),
+        }.items():
+            if any(alias in text for alias in aliases):
+                return qualifier
+        return ""
 
     def _mutable_fact_keys_for_memory(self, memory: MemoryRecord) -> set[str]:
         metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
