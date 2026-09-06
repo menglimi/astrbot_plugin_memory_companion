@@ -522,6 +522,21 @@ class MemorySummarizer:
         compact_fact = re.sub(r"\s+", "", clean_text(fact, 300)).casefold()
         if len(compact_fact) >= 4 and compact_fact in source:
             return True
+        # Lexical overlap is insufficient when polarity or temporal details
+        # disagree. Reject an assertion whose negation marker conflicts with
+        # the supporting text, and require explicit date/time tokens present
+        # in the claim to be present in the evidence.
+        negation_markers = ("不", "没", "未", "无", "不是", "别", "禁止")
+        fact_negated = any(marker in compact_fact for marker in negation_markers)
+        source_negated = any(marker in source for marker in negation_markers)
+        if fact_negated != source_negated:
+            return False
+        temporal_tokens = re.findall(
+            r"(?:20\d{2}[-年]\d{1,2}(?:[-月]\d{1,2})?|周[一二三四五六日天]|星期[一二三四五六日天]|上午|下午|早上|晚上|凌晨|\d{1,2}点(?:\d{1,2}分)?)",
+            compact_fact,
+        )
+        if temporal_tokens and any(token not in source for token in temporal_tokens):
+            return False
         generic_terms = {
             "事情", "内容", "消息", "聊天", "对话", "表示", "提到", "认为", "觉得",
             "用户", "对方", "某人", "某个", "相关", "已经", "还是", "然后", "这个", "那个",
