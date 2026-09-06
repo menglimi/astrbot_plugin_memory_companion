@@ -107,6 +107,9 @@ class MemoryClassifier:
             metadata = {
                 "source_memory_id": source_memory_id,
                 "extractor": "rule_v2",
+                "proposal_stage": "collected",
+                "proposal_protocol": "memory_proposal_v1",
+                "attribution": "user",
                 "owner_bot_id": clean_text(ctx.bot_id, 120),
             }
             if fact.get("profile_dimension"):

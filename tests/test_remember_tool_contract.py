@@ -88,6 +88,26 @@ class RememberToolContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({"ok": False, "error": "empty content"}, result)
         resolver.assert_not_awaited()
 
+    async def test_non_persistent_proposal_is_skipped_without_storage(self) -> None:
+        service = self.make_service()
+        ctx = self.private_context()
+        service.identity = SimpleNamespace(resolve_event_context=AsyncMock(return_value=ctx))
+        service.store.insert_memory = AsyncMock()
+
+        result = await service.tool_remember(
+            ctx,
+            "这只是当前会话的想法",
+            proposal={"requested_persistence": False},
+        )
+
+        self.assertEqual({
+            "ok": False,
+            "state": "skipped",
+            "reason": "persistence not requested",
+            "review_status": "none",
+        }, result)
+        service.store.insert_memory.assert_not_awaited()
+
     def test_confirmation_contract_is_system_level_and_idempotent(self) -> None:
         service = self.make_service()
         req = SimpleNamespace(system_prompt="原始系统提示")

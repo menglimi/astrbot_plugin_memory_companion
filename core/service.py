@@ -64,6 +64,7 @@ from .models import (
     stable_fingerprint,
     utc_now,
 )
+from .memory_proposal import MemoryProposal
 from .operations import (
     PRESET_LABELS,
     PortableMemoryArchive,
@@ -1053,69 +1054,80 @@ class MemoryCompanionService:
                             },
                         }
                     )
-            if self.config.bool("memory_capture.extract_stable_facts", True):
+            capture_mode = clean_text(
+                self.config.get("memory_capture.proposal_mode", "hybrid"), 32
+            ).lower()
+            if capture_mode not in {"hybrid", "summary_first", "explicit_only"}:
+                capture_mode = "hybrid"
+            if self.config.bool("memory_capture.extract_stable_facts", True) and capture_mode == "hybrid":
+                # Hybrid remains backward compatible. summary_first leaves
+                # semantic extraction to the summary provider; explicit_only
+                # keeps timeline capture while requiring the remember tool for
+                # durable user initiated writes.
                 derived_memories = self.classifier.derived_user_memories(
                     ctx,
                     source_memory_id=memory_id,
                 )
-                if not any(
-                    clean_text((item.metadata or {}).get("profile_dimension"), 80)
-                    for item in derived_memories
+            else:
+                derived_memories = []
+            if not any(
+                clean_text((item.metadata or {}).get("profile_dimension"), 80)
+                for item in derived_memories
+            ):
+                rejection_reason = self.classifier.profile_rejection_reason(
+                    ctx.message_text
+                )
+                if rejection_reason:
+                    logger.info(
+                        "[MemoryCompanion] 画像写入门禁: decision=rejected "
+                        "reason=%s type=profile_candidate dimension= subject=%s source=%s",
+                        rejection_reason,
+                        clean_text(ctx.user_id, 120),
+                        clean_text(memory_id, 160),
+                    )
+            for derived in derived_memories:
+                derived.id = self.stable_id(
+                    "derived", derived.memory_type, ctx.session_id, derived.content
+                )
+                self.importance.calibrate(derived, source="stable_fact_extraction")
+                write_mode, gate_reason = self._prepare_rule_profile_write(derived)
+                if write_mode == "reject":
+                    self._log_profile_write_gate(
+                        derived,
+                        decision="rejected",
+                        reason=gate_reason,
+                    )
+                    continue
+                if write_mode == "profile":
+                    write_ops.append({"kind": "profile", "record": derived})
+                else:
+                    write_ops.append({"kind": "memory", "record": derived})
+                op_index = len(write_ops) - 1
+                derived_jobs.append((op_index, derived, write_mode))
+                relation_type = str(derived.metadata.get("relation_type") or "")
+                if relation_type and self.config.bool(
+                    "memory_capture.record_relationship_edges", True
                 ):
-                    rejection_reason = self.classifier.profile_rejection_reason(
-                        ctx.message_text
+                    write_ops.append(
+                        {
+                            "kind": "relationship",
+                            "requires_ok": [op_index],
+                            "source_memory_id_from": op_index,
+                            "params": {
+                                "subject": derived.subject,
+                                "object": self._bot_entity(ctx),
+                                "relation_type": relation_type,
+                                "scope": ctx.scope,
+                                "session_id": ctx.session_id,
+                                "group_id": ctx.group_id,
+                                "visibility": derived.visibility,
+                                "evidence": derived.evidence,
+                                "confidence": derived.confidence,
+                                "review_status": derived.review_status,
+                                "metadata": {"source": "relationship_claim"},
+                            },
+                        }
                     )
-                    if rejection_reason:
-                        logger.info(
-                            "[MemoryCompanion] 画像写入门禁: decision=rejected "
-                            "reason=%s type=profile_candidate dimension= subject=%s source=%s",
-                            rejection_reason,
-                            clean_text(ctx.user_id, 120),
-                            clean_text(memory_id, 160),
-                        )
-                for derived in derived_memories:
-                    derived.id = self.stable_id(
-                        "derived", derived.memory_type, ctx.session_id, derived.content
-                    )
-                    self.importance.calibrate(derived, source="stable_fact_extraction")
-                    write_mode, gate_reason = self._prepare_rule_profile_write(derived)
-                    if write_mode == "reject":
-                        self._log_profile_write_gate(
-                            derived,
-                            decision="rejected",
-                            reason=gate_reason,
-                        )
-                        continue
-                    if write_mode == "profile":
-                        write_ops.append({"kind": "profile", "record": derived})
-                    else:
-                        write_ops.append({"kind": "memory", "record": derived})
-                    op_index = len(write_ops) - 1
-                    derived_jobs.append((op_index, derived, write_mode))
-                    relation_type = str(derived.metadata.get("relation_type") or "")
-                    if relation_type and self.config.bool(
-                        "memory_capture.record_relationship_edges", True
-                    ):
-                        write_ops.append(
-                            {
-                                "kind": "relationship",
-                                "requires_ok": [op_index],
-                                "source_memory_id_from": op_index,
-                                "params": {
-                                    "subject": derived.subject,
-                                    "object": self._bot_entity(ctx),
-                                    "relation_type": relation_type,
-                                    "scope": ctx.scope,
-                                    "session_id": ctx.session_id,
-                                    "group_id": ctx.group_id,
-                                    "visibility": derived.visibility,
-                                    "evidence": derived.evidence,
-                                    "confidence": derived.confidence,
-                                    "review_status": derived.review_status,
-                                    "metadata": {"source": "relationship_claim"},
-                                },
-                            }
-                        )
             batch_results = await self.store.capture_write_batch(write_ops)
             # 批量结果后处理：画像门禁日志与 embedding 调度。
             for op_index, derived, write_mode in derived_jobs:
@@ -1150,8 +1162,9 @@ class MemoryCompanionService:
                         continue
                     derived_id = clean_text(result.get("memory_id"), 120)
                     self._schedule_memory_embedding(derived_id, derived)
-            await self.portraits.capture_user_message(ctx, event=event, req=req)
-            self._ensure_portrait_daily_dispatcher()
+            if capture_mode != "explicit_only":
+                await self.portraits.capture_user_message(ctx, event=event, req=req)
+                self._ensure_portrait_daily_dispatcher()
             if not self.config.bool("memory_capture.capture_bot_responses", True):
                 self._schedule_session_summary(ctx, reason="after_user_message")
         except Exception as exc:
@@ -3191,6 +3204,9 @@ class MemoryCompanionService:
             "embedding_top_k": self.config.int("retrieval.embedding_top_k", 32),
             "embedding_score_threshold": self.config.float("retrieval.embedding_score_threshold", 0.34),
             "embedding_weight": self.config.float("retrieval.embedding_weight", 0.55),
+            "non_conversation_budget": self.config.int(
+                "retrieval_advanced.non_conversation_budget", 2
+            ),
             "current_window_candidate_limit": self.config.int("retrieval.current_window_candidate_limit", 600),
             "keyword_fallback_min_fts_candidates": self.config.int(
                 "retrieval.keyword_fallback_min_fts_candidates", 80
@@ -3530,6 +3546,9 @@ class MemoryCompanionService:
                 "retrieval_advanced.proactive_message_score_penalty", 1.0
             ),
             dedupe_content_ratio=self.config.float("retrieval_advanced.dedupe_content_ratio", 0.0),
+            non_conversation_budget=self.config.int(
+                "retrieval_advanced.non_conversation_budget", 2
+            ),
         )
 
     async def _resolve_rerank_provider(self, ctx: SessionContext, *, mode: str) -> tuple[Any, str]:
@@ -4836,6 +4855,13 @@ class MemoryCompanionService:
                     "sentiment": clean_text((payload or {}).get("sentiment"), 20),
                     "summary_provider_id": clean_text(used_summary.get("provider_id"), 120),
                     "summary_provider_source": clean_text(used_summary.get("source"), 40),
+                    "summary_boundary": clean_text(rows[-1].get("id") if rows else "", 160),
+                    "source_event_ids": [
+                        clean_text(row.get("id"), 160)
+                        for row in rows
+                        if clean_text(row.get("id"), 160)
+                    ],
+                    "policy_version": "memory_capture_v1",
                 },
             )
             self.importance.calibrate(record, source="conversation_summary")
@@ -5848,11 +5874,34 @@ class MemoryCompanionService:
     def _reconstruction_scan_limit(self) -> int:
         return max(12, min(200, self.config.int("memory_reconstruction.candidate_scan_limit", 96)))
 
-    async def tool_remember(self, event: Any, content: str, *, note_type: str = "memory") -> dict[str, Any]:
-        content = clean_text(content, 3000)
-        note_type = clean_text(note_type, 40) or "memory"
+    async def tool_remember(
+        self,
+        event: Any,
+        content: str,
+        *,
+        note_type: str = "memory",
+        proposal: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist an AI-selected memory proposal after runtime validation.
+
+        ``proposal`` is optional for backwards compatibility.  The model may
+        express durability, validity and evidence references, while scope,
+        privacy and storage safety remain runtime responsibilities.
+        """
+        proposal_data = dict(proposal) if isinstance(proposal, Mapping) else {}
+        proposal_data.setdefault("note_type", note_type)
+        memory_proposal = MemoryProposal.from_payload(content, proposal_data)
+        content = memory_proposal.content
+        note_type = clean_text(memory_proposal.memory_type, 40) or "memory"
         if not content:
             return {"ok": False, "error": "empty content"}
+        if not memory_proposal.requested_persistence:
+            return {
+                "ok": False,
+                "state": "skipped",
+                "reason": "persistence not requested",
+                "review_status": "none",
+            }
         ctx = None
         try:
             ctx = await self.identity.resolve_event_context(event)
@@ -5869,7 +5918,7 @@ class MemoryCompanionService:
                 visibility = "group_public"
             record = MemoryRecord(
                 id=self.stable_id("tool", note_type, ctx.session_id, content),
-                memory_type="tool_memory",
+                memory_type=memory_proposal.memory_type,
                 subject=self._bot_entity(ctx),
                 object=EntityRef(kind="user", id=ctx.user_id, name=ctx.user_name, role="conversation_partner"),
                 scope=ctx.scope,
@@ -5880,14 +5929,23 @@ class MemoryCompanionService:
                 visibility=visibility,
                 sayability="indirect",
                 reality_level="llm_tool_assertion",
-                lifecycle="stable_memory",
                 content=content,
                 evidence=ctx.message_text,
-                confidence=0.62,
-                importance=0.66,
-                review_status="auto",
+                confidence=memory_proposal.confidence,
+                importance=memory_proposal.importance,
+                review_status="auto" if memory_proposal.confidence >= 0.55 else "pending",
                 tags=["llm_tool", note_type, ctx.scope],
-                metadata={"tool": "memory_companion_remember", "note_type": note_type, "owner_bot_id": self._bot_subject_id(ctx)},
+                valid_from=memory_proposal.valid_from,
+                valid_to=memory_proposal.valid_to,
+                durability=memory_proposal.durability,
+                validity_status=memory_proposal.validity_status,
+                lifecycle="stable_memory" if memory_proposal.confidence >= 0.55 else "short_term_candidate",
+                metadata={
+                    "tool": "memory_companion_remember",
+                    "note_type": note_type,
+                    "owner_bot_id": self._bot_subject_id(ctx),
+                    **memory_proposal.as_metadata(),
+                },
             )
             self.importance.calibrate(record, source="tool_memory")
             memory_id = await self.store.insert_memory(record)
@@ -5900,7 +5958,13 @@ class MemoryCompanionService:
                     exc,
                     exc_info=True,
                 )
-            return {"ok": True, "memory_id": memory_id, "review_status": record.review_status}
+            return {
+                "ok": True,
+                "memory_id": memory_id,
+                "review_status": record.review_status,
+                "durability": record.durability,
+                "validity_status": record.validity_status,
+            }
         except Exception as exc:
             logger.warning(
                 "[MemoryCompanion] 主动记忆工具写入失败: session=%s error=%s",
@@ -8210,7 +8274,7 @@ class MemoryCompanionService:
         max_chars = max(1000, self.config.int("memory_injection.debug_log_max_chars", 12000))
         def clip(value: Any, limit: int = max_chars) -> str:
             text = self.injection._redact_sensitive_text(value)
-            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            text = text.replace("\n", "\n").replace("", "\n")
             if len(text) > limit:
                 return text[: max(0, limit - 1)].rstrip() + "…"
             return text

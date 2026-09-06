@@ -63,6 +63,17 @@
         "type": "bool",
         "default": true
       },
+      "proposal_mode": {
+        "description": "记忆提议模式",
+        "hint": "hybrid 保留即时事实抽取并由阶段总结补充；summary_first 只把消息交给阶段总结，由模型决定长期记忆；explicit_only 仅保留用户明确通过记忆工具提交的内容。",
+        "type": "string",
+        "options": [
+          "hybrid",
+          "summary_first",
+          "explicit_only"
+        ],
+        "default": "hybrid"
+      },
       "record_relationship_edges": {
         "description": "记录关系边",
         "hint": "记录群成员归属等结构化关系。身份冒领类关系声明不会自动沉淀为稳定记忆。",
@@ -571,6 +582,12 @@
         "hint": "检索结果中规范化文本相似度达到该比例（difflib ratio，0-1）的候选只保留评分最高的一条，避免同一事实的多条措辞变体占用注入名额。0=关闭（默认，行为与旧版一致）；建议 0.75-0.85。",
         "type": "float",
         "default": 0.0
+      },
+      "non_conversation_budget": {
+        "description": "非对话记忆预算",
+        "hint": "普通问题中 Bot 自身时间线（生图、创作、直播、日程等）最多占用的召回名额，默认 2；明确询问这些内容时会自动放宽。",
+        "type": "int",
+        "default": 2
       }
     }
   },

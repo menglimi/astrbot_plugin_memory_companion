@@ -209,6 +209,11 @@ class MemoryCompanionPlugin(Star):
         Args:
             content(string): 要保存的记忆内容。
             note_type(string): memory/preference/relationship/promise 等简短类别。
+            confidence/importance(number): 模型对事实和长期价值的判断，运行时会限制在 0-1。
+            durability(string): ephemeral/short/normal/durable/pinned；只表达保留倾向。
+            valid_from/valid_to(string): 可选的 ISO 时间边界。
+            evidence_refs(array[string]): 支持该提议的事件引用或简短线索。
+            rationale(string): 可选的写入理由，仅用于审计。
         """
         if not self.service.config.bool("memory_tools.enable_remember_tool", True):
             return json_dumps({"ok": False, "error": "remember tool disabled"})
@@ -217,6 +222,15 @@ class MemoryCompanionPlugin(Star):
                 event,
                 str(kwargs.get("content") or ""),
                 note_type=str(kwargs.get("note_type") or "memory"),
+                proposal={
+                    key: kwargs.get(key)
+                    for key in (
+                        "memory_type", "confidence", "importance", "durability",
+                        "validity_status", "valid_from", "valid_to", "rationale",
+                        "evidence_refs", "requested_persistence", "persist",
+                    )
+                    if kwargs.get(key) is not None
+                },
             )
         except Exception as exc:
             logger.warning("[MemoryCompanion] 主动记忆工具调用失败: %s", exc, exc_info=True)

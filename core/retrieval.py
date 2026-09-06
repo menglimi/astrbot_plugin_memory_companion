@@ -63,6 +63,7 @@ class RetrievalEngine:
         relax_keyword_min_hits: bool = False,
         proactive_message_score_penalty: float = 1.0,
         dedupe_content_ratio: float = 0.0,
+        non_conversation_budget: int = 2,
     ):
         self.store = store
         self.policy = policy
@@ -103,6 +104,10 @@ class RetrievalEngine:
         # dedupe_content_ratio：检索结果内容级去重阈值（规范化文本 difflib ratio）。
         # 0.0=关闭（历史行为）；>0 时同主题高相似候选只保留评分最高的一条。
         self.dedupe_content_ratio = max(0.0, min(1.0, float(dedupe_content_ratio or 0.0)))
+        # Bot self-timeline records are useful context, but should not crowd
+        # out user/query evidence in ordinary questions. Explicit self-timeline
+        # queries remove this cap via capped_slots.
+        self.non_conversation_budget = max(0, min(12, int(non_conversation_budget or 0)))
         self._rank_path_info: dict[str, Any] = {}
         # haystack 缓存：同一 (memory.id, updated_at) 在一次召回内会被
         # _term_document_stats/_score/MMR features 多次重建，按键复用可省去
@@ -320,6 +325,16 @@ class RetrievalEngine:
         selected: list[SearchResult] = []
         selected_ids: set[str] = set()
         slot_map: dict[str, list[SearchResult]] = {slot: [] for slot in slot_order}
+        # ``open_loop`` is usually derived from the conversation itself and
+        # remains part of query evidence.  Only Bot-owned/non-dialogue records
+        # in ``self_timeline`` consume this separate budget.
+        secondary_slots = {"self_timeline"}
+
+        def secondary_allowed(slot: str) -> bool:
+            if slot not in secondary_slots or slot not in enforced_caps:
+                return True
+            used = sum(len(slot_map.get(name, [])) for name in secondary_slots)
+            return used < self.non_conversation_budget
 
         # Give every available slot one chance before any slot spends the rest
         # of its normal budget. This keeps later summary and stable-memory
@@ -337,6 +352,7 @@ class RetrievalEngine:
                     if candidate.memory.id not in selected_ids
                     and self._slot_for_memory(candidate.memory, ctx) == slot
                     and selectable_for_slot(candidate, slot)
+                    and secondary_allowed(slot)
                 ),
                 None,
             )
@@ -360,6 +376,8 @@ class RetrievalEngine:
                     continue
                 if not selectable_for_slot(item, slot):
                     continue
+                if not secondary_allowed(slot):
+                    continue
                 item.reason = self._with_slot_reason(item.reason, slot)
                 slot_map[slot].append(item)
                 selected.append(item)
@@ -381,6 +399,8 @@ class RetrievalEngine:
                 if slot_limit <= 0:
                     continue
                 if slot in enforced_caps and len(slot_map.get(slot, [])) >= slot_limit:
+                    continue
+                if not secondary_allowed(slot):
                     continue
                 item.reason = self._with_slot_reason(item.reason, slot)
                 slot_map.setdefault(slot, []).append(item)
