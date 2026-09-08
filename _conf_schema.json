@@ -25,6 +25,16 @@
           "骨缥"
         ],
         "default": "月白"
+      },
+      "ui_style": {
+        "description": "拓展页 UI 样式",
+        "hint": "默认使用旧版管理面板；切换为新版后使用 Memory OS 三维终端界面。",
+        "type": "string",
+        "options": [
+          "旧版",
+          "新版"
+        ],
+        "default": "旧版"
       }
     }
   },

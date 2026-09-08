@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>记忆面板 · 我会牢牢记住你</title>
+  <script>
+    (() => {
+      const themeKey = "memory_companion_theme";
+      const navKey = "memory_companion_nav";
+      let theme = "dark";
+      try {
+        const saved = window.localStorage.getItem(themeKey);
+        if (saved === "dark" || saved === "light") theme = saved;
+      } catch (_) {}
+      document.documentElement.dataset.theme = theme;
+      try {
+        const savedNav = window.localStorage.getItem(navKey);
+        if (savedNav) document.documentElement.dataset.initialNav = savedNav;
+      } catch (_) {}
+    })();
+  </script>
+  <link rel="stylesheet" href="./app.css?v=2.1.0-ui-v1" />
+</head>
+<body>
+  <div class="shell" id="shell">
+    <aside class="rail" id="rail" aria-label="主导航">
+      <div class="rail-brand"><span class="brand-mark" aria-hidden="true"></span><span class="brand-copy"><b>记忆面板</b><small>我会牢牢记住你</small></span></div>
+      <nav class="rail-nav" id="railNav" role="navigation"></nav>
+      <div class="rail-foot"><button class="theme-toggle" id="themeToggle" type="button" aria-label="切换深浅主题"><span class="theme-toggle-track"><span class="theme-toggle-knob"></span></span><span class="theme-toggle-label" id="themeToggleLabel">深色</span></button><div class="rail-status" id="railStatus"><span class="status-dot" aria-hidden="true"></span><span id="railStatusText">正在连接…</span></div></div>
+    </aside>
+    <main class="main" id="main">
+      <header class="topbar"><div class="topbar-copy"><p class="eyebrow" id="viewEyebrow">Memory Companion</p><h1 id="viewTitle">总览</h1><p class="topbar-hint" id="viewHint">记忆库、范围与联动的整体状态</p></div><div class="topbar-tools"><div class="topbar-search"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4 14 14"/></svg><input id="globalSearch" type="search" placeholder="搜索记忆内容、证据或 ID" autocomplete="off" /></div><button class="tool-btn" id="refreshBtn" type="button" title="刷新当前视图"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.75"/><path d="M13.4 2.2v3.1h-3.1"/></svg><span>刷新</span></button></div></header>
+      <div class="content" id="content" tabindex="-1"></div>
+    </main>
+  </div>
+  <aside class="drawer" id="drawer" aria-hidden="true" aria-label="记忆详情"><div class="drawer-head"><div><p class="eyebrow" id="drawerEyebrow">记忆</p><h2 id="drawerTitle">未选择</h2></div><button class="icon-btn" id="drawerClose" type="button" aria-label="关闭详情"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg></button></div><div class="drawer-body" id="drawerBody"></div></aside>
+  <div class="scrim" id="scrim" hidden></div><div class="busy-layer" id="busyLayer" aria-hidden="true"><span class="busy-ring"></span><b id="busyText">正在处理…</b></div><div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/api/plugin/page/bridge-sdk.js"></script><script src="./app.js?v=2.1.0-ui-v1"></script>
+</body>
+</html>

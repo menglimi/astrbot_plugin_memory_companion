@@ -12,6 +12,7 @@ const PAGE_ENDPOINT_PREFIX = "page";
 const TRANSPARENT_IMAGE = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
 const THEME_KEY = "memory_companion_theme";
 const NAV_KEY = "memory_companion_nav";
+const MODE_KEY = "memory_companion_mode";
 
 /* ------------------------------------------------------------
    基础工具
@@ -246,6 +247,7 @@ const state = {
   view: "overview",
   group: "overview",
   theme: document.documentElement.dataset.theme || "dark",
+  mode: document.documentElement.dataset.initialMode === "cinema" ? "cinema" : "standard",
   ready: false,
   stats: null,
   buckets: [],
@@ -256,12 +258,14 @@ const state = {
   configModule: "appearance",
   companion: null,
   acl: null,
+  assemblyViewer: null,
 };
 
 /* ------------------------------------------------------------
    提示 / 忙碌 / 抽屉
    ------------------------------------------------------------ */
 let toastTimer = 0;
+let assemblyViewerTicket = 0;
 
 function toast(message, tone) {
   const node = $("#toast");
@@ -461,10 +465,11 @@ async function go(viewId, options) {
     /* 忽略 */
   }
 
-  $("#viewEyebrow").textContent = view.eyebrow || "Memory Companion";
-  $("#viewTitle").textContent = view.title;
-  $("#viewHint").textContent = view.hint || "";
-  document.title = view.title + " · 记忆面板";
+  const cinemaOverview = state.mode === "cinema" && viewId === "overview";
+  $("#viewEyebrow").textContent = cinemaOverview ? "MEMORY COMPANION / ARCHIVE OS" : (view.eyebrow || "Memory Companion");
+  $("#viewTitle").textContent = cinemaOverview ? "记忆终端" : view.title;
+  $("#viewHint").textContent = cinemaOverview ? "档案阵列、通道筛选与实时记忆状态" : (view.hint || "");
+  document.title = (cinemaOverview ? "记忆终端" : view.title) + " · 记忆面板";
   renderRail();
 
   const token = renderToken + 1;
@@ -790,6 +795,7 @@ function memoryDetailHtml(memory) {
     '<div class="drawer-section"><h4>操作</h4>' +
     '<div class="card is-tight" style="background:var(--surface-2)">' +
     '<div class="config-form">' +
+    '<button class="btn is-sm assembly-open-btn" type="button" id="openAssemblyViewerBtn">打开三维结构</button>' +
     '<div class="field"><span>内容</span><textarea id="editContent" rows="5">' + esc(compact(memory.content)) + "</textarea></div>" +
     '<div class="field is-inline"><span>重要性</span><input id="editImportance" type="number" step="0.01" min="0" max="1" value="' + esc(num(memory.importance, 2) === "-" ? "0.5" : num(memory.importance, 2)) + '" /></div>' +
     '<div class="field is-inline"><span>置信度</span><input id="editConfidence" type="number" step="0.01" min="0" max="1" value="' + esc(num(memory.confidence, 2) === "-" ? "0.5" : num(memory.confidence, 2)) + '" /></div>' +
@@ -809,6 +815,8 @@ function memoryDetailHtml(memory) {
 }
 
 function bindMemoryActions(memoryId) {
+  const viewerBtn = $("#openAssemblyViewerBtn");
+  if (viewerBtn) viewerBtn.addEventListener("click", () => openAssemblyViewer(memoryId));
   const saveBtn = $("#saveMemoryBtn");
   if (saveBtn) {
     saveBtn.addEventListener("click", async () => {
@@ -858,28 +866,151 @@ async function openMemory(memoryId) {
   });
 }
 
+async function openAssemblyViewer(memoryId) {
+  const viewer = $("#assemblyViewer");
+  const canvas = $("#assemblyViewerCanvas");
+  if (!viewer || !canvas) return;
+  const ticket = ++assemblyViewerTicket;
+  const title = $("#drawerTitle")?.textContent || "档案结构";
+  $("#assemblyViewerTitle").textContent = title;
+  $("#assemblyViewerFile").textContent = "FILE " + compact(memoryId) + " / INTERNAL DATABASE";
+  viewer.hidden = false;
+  viewer.setAttribute("aria-hidden", "false");
+  document.body.classList.add("assembly-viewer-open");
+  $("#assemblyViewerLoading").hidden = false;
+  $("#assemblyViewerRetry").hidden = true;
+  const mount = () => window.MemoryCinema3D?.mountAssemblyViewer(canvas, {
+    onState: (value) => { const node = $("#assemblyViewerState"); if (node) node.textContent = value; },
+    onError: () => { const node = $("#assemblyViewerRetry"); if (node) node.hidden = false; },
+  });
+  let mounted;
+  if (window.MemoryCinema3D?.mountAssemblyViewer) mounted = await mount();
+  else {
+    await Promise.race([
+      new Promise((resolve) => window.addEventListener("memory-cinema-ready", resolve, { once: true })),
+      sleep(8000),
+    ]);
+    if (!window.MemoryCinema3D?.mountAssemblyViewer) {
+      canvas.innerHTML = '<span class="scene-loading">ASSEMBLY VIEWER / UNAVAILABLE</span>';
+      $("#assemblyViewerLoading").hidden = true;
+      $("#assemblyViewerRetry").hidden = false;
+      return;
+    }
+    mounted = await mount();
+  }
+  if (ticket !== assemblyViewerTicket || viewer.hidden) {
+    mounted?.dispose?.();
+    return;
+  }
+  state.assemblyViewer = mounted;
+  $("#assemblyViewerLoading").hidden = true;
+}
+
+function closeAssemblyViewer() {
+  assemblyViewerTicket += 1;
+  state.assemblyViewer?.dispose?.();
+  state.assemblyViewer = null;
+  const viewer = $("#assemblyViewer");
+  if (viewer) {
+    viewer.hidden = true;
+    viewer.setAttribute("aria-hidden", "true");
+  }
+  document.body.classList.remove("assembly-viewer-open");
+}
+
+function applyMode(mode) {
+  state.mode = mode === "cinema" ? "cinema" : "standard";
+  document.documentElement.dataset.uiMode = state.mode;
+  const button = $("#modeToggle");
+  const label = $("#modeToggleLabel");
+  if (button) button.setAttribute("aria-pressed", state.mode === "cinema" ? "true" : "false");
+  if (label) label.textContent = state.mode === "cinema" ? "标准模式" : "终端模式";
+  try {
+    window.localStorage.setItem(MODE_KEY, state.mode);
+  } catch (error) {
+    /* 忽略存储禁用 */
+  }
+}
+
 /* ============================================================
    视图：总览
    ============================================================ */
+function renderCinemaOverview(data) {
+  const stats = data.stats || {};
+  const memories = Array.isArray(data.memories) ? data.memories : [];
+  const coreRecords = (data.core || []).map((block) => ({
+    id: block.id,
+    scope: "core",
+    memory_type: block.kind || "fact",
+    canonical_summary: block.label || "核心记忆",
+    content: block.content,
+    isCore: true,
+  }));
+  const buckets = Array.isArray(data.buckets) ? data.buckets : [];
+  const records = memories.length ? memories.slice(0, 32).concat(coreRecords.slice(0, 8)) : buckets.slice(0, 24).map((bucket, index) => ({
+    id: "bucket-" + index,
+    scope: bucket.scope,
+    target_id: bucket.target_id,
+    canonical_summary: bucket.label || bucket.target_name || bucket.target_id,
+    content: bucket.sample_session_id || "此档案窗口暂未提供摘要",
+    memory_count: bucket.memory_count,
+    updated_at_local: bucket.last_activity_at || bucket.updated_at,
+    isBucket: true,
+  }));
+  const cinemaChannel = (memory) => {
+    const scope = compact(memory.scope);
+    const type = compact(memory.memory_type);
+    const visibility = compact(memory.visibility);
+    if (scope === "core") return "core";
+    if (scope === "personal" || visibility === "bot_self" || type === "companion_note" || type === "schedule") return "personal";
+    if (scope === "profile" || type === "profile" || type === "preference" || type === "user_profile") return "profile";
+    if (type === "relationship" || type === "relationship_claim" || type === "relationship_phase_summary") return "relationship";
+    return "session";
+  };
+  const channelLabels = { session: "会话存档", profile: "用户画像", relationship: "关系脉络", core: "核心记忆", personal: "Bot 生活" };
+  const recordButtons = records.map((memory, index) => {
+    const scope = compact(memory.scope) || "private";
+    const channel = cinemaChannel(memory);
+    const type = compact(memory.memory_type) || (memory.isBucket ? "archive" : "memory");
+    const title = memoryTitle(memory);
+    const detail = memory.isBucket
+      ? (compact(memory.target_id) || "未命名窗口") + " · " + fmtInt(memory.memory_count) + " 条记录"
+      : (TYPE_LABEL[type] || type) + " · " + (SCOPE_META[scope] ? SCOPE_META[scope].label : scope);
+    return '<button class="terminal-record" type="button" data-terminal-index="' + index + '" data-memory="' + esc(memory.isBucket || memory.isCore ? "" : memory.id) + '" data-core="' + esc(memory.isCore ? memory.id : "") + '" data-terminal-channel="' + esc(channel) + '" data-terminal-text="' + esc(title + " " + detail) + '">' +
+      '<span class="terminal-record-id mono">' + String(index + 1).padStart(3, "0") + '</span><span class="terminal-record-channel">' + esc(channelLabels[channel] || channel) + '</span><strong>' + esc(clip(title, 72)) + '</strong><span class="terminal-record-meta">' + esc(detail) + '</span><i class="terminal-record-signal">●</i></button>';
+  }).join("");
+  return '<section class="terminal-stage" aria-label="Rhine Lab 记忆终端">' +
+    '<div class="terminal-stage-top"><span class="terminal-kicker">RHINE LAB / MEMORY ARCHIVE</span><span class="terminal-session mono">SESSION M-' + String(int(stats.total_memories)).padStart(6, "0") + ' <i></i> AUTHORIZED</span></div>' +
+    '<div class="terminal-scene-wrap"><div class="cinema-scene" id="cinemaScene" aria-label="三维档案阵列"><span class="scene-loading">ARCHIVE SCENE / LOADING</span></div><div class="terminal-scanline" aria-hidden="true"></div></div>' +
+    '<div class="terminal-callout"><div class="terminal-label">INTERNAL DATABASE <span>/</span> <b id="terminalCategory">记忆档案</b></div><button class="terminal-file-title" id="terminalFileTitle" type="button"><span>FILE NUMBER: </span><strong id="terminalFileId">M-001</strong><span>↗</span></button><div class="terminal-rule"><i></i></div><div class="terminal-summary"><strong id="terminalSelectedTitle">等待档案</strong><span id="terminalSelectedMeta">MEMORY CHANNEL</span></div><button class="terminal-access" id="terminalAccess" type="button">ACCESS MEMORY <span>→</span></button></div>' +
+    '<div class="terminal-feed-head"><span class="terminal-label">ARCHIVE STREAM / 记录带</span><label><span>/</span><input id="terminalSearch" type="search" placeholder="检索记录" autocomplete="off" /></label><b id="terminalResultCount">' + fmtInt(records.length) + ' RECORDS</b></div>' +
+    '<div class="terminal-feed" id="terminalFeed">' + (recordButtons || emptyState("暂无记录", "连接后会在这里展开记忆流。")) + '</div>' +
+    '<div class="terminal-controls"><div class="terminal-counter"><span>ARCHIVE / SELECT</span><strong><b id="terminalSelectedNumber">01</b><i>/</i><b>' + String(Math.max(records.length, 1)).padStart(2, "0") + '</b></strong></div><div class="terminal-arrows"><button type="button" data-terminal-prev aria-label="上一个记忆">↑</button><button type="button" data-terminal-next aria-label="下一个记忆">↓</button></div><div class="terminal-column"><button type="button" data-terminal-column-prev aria-label="上一记忆通道">←</button><span><small>MEMORY CHANNEL</small><b id="terminalChannel">ALL RECORDS</b></span><button type="button" data-terminal-column-next aria-label="下一记忆通道">→</button></div><span class="terminal-hint"><kbd>←</kbd><kbd>→</kbd> 通道 <span>/</span> <kbd>↑</kbd><kbd>↓</kbd> 档案 <span>/</span> <kbd>ENTER</kbd> 读取</span></div>' +
+    '<div class="terminal-marquee"><span>ARCHIVE CHANNEL CONNECTED</span><i>●</i><span>PERSONAL CONTEXT READY</span><i>●</i><span>RECALL ENGINE STANDBY</span><i>●</i><span>ARCHIVE CHANNEL CONNECTED</span></div>' +
+    '</section>';
+}
+
 defineView("overview", {
   title: "总览",
   navLabel: "总览",
   eyebrow: "Overview",
   hint: "记忆库规模、范围分布与联动状态的整体快照",
   async load() {
-    const [statsPayload, buckets, core, personal, coord] = await Promise.all([
+    const [statsPayload, buckets, core, personal, coord, memories] = await Promise.all([
       apiGet("/stats"),
       apiTry(() => apiGet("/buckets?limit=160"), { buckets: [] }),
       apiTry(() => apiGet("/core-memory"), { blocks: [] }),
       apiTry(() => apiGet("/capabilities/bot-personal"), {}),
       apiTry(() => apiGet("/coordination/status"), { status: {} }),
+      apiTry(() => apiGet("/memories?limit=80"), { memories: [] }),
     ]);
     const stats = (statsPayload && statsPayload.stats) || {};
     state.stats = stats;
     state.buckets = Array.isArray(buckets.buckets) ? buckets.buckets : [];
-    return { stats, buckets: state.buckets, core: core.blocks || [], personal, coord: coord.status || {} };
+    return { stats, buckets: state.buckets, core: core.blocks || [], personal, coord: coord.status || {}, memories: memories.memories || [] };
   },
   render(data) {
+    if (state.mode === "cinema") return renderCinemaOverview(data);
     const stats = data.stats || {};
     const byScope = stats.by_scope || {};
     const storageMb = (int(stats.memory_storage_bytes) / 1048576).toFixed(1);
@@ -971,6 +1102,80 @@ defineView("overview", {
       "</div>" +
       "</div>"
     );
+  },
+  mount(node) {
+    const sceneRoot = $("#cinemaScene", node);
+    if (sceneRoot) {
+      const mountScene = () => window.MemoryCinema3D && window.MemoryCinema3D.mountArchiveScene(sceneRoot);
+      if (window.MemoryCinema3D) mountScene();
+      else window.addEventListener("memory-cinema-ready", mountScene, { once: true });
+      if (!window.MemoryCinema3D) sceneRoot.dataset.waitingForScene = "true";
+      /* Static module loading is rewritten by AstrBot to include its asset token. */
+      window.setTimeout(() => {
+        if (!window.MemoryCinema3D && sceneRoot.isConnected) sceneRoot.innerHTML = '<span class="scene-loading">ARCHIVE SCENE / UNAVAILABLE</span>';
+      }, 8000);
+    }
+    const records = $$(".terminal-record", node);
+    const search = $("#terminalSearch", node);
+    const resultCount = $("#terminalResultCount", node);
+    const channels = ["all", "session", "profile", "relationship", "core", "personal"];
+    let selectedIndex = 0;
+    let channelIndex = 0;
+    const select = (index, focus = false) => {
+      if (!records.length) return;
+      selectedIndex = (index + records.length) % records.length;
+      const record = records[selectedIndex];
+      records.forEach((item) => item.classList.toggle("is-selected", item === record));
+      if (sceneRoot) sceneRoot.dataset.selectedIndex = String(selectedIndex);
+      const title = $("#terminalSelectedTitle", node);
+      const meta = $("#terminalSelectedMeta", node);
+      const id = $("#terminalFileId", node);
+      const number = $("#terminalSelectedNumber", node);
+      const category = $("#terminalCategory", node);
+      const channel = $("#terminalChannel", node);
+      if (title) title.textContent = $("strong", record)?.textContent || "等待档案";
+      if (meta) meta.textContent = $(".terminal-record-meta", record)?.textContent || "MEMORY CHANNEL";
+      if (id) id.textContent = "M-" + String(selectedIndex + 1).padStart(3, "0");
+      if (number) number.textContent = String(selectedIndex + 1).padStart(2, "0");
+      if (category) category.textContent = $(".terminal-record-channel", record)?.textContent || "记忆档案";
+      if (channel) channel.textContent = $(".terminal-record-channel", record)?.textContent || "ALL RECORDS";
+      if (focus) record.focus({ preventScroll: true });
+    };
+    const applySearch = () => {
+      const query = compact(search?.value).toLowerCase();
+      let visible = 0;
+      records.forEach((record) => {
+        const shown = !query || compact(record.dataset.terminalText).toLowerCase().includes(query);
+        record.hidden = !shown;
+        if (shown) visible += 1;
+      });
+      if (resultCount) resultCount.textContent = visible + " RECORDS";
+    };
+    search?.addEventListener("input", applySearch);
+    records.forEach((record, index) => record.addEventListener("click", () => {
+      select(index);
+      if (record.dataset.memory) openMemory(record.dataset.memory);
+      else if (record.dataset.core) go("core");
+      else go("inspect");
+    }));
+    $("#terminalFileTitle", node)?.addEventListener("click", () => records[selectedIndex]?.click());
+    $("#terminalAccess", node)?.addEventListener("click", () => records[selectedIndex]?.click());
+    $("[data-terminal-prev]", node)?.addEventListener("click", () => select(selectedIndex - 1, true));
+    $("[data-terminal-next]", node)?.addEventListener("click", () => select(selectedIndex + 1, true));
+    $("[data-terminal-column-prev]", node)?.addEventListener("click", () => {
+      channelIndex = (channelIndex + channels.length - 1) % channels.length;
+      const target = channels[channelIndex];
+      const index = target === "all" ? 0 : records.findIndex((record) => record.dataset.terminalChannel === target);
+      if (index >= 0) select(index, true);
+    });
+    $("[data-terminal-column-next]", node)?.addEventListener("click", () => {
+      channelIndex = (channelIndex + 1) % channels.length;
+      const target = channels[channelIndex];
+      const index = target === "all" ? 0 : records.findIndex((record) => record.dataset.terminalChannel === target);
+      if (index >= 0) select(index, true);
+    });
+    applySearch();
+    select(0);
   },
 });
 
@@ -3942,11 +4147,28 @@ function bindShell() {
 
   $("#drawerClose").addEventListener("click", closeDrawer);
   $("#scrim").addEventListener("click", closeDrawer);
+  $("#assemblyViewerClose")?.addEventListener("click", closeAssemblyViewer);
+  $("#assemblyViewerRetry")?.addEventListener("click", () => {
+    const id = $("#assemblyViewerFile")?.textContent.replace(/^FILE\s+|\s+\/.*$/g, "").trim();
+    if (id) openAssemblyViewer(id);
+  });
+  $("#assemblyExplode")?.addEventListener("click", () => state.assemblyViewer?.setExploded(true));
+  $("#assemblyAssemble")?.addEventListener("click", () => state.assemblyViewer?.setExploded(false));
+  $("#assemblyReset")?.addEventListener("click", () => state.assemblyViewer?.reset());
 
   $("#refreshBtn").addEventListener("click", () => {
     invalidatePool();
     refresh();
   });
+
+  const modeToggle = $("#modeToggle");
+  if (modeToggle) {
+    modeToggle.addEventListener("click", () => {
+      applyMode(state.mode === "cinema" ? "standard" : "cinema");
+      toast(state.mode === "cinema" ? "已进入终端模式" : "已切回标准模式", "ok");
+      go(state.mode === "cinema" ? "overview" : state.view);
+    });
+  }
 
   const search = $("#globalSearch");
   search.addEventListener("keydown", (event) => {
@@ -3984,6 +4206,49 @@ function bindShell() {
   });
 
   document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !$("#assemblyViewer")?.hidden) {
+      event.preventDefault();
+      closeAssemblyViewer();
+      return;
+    }
+    if (state.mode === "cinema" && state.view === "overview") {
+      const searchBox = $("#terminalSearch");
+      if (event.key === "/" && document.activeElement !== searchBox) {
+        event.preventDefault();
+        searchBox && searchBox.focus();
+        return;
+      }
+      const prevColumn = $("[data-terminal-column-prev]");
+      const nextColumn = $("[data-terminal-column-next]");
+      const prevRecord = $("[data-terminal-prev]");
+      const nextRecord = $("[data-terminal-next]");
+      const records = $$("#terminalFeed .terminal-record:not([hidden])");
+      if (event.key === "ArrowLeft" && prevColumn) {
+        event.preventDefault();
+        prevColumn.click();
+        return;
+      }
+      if (event.key === "ArrowRight" && nextColumn) {
+        event.preventDefault();
+        nextColumn.click();
+        return;
+      }
+      if (event.key === "ArrowUp" && prevRecord) {
+        event.preventDefault();
+        prevRecord.click();
+        return;
+      }
+      if (event.key === "ArrowDown" && nextRecord) {
+        event.preventDefault();
+        nextRecord.click();
+        return;
+      }
+      if (event.key === "Enter" && document.activeElement?.classList.contains("terminal-record")) {
+        event.preventDefault();
+        document.activeElement.click();
+        return;
+      }
+    }
     if (event.key === "Escape") {
       closeDrawer();
       const box = $(".lightbox");
@@ -3995,11 +4260,12 @@ function bindShell() {
 async function boot() {
   bindShell();
   applyTheme(state.theme);
+  applyMode(state.mode);
   renderRail();
   setRailStatus("loading", "正在连接…");
 
   const initial = document.documentElement.dataset.initialNav;
-  const target = initial && VIEWS[initial] ? initial : "overview";
+  const target = state.mode === "cinema" ? "overview" : (initial && VIEWS[initial] ? initial : "overview");
 
   try {
     await apiGet("/stats");

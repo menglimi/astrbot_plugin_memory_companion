@@ -216,6 +216,7 @@ class PluginPageApi:
     def _route_specs(self) -> list[tuple[str, Any, list[str], str]]:
         return [
             ("/ui/capabilities", self.ui_capabilities, ["GET"], "MemoryCompanion UI capability contract"),
+            ("/ui-preferences", self.ui_preferences, ["GET"], "MemoryCompanion UI preferences"),
             ("/stats", self.stats, ["GET"], "MemoryCompanion Page stats"),
             ("/buckets", self.buckets, ["GET"], "MemoryCompanion Page buckets"),
             ("/memories", self.memories, ["GET"], "MemoryCompanion Page memories"),
@@ -320,6 +321,11 @@ class PluginPageApi:
                 ],
             }
         )
+
+    async def ui_preferences(self):
+        style = clean_text(self.plugin.service.config.get("appearance.ui_style", "旧版"), 20).lower()
+        modern = style in {"modern", "new", "新版"}
+        return self._ok({"ui_style": "modern" if modern else "legacy"})
 
     async def stats(self):
         stats = await self.plugin.service.store.stats()
@@ -1844,6 +1850,7 @@ class PluginPageApi:
             query=query,
             selected_date=companion.payload["selected_date"],
         )
+
         payload = self._project_companion_page(companion, records)
         selected = payload["selected_date"]
         filtered = [record for record in records if self._memory_date_key(record) == selected] if selected else records

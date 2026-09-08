@@ -8274,7 +8274,8 @@ class MemoryCompanionService:
         max_chars = max(1000, self.config.int("memory_injection.debug_log_max_chars", 12000))
         def clip(value: Any, limit: int = max_chars) -> str:
             text = self.injection._redact_sensitive_text(value)
-            text = text.replace("\n", "\n").replace("", "\n")
+            # Keep multiline diagnostics readable across Windows and Unix logs.
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
             if len(text) > limit:
                 return text[: max(0, limit - 1)].rstrip() + "…"
             return text
