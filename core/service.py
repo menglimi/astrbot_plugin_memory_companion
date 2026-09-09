@@ -4609,6 +4609,12 @@ class MemoryCompanionService:
                 last_error = clean_text(failure.get("last_error"), 1000)
                 transient = self._summary_failure_is_transient(last_error)
                 age_seconds = self._summary_failure_age_seconds(failure)
+                # Evidence-gate rejections are quarantined for human review.
+                # Retrying the same raw batch automatically only repeats the
+                # model call and can create an unbounded token-burning loop.
+                # An explicit force=True summary is still allowed to retry it.
+                if state == "evidence_quarantine":
+                    return ""
                 if retries >= max_retries:
                     cooldown_seconds = self._summary_failure_cooldown_seconds(transient=transient)
                     cooldown_state = "transient_cooldown" if transient else "retry_cooldown"
