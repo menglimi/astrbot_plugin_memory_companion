@@ -5,14 +5,59 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="theme-color" content="#e8e5e1" />
   <title>Memory OS · 拓展页</title>
+  <!-- Load the AstrBot page bridge before the selector runs.  The bridge is
+       required in mobile WebViews where dashboard cookies are unavailable. -->
+  <script src="/api/plugin/page/bridge-sdk.js"></script>
   <script>
-    (async () => {
-      let style = "legacy";
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    function getBridge() {
+      if (window.AstrBotPluginPage) return window.AstrBotPluginPage;
       try {
-        const response = await fetch("/api/v1/plugins/extensions/astrbot_plugin_memory_companion/page/ui-preferences", { credentials: "same-origin", cache: "no-store" });
-        const payload = await response.json();
-        style = payload?.ui_style === "modern" || payload?.data?.ui_style === "modern" ? "modern" : "legacy";
+        if (window.parent && window.parent !== window && window.parent.AstrBotPluginPage) {
+          return window.parent.AstrBotPluginPage;
+        }
       } catch (_) {}
+      return null;
+    }
+
+    async function resolveStyle() {
+      const bridge = getBridge();
+      if (bridge && typeof bridge.apiGet === "function") {
+        // Give the bridge a short opportunity to receive its signed context;
+        // apiGet itself remains safe to call when context delivery is delayed.
+        if (typeof bridge.ready === "function") {
+          await Promise.race([bridge.ready(), wait(800)]).catch(() => {});
+        }
+        try {
+          const payload = await Promise.race([
+            bridge.apiGet("page/ui-preferences"),
+            wait(2500).then(() => { throw new Error("bridge timeout"); }),
+          ]);
+          const value = payload?.ui_style ?? payload?.data?.ui_style;
+          return value === "modern" || value === "new" || value === "新版" ? "modern" : "legacy";
+        } catch (_) {}
+      }
+
+      // Desktop builds expose the authenticated extension endpoint directly;
+      // this fallback also works when a WebView blocks postMessage bridges.
+      for (const endpoint of [
+        "/api/plug/astrbot_plugin_memory_companion/page/ui-preferences",
+        "/api/v1/plugins/extensions/astrbot_plugin_memory_companion/page/ui-preferences",
+      ]) {
+        try {
+          const response = await fetch(endpoint, { credentials: "same-origin", cache: "no-store" });
+          if (!response.ok) continue;
+          const payload = await response.json();
+          const value = payload?.ui_style ?? payload?.data?.ui_style;
+          return value === "modern" || value === "new" || value === "新版" ? "modern" : "legacy";
+        } catch (_) {}
+      }
+      return "legacy";
+    }
+
+    (async () => {
+      const style = await resolveStyle();
       // AstrBot signs extension page URLs with asset_token. Keep the token
       // when switching from this selector page to the actual UI; mobile
       // WebViews often do not have the dashboard cookie available.

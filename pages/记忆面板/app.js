@@ -4,10 +4,11 @@
    ============================================================ */
 "use strict";
 
-// Keep the fallback on AstrBot's authenticated extension API. The legacy
-// /astrbot_plugin_memory_companion/page/* path is not served by current
-// dashboard builds, while the page bridge uses this same extension route.
-const API = "/api/v1/plugins/extensions/astrbot_plugin_memory_companion/page";
+// Keep the fallback on AstrBot's authenticated extension API.  The legacy
+// /api/plug route is available across dashboard versions and does not depend
+// on a dashboard cookie inside mobile WebViews; the page bridge remains the
+// preferred transport when the page is embedded by AstrBot.
+const API = "/api/plug/astrbot_plugin_memory_companion/page";
 const PAGE_ENDPOINT_PREFIX = "page";
 const TRANSPARENT_IMAGE = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
 const THEME_KEY = "memory_companion_theme";

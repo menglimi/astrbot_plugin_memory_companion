@@ -17,7 +17,7 @@ from .core.models import json_dumps
 from .core.service import MemoryCompanionService
 
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
-PLUGIN_VERSION = "2.1.2"
+PLUGIN_VERSION = "2.1.3"
 
 _ACTIVE_BRIDGE: MemoryCompanionBridge | None = None
 
