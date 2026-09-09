@@ -13,7 +13,13 @@
         const payload = await response.json();
         style = payload?.ui_style === "modern" || payload?.data?.ui_style === "modern" ? "modern" : "legacy";
       } catch (_) {}
-      location.replace(style === "modern" ? "./modern.html" : "./legacy.html");
+      // AstrBot signs extension page URLs with asset_token. Keep the token
+      // when switching from this selector page to the actual UI; mobile
+      // WebViews often do not have the dashboard cookie available.
+      const target = new URL(style === "modern" ? "./modern.html" : "./legacy.html", location.href);
+      target.search = location.search;
+      target.hash = location.hash;
+      location.replace(target.href);
     })();
   </script>
 </head>
