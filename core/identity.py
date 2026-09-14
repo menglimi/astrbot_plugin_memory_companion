@@ -169,11 +169,30 @@ class IdentityResolver:
             try:
                 value = await maybe_await(getter())
                 if isinstance(value, str):
-                    return value
+                    return self._original_wake_message_text(event, value)
             except Exception:
                 pass
         value = getattr(event, "message_str", "")
-        return value if isinstance(value, str) else ""
+        return self._original_wake_message_text(event, value) if isinstance(value, str) else ""
+
+    @staticmethod
+    def _original_wake_message_text(event: Any, current: str) -> str:
+        snapshot = getattr(event, "_private_companion_wake_message_context", None)
+        if not isinstance(snapshot, dict) or bool(getattr(event, "private_companion_proactive_framework", False)):
+            return current
+        original = snapshot.get("original_text")
+        routed = snapshot.get("routed_text")
+        prefix = snapshot.get("wake_prefix")
+        source = getattr(getattr(event, "message_obj", None), "message_str", None)
+        if (
+            isinstance(original, str) and isinstance(routed, str)
+            and isinstance(prefix, str) and any(char.isalnum() for char in prefix)
+            and isinstance(source, str) and source.strip() == original
+            and current.strip() == routed and original.startswith(prefix)
+            and original[len(prefix):].strip() == routed
+        ):
+            return original
+        return current
 
     def _message_id(self, event: Any) -> str:
         message_obj = getattr(event, "message_obj", None)
