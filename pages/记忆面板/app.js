@@ -1014,6 +1014,7 @@ defineView("overview", {
     if (state.mode === "cinema") return renderCinemaOverview(data);
     const stats = data.stats || {};
     const byScope = stats.by_scope || {};
+    const progress = stats.summary_progress || {};
     const storageMb = (int(stats.memory_storage_bytes) / 1048576).toFixed(1);
     const privateCount = int(byScope.private);
     const groupCount = int(byScope.group);
@@ -1025,6 +1026,11 @@ defineView("overview", {
       kpi("用户档案", fmtInt(stats.identities), "已识别身份", "relation"),
       kpi("核心记忆", fmtInt((data.core || []).length), "强制注入块", "gold"),
       kpi("开放线程", fmtInt(stats.open_threads), "跨窗口续接", "fact"),
+      kpi("原文已记录", fmtInt(progress.raw_events), "原始会话事件", "group"),
+      kpi("会话记忆已生成", fmtInt(progress.conversation_memories), "不含待审核候选", "fact"),
+      kpi("待处理批次", fmtInt(progress.pending_batches), "排队或延迟重试", "accent"),
+      kpi("待修复批次", fmtInt(progress.quarantined_batches), "仅隔离本批，后续继续", "gold"),
+      kpi("已处理，无新增记忆", fmtInt(progress.no_memory_batches), "原文保留，不重复总结", "private"),
     ].join("");
 
     const entries = [

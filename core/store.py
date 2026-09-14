@@ -94,7 +94,10 @@ def _normalize_embedding_vector_values(values: list[float]) -> list[float]:
     return [value / norm for value in values]
 
 
-class MemoryStore:
+from .summary_batches import SummaryBatchStore
+
+
+class MemoryStore(SummaryBatchStore):
     EMBEDDING_CANDIDATE_CACHE_MAX = 64
     SCHEMA_VERSION = "memory-atom-v2"
     # Redaction is idempotent but scanning the whole history at every startup
@@ -1146,6 +1149,7 @@ class MemoryStore:
                    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
                 (self.SCHEMA_VERSION, utc_now()),
             )
+            self._initialize_summary_batches()
             self._conn.commit()
 
     def _cleanup_placeholder_memory_indexes_sync(self) -> int:
@@ -2961,6 +2965,7 @@ class MemoryStore:
             "review_queue",
             "injection_logs",
             "summary_failures",
+            "summary_batches",
             "chat_import_segments",
             "chat_import_batches",
             "relationship_edges",
@@ -3065,6 +3070,7 @@ class MemoryStore:
                 ),
                 "injection_logs": self._count_where("injection_logs", injection_where, injection_params),
                 "summary_failures": self._count_where("summary_failures", injection_where, injection_params),
+                "summary_batches": self._count_where("summary_batches", injection_where, injection_params),
                 "cross_window_threads": self._count_where("cross_window_threads", thread_where, thread_params),
             }
             if not execute:
@@ -3099,6 +3105,7 @@ class MemoryStore:
                 deleted["knowledge_nodes"] = self._delete_where("knowledge_nodes", knowledge_node_where, knowledge_node_params)
                 deleted["injection_logs"] = self._delete_where("injection_logs", injection_where, injection_params)
                 deleted["summary_failures"] = self._delete_where("summary_failures", injection_where, injection_params)
+                deleted["summary_batches"] = self._delete_where("summary_batches", injection_where, injection_params)
                 deleted["cross_window_threads"] = self._delete_where("cross_window_threads", thread_where, thread_params)
         return {
             "target_type": target_type,
@@ -8113,6 +8120,7 @@ class MemoryStore:
         scope: str = "",
         limit: int = 40,
         after_timeline_id: str = "",
+        exclude_assigned: bool = False,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
             self._unsummarized_timeline_window_sync,
@@ -8120,6 +8128,7 @@ class MemoryStore:
             scope,
             limit,
             after_timeline_id,
+            exclude_assigned,
         )
 
     def _unsummarized_timeline_window_sync(
@@ -8128,9 +8137,12 @@ class MemoryStore:
         scope: str,
         limit: int,
         after_timeline_id: str = "",
+        exclude_assigned: bool = False,
     ) -> dict[str, Any]:
         params: list[Any] = [clean_text(session_id, 200)]
         where = "session_id=? AND summarized_at=''"
+        if exclude_assigned:
+            where += " AND NOT EXISTS (SELECT 1 FROM summary_batch_events e WHERE e.event_id=timeline.id)"
         if scope:
             where += " AND scope=?"
             params.append(clean_text(scope, 40))
@@ -8138,16 +8150,16 @@ class MemoryStore:
             cursor = None
             if clean_text(after_timeline_id, 160):
                 cursor = self._conn.execute(
-                    "SELECT occurred_at, created_at FROM timeline WHERE id=? AND session_id=?",
+                    "SELECT occurred_at, created_at, id FROM timeline WHERE id=? AND session_id=?",
                     (clean_text(after_timeline_id, 160), clean_text(session_id, 200)),
                 ).fetchone()
             if cursor:
-                where += " AND (occurred_at > ? OR (occurred_at = ? AND created_at > ?))"
+                where += " AND (occurred_at, created_at, id) > (?, ?, ?)"
                 params.extend(
                     [
                         clean_text(cursor["occurred_at"], 80),
-                        clean_text(cursor["occurred_at"], 80),
                         clean_text(cursor["created_at"], 80),
+                        clean_text(cursor["id"], 160),
                     ]
                 )
             total = self._conn.execute(
@@ -8159,7 +8171,7 @@ class MemoryStore:
                 SELECT occurred_at
                 FROM timeline
                 WHERE {where}
-                ORDER BY occurred_at ASC, created_at ASC
+                ORDER BY occurred_at ASC, created_at ASC, id ASC
                 LIMIT 1
                 """,
                 params,
@@ -8169,7 +8181,7 @@ class MemoryStore:
                 SELECT *
                 FROM timeline
                 WHERE {where}
-                ORDER BY occurred_at ASC, created_at ASC
+                ORDER BY occurred_at ASC, created_at ASC, id ASC
                 LIMIT ?
                 """,
                 params + [max(1, int(limit))],

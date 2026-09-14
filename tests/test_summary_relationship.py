@@ -119,7 +119,7 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({"fresh"}, set(service._relationship_phase_state))
 
     async def test_async_close_finishes_background_cancellation_before_store_close(self) -> None:
-        service = self.make_service()
+        service = self.make_service({"startup": {"background_grace_seconds": 0}})
         started = asyncio.Event()
         finalized = asyncio.Event()
 
@@ -945,8 +945,9 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
             "SELECT summarized_at FROM timeline WHERE id=?", (timeline_id,)
         ).fetchone()
         self.assertEqual("", row["summarized_at"])
-        failure = await service.store.get_summary_failure(ctx.session_id)
-        self.assertEqual("retry_cooldown", failure["metadata"]["state"])
+        self.assertIsNone(await service.store.get_summary_failure(ctx.session_id))
+        failure = await service.store.next_summary_batch(ctx.session_id, force=True)
+        self.assertEqual("retry_pending", failure["state"])
 
     def test_summary_parser_accepts_json_fence_and_preamble(self) -> None:
         summarizer = MemorySummarizer()
@@ -1023,8 +1024,9 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
         rows = await service.store.get_timeline_by_ids([first_id, second_id])
         self.assertEqual("", rows[first_id]["summarized_at"])
         self.assertTrue(rows[second_id]["summarized_at"])
-        failure = await service.store.get_summary_failure(ctx.session_id)
-        self.assertEqual("retry_cooldown", failure["metadata"]["state"])
+        self.assertIsNone(await service.store.get_summary_failure(ctx.session_id))
+        failure = await service.store.next_summary_batch(ctx.session_id, force=True)
+        self.assertEqual("retry_pending", failure["state"])
 
     async def test_legacy_dead_letter_auto_recovers(self) -> None:
         service = self.make_service(
@@ -1123,10 +1125,10 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
 
         service._summary_provider_attempts = fail_if_called
         self.assertEqual("", await service.maybe_summarize_session(ctx))
-        first = await service.store.get_summary_failure(ctx.session_id)
-        self.assertEqual("transient_cooldown", first["metadata"]["state"])
+        first = await service.store.next_summary_batch(ctx.session_id, force=True)
+        self.assertEqual("retry_pending", first["state"])
         self.assertEqual("", await service.maybe_summarize_session(ctx))
-        second = await service.store.get_summary_failure(ctx.session_id)
+        second = await service.store.next_summary_batch(ctx.session_id, force=True)
         self.assertEqual(first["updated_at"], second["updated_at"])
         row = service.store._conn.execute(
             "SELECT summarized_at FROM timeline WHERE id=?", (timeline_id,)
@@ -1187,10 +1189,6 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
             return [{"source": "primary", "provider_id": "test-summary", "provider": provider}]
 
         service._summary_provider_attempts = attempts
-        self.assertEqual("", await service.maybe_summarize_session(ctx))
-        failure = await service.store.get_summary_failure(ctx.session_id)
-        self.assertEqual("transient_cooldown", failure["metadata"]["state"])
-
         memory_id = await service.maybe_summarize_session(ctx)
 
         self.assertTrue(memory_id)

@@ -31,6 +31,18 @@ class _JsonResponse(dict):
 
 
 class PageMemoryAtomAdminTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stats_exposes_summary_progress_without_review_candidates(self) -> None:
+        progress = {"raw_events": 40, "conversation_memories": 2, "quarantined_batches": 1}
+        store = SimpleNamespace(
+            stats=AsyncMock(return_value={"total_memories": 3, "pending_review": 1}),
+            summary_progress=AsyncMock(return_value=progress),
+        )
+        api = PluginPageApi(SimpleNamespace(service=SimpleNamespace(store=store)))
+        with patch.object(page_api_module, "jsonify", side_effect=lambda body: body):
+            response = await api.stats()
+        self.assertEqual(progress, response["stats"]["summary_progress"])
+        self.assertNotIn("pending_review", response["stats"])
+
     async def invoke(self, payload: dict, *, current=None):
         if current is None:
             current = SimpleNamespace(valid_from="", valid_to="")

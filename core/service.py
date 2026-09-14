@@ -4589,195 +4589,113 @@ class MemoryCompanionService:
                 force,
             )
         async with lock:
+            max_calls = max(1, self.config.int("memory_summary.max_retries", 3))
+            hourly_limit = max(1, self.config.int("memory_summary.max_calls_per_session_hour", 6))
+            legacy_failure = await self.store.get_summary_failure(ctx.session_id)
+            if legacy_failure:
+                await self.store.migrate_summary_failure(
+                    ctx.session_id, max_calls,
+                    cooldown=self._summary_failure_cooldown_seconds(
+                        transient=self._summary_failure_is_transient(legacy_failure.get("last_error")),
+                    ),
+                )
+            batch = await self.store.next_summary_batch(ctx.session_id, force=True) if force else None
             window = await self.store.unsummarized_timeline_window(
-                session_id=ctx.session_id,
-                scope=ctx.scope,
+                session_id=ctx.session_id, scope=ctx.scope,
                 limit=self.config.int("memory_summary.max_events_per_summary", 40),
+                exclude_assigned=True,
             )
-            rows = list(window.get("rows") or [])
-            total = int(window.get("total") or 0)
-            if not self._summary_window_ready(window, force=force):
-                return ""
-
-            failure = await self.store.get_summary_failure(ctx.session_id)
-            bypassed_failed_batch = False
-            max_retries = max(1, self.config.int("memory_summary.max_retries", 3))
-            if failure and not force:
-                retries = int(failure.get("retry_count") or 0)
-                metadata = failure.get("metadata") if isinstance(failure.get("metadata"), dict) else {}
-                state = clean_text(metadata.get("state"), 40)
-                last_error = clean_text(failure.get("last_error"), 1000)
-                transient = self._summary_failure_is_transient(last_error)
-                age_seconds = self._summary_failure_age_seconds(failure)
-                # Evidence-gate rejections are quarantined for human review.
-                # Retrying the same raw batch automatically only repeats the
-                # model call and can create an unbounded token-burning loop.
-                # An explicit force=True summary is still allowed to retry it.
-                if state == "evidence_quarantine":
+            # New messages take priority over bounded recovery of historical batches.
+            if batch is None and self._summary_window_ready(window, force=force):
+                rows = self.summarizer.rows_for_prompt(list(window.get("rows") or []))
+                if not rows:
                     return ""
-                if retries >= max_retries:
-                    cooldown_seconds = self._summary_failure_cooldown_seconds(transient=transient)
-                    cooldown_state = "transient_cooldown" if transient else "retry_cooldown"
-                    if state not in {"transient_cooldown", "retry_cooldown", "dead_letter"}:
-                        await self.store.mark_summary_failure_cooldown(
-                            ctx.session_id,
-                            max_retries,
-                            cooldown_seconds,
-                            state=cooldown_state,
-                        )
-                        logger.warning(
-                            "[MemoryCompanion] 阶段性总结连续失败，已隔离当前批次并进入 %s 分钟冷却；后续新批次仍可继续总结: session=%s retries=%s last_error=%s",
-                            max(0, cooldown_seconds // 60),
-                            ctx.session_id,
-                            retries,
-                            clean_text(last_error, 160),
-                        )
-                        return ""
-                    if age_seconds < cooldown_seconds:
-                        fresh_window = await self._summary_window_after_failure(ctx, failure)
-                        if not self._summary_window_ready(fresh_window, force=False):
-                            return ""
-                        window = fresh_window
-                        rows = list(window.get("rows") or [])
-                        total = int(window.get("total") or 0)
-                        bypassed_failed_batch = True
-                        logger.info(
-                            "[MemoryCompanion] 阶段性总结正在绕过冷却中的失败批次，继续处理后续消息: session=%s failed_end=%s fresh_events=%s",
-                            ctx.session_id,
-                            clean_text(failure.get("end_timeline_id"), 120),
-                            total,
-                        )
-                    else:
-                        logger.info(
-                            "[MemoryCompanion] 阶段性总结失败批次冷却结束，开始自动恢复探测: session=%s state=%s",
-                            ctx.session_id,
-                            state or "legacy",
-                        )
-                else:
-                    retry_delay = self._summary_retry_backoff_seconds(retries)
-                    if age_seconds < retry_delay:
-                        fresh_window = await self._summary_window_after_failure(ctx, failure)
-                        if not self._summary_window_ready(fresh_window, force=False):
-                            return ""
-                        window = fresh_window
-                        rows = list(window.get("rows") or [])
-                        total = int(window.get("total") or 0)
-                        bypassed_failed_batch = True
-
+                batch_id = await self.store.create_summary_batch(ctx.session_id, ctx.scope, rows)
+                batch = await self.store.get_summary_batch(batch_id)
+            if batch is None:
+                batch = await self.store.next_summary_batch(ctx.session_id, force=force)
+            if batch is None:
+                return ""
+            batch_id = batch["id"]
+            rows = await self.store.summary_batch_rows(batch_id)
+            total = len(rows)
+            if not rows:
+                return ""
             summary_attempts = await self._summary_provider_attempts(ctx)
             if not summary_attempts:
-                logger.warning("[MemoryCompanion] 无可用 Provider，跳过阶段性记忆总结: session=%s", ctx.session_id)
                 return ""
-
             slot_held = await self._acquire_summary_call_slot(force=force)
             if not slot_held:
-                logger.info(
-                    "[MemoryCompanion] 摘要调用队列繁忙，本轮跳过，等待下次触发: session=%s",
-                    ctx.session_id,
-                )
                 return ""
             payload = None
             content = ""
             used_summary = {}
-            last_error: Exception | None = None
+            previous_response = ""
+            feedback = batch["last_error"][7:] if batch["last_error"].startswith("repair:") else ""
+            repair = bool(feedback)
+            attempt_index = 0
+            # Manual runs get a bounded new round, without resetting automatic counters.
+            round_calls = 0
             try:
-                try:
-                    for attempt in summary_attempts:
-                        try:
-                            payload = await self.summarizer.summarize_with_provider(
-                                attempt["provider"],
-                                rows=rows,
-                                session_label=ctx.label,
-                                provider_id=attempt["provider_id"] or attempt["source"],
-                                usage_recorder=self._record_token_usage,
-                                usage_task="memory_summary",
+                while attempt_index < len(summary_attempts) and round_calls < max_calls:
+                    attempt = summary_attempts[attempt_index]
+                    if not await self.store.reserve_summary_call(
+                        batch_id, max_calls=max_calls, hourly_limit=hourly_limit,
+                        repair=repair, force=force,
+                        lease_seconds=max(240, self.config.int("memory_summary.provider_timeout_seconds", 180) + 60),
+                    ):
+                        break
+                    round_calls += 1
+                    payload = None
+                    content = ""
+                    try:
+                        payload = await self.summarizer.summarize_with_provider(
+                            attempt["provider"], rows=rows, session_label=ctx.label,
+                            provider_id=attempt["provider_id"] or attempt["source"],
+                            usage_recorder=self._record_token_usage,
+                            usage_task="memory_summary_repair" if repair else "memory_summary",
+                            repair_feedback=feedback, previous_response=previous_response,
+                        )
+                        errors = self.summarizer.validation_errors(payload or {})
+                        content = self.summarizer.compose_memory_content(payload or {})
+                        used_summary = attempt
+                        if not errors:
+                            break
+                        feedback = "; ".join(errors)
+                        previous_response = json_dumps(payload or {})
+                    except Exception as exc:
+                        feedback = self._describe_exception(exc)
+                        if self._summary_failure_is_transient(feedback):
+                            current = await self.store.get_summary_batch(batch_id)
+                            exhausted = not force and current["automatic_calls"] >= max_calls
+                            await self.store.defer_summary_batch(
+                                batch_id, "repair:" + feedback if repair else feedback,
+                                quarantine=exhausted or repair,
+                                delay=self._summary_retry_backoff_seconds(current["automatic_calls"]),
                             )
-                            content = self.summarizer.compose_memory_content(payload or {})
-                            if content:
-                                used_summary = attempt
-                                break
-                            last_error = RuntimeError("empty summary content")
-                            logger.warning(
-                                "[MemoryCompanion] 阶段性总结候选返回空内容，尝试下一个: session=%s provider=%s",
-                                ctx.session_id,
-                                attempt["provider_id"] or attempt["source"],
-                            )
-                        except Exception as exc:
-                            last_error = exc
-                            error_text = self._describe_exception(exc)
-                            expected_failure = isinstance(exc, (TimeoutError, ValueError)) or type(exc).__name__ in {
-                                "APIConnectionError",
-                                "APITimeoutError",
-                                "ConnectError",
-                                "ConnectTimeout",
-                                "ReadError",
-                                "ReadTimeout",
-                            }
-                            expected_failure = expected_failure or self._summary_failure_is_transient(error_text)
-                            if expected_failure:
-                                logger.info(
-                                    "[MemoryCompanion] 阶段性总结候选暂不可用，尝试下一个: session=%s provider=%s error=%s",
-                                    ctx.session_id,
-                                    attempt["provider_id"] or attempt["source"],
-                                    error_text,
-                                )
-                            else:
-                                logger.warning(
-                                    "[MemoryCompanion] 阶段性总结候选失败，尝试下一个: session=%s provider=%s error=%s",
-                                    ctx.session_id,
-                                    attempt["provider_id"] or attempt["source"],
-                                    error_text,
-                                    exc_info=True,
-                                )
-                except Exception as exc:
-                    last_error = exc
+                            if repair or exhausted:
+                                return ""
+                            attempt_index += 1
+                            continue
+                        previous_response = getattr(exc, "response", "")
+                    current = await self.store.get_summary_batch(batch_id)
+                    exhausted = not force and current["automatic_calls"] >= max_calls
+                    await self.store.defer_summary_batch(
+                        batch_id, "repair:" + feedback, quarantine=repair or exhausted,
+                        delay=self._summary_retry_backoff_seconds(current["automatic_calls"]),
+                    )
+                    if repair or exhausted:
+                        break
+                    # Repeat once with actionable validation feedback, never the unchanged prompt.
+                    repair = True
             finally:
                 if not force:
                     self._summary_call_semaphore.release()
-            if not content:
-                failure_error = self._describe_exception(last_error) if last_error is not None else "summary failed"
-                transient_failure = self._summary_failure_is_transient(failure_error)
-                retries = await self.store.record_summary_failure(
-                    session_id=ctx.session_id,
-                    scope=ctx.scope,
-                    start_timeline_id=str(rows[0].get("id") if rows else ""),
-                    end_timeline_id=str(rows[-1].get("id") if rows else ""),
-                    error=failure_error,
-                    metadata={
-                        "reason": "provider_or_parse_error",
-                        "force": force,
-                        "max_retries": max_retries,
-                        "state": "retry_pending",
-                        "transient": transient_failure,
-                    },
+            if not payload or self.summarizer.validation_errors(payload):
+                logger.warning(
+                    "[MemoryCompanion] 阶段总结批次等待修复，后续消息继续处理: session=%s batch=%s",
+                    ctx.session_id, batch_id,
                 )
-                if retries >= max_retries:
-                    cooldown_seconds = self._summary_failure_cooldown_seconds(transient=transient_failure)
-                    cooldown_state = "transient_cooldown" if transient_failure else "retry_cooldown"
-                    await self.store.mark_summary_failure_cooldown(
-                        ctx.session_id,
-                        max_retries,
-                        cooldown_seconds,
-                        state=cooldown_state,
-                    )
-                    logger.warning(
-                        "[MemoryCompanion] 阶段性总结失败达到上限，已隔离当前批次并进入 %s 分钟冷却；后续消息不受阻塞，冷却结束后会自动重试: session=%s retry=%s/%s error=%s",
-                        max(0, cooldown_seconds // 60),
-                        ctx.session_id,
-                        retries,
-                        max_retries,
-                        clean_text(failure_error, 160),
-                    )
-                else:
-                    retry_delay = self._summary_retry_backoff_seconds(retries)
-                    logger.warning(
-                        "[MemoryCompanion] 阶段性总结暂时失败，已保留原始时间线，将在至少 %s 秒后再试: session=%s retry=%s/%s error=%s",
-                        retry_delay,
-                        ctx.session_id,
-                        retries,
-                        max_retries,
-                        clean_text(failure_error, 160),
-                    )
                 return ""
 
             consumed_ids = {
@@ -4789,6 +4707,14 @@ class MemoryCompanionService:
                 rows = [row for row in rows if clean_text(row.get("id"), 160) in consumed_ids]
             if not rows:
                 logger.warning("[MemoryCompanion] 阶段性总结没有可确认的已消费事件，拒绝标记时间线: session=%s", ctx.session_id)
+                return ""
+
+            if self.summarizer.summary_quality(payload) == "no_memory":
+                await self.store.finish_summary_batch(
+                    batch_id, [str(row["id"]) for row in rows], no_memory=True,
+                    reason=payload.get("no_memory_reason", ""),
+                )
+                logger.info("[MemoryCompanion] 批次已处理，无新增记忆，原文保留: batch=%s", batch_id)
                 return ""
 
             visibility = "group_public" if ctx.scope == "group" else "private_pair"
@@ -4809,7 +4735,7 @@ class MemoryCompanionService:
                 else ""
             )
             record = MemoryRecord(
-                id=self.stable_id("summary", ctx.session_id, start_at, end_at, content),
+                id=self.stable_id("summary_batch", batch_id),
                 memory_type="conversation_summary",
                 subject=self._bot_entity(ctx) if ctx.scope == "group" else EntityRef(kind="user", id=ctx.user_id, name=ctx.user_name, role="conversation_partner"),
                 object=EntityRef(kind="group", id=ctx.group_id, name=ctx.group_name, role="group") if ctx.scope == "group" else self._bot_entity(ctx),
@@ -4836,6 +4762,8 @@ class MemoryCompanionService:
                 durability="normal" if evidence_gate_passed else "short",
                 sensitivity="internal",
                 metadata={
+                    "summary_batch_id": batch_id,
+                    "summary_refs": payload.get("summary_refs", []),
                     "summary_event_count": len(rows),
                     "unsummarized_total": total,
                     "start_at": start_at,
@@ -4871,34 +4799,11 @@ class MemoryCompanionService:
                 },
             )
             self.importance.calibrate(record, source="conversation_summary")
-            memory_id = await self.store.insert_memory(record)
-            if not evidence_gate_passed:
-                retries = await self.store.record_summary_failure(
-                    session_id=ctx.session_id,
-                    scope=ctx.scope,
-                    start_timeline_id=str(rows[0].get("id") or ""),
-                    end_timeline_id=str(rows[-1].get("id") or ""),
-                    error="evidence_gate_rejected",
-                    metadata={
-                        "reason": "missing_or_unsupported_fact_references",
-                        "state": "evidence_quarantine",
-                        "candidate_memory_id": memory_id,
-                        "raw_timeline_preserved": True,
-                    },
-                )
-                logger.warning(
-                    "[MemoryCompanion] 阶段总结未通过证据门禁，已隔离候选并保留原始时间线: session=%s memory=%s retry=%s",
-                    ctx.session_id,
-                    memory_id,
-                    retries,
-                )
-                return memory_id
+            memory_id = await self.store.finish_summary_batch(batch_id, [str(row["id"]) for row in rows], record=record)
             self._schedule_memory_embedding(memory_id, record)
             await self._record_verified_group_bot_self_facts(ctx, rows, payload or {}, memory_id)
             await self._index_summary_knowledge_graph(ctx, record, payload or {}, memory_id)
-            marked = await self.store.mark_timeline_summarized([str(row.get("id") or "") for row in rows])
-            if not bypassed_failed_batch:
-                await self.store.clear_summary_failure(ctx.session_id)
+            marked = len(rows)
             logger.info(
                 "[MemoryCompanion] 已生成阶段性长期记忆: session=%s memory=%s events=%s marked=%s",
                 ctx.session_id,
@@ -6773,7 +6678,9 @@ class MemoryCompanionService:
         return result
 
     async def operational_report(self) -> dict[str, Any]:
-        return await build_operational_report(self)
+        report = await build_operational_report(self)
+        report["summary_progress"] = await self.store.summary_progress()
+        return report
 
     async def export_portable_data(self) -> dict[str, Any]:
         return await self.portable_archive.export()

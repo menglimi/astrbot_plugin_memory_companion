@@ -88,7 +88,7 @@ class MemoryCompanionCommandHandler:
         ctx = await self.service.identity.resolve_event_context(event)
         memory_id = await self.service.maybe_summarize_session(ctx, force=True)
         if not memory_id:
-            return "当前会话没有可总结的未处理时间线，或暂时没有可用模型。"
+            return "本次未生成新记忆：可能无新增内容、模型暂不可用或批次仍待修复。原文已保留，可在面板总览查看处理进度。"
         return f"已生成阶段性长期记忆：{memory_id}"
 
     async def delete(self, memory_id: str = "") -> str:

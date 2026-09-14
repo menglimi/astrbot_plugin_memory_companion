@@ -330,6 +330,7 @@ class PluginPageApi:
     async def stats(self):
         stats = await self.plugin.service.store.stats()
         stats.pop("pending_review", None)
+        stats["summary_progress"] = await self.plugin.service.store.summary_progress()
         return self._ok({"stats": stats})
 
     async def profiles(self):

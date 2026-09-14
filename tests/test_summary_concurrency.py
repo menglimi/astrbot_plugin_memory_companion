@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,7 +43,8 @@ class _ConcurrentProvider:
             return _Response(
                 json.dumps(
                     {
-                        "summary": "会话内容已被整理。",
+                        "summary": "小王正在分享无糖拿铁的味道。",
+                        "summary_refs": re.findall(r'"event_id"\s*:\s*"([^"\n]+)"', _kwargs.get("prompt", "").split("<untrusted_messages_jsonl>")[-1]),
                         "canonical_summary": "整理后的会话。",
                         "key_facts": [],
                         "importance": 0.5,
@@ -82,7 +84,7 @@ class SummaryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 scope=ctx.scope,
                 subject_id=ctx.user_id,
                 object_id=ctx.group_id,
-                content=f"{session_id} 会话内容 {i}",
+                content=f"小王正在分享无糖拿铁的味道。第 {i} 条",
                 occurred_at=f"2026-08-20T00:{i:02d}:00+00:00",
             )
         return ctx
