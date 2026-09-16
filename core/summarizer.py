@@ -5,11 +5,73 @@ import json
 import re
 import time
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from .models import clean_text, json_dumps, json_loads
 from .turn_signal import message_terms
+
+
+# 断言级证据校验口径（M-02：错误断言不能仅凭词语重合通过证据验证）。
+# 关键点：**绝对时间必须能在证据里落地**——提示词要求断言写「YYYY-MM-DD 晚上」这类
+# 绝对表达，而同一日期在证据里的形态有三种：① 消息自身时间戳；② 正文里的其他写法
+# （9/18、8月22日）；③ 由「明天/明年/月底」这类相对说法换算而来（本插件的
+# _normalize_relative_time_mentions 就会做这种换算）。所以日期必须**归一化后比较**，
+# 并把相对时间换算当作无法证伪的情形放行；只拒绝**有明确矛盾**的断言
+# （如证据是周三、断言写周五）。
+_TIME_CLAIM_RE = re.compile(
+    r"(?:20\d{2}[-年]\d{1,2}(?:[-月]\d{1,2})?|\d{1,2}月\d{1,2}日|"
+    r"周[一二三四五六日天]|星期[一二三四五六日天]|"
+    r"上午|下午|早上|晚上|凌晨|中午|傍晚|深夜|\d{1,2}点(?:\d{1,2}分)?)"
+)
+# 可校验的完整日期写法：(正则, 是否带年份)；命中后归一化成 (年或 0, 月, 日)
+_DATE_PATTERNS: tuple[tuple[re.Pattern[str], bool], ...] = (
+    (re.compile(r"(20\d{2})\s*[-/年]\s*(\d{1,2})\s*[-/月]\s*(\d{1,2})\s*[日号]?"), True),
+    (re.compile(r"(?<![\d/])(\d{1,2})\s*/\s*(\d{1,2})(?![\d/])"), False),
+    (re.compile(r"(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]"), False),
+)
+_WEEKDAY_RE = re.compile(r"(?:周|星期)([一二三四五六日天])")
+# 正文出现这些相对时间说法时，断言里的绝对日期/周几可能是模型（或本插件）换算出来的
+# → 不做日期硬校验（无法证伪）。刻意不含「今天/今晚/这周」这类无法产生偏移的说法。
+_RELATIVE_TIME_HINTS = (
+    "昨天", "昨晚", "前天", "明晚", "明天", "后天", "大后天",
+    "上周", "下周", "上个月", "下个月", "下个星期", "去年", "明年", "后年",
+    "月底", "月初", "年底", "年初",
+)
+# 否定词按单字收集即可（"不是" 含 "不"、"禁止" 含 "禁"）
+_NEGATION_CHARS = frozenset("不没未无别禁")
+# 整点落在时段边界时同时接受相邻时段，避免与提示词口径差异造成误杀
+_HOUR_PERIODS: dict[int, tuple[str, ...]] = {
+    0: ("凌晨", "深夜"),
+    1: ("凌晨", "深夜"),
+    2: ("凌晨", "深夜"),
+    3: ("凌晨", "深夜"),
+    4: ("凌晨", "深夜"),
+    5: ("凌晨", "早上"),
+    6: ("早上",),
+    7: ("早上",),
+    8: ("早上", "上午"),
+    9: ("上午", "早上"),
+    10: ("上午",),
+    11: ("上午", "中午"),
+    12: ("中午",),
+    13: ("中午", "下午"),
+    14: ("下午",),
+    15: ("下午",),
+    16: ("下午",),
+    17: ("下午", "傍晚"),
+    18: ("傍晚", "晚上"),
+    19: ("晚上",),
+    20: ("晚上",),
+    21: ("晚上",),
+    22: ("晚上", "深夜"),
+    23: ("晚上", "深夜"),
+}
+# 近似极性比对的下限/上限：短断言才可能是逐句复述，长断言是跨事件转述
+_CONTRADICTION_MIN_CHARS = 4
+_CONTRADICTION_MAX_CHARS = 120
+_CONTRADICTION_COVERAGE = 0.6
 
 
 class SummaryFormatError(ValueError):
@@ -408,9 +470,11 @@ class MemorySummarizer:
             self.max_summary_chars,
         )
         summary = self._normalize_relative_time_mentions(summary, rows)
+        drop_reasons: list[str] = []
         _readable_key_facts, key_facts_with_refs = self._normalize_key_facts(
             payload.get("key_facts") or payload.get("facts"),
             rows,
+            drop_reasons=drop_reasons,
         )
         # Legacy string facts remain readable through _normalize_key_facts(),
         # but newly normalized summaries may only persist evidence-backed
@@ -465,11 +529,17 @@ class MemorySummarizer:
         raw_facts = payload.get("key_facts") or payload.get("facts") or []
         raw_facts = raw_facts if isinstance(raw_facts, list) else [raw_facts]
         if len(raw_facts) > len(key_facts_with_refs):
-            errors.append("部分关键事实没有有效引用或不受原文支持，删除该结论并同步修正正文")
+            detail = "；".join(dict.fromkeys(drop_reasons))[:200]
+            errors.append(
+                "部分关键事实没有有效引用或不受原文支持，删除该结论并同步修正正文"
+                + ("（%s）" % detail if detail else "")
+            )
         if any(ref not in valid_ids for ref in normalized_refs):
             errors.append("summary_refs 含本批次不存在的 event_id")
-        if refs and summary and not self.fact_supported_by_rows(summary, [row for row in rows if row.get("id") in refs]):
-            errors.append("摘要正文与所引用消息缺乏对应，请贴近原文纠正")
+        if refs and summary:
+            reason = self._support_failure_reason(summary, [row for row in rows if row.get("id") in refs])
+            if reason:
+                errors.append("摘要正文与所引用消息缺乏对应（%s），请贴近原文纠正" % reason)
         if payload.get("outcome") == "no_memory" and set(refs) != valid_ids:
             errors.append("no_memory 需要确认本次所有已阅读消息均无新增记忆价值")
         payload["_validation_errors"] = errors
@@ -503,12 +573,21 @@ class MemorySummarizer:
         self,
         value: Any,
         rows: list[dict[str, Any]],
+        drop_reasons: list[str] | None = None,
     ) -> tuple[list[str], list[dict[str, Any]]]:
-        """Accept only evidence-backed fact objects with valid source event IDs."""
+        """Accept only evidence-backed fact objects with valid source event IDs.
+
+        ``drop_reasons``（可选）收集每条被丢弃的原因：静默清空 key_facts 会让
+        「纠正一次」拿不到可执行信息，只能重复同一个失败请求。
+        """
         if isinstance(value, (str, dict)):
             value = [value]
         if not isinstance(value, list):
             return [], []
+
+        def drop(index: int, reason: str) -> None:
+            if drop_reasons is not None:
+                drop_reasons.append("第 %d 条关键事实%s" % (index + 1, reason))
 
         row_by_id = {
             clean_text(row.get("id"), 160): row
@@ -518,7 +597,7 @@ class MemorySummarizer:
         facts: list[str] = []
         traced: list[dict[str, Any]] = []
         seen_facts: set[str] = set()
-        for item in value:
+        for index, item in enumerate(value):
             if isinstance(item, dict):
                 raw_fact = item.get("fact") or item.get("text") or item.get("content")
                 raw_refs = item.get("refs") or item.get("event_ids") or item.get("source_event_ids") or []
@@ -535,16 +614,19 @@ class MemorySummarizer:
                     if fact_key not in seen_facts:
                         seen_facts.add(fact_key)
                         facts.append(fact)
+                drop(index, "是字符串形态、没有 refs 引用")
                 continue
             fact = self._normalize_relative_time_mentions(
                 self._sanitize_generated_memory_text(clean_text(raw_fact, 160), 160),
                 rows,
             )
             if len(fact) < 2 or self._looks_like_prompt_injection(fact):
+                drop(index, "内容为空或不可用")
                 continue
             if isinstance(raw_refs, str):
                 raw_refs = [raw_refs]
             if not isinstance(raw_refs, list):
+                drop(index, "缺少 refs 引用")
                 continue
             refs = list(
                 dict.fromkeys(
@@ -553,8 +635,13 @@ class MemorySummarizer:
                     if clean_text(ref, 160) in row_by_id
                 )
             )[:6]
+            if not refs:
+                drop(index, "的 refs 不是本批次存在的 event_id")
+                continue
             evidence_rows = [row_by_id[ref] for ref in refs]
-            if not refs or not self.fact_supported_by_rows(fact, evidence_rows):
+            reason = self._support_failure_reason(fact, evidence_rows)
+            if reason:
+                drop(index, reason)
                 continue
             fact_key = fact.casefold()
             if fact_key in seen_facts:
@@ -571,46 +658,194 @@ class MemorySummarizer:
         return facts[:8], traced[:8]
 
     @classmethod
-    def fact_supported_by_rows(cls, fact: Any, rows: list[dict[str, Any]]) -> bool:
-        source = re.sub(
+    def _row_time_evidence(cls, row: dict[str, Any]) -> str:
+        """把一条消息自身的时间戳转成可参与校验的本地时间事实文本。
+
+        这是绝对时间的唯一证据来源：正文里没有日期串，但提示词要求断言写绝对时间。
+        """
+        dt = cls._parse_local_datetime(row.get("occurred_at") or row.get("created_at"))
+        if dt is None:
+            return ""
+        weekday = "一二三四五六日"[dt.weekday()]
+        parts = [
+            dt.strftime("%Y-%m-%d"),
+            f"{dt.month}月{dt.day}日",
+            f"周{weekday}",
+            f"星期{weekday}",
+            *cls._hour_periods(dt.hour),
+            f"{dt.hour}点",
+            f"{dt.hour}点{dt.minute:02d}分",
+        ]
+        return "".join(parts)
+
+    @staticmethod
+    def _hour_periods(hour: int) -> tuple[str, ...]:
+        return _HOUR_PERIODS.get(hour, ())
+
+    @classmethod
+    def _rows_time_evidence(cls, rows: list[dict[str, Any]]) -> str:
+        return "".join(cls._row_time_evidence(row) for row in rows)
+
+    @staticmethod
+    def _strip_negations(text: str) -> tuple[str, list[int]]:
+        """去掉否定词，并保留去掉后每个字符在原文中的下标（用于回看原始片段）。"""
+        stripped: list[str] = []
+        index_map: list[int] = []
+        for index, char in enumerate(text):
+            if char in _NEGATION_CHARS:
+                continue
+            stripped.append(char)
+            index_map.append(index)
+        return "".join(stripped), index_map
+
+    @classmethod
+    def _polarity_conflict(cls, compact_fact: str, source: str) -> bool:
+        """断言与证据是否在「同一条被照抄的表述」上否定状态相反。
+
+        只有断言主体确实出现在证据里（原句复述 / 近似复述）时才比对极性：
+        整段证据任意位置出现「不/没」不足以否证一条跨事件的转述式断言，
+        中文里「不过、不知道、不用」几乎必然出现在长对话里。
+        """
+        stripped_fact, _ = cls._strip_negations(compact_fact)
+        if len(stripped_fact) < _CONTRADICTION_MIN_CHARS:
+            return False
+        stripped_source, index_map = cls._strip_negations(source)
+        if not stripped_source:
+            return False
+        spans: list[tuple[int, int]] = []
+        position = stripped_source.find(stripped_fact)
+        if position >= 0:
+            spans.append((position, position + len(stripped_fact)))
+        elif len(stripped_fact) <= _CONTRADICTION_MAX_CHARS:
+            blocks = [
+                block
+                for block in SequenceMatcher(None, stripped_fact, stripped_source, autojunk=False).get_matching_blocks()
+                if block.size
+            ]
+            if blocks:
+                matched = sum(block.size for block in blocks)
+                if matched / len(stripped_fact) >= _CONTRADICTION_COVERAGE:
+                    spans.append((blocks[0].b, blocks[-1].b + blocks[-1].size))
+        fact_negated = any(char in compact_fact for char in _NEGATION_CHARS)
+        for start, end in spans:
+            if start >= len(index_map) or end - 1 >= len(index_map):
+                continue
+            window = source[max(0, index_map[start] - 4): index_map[end - 1] + 5]
+            if any(char in window for char in _NEGATION_CHARS) != fact_negated:
+                return True
+        return False
+
+    @classmethod
+    def _date_tokens(cls, text: str) -> set[tuple[int, int, int]]:
+        """抽出文本里的完整日期，归一化成 (年, 月, 日)；无年份写法年记 0。"""
+        found: set[tuple[int, int, int]] = set()
+        for pattern, has_year in _DATE_PATTERNS:
+            for match in pattern.finditer(text):
+                groups = match.groups()
+                try:
+                    if has_year:
+                        year, month, day = int(groups[0]), int(groups[1]), int(groups[2])
+                    else:
+                        year, month, day = 0, int(groups[0]), int(groups[1])
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= month <= 12 and 1 <= day <= 31:
+                    found.add((year, month, day))
+        return found
+
+    @staticmethod
+    def _format_date_claim(value: tuple[int, int, int]) -> str:
+        year, month, day = value
+        return ("%04d-%02d-%02d" % (year, month, day)) if year else ("%02d-%02d" % (month, day))
+
+    @staticmethod
+    def _date_supported(claim: tuple[int, int, int], evidence: set[tuple[int, int, int]]) -> bool:
+        """月日一致即可（任一侧缺年份时无法比年）；两侧都有年份则必须一致。"""
+        claim_year, claim_month, claim_day = claim
+        for year, month, day in evidence:
+            if (month, day) != (claim_month, claim_day):
+                continue
+            if claim_year and year and claim_year != year:
+                continue
+            return True
+        return False
+
+    @classmethod
+    def _time_claim_mismatch(
+        cls,
+        compact_fact: str,
+        text: str,
+        time_evidence: str,
+        rows: list[dict[str, Any]],
+    ) -> str:
+        """只拒绝**有明确矛盾**的时间断言，返回矛盾描述；"" = 不拒绝。
+
+        规则（对齐 M-02「错误断言不能仅凭词语重合通过证据验证」，同时不误杀合法换算）：
+        - 只校验**完整日期**（YYYY-MM-DD / M/D / M月D日）与**周几**——正文里被讨论的
+          日期、消息自身时间戳、以及「明天/明年/月底」这类相对说法的换算结果都算有依据；
+        - 无从判定的写法（只有月、只有日）不参与拒绝；
+        - 时段/钟点（上午/晚上/22点）不参与拒绝——转述里常跨事件漂移，且它们不构成硬事实。
+        """
+        if not _TIME_CLAIM_RE.search(compact_fact):
+            return ""
+        claim_dates = cls._date_tokens(compact_fact)
+        claim_weekdays = set(_WEEKDAY_RE.findall(compact_fact))
+        if not claim_dates and not claim_weekdays:
+            return ""
+        # 正文含相对时间说法 → 断言里的绝对日期/周几可能是换算出来的，无法证伪
+        if any(hint in text for hint in _RELATIVE_TIME_HINTS):
+            return ""
+        evidence_dates = cls._date_tokens(text) | cls._date_tokens(time_evidence)
+        evidence_weekdays = set(_WEEKDAY_RE.findall(text)) | set(_WEEKDAY_RE.findall(time_evidence))
+        missing = [
+            cls._format_date_claim(claim)
+            for claim in sorted(claim_dates)
+            if not cls._date_supported(claim, evidence_dates)
+        ]
+        missing.extend("周%s" % weekday for weekday in sorted(claim_weekdays)
+                       if weekday not in evidence_weekdays)
+        return "、".join(dict.fromkeys(missing))
+
+    @classmethod
+    def _support_failure_reason(cls, fact: Any, rows: list[dict[str, Any]]) -> str:
+        """断言是否被所引用消息支持："" = 支持，否则返回可读的失败原因。
+
+        证据 = 消息正文（词语重合、极性、正文里提到的日期）+ 消息自身的时间戳
+        （日期/周几/时段/钟点，按 Asia/Shanghai）。返回原因而不是布尔值，是为了让
+        「自动纠正一次」拿到可执行的诊断。
+        """
+        text = re.sub(
             r"\s+",
             "",
             " ".join(clean_text(row.get("content"), 1000) for row in rows),
         ).casefold()
-        if not source:
-            return False
+        if not text:
+            return "所引用消息没有正文"
         compact_fact = re.sub(r"\s+", "", clean_text(fact, 300)).casefold()
+        if len(compact_fact) < 2:
+            return "断言内容过短"
+        time_evidence = cls._rows_time_evidence(rows)
+        source = text + time_evidence
         if len(compact_fact) >= 4 and compact_fact in source:
-            return True
-        # Lexical overlap is insufficient when polarity or temporal details
-        # disagree. Reject an assertion whose negation marker conflicts with
-        # the supporting text, and require explicit date/time tokens present
-        # in the claim to be present in the evidence.
-        negation_markers = ("不", "没", "未", "无", "不是", "别", "禁止")
-        fact_negated = any(marker in compact_fact for marker in negation_markers)
-        source_negated = any(marker in source for marker in negation_markers)
-        if fact_negated != source_negated:
-            return False
-        temporal_tokens = re.findall(
-            r"(?:20\d{2}[-年]\d{1,2}(?:[-月]\d{1,2})?|周[一二三四五六日天]|星期[一二三四五六日天]|上午|下午|早上|晚上|凌晨|\d{1,2}点(?:\d{1,2}分)?)",
-            compact_fact,
-        )
-        # _normalize_relative_time_mentions rewrites "今天/昨天" into absolute
-        # dates taken from the rows themselves, but the evidence text below is
-        # only the message bodies -- so a claim written exactly as the prompt
-        # demands ("YYYY-MM-DD 中午") failed its own temporal check whenever the
-        # user's original wording was relative. Compare against the same date
-        # vocabulary the normalization side uses instead of the raw bodies.
-        temporal_source = source + "".join(cls._rows_local_dates(rows))
-        if temporal_tokens and any(token not in temporal_source for token in temporal_tokens):
-            return False
+            return ""
+        if cls._polarity_conflict(compact_fact, text):
+            return "与所引用原文的否定状态不一致"
+        mismatch = cls._time_claim_mismatch(compact_fact, text, time_evidence, rows)
+        if mismatch:
+            return "提到的 %s 在所引用消息中找不到依据" % mismatch
         generic_terms = {
             "事情", "内容", "消息", "聊天", "对话", "表示", "提到", "认为", "觉得",
             "用户", "对方", "某人", "某个", "相关", "已经", "还是", "然后", "这个", "那个",
         }
         terms = [term for term in message_terms(clean_text(fact, 300), limit=80) if term not in generic_terms]
-        matched = {term for term in terms if term in source}
-        return len(matched) >= 2
+        matched = {term for term in terms if term in text}
+        if len(matched) >= 2:
+            return ""
+        return "在所引用原文中找不到依据"
+
+    @classmethod
+    def fact_supported_by_rows(cls, fact: Any, rows: list[dict[str, Any]]) -> bool:
+        return cls._support_failure_reason(fact, rows) == ""
 
     def _normalize_associations(
         self,
