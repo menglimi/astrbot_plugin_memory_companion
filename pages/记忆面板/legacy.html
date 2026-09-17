@@ -8,6 +8,7 @@
     (() => {
       const themeKey = "memory_companion_theme";
       const navKey = "memory_companion_nav";
+      const modeKey = "memory_companion_mode";
       let theme = "dark";
       try {
         const saved = window.localStorage.getItem(themeKey);
@@ -17,6 +18,12 @@
       try {
         const savedNav = window.localStorage.getItem(navKey);
         if (savedNav) document.documentElement.dataset.initialNav = savedNav;
+      } catch (_) {}
+      try {
+        const savedMode = window.localStorage.getItem(modeKey);
+        if (savedMode === "cinema" || savedMode === "standard") {
+          document.documentElement.dataset.initialMode = savedMode;
+        }
       } catch (_) {}
     })();
   </script>
@@ -30,7 +37,7 @@
       <div class="rail-foot"><button class="theme-toggle" id="themeToggle" type="button" aria-label="切换深浅主题"><span class="theme-toggle-track"><span class="theme-toggle-knob"></span></span><span class="theme-toggle-label" id="themeToggleLabel">深色</span></button><div class="rail-status" id="railStatus"><span class="status-dot" aria-hidden="true"></span><span id="railStatusText">正在连接…</span></div></div>
     </aside>
     <main class="main" id="main">
-      <header class="topbar"><div class="topbar-copy"><p class="eyebrow" id="viewEyebrow">Memory Companion</p><h1 id="viewTitle">总览</h1><p class="topbar-hint" id="viewHint">记忆库、范围与联动的整体状态</p></div><div class="topbar-tools"><div class="topbar-search"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4 14 14"/></svg><input id="globalSearch" type="search" placeholder="搜索记忆内容、证据或 ID" autocomplete="off" /></div><button class="tool-btn" id="refreshBtn" type="button" title="刷新当前视图"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.75"/><path d="M13.4 2.2v3.1h-3.1"/></svg><span>刷新</span></button></div></header>
+      <header class="topbar"><div class="topbar-copy"><p class="eyebrow" id="viewEyebrow">Memory Companion</p><h1 id="viewTitle">总览</h1><p class="topbar-hint" id="viewHint">记忆库、范围与联动的整体状态</p></div><div class="topbar-tools"><div class="topbar-search"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4 14 14"/></svg><input id="globalSearch" type="search" placeholder="搜索记忆内容、证据或 ID" autocomplete="off" /></div><button class="tool-btn" id="refreshBtn" type="button" title="刷新当前视图"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.75"/><path d="M13.4 2.2v3.1h-3.1"/></svg><span>刷新</span></button><button class="tool-btn mode-toggle" id="modeToggle" type="button" aria-pressed="false" aria-label="切换标准界面与终端界面"><span id="modeToggleLabel">终端模式</span></button></div></header>
       <div class="content" id="content" tabindex="-1"></div>
     </main>
   </div>

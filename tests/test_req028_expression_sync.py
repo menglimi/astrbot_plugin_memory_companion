@@ -11,6 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core.bridge import MemoryCompanionBridge, sanitize_companion_expression_decision
+from core.config import ConfigView
 from core.models import MemoryRecord, SearchResult, SessionContext
 from core.service import MemoryCompanionService, MemoryRouteDecision
 from core.time_intent import TimeIntent
@@ -56,6 +57,19 @@ def memory_item() -> tuple[MemoryRecord, SearchResult]:
 
 
 class Req028ExpressionSyncTests(unittest.TestCase):
+    @staticmethod
+    def bare_service() -> MemoryCompanionService:
+        """构造只带配置视图的裸服务实例。
+
+        `_memory_expression_decision` 会先读取
+        `memory_injection.enable_tone_abstraction` 总闸（默认开启，见
+        core/service.py:10468-10472），因此 `__new__` 构造的实例必须补上
+        `config`，否则判定逻辑还没跑到陪伴表达协同就在总闸处抛 AttributeError。
+        """
+        service = MemoryCompanionService.__new__(MemoryCompanionService)
+        service.config = ConfigView({})
+        return service
+
     @staticmethod
     def attested_decision() -> dict:
         companion = object()
@@ -138,7 +152,7 @@ class Req028ExpressionSyncTests(unittest.TestCase):
         self.assertEqual("", ctx.companion_expression_contract)
 
     def test_companion_caps_unsolicited_mentions_but_explicit_recall_still_reads_fact(self) -> None:
-        service = MemoryCompanionService.__new__(MemoryCompanionService)
+        service = self.bare_service()
         memory, item = memory_item()
         route = MemoryRouteDecision()
         restricted = SessionContext(
@@ -163,7 +177,7 @@ class Req028ExpressionSyncTests(unittest.TestCase):
         self.assertEqual("stable_user_fact", reason)
 
     def test_allowed_behaviors_are_a_maximum_not_a_memory_override(self) -> None:
-        service = MemoryCompanionService.__new__(MemoryCompanionService)
+        service = self.bare_service()
         memory, item = memory_item()
         route = MemoryRouteDecision()
         relaxed = SessionContext(
@@ -223,8 +237,32 @@ class Req028ExpressionSyncTests(unittest.TestCase):
         source = (ROOT / "pages" / "记忆面板" / "app.js").read_text(encoding="utf-8")
         for retired in ("关系阶段演进", "情绪事件队列", "称呼演变记录", "Bot 称呼建议"):
             self.assertNotIn(retired, source)
-        for required in ("陪伴表达协同状态", "记忆触动趋势", "记忆触动事件", "当时关系情境"):
+        # 2.0.0 重写把「陪伴表达协同状态 / 记忆触动事件 / 当时关系情境」三块旧卡片
+        # 合并进「互动协同」视图（视图标题与区块名见 app.js:2797、2877），数据契约
+        # 未变，仍是 /persona-state 的只读投影（page_api.py:878-905）。断言因此锚定
+        # 到当前实现里承载同一契约的数据源与字段，而不是已经消失的字面标题。
+        for required in (
+            "互动协同",  # 视图标题 / 导航名
+            "表达协同",  # 「陪伴表达协同状态」的当前区块名
+            "由陪伴插件主导",  # 只读归属：最终表达由陪伴插件裁决
+            "persona.expression_coordination",  # 表达协同数据源
+            "expr.expression_authority",  # 表达权威仍归陪伴插件
+            "expr.memory_role",  # 记忆侧职责：事实、可见性与提及上限
+            "否（请求级只读）",  # 表达状态不持久化
+            "记忆触动趋势",  # 标题未变
+            "persona.memory_touch_trends",
+            "persona.memory_touch_events",  # 「记忆触动事件」的当前标题是「近期情绪事件」
+            "legacy_context_labels",
+            "item.legacy_context",  # 「当时关系情境」在趋势行上的投影
+        ):
             self.assertIn(required, source)
+        # 互动协同视图必须保持只读：出现写请求就等于记忆侧建立了第二套表达/关系权威；
+        # 同时不得出现称呼系统（对应退役的「称呼演变记录 / Bot 称呼建议」）。
+        start = source.index('defineView("synergy"')
+        end = source.index("defineView(", start + 1)
+        synergy = source[start:end]
+        self.assertNotIn("apiPost", synergy)
+        self.assertNotIn("称呼", synergy)
 
 
 if __name__ == "__main__":

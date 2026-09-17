@@ -23,6 +23,21 @@ from .p6_readonly_projection import P6_READONLY_STATUS_FINGERPRINT, P6_READONLY_
 
 
 COORDINATION_STATUS_SCHEMA = "ops.memory.coordination_status.v1"
+# Closed field contract for the coordination projection.  ``build_coordination_status``
+# returns exactly these keys, so page consumers can rely on the declaration instead of
+# guessing (``contract`` / ``compatibility_level`` were never part of it).
+COORDINATION_STATUS_FIELDS = (
+    "schema_version",
+    "contract_fingerprint",
+    "health",
+    "reason_code",
+    "page_api",
+    "runtime",
+    "bridge",
+    "p5",
+    "p6",
+    "four_package",
+)
 _HEALTH = frozenset({"ready", "degraded", "unverifiable"})
 _P5_B_FLAGS = (
     "enable_p5_b1_recall_gate",
@@ -198,7 +213,7 @@ def build_coordination_status(*, config: Any, runtime: Any, bridge: dict[str, st
         health, reason_code = "degraded", "coordination_degraded"
     else:
         health, reason_code = "ready", "coordination_ready"
-    return {
+    result = {
         "schema_version": COORDINATION_STATUS_SCHEMA,
         "contract_fingerprint": COORDINATION_STATUS_FINGERPRINT,
         "health": health,
@@ -216,6 +231,7 @@ def build_coordination_status(*, config: Any, runtime: Any, bridge: dict[str, st
             "expected_package_count": len(FOUR_PACKAGE_IDS),
         },
     }
+    return {key: result[key] for key in COORDINATION_STATUS_FIELDS}
 
 
-__all__ = ["COORDINATION_STATUS_FINGERPRINT", "COORDINATION_STATUS_SCHEMA", "build_coordination_status", "build_p5_status", "project_p6_status", "project_runtime_health"]
+__all__ = ["COORDINATION_STATUS_FIELDS", "COORDINATION_STATUS_FINGERPRINT", "COORDINATION_STATUS_SCHEMA", "build_coordination_status", "build_p5_status", "project_p6_status", "project_runtime_health"]

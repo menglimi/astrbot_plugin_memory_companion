@@ -196,7 +196,7 @@ async function apiRequest(path, options) {
     throw new Error(data.message || data.error || "请求失败");
   }
   if (!data || data.success === false) throw new Error(data && data.error ? data.error : "请求失败");
-  return data.data !== undefined ? data.data : data;
+  return guardPayload(data.data !== undefined ? data.data : data, path);
 }
 
 async function bridgeRequest(bridge, path, method, body) {
@@ -239,6 +239,58 @@ async function apiTry(fn, fallback) {
   } catch (error) {
     return fallback;
   }
+}
+
+/* ------------------------------------------------------------
+   字段护栏（只检测，不阻止）
+   开发模式下用 Proxy 包装 apiRequest 的返回值，读取响应里不存在的字段时
+   console.error 并上报，把「静默显示错误值」变成「可见错误」。开启方式：
+   window.__MC_FIELD_GUARD__ = true。它不阻止错误发生；编译期强制需要
+   JSDoc + tsc --checkJs 或迁移 TypeScript，成本远超收益，明确不做。
+   ------------------------------------------------------------ */
+const guardedFieldReads = new Set();
+
+function guardPayload(payload, path) {
+  if (typeof window === "undefined" || window.__MC_FIELD_GUARD__ !== true) return payload;
+  if (payload === null || typeof payload !== "object") return payload;
+  const endpoint = String(path || "").split("?")[0];
+  return new Proxy(payload, {
+    get(target, key, receiver) {
+      if (typeof key === "string" && !(key in target)) {
+        const marker = endpoint + " · " + key;
+        if (!guardedFieldReads.has(marker)) {
+          guardedFieldReads.add(marker);
+          console.error(
+            "[记忆面板] 读取了响应中不存在的字段：" + marker +
+            "；字段归属以 page_api.ENDPOINT_FIELD_CONTRACT 为准。"
+          );
+          if (typeof window.__MC_FIELD_REPORT__ === "function") window.__MC_FIELD_REPORT__(marker);
+        }
+      }
+      return Reflect.get(target, key, receiver);
+    },
+  });
+}
+
+/* ------------------------------------------------------------
+   陪伴插件联动状态的唯一取数入口
+   每个字段只从声明了它的端点读取，视图不再直接摸 caps.* / personal.*：
+     available        ← /capabilities/bot-personal 或 /companion/personal-memory
+     pluginName       ← /companion/personal-memory · plugin_name
+     dailyPlanEnabled ← /companion/personal-memory · daily_plan_enabled
+     detailEnabled    ← /companion/personal-memory · detail_enabled
+     reason           ← /companion/personal-memory · reason / bridge_reason
+   ------------------------------------------------------------ */
+function companionStatus(capsPayload, personalPayload) {
+  const caps = capsPayload && typeof capsPayload === "object" ? capsPayload : {};
+  const personal = personalPayload && typeof personalPayload === "object" ? personalPayload : {};
+  return {
+    available: caps.available === true || personal.available === true,
+    pluginName: compact(personal.plugin_name),
+    dailyPlanEnabled: personal.daily_plan_enabled === true,
+    detailEnabled: personal.detail_enabled === true,
+    reason: compact(personal.reason) || compact(personal.bridge_reason) || compact(caps.error_code),
+  };
 }
 
 /* ------------------------------------------------------------
@@ -997,18 +1049,19 @@ defineView("overview", {
   eyebrow: "Overview",
   hint: "记忆库规模、范围分布与联动状态的整体快照",
   async load() {
-    const [statsPayload, buckets, core, personal, coord, memories] = await Promise.all([
+    const [statsPayload, buckets, core, caps, coord, memories, personal] = await Promise.all([
       apiGet("/stats"),
       apiTry(() => apiGet("/buckets?limit=160"), { buckets: [] }),
       apiTry(() => apiGet("/core-memory"), { blocks: [] }),
       apiTry(() => apiGet("/capabilities/bot-personal"), {}),
       apiTry(() => apiGet("/coordination/status"), { status: {} }),
       apiTry(() => apiGet("/memories?limit=80"), { memories: [] }),
+      apiTry(() => apiGet("/companion/personal-memory?limit=1"), null),
     ]);
     const stats = (statsPayload && statsPayload.stats) || {};
     state.stats = stats;
     state.buckets = Array.isArray(buckets.buckets) ? buckets.buckets : [];
-    return { stats, buckets: state.buckets, core: core.blocks || [], personal, coord: coord.status || {}, memories: memories.memories || [] };
+    return { stats, buckets: state.buckets, core: core.blocks || [], caps, personal, coord: coord.status || {}, memories: memories.memories || [] };
   },
   render(data) {
     if (state.mode === "cinema") return renderCinemaOverview(data);
@@ -1075,13 +1128,13 @@ defineView("overview", {
       "陪伴插件联动",
       bridgeHealth === "ready" ? "已连接" : compact(coordStatus.bridge && coordStatus.bridge.reason_code) || "未连接",
     ]);
-    const personalOk = data.personal && data.personal.available !== false;
+    const personalStatus = companionStatus(data.caps, data.personal);
     bridges.push([
-      personalOk ? "is-ok" : "is-bad",
+      personalStatus.available ? "is-ok" : "is-bad",
       "Bot 个人记忆",
-      personalOk
-        ? (data.personal.daily_plan_enabled ? "日程已启用" : "日程未启用") + " · " + (data.personal.detail_enabled ? "细化已启用" : "细化未启用")
-        : compact(data.personal && data.personal.reason) || "不可用",
+      personalStatus.available
+        ? (personalStatus.dailyPlanEnabled ? "日程已启用" : "日程未启用") + " · " + (personalStatus.detailEnabled ? "细化已启用" : "细化未启用")
+        : personalStatus.reason || "不可用",
     ]);
     bridges.push(["is-ok", "外部写入接口", compact(stats.injection_logs) + " 条注入日志"]);
 
@@ -2853,16 +2906,15 @@ defineView("companion", {
     return { caps, coord: (coord && coord.status) || {}, personal };
   },
   render(data) {
-    const caps = data.caps || {};
     const coord = data.coord || {};
     const bridge = coord.bridge || {};
-    const available = caps.available === true || (data.personal && data.personal.available === true);
+    const status = companionStatus(data.caps, data.personal);
 
     const items = [];
     items.push([
-      available ? "is-ok" : "is-bad",
+      status.available ? "is-ok" : "is-bad",
       "插件加载",
-      available ? compact(caps.plugin_name) || "astrbot_plugin_private_companion" : compact(caps.reason) || "未检测到",
+      status.available ? status.pluginName || "-" : status.reason || "未检测到",
     ]);
     items.push([
       bridge.health === "ready" ? "is-ok" : bridge.health === "degraded" ? "is-warn" : "is-bad",
@@ -2870,14 +2922,14 @@ defineView("companion", {
       compact(bridge.health) || "未知",
     ]);
     items.push([
-      caps.daily_plan_enabled ? "is-ok" : "is-warn",
+      status.dailyPlanEnabled ? "is-ok" : "is-warn",
       "每日日程",
-      caps.daily_plan_enabled ? "已启用" : "未启用",
+      status.dailyPlanEnabled ? "已启用" : "未启用",
     ]);
     items.push([
-      caps.detail_enabled ? "is-ok" : "is-warn",
+      status.detailEnabled ? "is-ok" : "is-warn",
       "细化增强",
-      caps.detail_enabled ? "已启用" : "未启用",
+      status.detailEnabled ? "已启用" : "未启用",
     ]);
     if (data.personal && data.personal.available) {
       items.push(["is-ok", "可选日期", (data.personal.dates || []).length + " 天有记录"]);
@@ -2885,14 +2937,18 @@ defineView("companion", {
     }
 
     const bridgeReason = compact(bridge.reason_code);
-    const p6 = coord.p6 || coord.p6_status || null;
+    const p6 = coord.p6 || null;
+    const runtime = coord.runtime || {};
+    const runtimeLabel = compact(runtime.health)
+      ? compact(runtime.health) + " / " + (compact(runtime.reason_code) || "-")
+      : "-";
 
     return (
       '<div class="grid" style="gap:16px">' +
       '<div class="grid split-2">' +
         card(
           "联动状态",
-          available ? "已连接" : "未连接",
+          status.available ? "已连接" : "未连接",
           '<div class="row-list" style="gap:6px">' +
             items.map((item) => '<div class="link-item ' + item[0] + '"><span class="link-dot"></span><b>' + esc(item[1]) + "</b><span>" + esc(item[2]) + "</span></div>").join("") +
             "</div>" +
@@ -2903,8 +2959,9 @@ defineView("companion", {
           "协调契约",
           "只读投影 · 不在本插件持久化",
           '<dl class="kv">' +
-            "<dt>契约版本</dt><dd>" + esc(compact(coord.contract) || "companion_coordination.v1") + "</dd>" +
-            "<dt>兼容等级</dt><dd>" + esc(compact(coord.compatibility_level) || "-") + "</dd>" +
+            "<dt>契约版本</dt><dd>" + esc(compact(coord.schema_version) || "-") + "</dd>" +
+            "<dt>契约指纹</dt><dd>" + esc(compact(coord.contract_fingerprint) || "-") + "</dd>" +
+            "<dt>兼容等级</dt><dd>" + esc(runtimeLabel) + "</dd>" +
             "<dt>桥接状态</dt><dd>" + esc(compact(bridge.health) || "-") + "</dd>" +
             "<dt>表达权威</dt><dd>private_companion</dd>" +
             "<dt>记忆角色</dt><dd>召回可见性与提及上限</dd>" +
@@ -3079,14 +3136,15 @@ defineView("chatimport", {
   },
   render(data) {
     const caps = data.caps || {};
-    const platforms = Array.isArray(caps.platforms) ? caps.platforms : [];
-    const available = caps.available === true || platforms.length > 0;
+    const adapters = Array.isArray(caps.adapters) ? caps.adapters : [];
+    const available = caps.available === true;
+    const adapterError = adapters.map((item) => compact(item.error)).find((value) => value) || "";
 
     const qqPanel =
       '<div class="config-form">' +
       '<label class="field"><span>当前 Bot 连接</span><select id="qqPlatform"' + (available ? "" : " disabled") + ">" +
-        (platforms.length
-          ? platforms.map((p) => '<option value="' + esc(compact(p.platform_id) || compact(p.id)) + '">' + esc(compact(p.name) || compact(p.platform_id) || compact(p.id)) + "</option>").join("")
+        (adapters.length
+          ? adapters.map((p) => '<option value="' + esc(compact(p.platform_id)) + '">' + esc(compact(p.platform_name) || compact(p.platform_id)) + "</option>").join("")
           : '<option value="">等待能力检测</option>') +
       "</select></label>" +
       '<label class="field"><span>目标好友 QQ</span><input id="qqUserId" type="text" inputmode="numeric" placeholder="输入纯数字 QQ 号" /></label>' +
@@ -3098,7 +3156,7 @@ defineView("chatimport", {
         '<button class="btn is-sm is-ghost" type="button" id="qqCapBtn">重新检测</button>' +
         '<button class="btn is-primary" type="button" id="qqPreviewBtn">读取并生成预览</button>' +
       "</div>" +
-      (caps.available === false ? '<p class="section-note">' + esc(compact(caps.reason) || "当前连接不支持读取历史") + "</p>" : "") +
+      (caps.available === false ? '<p class="section-note">' + esc(adapterError || "当前连接不支持读取历史") + "</p>" : "") +
       "</div>";
 
     const filePanel =

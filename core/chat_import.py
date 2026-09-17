@@ -1510,7 +1510,7 @@ class HistoricalChatImporter:
             # 时间线导致归属和回滚边界不完整。
             await self.rollback_batch(batch_id)
 
-        backup = self.store.backup(".before_chat_import")
+        backup = await self.store.backup_async(".before_chat_import")
         batch_dir = self.batch_root / batch_id
         batch_dir.mkdir(parents=True, exist_ok=True)
         upload_dir = self._upload_dir(upload_id)
@@ -1875,7 +1875,7 @@ class HistoricalChatImporter:
                 if old_user_id:
                     break
 
-        backup = self.store.backup(".before_chat_import_rebind")
+        backup = await self.store.backup_async(".before_chat_import_rebind")
         rebound = await self.store.rebind_chat_import_batch(
             batch_id=batch_id,
             session_id=session_id,

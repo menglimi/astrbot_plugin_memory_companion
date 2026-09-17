@@ -238,6 +238,10 @@ class _HookStageTimer:
 
 class MemoryCompanionService:
     _SCOPE_CONTROL_FEATURES = frozenset({"capture", "recall", "topology"})
+    # How often the worker thread compares the stored revision and rebuilds the
+    # in-process ACL projection.  The hot read never touches the database, so a
+    # missed write-path update self-heals within one interval.
+    _ACL_RECONCILE_INTERVAL_SECONDS = 60.0
 
     def __init__(self, *, context: Any, config: Any, plugin_root: Path, data_dir: Path):
         self.context = context
@@ -322,6 +326,14 @@ class MemoryCompanionService:
             "last_completed_at": "",
             "last_result": {},
         }
+        self._acl_reconcile_task: asyncio.Task[Any] | None = None
+        self._acl_reconcile_status: dict[str, Any] = {
+            "state": "idle",
+            "last_error": "",
+            "last_completed_at": "",
+            "last_revision": "",
+            "last_changed": False,
+        }
         self._portrait_dispatch_status: dict[str, Any] = {
             "state": "idle",
             "last_run_day": "",
@@ -352,6 +364,9 @@ class MemoryCompanionService:
         # 注入结果 TTL 缓存（§3.5）：同一会话短时间连续提问的注入包变化很小，
         # 命中缓存可毫秒级注入，避免重复检索与编排。
         self._injection_cache: dict[str, tuple[float, str, str]] = {}
+        # 注入缓存是派生投影：数据 revision 变化后必须整体失效。注册到 store
+        # 的失效广播里，而不是让每个缓存各自记得去比对 revision。
+        self.store.register_invalidation("injection", self._injection_cache.clear)
         self._reconstruction_states: dict[str, dict[str, Any]] = {}
         self._reconstruction_lock = asyncio.Lock()
         self._reconstruction_last_cleanup: float = 0.0
@@ -748,7 +763,7 @@ class MemoryCompanionService:
         if not candidates:
             return {"mode": "applied", "updated": 0, "preview": preview}
 
-        backup = self.store.backup(".before_memory_owner_rebind")
+        backup = await self.store.backup_async(".before_memory_owner_rebind")
         updated = 0
         for record in candidates:
             if await self.store.update_memory_owner_bot(record.id, target_bot_id):
@@ -861,6 +876,7 @@ class MemoryCompanionService:
         )
         self._ensure_lifecycle_maintenance_dispatcher()
         self._ensure_wal_checkpoint_loop()
+        self._ensure_acl_projection_reconcile_loop()
         ctx = await self.identity.resolve_event_context(event)
         stage_timer.mark("identity")
         self._sanitize_session_context_message_text(ctx)
@@ -1178,6 +1194,7 @@ class MemoryCompanionService:
     async def handle_group_message(self, event: Any) -> None:
         self._ensure_lifecycle_maintenance_dispatcher()
         self._ensure_wal_checkpoint_loop()
+        self._ensure_acl_projection_reconcile_loop()
         if not self.config.bool("memory_capture.enabled", True):
             return
         if not self.config.bool("conversation_memory.enabled", True):
@@ -1266,6 +1283,55 @@ class MemoryCompanionService:
         self._portrait_dispatch_task = task
         if task is not None:
             self._portrait_dispatch_status["state"] = "scheduled"
+
+    def _ensure_acl_projection_reconcile_loop(self) -> None:
+        """Start one retained reconciler for the in-process projections.
+
+        The synchronous ACL read must stay free of database I/O, so the
+        projection is refreshed in a worker thread: it compares the stored
+        revision and rebuilds — plus broadcasts cache invalidation — only when
+        data actually changed.
+        """
+        if self._closing or self._closed:
+            return
+        if self._acl_reconcile_task is not None and not self._acl_reconcile_task.done():
+            return
+        task = self._spawn_background(
+            self._acl_projection_reconcile_loop(),
+            label="acl-projection-reconcile",
+        )
+        self._acl_reconcile_task = task
+        if task is not None:
+            self._acl_reconcile_status["state"] = "scheduled"
+
+    async def _acl_projection_reconcile_loop(self) -> None:
+        interval_seconds = float(self._ACL_RECONCILE_INTERVAL_SECONDS)
+        await asyncio.sleep(max(5.0, interval_seconds / 4))
+        while not self._closing and not self._closed:
+            try:
+                self._acl_reconcile_status["state"] = "running"
+                result = await asyncio.to_thread(self.store.reconcile_caches_sync)
+                self._acl_reconcile_status.update(
+                    {
+                        "state": "scheduled",
+                        "last_error": "",
+                        "last_completed_at": utc_now(),
+                        "last_revision": str(result.get("revision", "")),
+                        "last_changed": bool(result.get("changed")),
+                    }
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._acl_reconcile_status.update(
+                    {
+                        "state": "degraded",
+                        "last_error": self._describe_exception(exc),
+                        "last_completed_at": utc_now(),
+                    }
+                )
+                logger.warning("[MemoryCompanion] ACL 投影对账失败: %s", exc, exc_info=True)
+            await asyncio.sleep(interval_seconds)
 
     def _ensure_wal_checkpoint_loop(self) -> None:
         """Start one retained, low-frequency WAL truncation task.
@@ -4692,10 +4758,19 @@ class MemoryCompanionService:
                 if not force:
                     self._summary_call_semaphore.release()
             if not payload or self.summarizer.validation_errors(payload):
-                logger.warning(
-                    "[MemoryCompanion] 阶段总结批次等待修复，后续消息继续处理: session=%s batch=%s",
-                    ctx.session_id, batch_id,
-                )
+                # Quarantine is not "waiting": the batch keeps owning its
+                # events, so they stay frozen until a human releases them.
+                current = await self.store.get_summary_batch(batch_id)
+                if str((current or {}).get("state") or "") == "quarantined":
+                    logger.warning(
+                        "[MemoryCompanion] 阶段总结批次已隔离，本批原始事件冻结等待复核释放: session=%s batch=%s",
+                        ctx.session_id, batch_id,
+                    )
+                else:
+                    logger.warning(
+                        "[MemoryCompanion] 阶段总结批次等待修复，后续消息继续处理: session=%s batch=%s",
+                        ctx.session_id, batch_id,
+                    )
                 return ""
 
             consumed_ids = {
@@ -6654,7 +6729,7 @@ class MemoryCompanionService:
 
     async def import_livingmemory(self, *, configured_path: str = "") -> dict[str, Any]:
         if self.config.bool("maintenance.backup_before_import", True):
-            backup = self.store.backup(".before_livingmemory_import")
+            backup = await self.store.backup_async(".before_livingmemory_import")
             logger.info("[MemoryCompanion] LivingMemory 导入前已备份数据库: %s", backup)
         return await self.migrator.import_data(
             configured_path=configured_path,
@@ -6720,6 +6795,13 @@ class MemoryCompanionService:
         self._embedding_backfill_inflight.clear()
         self._embedding_memory_inflight.clear()
         self._embedding_backfill_last_run.clear()
+        # 清库必须同时通知 store：策略表已经清空，持有的 ACL 投影与已注册
+        # 的派生缓存都不允许保留旧值。
+        self.store.clear_acl_projection_sync()
+        result["invalidated_caches"] = await asyncio.to_thread(
+            self.store.invalidate_registered_caches,
+            reason="clear_all_memory_data",
+        )
         return result
 
     async def clear_scoped_memory(
@@ -6794,7 +6876,7 @@ class MemoryCompanionService:
     async def sleep_maintenance(self, *, reason: str = "manual") -> dict[str, Any]:
         backup = ""
         if self.config.bool("maintenance.sleep_backup_enabled", False):
-            backup = str(self.store.backup(".before_sleep_maintenance"))
+            backup = str(await self.store.backup_async(".before_sleep_maintenance"))
         # The scheduled pass runs while normal message and dashboard traffic is
         # already active.  A full repair takes the store write lock for every
         # memory row and makes synchronous compatibility reads stall the whole

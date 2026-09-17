@@ -98,10 +98,21 @@ class C7RetrievalBoundaryTests(unittest.TestCase):
         self.assertLessEqual(RetrievalEngine.DEFAULT_MATERIALIZE_LIMIT, 2000)
 
     def test_panel_polling_has_attempt_and_time_bounds(self) -> None:
+        """历史导入任务状态轮询必须有上限。
+
+        2.0.0 重写移除了历史导入页的自动轮询（`historicalChatPollAttempts`、
+        `elapsed > 10 * 60 * 1000` 与「历史导入轮询已达到上限」提示随之消失），
+        状态改为进入视图时读取一次、之后由「刷新状态」按钮按需触发。因此
+        「轮询必须有次数与时间上限」的等价契约收紧为「面板不得存在定时轮询器」：
+        轮询器不存在时次数与时间上限自动满足，一旦有人加回 setInterval 轮询即失败。
+        """
         panel = (ROOT / "pages" / "记忆面板" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("historicalChatPollAttempts > 120", panel)
-        self.assertIn("elapsed > 10 * 60 * 1000", panel)
-        self.assertIn("历史导入轮询已达到上限", panel)
+        self.assertNotIn("setInterval", panel)
+        self.assertIn(
+            'apiGet("/conversation-import/status?batch_id=" + encodeURIComponent(importState.batchId)',
+            panel,
+        )
+        self.assertIn('const result = await apiTry(() => apiGet("/conversation-import/status"), null);', panel)
 
 
 class C7PerformanceBoundaryTests(unittest.IsolatedAsyncioTestCase):

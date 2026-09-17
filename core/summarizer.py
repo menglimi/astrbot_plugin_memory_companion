@@ -454,13 +454,19 @@ class MemorySummarizer:
         raw_refs = payload.get("summary_refs") or []
         raw_refs = [raw_refs] if isinstance(raw_refs, str) else raw_refs
         raw_refs = raw_refs if isinstance(raw_refs, list) else []
-        refs = list(dict.fromkeys(str(ref) for ref in raw_refs if str(ref) in valid_ids))
+        # Normalize once, with the same helper the key_facts and associations
+        # refs use. Comparing the raw string here rejected a ref that only
+        # differed by whitespace even though the identical id matched in
+        # key_facts, so the same batch reported "summary_refs 含本批次不存在
+        # 的 event_id" for a reference that was in fact valid.
+        normalized_refs = [clean_text(ref, 160) for ref in raw_refs]
+        refs = list(dict.fromkeys(ref for ref in normalized_refs if ref in valid_ids))
         errors = []
         raw_facts = payload.get("key_facts") or payload.get("facts") or []
         raw_facts = raw_facts if isinstance(raw_facts, list) else [raw_facts]
         if len(raw_facts) > len(key_facts_with_refs):
             errors.append("部分关键事实没有有效引用或不受原文支持，删除该结论并同步修正正文")
-        if any(str(ref) not in valid_ids for ref in raw_refs):
+        if any(ref not in valid_ids for ref in normalized_refs):
             errors.append("summary_refs 含本批次不存在的 event_id")
         if refs and summary and not self.fact_supported_by_rows(summary, [row for row in rows if row.get("id") in refs]):
             errors.append("摘要正文与所引用消息缺乏对应，请贴近原文纠正")
@@ -551,16 +557,21 @@ class MemorySummarizer:
             if not refs or not self.fact_supported_by_rows(fact, evidence_rows):
                 continue
             fact_key = fact.casefold()
-            if fact_key not in seen_facts:
-                seen_facts.add(fact_key)
-                facts.append(fact)
+            if fact_key in seen_facts:
+                # A duplicate must not enter the traced list: validation_errors
+                # compares len(key_facts_with_refs) with len(key_facts), so an
+                # extra trace entry reports "关键事实缺少有效引用" for a batch
+                # whose facts are all correctly referenced.
+                continue
+            seen_facts.add(fact_key)
+            facts.append(fact)
             traced.append({"fact": fact, "refs": refs})
             if len(facts) >= 8:
                 break
         return facts[:8], traced[:8]
 
-    @staticmethod
-    def fact_supported_by_rows(fact: Any, rows: list[dict[str, Any]]) -> bool:
+    @classmethod
+    def fact_supported_by_rows(cls, fact: Any, rows: list[dict[str, Any]]) -> bool:
         source = re.sub(
             r"\s+",
             "",
@@ -584,7 +595,14 @@ class MemorySummarizer:
             r"(?:20\d{2}[-年]\d{1,2}(?:[-月]\d{1,2})?|周[一二三四五六日天]|星期[一二三四五六日天]|上午|下午|早上|晚上|凌晨|\d{1,2}点(?:\d{1,2}分)?)",
             compact_fact,
         )
-        if temporal_tokens and any(token not in source for token in temporal_tokens):
+        # _normalize_relative_time_mentions rewrites "今天/昨天" into absolute
+        # dates taken from the rows themselves, but the evidence text below is
+        # only the message bodies -- so a claim written exactly as the prompt
+        # demands ("YYYY-MM-DD 中午") failed its own temporal check whenever the
+        # user's original wording was relative. Compare against the same date
+        # vocabulary the normalization side uses instead of the raw bodies.
+        temporal_source = source + "".join(cls._rows_local_dates(rows))
+        if temporal_tokens and any(token not in temporal_source for token in temporal_tokens):
             return False
         generic_terms = {
             "事情", "内容", "消息", "聊天", "对话", "表示", "提到", "认为", "觉得",

@@ -44,6 +44,11 @@ _SNAPSHOT_KEYS = (
 _MAX_ITEMS = 64
 _MAX_TEXT = 256
 
+# Public name for the same closed set: it is the page-facing capability contract,
+# so page consumers may read these keys and nothing else.  Kept as an alias so the
+# existing `_SNAPSHOT_KEYS` callers keep working unchanged.
+CAPABILITY_SNAPSHOT_FIELDS = _SNAPSHOT_KEYS
+
 
 def _text(value: object, *, limit: int = _MAX_TEXT) -> str:
     try:
@@ -235,6 +240,7 @@ class _MappingContract:
 
 
 __all__ = [
+    "CAPABILITY_SNAPSHOT_FIELDS",
     "CAPABILITY_STATES",
     "PROFILE_NAMES",
     "CapabilityCache",
