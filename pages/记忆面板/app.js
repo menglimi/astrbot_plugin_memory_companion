@@ -1082,7 +1082,7 @@ defineView("overview", {
       kpi("原文已记录", fmtInt(progress.raw_events), "原始会话事件", "group"),
       kpi("会话记忆已生成", fmtInt(progress.conversation_memories), "不含待审核候选", "fact"),
       kpi("待处理批次", fmtInt(progress.pending_batches), "排队或延迟重试", "accent"),
-      kpi("待修复批次", fmtInt(progress.quarantined_batches), "仅隔离本批，后续继续", "gold"),
+      kpi("待修复批次", fmtInt(progress.quarantined_batches), "本批事件已冻结，需人工复核释放", "gold"),
       kpi("已处理，无新增记忆", fmtInt(progress.no_memory_batches), "原文保留，不重复总结", "private"),
     ].join("");
 
@@ -3447,7 +3447,17 @@ defineView("migrate", {
         actions: [["maintenanceBtn", "运行维护"]],
       },
       {
-        title: "7. 可回滚记忆审计",
+        title: "7. 汇总批次释放",
+        desc: "被证据门禁隔离的批次会永远持有其时间线事件，那些原文不会再进入任何后续批次。填批次 ID 后由人工复核决定：重新排队（事件交还，可被新批次消费）或放弃（承认丢失，不再悬空）。",
+        input: "releaseBatchId",
+        placeholder: "summary_batch_... 批次 ID",
+        actions: [
+          ["releaseRetryBtn", "重新排队"],
+          ["releaseDiscardBtn", "放弃并关闭"],
+        ],
+      },
+      {
+        title: "8. 可回滚记忆审计",
         desc: "先生成证据约束的预览，再明确应用；已应用批次可回滚。",
         audits: true,
         actions: [
@@ -3458,7 +3468,7 @@ defineView("migrate", {
         ],
       },
       {
-        title: "8. 危险清理",
+        title: "9. 危险清理",
         desc: "清空会先备份数据库，再删除记忆、权限规则、时间线、关系、身份与注入日志。",
         danger: true,
         actions: [["clearAllBtn", "清空全部记忆"]],
@@ -3542,6 +3552,22 @@ defineView("migrate", {
     bind("#lmRunBtn", () => apiPost("/import/livingmemory/run", { path: $("#lmPath", node).value.trim() }), "执行迁移");
     bind("#lmRepairBtn", () => apiPost("/maintenance/repair_livingmemory_content", { path: $("#lmRepairPath", node).value.trim() }), "修复内容");
     bind("#maintenanceBtn", () => apiPost("/maintenance", {}), "运行维护");
+    bind("#releaseRetryBtn", () => {
+      const batchId = $("#releaseBatchId", node).value.trim();
+      if (!batchId) throw new Error("请先填写批次 ID");
+      return apiPost("/maintenance/release_summary_batch", { batch_id: batchId, mode: "retry" });
+    }, "释放批次事件");
+    bind("#releaseDiscardBtn", async () => {
+      const batchId = $("#releaseBatchId", node).value.trim();
+      if (!batchId) throw new Error("请先填写批次 ID");
+      const confirmed = await showInlineConfirmation(
+        "放弃该批次的事件",
+        "这些原始消息将被标记为已总结，等于承认它们不会进入长期记忆。确定继续？",
+        "放弃"
+      );
+      if (!confirmed) throw new Error("已取消");
+      return apiPost("/maintenance/release_summary_batch", { batch_id: batchId, mode: "discard" });
+    }, "放弃批次事件");
     bind("#auditPreviewBtn", () => apiPost("/maintenance/audit/preview", { limit: int($("#auditLimit", node).value) }), "生成审计预览");
     bind("#auditStatusBtn", () => apiGet("/maintenance/audit/status?batch_id=" + encodeURIComponent($("#auditBatch", node).value.trim())), "读取审计状态");
     bind("#auditApplyBtn", () => apiPost("/maintenance/audit/apply", { batch_id: $("#auditBatch", node).value.trim(), confirm: "应用" }), "应用审计");
