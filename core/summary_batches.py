@@ -345,6 +345,13 @@ class SummaryBatchStore:
                 ).fetchone()
                 if not row:
                     return {"ok": False, "error": "batch_not_found", "batch_id": batch_id}
+                if row['state'] != 'quarantined':
+                    return {
+                        "ok": False,
+                        "error": "batch_not_quarantined",
+                        "batch_id": batch_id,
+                        "state": clean_text(row['state'], 40),
+                    }
                 event_ids = [
                     clean_text(item[0], 160)
                     for item in self._conn.execute(
@@ -362,7 +369,8 @@ class SummaryBatchStore:
                 if normalized_mode == 'retry':
                     state = 'retry_pending'
                     self._conn.execute(
-                        "UPDATE summary_batches SET state=?,next_retry_at=NULL,retry_reason='',repair_used=0,updated_at=? WHERE id=?",
+                        "UPDATE summary_batches SET state=?,automatic_calls=0,repair_used=0,"
+                        "next_retry_at=NULL,retry_reason='',last_error='',memory_id='',updated_at=? WHERE id=?",
                         (state, utc_now(), batch_id),
                     )
                 else:
@@ -405,6 +413,9 @@ class SummaryBatchStore:
         def read():
             with self._lock:
                 counts = dict(self._conn.execute('SELECT state,COUNT(*) FROM summary_batches GROUP BY state').fetchall())
+                pending = self._conn.execute('''SELECT COUNT(*) FROM summary_batches b
+                    WHERE b.state IN ('pending','retry_pending')
+                    AND EXISTS(SELECT 1 FROM summary_batch_events e WHERE e.batch_id=b.id)''').fetchone()[0]
                 timeline = self._conn.execute('SELECT COUNT(*),MAX(created_at) FROM timeline').fetchone()
                 memories = self._conn.execute("SELECT COUNT(*),MAX(created_at) FROM memories WHERE memory_type='conversation_summary' AND review_status!='pending'").fetchone()
                 legacy = self._conn.execute('SELECT COUNT(*) FROM summary_failures').fetchone()[0]
@@ -414,7 +425,7 @@ class SummaryBatchStore:
                     JOIN summary_batches b ON b.id=e.batch_id WHERE b.state='quarantined' ''').fetchone()[0]
                 return {'raw_events': timeline[0], 'last_recorded_at': timeline[1] or '',
                         'conversation_memories': memories[0], 'last_summary_at': memories[1] or '',
-                        'pending_batches': counts.get('pending', 0) + counts.get('retry_pending', 0),
+                        'pending_batches': int(pending or 0),
                         'quarantined_batches': counts.get('quarantined', 0) + legacy,
                         'frozen_events': int(frozen or 0),
                         'no_memory_batches': counts.get('no_memory', 0)}

@@ -290,7 +290,8 @@ class StoreProjectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_quarantined_events_are_frozen_until_released(self) -> None:
         batch_id, event_id = await self._batch_with_event()
         self.store._conn.execute(
-            "UPDATE summary_batches SET state='quarantined' WHERE id=?", (batch_id,)
+            "UPDATE summary_batches SET state='quarantined',automatic_calls=3,repair_used=1 "
+            "WHERE id=?", (batch_id,)
         )
         self.store._conn.commit()
 
@@ -308,9 +309,26 @@ class StoreProjectionTests(unittest.IsolatedAsyncioTestCase):
             session_id=SESSION_ID, exclude_assigned=True
         )
         self.assertEqual([event_id], [row["id"] for row in window["rows"]])
+        released = await self.store.get_summary_batch(batch_id)
+        self.assertEqual(0, released["automatic_calls"])
+        self.assertEqual(0, released["repair_used"])
+        self.assertEqual(0, (await self.store.summary_progress())["pending_batches"])
+
+        rows = list((await self.store.get_timeline_by_ids([event_id])).values())
+        recreated = await self.store.create_summary_batch(SESSION_ID, "private", rows)
+        self.assertEqual(batch_id, recreated)
+        self.assertTrue(
+            await self.store.reserve_summary_call(
+                recreated, max_calls=3, hourly_limit=6,
+            )
+        )
 
     async def test_release_discard_marks_events_summarized(self) -> None:
         batch_id, event_id = await self._batch_with_event()
+        self.store._conn.execute(
+            "UPDATE summary_batches SET state='quarantined' WHERE id=?", (batch_id,)
+        )
+        self.store._conn.commit()
         result = await self.store.release_summary_batch(batch_id, mode="discard")
         self.assertEqual(1, result["released_events"])
         self.assertEqual("completed", result["state"])
@@ -322,6 +340,10 @@ class StoreProjectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], [row["id"] for row in window["rows"]])
 
     async def test_release_rejects_unknown_mode_and_batch(self) -> None:
+        batch_id, _ = await self._batch_with_event()
+        active = await self.store.release_summary_batch(batch_id, mode="retry")
+        self.assertFalse(active["ok"])
+        self.assertEqual("batch_not_quarantined", active["error"])
         self.assertFalse(
             (await self.store.release_summary_batch("sb_missing", mode="retry"))["ok"]
         )
