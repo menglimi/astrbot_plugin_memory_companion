@@ -153,6 +153,12 @@ class CaptureAsyncRegistrationTests(unittest.IsolatedAsyncioTestCase):
         self._store, self._temp_dir = make_store()
         self.addCleanup(self._temp_dir.cleanup)
         self._service = make_service(Path(self._temp_dir.name))
+        # startup.background_grace_seconds（默认 60 秒）会推迟/跳过新建服务的前
+        # N 秒内的后台任务，_spawn_background 在此期间返回 None。本组用例验证的是
+        # 「注册进 _background_tasks 并随任务结束/关闭被清理」这一语义，与宽限期
+        # 无关，因此显式把宽限期归零；生产链路的采集任务在宽限期内走
+        # defer_during_grace=True（core/service.py:940-944），同样会被注册。
+        self._service._background_grace_seconds = 0
 
     def tearDown(self) -> None:
         self._service._closed = True

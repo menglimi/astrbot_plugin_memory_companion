@@ -112,8 +112,11 @@ class RetrievalEngine:
         # haystack 缓存：同一 (memory.id, updated_at) 在一次召回内会被
         # _term_document_stats/_score/MMR features 多次重建，按键复用可省去
         # 重复的字段拼接与 lower()。以锁保护以便在线程池中安全访问。
+        # 引擎每次召回都会重建，实例内缓存只活一次调用；store 提供共享缓存
+        # 时优先使用它，条目由同一条失效广播随其它投影一起清除。
         self._haystack_cache: dict[tuple[str, str], str] = {}
         self._haystack_cache_lock = threading.Lock()
+        self._shared_haystack_cache = getattr(store, "haystack_cache", None)
         self.last_path_info: dict[str, Any] = {
             "mode": self.retrieval_mode,
             "path": "basic",
@@ -3104,12 +3107,28 @@ class RetrievalEngine:
             if df > 0
         }
 
+    def _cached_haystack(self, cache_key: tuple[str, str]) -> str | None:
+        shared = self._shared_haystack_cache
+        if shared is not None:
+            return shared.get(cache_key)
+        with self._haystack_cache_lock:
+            return self._haystack_cache.get(cache_key)
+
+    def _cache_haystack(self, cache_key: tuple[str, str], haystack: str) -> None:
+        shared = self._shared_haystack_cache
+        if shared is not None:
+            shared.put(cache_key, haystack)
+            return
+        with self._haystack_cache_lock:
+            if len(self._haystack_cache) >= 4096:
+                self._haystack_cache.clear()
+            self._haystack_cache[cache_key] = haystack
+
     def _haystack(self, memory: MemoryRecord) -> str:
         cache_key = (memory.id, memory.updated_at)
-        with self._haystack_cache_lock:
-            cached = self._haystack_cache.get(cache_key)
-            if cached is not None:
-                return cached
+        cached = self._cached_haystack(cache_key)
+        if cached is not None:
+            return cached
         metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
         metadata_text_parts = [
             metadata.get("canonical_summary", ""),
@@ -3140,10 +3159,7 @@ class RetrievalEngine:
                 memory.group_id,
             ]
         ).lower()
-        with self._haystack_cache_lock:
-            if len(self._haystack_cache) >= 4096:
-                self._haystack_cache.clear()
-            self._haystack_cache[cache_key] = haystack
+        self._cache_haystack(cache_key, haystack)
         return haystack
 
     @staticmethod

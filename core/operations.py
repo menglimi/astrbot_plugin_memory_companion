@@ -386,7 +386,7 @@ class PortableMemoryArchive:
     async def import_data(self, path: str) -> dict[str, Any]:
         header, records = self._read(path)
         preview_counts = Counter(str(item.get("record_type") or "unknown") for item in records)
-        backup = self.store.backup(".before_portable_import")
+        backup = await self.store.backup_async(".before_portable_import")
         batch_id = await self.store.add_import_batch(
             source_plugin=clean_text(header.get("plugin"), 120) or "portable_jsonl",
             source_path=str(Path(path).expanduser().resolve()),

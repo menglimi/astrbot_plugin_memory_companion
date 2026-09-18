@@ -25,6 +25,7 @@ except Exception:  # pragma: no cover - optional in isolated page tests.
     astrbot_web_request = None
 
 from .core.bridge import serialize_memory
+from .core.capability_probe import CAPABILITY_SNAPSHOT_FIELDS
 from .core.coordination_status import build_coordination_status, project_p6_status
 from .core.identity import normalize_session_context_fields, parse_scope_from_session
 from .core.memory_atom import DURABILITY_LEVELS, SENSITIVITY_LEVELS, VALIDITY_STATUSES
@@ -41,6 +42,30 @@ PLUGIN_NAME = "astrbot_plugin_memory_companion"
 PAGE_API_PREFIXES = (f"/{PLUGIN_NAME}/page",)
 
 logger = logging.getLogger("MemoryCompanion.PageAPI")
+
+# 响应字段归属契约：端点 → 页面允许读取、且后端保证提供的业务字段。
+# 沿用 core/capability_probe.py 的白名单范式：契约之外的字段不构成页面接口，
+# 页面不得跨端点猜字段（例如从能力快照里读插件自身的功能开关）。
+ENDPOINT_FIELD_CONTRACT: dict[str, tuple[str, ...]] = {
+    "/capabilities/bot-personal": CAPABILITY_SNAPSHOT_FIELDS,
+    "/companion/personal-memory": (
+        "available",
+        "plugin_name",
+        "reason",
+        "daily_plan_enabled",
+        "detail_enabled",
+        "bridge_available",
+        "bridge_state",
+        "bridge_reason",
+        "selected_date",
+        "dates",
+        "snapshot",
+        "actions",
+    ),
+    "/conversation-import/qq/capabilities": ("available", "adapters", "limits", "source"),
+}
+COMPANION_PERSONAL_FIELDS = ENDPOINT_FIELD_CONTRACT["/companion/personal-memory"]
+QQ_HISTORY_CAPABILITY_FIELDS = ENDPOINT_FIELD_CONTRACT["/conversation-import/qq/capabilities"]
 
 THEME_NAME_TO_KEY = {
     "黄白游": "huangbaiyou",
@@ -183,6 +208,26 @@ UI_ENDPOINT_EXPOSURE = {
     "/companion/personal-photo": {"exposure": "internal", "reason": "图片代理兼容入口"},
     "/companion/personal-photo-data": {"exposure": "visible", "reason": "个人相册按需加载的数据端点"},
     "/maintenance/sleep": {"exposure": "compat", "reason": "页面使用统一 maintenance 操作，保留状态/命令兼容"},
+    # 2.1.0 面板重写删除了一批旧视图入口，下列端点失去前端调用点；
+    # 逐条登记保留理由，避免“后端有路由但没有消费方”再次静默发生。
+    "/timeline": {"exposure": "compat", "reason": "旧记忆时间线视图入口，面板改为在 /memories 与 /stats 之上本地聚合，保留兼容读取"},
+    "/relations": {"exposure": "compat", "reason": "旧关系视图入口，面板改为按 /memories 的关系记忆分类呈现，保留兼容读取"},
+    "/graph": {"exposure": "compat", "reason": "旧知识图谱数据入口，面板改用 /memories 结果本地构图，保留兼容读取"},
+    "/threads": {"exposure": "compat", "reason": "旧开放线程列表入口，面板改用 /stats 与 /memories 聚合，保留兼容读取"},
+    "/thread/status": {"exposure": "advanced", "reason": "线程开闭状态写入，面板不提供按钮，保留给管理员直接维护未闭环线程"},
+    "/logs": {"exposure": "compat", "reason": "注入日志明细，面板只显示 /stats 的条数汇总，保留给排障直连读取"},
+    "/context/config": {"exposure": "compat", "reason": "上下文编排配置读取，面板统一走 /config/schema 的 context_orchestration 模块"},
+    "/retrieval/config/update": {"exposure": "compat", "reason": "检索配置写入，面板统一走 /config/module/update 的 retrieval 模块"},
+    "/memory/rebind-owner": {"exposure": "compat", "reason": "记忆归属改绑，面板统一走 /memory/update 表单，保留兼容修复入口"},
+    "/core-memory/delete": {"exposure": "advanced", "reason": "核心记忆删除是危险操作，面板只提供 /core-memory/upsert，保留管理员直连删除"},
+    "/maintenance/clear_scope": {"exposure": "advanced", "reason": "按私聊/群聊范围清理记忆是危险操作，面板只暴露 /maintenance/clear_all，保留管理员直连"},
+    "/emotion/trace": {"exposure": "internal", "reason": "情绪痕迹诊断只对已绑定 Dashboard 管理员开放，面板以 /persona-state 投影展示"},
+    "/emotion/traces": {"exposure": "internal", "reason": "情绪痕迹列表同样只对已绑定 Dashboard 管理员开放，面板不提供按钮"},
+    "/conversation-import/targets": {"exposure": "advanced", "reason": "导入目标的私聊候选列表，面板改为手填会话 ID，保留给管理员核对候选窗口"},
+    "/conversation-import/rebind": {"exposure": "advanced", "reason": "导入批次重新绑定目标窗口的修复入口，面板只做预览/开始/暂停/继续/回滚"},
+    "/portrait/profiles": {"exposure": "compat", "reason": "统一画像档案列表，面板改用 /memories 的画像分类筛选，保留兼容读取"},
+    "/portrait/profile": {"exposure": "compat", "reason": "统一画像单档详情，面板改用 /memories 的画像分类筛选，保留兼容读取"},
+    "/portrait/govern": {"exposure": "advanced", "reason": "统一画像治理是危险操作，面板不提供按钮，保留管理员直连"},
 }
 UI_DANGEROUS_ENDPOINTS = frozenset(
     {
@@ -281,6 +326,7 @@ class PluginPageApi:
             ("/maintenance/repair_livingmemory_content", self.repair_livingmemory_content, ["POST"], "MemoryCompanion Page repair LivingMemory content"),
             ("/maintenance/clear_all", self.clear_all, ["POST"], "MemoryCompanion Page clear all memory data"),
             ("/maintenance/clear_scope", self.clear_scope, ["POST"], "MemoryCompanion Page clear scoped memory data"),
+            ("/maintenance/release_summary_batch", self.release_summary_batch, ["POST"], "MemoryCompanion Page release quarantined summary batch"),
             ("/import/livingmemory/preview", self.import_preview, ["GET"], "MemoryCompanion Page import preview"),
             ("/import/livingmemory/run", self.import_run, ["POST"], "MemoryCompanion Page import run"),
             ("/persona-state", self.persona_state, ["GET"], "MemoryCompanion Page persona state"),
@@ -350,7 +396,7 @@ class PluginPageApi:
             current_window=current_window,
             authorized=False,
         )
-        return self._ok({"result": result})
+        return self._ok({"data": result})
 
     async def user_memory_summary(self):
         user_id = clean_text(request.args.get("user_id", ""), 120)
@@ -393,7 +439,7 @@ class PluginPageApi:
                     "workspace": {"kind": "memory_user_workspace", "route_hint": "user_memory", "user_id": user_id},
                     "error_code": "summary_unavailable",
                 }
-        return self._ok({"result": result})
+        return self._ok({"data": result})
 
     async def portrait_profiles(self):
         try:
@@ -416,13 +462,13 @@ class PluginPageApi:
             return self._err("缺少 person_id", 400)
         portraits = getattr(getattr(self.plugin, "service", None), "portraits", None)
         if portraits is None:
-            return self._ok({"result": {"ok": False, "code": "bridge_unavailable", "person": {}, "facts": [], "suppressions": []}})
+            return self._ok({"data": {"ok": False, "code": "bridge_unavailable", "person": {}, "facts": [], "suppressions": []}})
         try:
             result = await portraits.governance_detail(person_id)
         except Exception:
             logger.exception("统一画像详情读取失败")
             return self._err("统一画像详情读取失败", 500)
-        return self._ok({"result": result})
+        return self._ok({"data": result})
 
     async def portrait_govern(self):
         payload = await self._json()
@@ -441,7 +487,7 @@ class PluginPageApi:
         except Exception:
             logger.exception("统一画像治理失败")
             return self._err("统一画像治理失败", 500)
-        return self._ok({"result": result})
+        return self._ok({"data": result})
 
     async def portrait_migration(self):
         payload = await self._json()
@@ -464,7 +510,7 @@ class PluginPageApi:
         except Exception:
             logger.exception("统一画像迁移操作失败")
             return self._err("统一画像迁移操作失败", 500)
-        return self._ok({"result": result})
+        return self._ok({"data": result})
 
     async def bot_personal_capabilities(self):
         getter = getattr(self.plugin, "bot_personal_capability_status", None)
@@ -474,7 +520,7 @@ class PluginPageApi:
             "degraded": True,
             "warnings": ["capability_status_unavailable"],
         }
-        return self._ok({"result": result if isinstance(result, dict) else {}})
+        return self._ok({"data": result if isinstance(result, dict) else {}})
 
     async def operations_diagnostics(self):
         try:
@@ -492,8 +538,8 @@ class PluginPageApi:
         bridge = getattr(self.plugin, "memory_companion", None)
         getter = getattr(bridge, "get_emotion_trace_diagnostic", None)
         if not callable(getter):
-            return self._ok({"result": {"state": "degraded", "read_only": True, "items": [], "error_code": "bridge_method_unavailable"}})
-        return self._ok({"result": await getter(trace_id, context, limit=100)})
+            return self._ok({"data": {"state": "degraded", "read_only": True, "items": [], "error_code": "bridge_method_unavailable"}})
+        return self._ok({"data": await getter(trace_id, context, limit=100)})
 
     async def emotion_traces(self):
         context = self._trusted_emotion_admin_context()
@@ -502,8 +548,8 @@ class PluginPageApi:
         bridge = getattr(self.plugin, "memory_companion", None)
         getter = getattr(bridge, "get_emotion_trace_summary", None)
         if not callable(getter):
-            return self._ok({"result": {"state": "degraded", "read_only": True, "items": [], "error_code": "bridge_method_unavailable"}})
-        return self._ok({"result": await getter(
+            return self._ok({"data": {"state": "degraded", "read_only": True, "items": [], "error_code": "bridge_method_unavailable"}})
+        return self._ok({"data": await getter(
             context,
             cursor=clean_text(request.args.get("cursor", ""), 20),
             limit=max(1, min(100, self._int(request.args.get("limit", "20"), 20))),
@@ -614,7 +660,7 @@ class PluginPageApi:
 
     async def data_export(self):
         try:
-            return self._ok({"result": await self.plugin.service.export_portable_data()})
+            return self._ok({"data": await self.plugin.service.export_portable_data()})
         except Exception as exc:
             return self._err(f"导出失败: {exc}", 500)
 
@@ -623,7 +669,7 @@ class PluginPageApi:
         if not path:
             return self._err("path is required", 400)
         try:
-            return self._ok({"result": self.plugin.service.preview_portable_data(path)})
+            return self._ok({"data": self.plugin.service.preview_portable_data(path)})
         except (OSError, ValueError) as exc:
             return self._err(str(exc), 400)
 
@@ -633,7 +679,7 @@ class PluginPageApi:
         if not path:
             return self._err("path is required", 400)
         try:
-            return self._ok({"result": await self.plugin.service.import_portable_data(path)})
+            return self._ok({"data": await self.plugin.service.import_portable_data(path)})
         except (OSError, ValueError) as exc:
             return self._err(str(exc), 400)
         except Exception as exc:
@@ -655,7 +701,7 @@ class PluginPageApi:
                 content=content,
                 base_year=int(payload.get("base_year") or 0),
             )
-            return self._ok({"result": result})
+            return self._ok({"data": result})
         except (ValueError, OSError) as exc:
             return self._err(str(exc), 400)
         except Exception as exc:
@@ -665,7 +711,7 @@ class PluginPageApi:
     async def conversation_import_qq_capabilities(self):
         try:
             result = await self.plugin.service.qq_history_capabilities()
-            return self._ok({"result": result})
+            return self._ok({"data": self._declared_payload(result, QQ_HISTORY_CAPABILITY_FIELDS)})
         except Exception as exc:
             logger.exception("QQ 历史读取能力检测失败")
             return self._err(f"QQ 历史读取能力检测失败: {exc}", 500)
@@ -674,7 +720,7 @@ class PluginPageApi:
         payload = await self._json()
         try:
             result = await self.plugin.service.preview_qq_historical_chat(payload)
-            return self._ok({"result": result})
+            return self._ok({"data": result})
         except ValueError as exc:
             return self._err(str(exc), 400)
         except (RuntimeError, asyncio.TimeoutError) as exc:
@@ -687,7 +733,7 @@ class PluginPageApi:
         payload = await self._json()
         try:
             result = await self.plugin.service.start_historical_chat_import(payload)
-            return self._ok({"result": result})
+            return self._ok({"data": result})
         except (ValueError, OSError) as exc:
             return self._err(str(exc), 400)
         except Exception as exc:
@@ -702,7 +748,7 @@ class PluginPageApi:
                 batch_id,
                 upgrade_legacy=upgrade_legacy,
             )
-            return self._ok({"result": result})
+            return self._ok({"data": result})
         except ValueError as exc:
             return self._err(str(exc), 404)
         except Exception as exc:
@@ -710,6 +756,8 @@ class PluginPageApi:
 
     async def conversation_import_targets(self):
         try:
+            # 导入目标只接受真实私聊窗口：bot_personal 归档行属于内部合成会话
+            # （session_id=bot_personal:<digest>），因此保持默认的排除语义。
             buckets = await self.plugin.service.store.list_memory_buckets(
                 limit=None,
                 include_raw_events=self.plugin.service.config.bool(
@@ -734,7 +782,7 @@ class PluginPageApi:
         if not batch_id:
             return self._err("batch_id is required", 400)
         try:
-            return self._ok({"result": await self.plugin.service.pause_historical_chat_import(batch_id)})
+            return self._ok({"data": await self.plugin.service.pause_historical_chat_import(batch_id)})
         except ValueError as exc:
             return self._err(str(exc), 404)
 
@@ -744,7 +792,7 @@ class PluginPageApi:
         if not batch_id:
             return self._err("batch_id is required", 400)
         try:
-            return self._ok({"result": await self.plugin.service.resume_historical_chat_import(batch_id)})
+            return self._ok({"data": await self.plugin.service.resume_historical_chat_import(batch_id)})
         except ValueError as exc:
             return self._err(str(exc), 404)
 
@@ -752,7 +800,7 @@ class PluginPageApi:
         payload = await self._json()
         try:
             result = await self.plugin.service.rebind_historical_chat_import(payload)
-            return self._ok({"result": result})
+            return self._ok({"data": result})
         except ValueError as exc:
             message = str(exc)
             return self._err(message, 404 if message == "导入批次不存在" else 400)
@@ -766,7 +814,7 @@ class PluginPageApi:
         if not batch_id:
             return self._err("batch_id is required", 400)
         try:
-            return self._ok({"result": await self.plugin.service.rollback_historical_chat_import(batch_id)})
+            return self._ok({"data": await self.plugin.service.rollback_historical_chat_import(batch_id)})
         except ValueError as exc:
             return self._err(str(exc), 404)
         except Exception as exc:
@@ -881,6 +929,7 @@ class PluginPageApi:
                     "memory_injection.include_raw_events",
                     False,
                 ),
+                include_archive=True,
             )
             windows: list[dict[str, Any]] = []
             for b in buckets:
@@ -1052,7 +1101,7 @@ class PluginPageApi:
         payload = await self._json()
         try:
             result = await self.plugin.service.rebind_memory_owners(payload)
-            return self._ok({"result": result})
+            return self._ok({"data": result})
         except ValueError as exc:
             return self._err(str(exc), 400)
         except Exception as exc:
@@ -1844,7 +1893,9 @@ class PluginPageApi:
             companion = await self._companion_page_bridge.export_snapshot(selected_date)
         except CompanionPageBridgeError as exc:
             if exc.code == "memory_page_companion_unavailable":
-                return self._no_store(self._ok(self._companion_page_unavailable(exc.code)))
+                return self._no_store(
+                    self._ok(self._declared_payload(self._companion_page_unavailable(exc.code), COMPANION_PERSONAL_FIELDS))
+                )
             return self._no_store(self._err(exc.code, self._companion_page_error_status(exc.code)))
         records = await self._personal_memory_records(
             limit=limit,
@@ -1860,7 +1911,7 @@ class PluginPageApi:
             for record in filtered
             if self._is_personal_action(record)
         ][:limit]
-        return self._no_store(self._ok(payload))
+        return self._no_store(self._ok(self._declared_payload(payload, COMPANION_PERSONAL_FIELDS)))
 
     async def companion_personal_photo(self):
         resolved = await self._read_companion_photo_from_request()
@@ -3042,14 +3093,14 @@ class PluginPageApi:
 
     async def maintenance(self):
         result = await self.plugin.service.sleep_maintenance(reason="page_maintenance")
-        return self._ok({"result": result})
+        return self._ok({"data": result})
 
     async def sleep_maintenance(self):
         if request.method == "POST":
             result = await self.plugin.service.sleep_maintenance(reason="page_sleep")
         else:
             result = self.plugin.service.sleep_status()
-        return self._ok({"result": result})
+        return self._ok({"data": result})
 
     async def audit_preview(self):
         payload = await self._json()
@@ -3059,7 +3110,7 @@ class PluginPageApi:
             )
         except (ValueError, RuntimeError) as exc:
             return self._err(clean_text(exc, 300), 400)
-        return self._ok({"result": result})
+        return self._ok({"data": result})
 
     async def audit_status(self):
         try:
@@ -3068,7 +3119,7 @@ class PluginPageApi:
             )
         except ValueError as exc:
             return self._err(clean_text(exc, 300), 400)
-        return self._ok({"result": result})
+        return self._ok({"data": result})
 
     async def audit_apply(self):
         payload = await self._json()
@@ -3079,7 +3130,7 @@ class PluginPageApi:
             )
         except ValueError as exc:
             return self._err(clean_text(exc, 300), 400)
-        return self._ok({"result": result})
+        return self._ok({"data": result})
 
     async def audit_rollback(self):
         payload = await self._json()
@@ -3090,21 +3141,21 @@ class PluginPageApi:
             )
         except ValueError as exc:
             return self._err(clean_text(exc, 300), 400)
-        return self._ok({"result": result})
+        return self._ok({"data": result})
 
     async def repair_livingmemory_content(self):
         payload = await self._json()
         result = await self.plugin.service.migrator.repair_imported_content(
             configured_path=clean_text(payload.get("path"), 1000)
         )
-        return self._ok({"result": result})
+        return self._ok({"data": result})
 
     async def clear_all(self):
         payload = await self._json()
         if clean_text(payload.get("confirm"), 20) != "清空":
             return self._err("confirmation mismatch", 400)
         result = await self.plugin.service.clear_all_memory_data()
-        return self._ok({"result": result})
+        return self._ok({"data": result})
 
     async def clear_scope(self):
         payload = await self._json()
@@ -3129,7 +3180,24 @@ class PluginPageApi:
                 )
         except ValueError as exc:
             return self._err(str(exc), 400)
-        return self._ok({"result": result})
+        return self._ok({"data": result})
+
+    async def release_summary_batch(self):
+        """End the quarantine freeze of one summary batch after human review.
+
+        Without this the events a quarantined batch owns stay excluded from the
+        pending window forever, so those messages never become long-term memory
+        and nothing tells the administrator that they will not.
+        """
+        payload = await self._json()
+        batch_id = clean_text(payload.get("batch_id"), 160)
+        mode = clean_text(payload.get("mode"), 20).lower() or "retry"
+        if not batch_id:
+            return self._err("batch_id is required", 400)
+        result = await self.plugin.service.store.release_summary_batch(batch_id, mode=mode)
+        if not result.get("ok"):
+            return self._err(clean_text(result.get("error"), 120) or "release failed", 400)
+        return self._ok({"data": result})
 
     async def import_preview(self):
         configured = clean_text(request.args.get("path", ""), 1000)
@@ -3141,14 +3209,26 @@ class PluginPageApi:
         result = await self.plugin.service.import_livingmemory(
             configured_path=clean_text(payload.get("path"), 1000)
         )
-        return self._ok({"result": result})
+        return self._ok({"data": result})
 
     @staticmethod
     def _ok(data: dict[str, Any] | None = None):
+        """单一响应信封：业务负载整体放在 `data` 键下。
+
+        前端 `pages/记忆面板/app.js` 按 `data.data !== undefined ? data.data : data`
+        解包，因此扁平端点（业务字段平铺在顶层）与包裹端点共用同一条解包规则；
+        `result` 键不属于信封，不得再引入。
+        """
         body = {"success": True}
         if data:
             body.update(data)
         return jsonify(body)
+
+    @staticmethod
+    def _declared_payload(payload: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+        """按字段归属契约裁剪负载，契约外的字段不会到达页面。"""
+
+        return {key: payload[key] for key in fields if key in payload}
 
     @staticmethod
     def _err(message: str, status: int = 500):

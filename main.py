@@ -55,6 +55,7 @@ class MemoryCompanionPlugin(Star):
             data_dir=data_dir,
         )
         self.memory_companion = MemoryCompanionBridge(self.service)
+        self.memory_companion.bind_cache_invalidation(self.service.store)
         self.bot_personal_capabilities = self.memory_companion.probe_capability_snapshot()
         if not self.bot_personal_capabilities.get("available", False):
             logger.warning(

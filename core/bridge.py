@@ -458,6 +458,20 @@ class MemoryCompanionBridge:
         self._emotion_page_admin_token = object()
         self._active = True
 
+    def bind_cache_invalidation(self, store: Any) -> bool:
+        """Wire the capability cache into the store's invalidation broadcast.
+
+        Called by the plugin assembly once the service and its store exist.
+        It stays out of ``__init__`` on purpose: constructing a bridge and
+        probing the bot-personal contract are pure contract work that must not
+        touch the plugin, its services or its database.
+        """
+        register = getattr(store, "register_invalidation", None)
+        if not callable(register):
+            return False
+        register("bridge_capability", self._capability_cache.clear)
+        return True
+
     @property
     def _scoped_store(self) -> ScopedStore | None:
         """Resolve the namespace store only when a namespace API is used.

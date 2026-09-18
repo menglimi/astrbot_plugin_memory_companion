@@ -59,10 +59,26 @@ class C7StaticBoundaryTests(unittest.TestCase):
 
     def test_frontend_http_and_partial_context_errors_are_visible(self):
         source = (ROOT / "pages" / "记忆面板" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("if (!response.ok || data?.success === false)", source)
-        self.assertIn("renderContextPanelErrors", source)
-        self.assertIn("errors: {", source)
-        self.assertIn("已显示可用数据", source)
+        # 2.0.0 重写时知识图谱视图连同 renderContextPanelErrors 一起被移除，旧断言锚定
+        # 的元素已不存在。等价契约仍是「HTTP 层失败必须抛出可见错误」「视图或子请求
+        # 失败必须有显式错误出口，不能退化成静默空数据」，断言因此锚定到当前实现里
+        # 承担该职责的请求层、视图层与子请求层三处代码。
+        # 请求层：非 2xx 或业务 success=false 必须抛出，并带上 HTTP 状态码。
+        self.assertIn("if (!response.ok || (data && data.success === false)) {", source)
+        self.assertIn("error.status = response.status;", source)
+        self.assertIn('if (data && data.status === "error") {', source)
+        self.assertIn('throw new Error(data.message || data.error || "请求失败");', source)
+        # 视图层：视图整体加载失败必须渲染可见错误，而不是空白。
+        self.assertIn("这个视图没能加载出来", source)
+        # 子请求层：作为上下文之一的请求失败时必须切到显式错误/不可用分支。
+        self.assertIn('return card("互动协同不可用", "读取失败"', source)
+        self.assertIn('if (!result) return { error: "权限矩阵读取失败" };', source)
+        self.assertIn(
+            'if (data.error) return card("权限拓扑", "", emptyState("读取失败", data.error));',
+            source,
+        )
+        self.assertIn("if (result.available === false) {", source)
+        self.assertIn("return { available: false, reason: compact(result.reason)", source)
 
 
 if __name__ == "__main__":

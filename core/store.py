@@ -15,7 +15,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .identity import parse_scope_from_session
 from .astrbot_compat import logger
@@ -48,6 +48,39 @@ from .sensitive_data import redact_sensitive_text, redact_sensitive_value
 
 
 _ACL_UNSET = object()
+
+
+class SharedTextCache:
+    """Bounded, thread-safe text cache owned by the store.
+
+    Consumers such as the retrieval engine are rebuilt per call, so a cache
+    held on the instance only survives a single recall.  Keeping the entries
+    here lets one invalidation broadcast drop them together with the other
+    projections instead of leaving a copy that nobody can reach.
+    """
+
+    def __init__(self, max_entries: int = 4096) -> None:
+        self._max_entries = max(1, int(max_entries or 1))
+        self._entries: dict[Any, str] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: Any) -> str | None:
+        with self._lock:
+            return self._entries.get(key)
+
+    def put(self, key: Any, value: str) -> None:
+        with self._lock:
+            if len(self._entries) >= self._max_entries:
+                self._entries.clear()
+            self._entries[key] = value
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
 
 
 # 向量二进制格式常量：little-endian float64 打包，
@@ -124,6 +157,23 @@ class MemoryStore(SummaryBatchStore):
             f"lower({prefix}content) NOT LIKE 'bot personal archive reference [%]'"
         )
 
+    RECALLABLE_MEMORY_VIEW = "recallable_memories"
+
+    def _initialize_recallable_memory_view(self) -> None:
+        """Expose the recall filter as a view so no query can omit it.
+
+        ``_recallable_memory_sql`` returns a bare predicate that every caller
+        has to remember to splice into its own ``WHERE`` clause, which is why
+        list-style queries silently drifted away from recall queries.  The
+        view carries the same rule at the data entry point instead, and is
+        recreated from the code predicate so the two can never disagree.
+        """
+        self._conn.execute(f"DROP VIEW IF EXISTS {self.RECALLABLE_MEMORY_VIEW}")
+        self._conn.execute(
+            f"CREATE VIEW {self.RECALLABLE_MEMORY_VIEW} AS "
+            f"SELECT * FROM memories WHERE {self._recallable_memory_sql()}"
+        )
+
     PROFILE_SINGLE_VALUE_DIMENSIONS = frozenset(
         {
             "preferred_address",
@@ -174,6 +224,18 @@ class MemoryStore(SummaryBatchStore):
         self._acl_feature_override_cache: dict[
             tuple[str, str], tuple[bool | None, bool | None]
         ] = {}
+        # `memory_acl_policies` is administrator configuration: one row per
+        # window, no hot writes.  The in-process projection above is therefore
+        # authoritative for the synchronous hot path, refreshed by the write
+        # path after its transaction commits and reconciled in the background.
+        self._acl_projection_pending: dict[
+            tuple[str, str], tuple[bool | None, bool | None]
+        ] = {}
+        self._acl_projection_lock = threading.Lock()
+        self._acl_projection_revision = ""
+        self._cache_invalidation_lock = threading.Lock()
+        self._cache_invalidation_callbacks: dict[str, Callable[[], None]] = {}
+        self.haystack_cache = SharedTextCache(4096)
         self._last_wal_health: dict[str, Any] = {}
         self._last_database_error: dict[str, Any] = {}
         self._database_recovery_attempts = 0
@@ -458,16 +520,25 @@ class MemoryStore(SummaryBatchStore):
 
     @contextmanager
     def _transaction_sync(self):
-        """Run a write unit atomically; callers must hold ``self._lock``."""
+        """Run a write unit atomically; callers must hold ``self._lock``.
+
+        Projection updates staged by write paths are published only after the
+        outermost commit succeeds, so a rolled back unit (including a single
+        failed item isolated by a SAVEPOINT) can never leak an uncommitted
+        value into the in-process projections.
+        """
         if self._conn.in_transaction:
             self._savepoint_counter += 1
             savepoint = f"memory_companion_{self._savepoint_counter}"
+            with self._acl_projection_lock:
+                staged_before = dict(self._acl_projection_pending)
             self._conn.execute(f"SAVEPOINT {savepoint}")
             try:
                 yield
             except BaseException:
                 self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
                 self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                self._restore_acl_projection_pending_sync(staged_before)
                 raise
             else:
                 self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
@@ -477,9 +548,150 @@ class MemoryStore(SummaryBatchStore):
             yield
         except BaseException:
             self._conn.rollback()
+            self._discard_acl_projection_pending_sync()
             raise
         else:
             self._conn.commit()
+            self._flush_acl_projection_pending_sync()
+
+    def register_invalidation(self, name: str, callback: Callable[[], None]) -> None:
+        """Register a cache that must be dropped whenever stored data changes.
+
+        Caches register themselves instead of each one remembering to compare
+        a revision: anything registered here is cleared by the same broadcast
+        that refreshes the store-owned projections, so a new cache cannot be
+        forgotten by the invalidation path.
+        """
+        key = clean_text(name, 80)
+        if not key or not callable(callback):
+            return
+        with self._cache_invalidation_lock:
+            self._cache_invalidation_callbacks[key] = callback
+
+    def invalidate_registered_caches(self, *, reason: str = "") -> list[str]:
+        """Broadcast an invalidation to every registered cache."""
+        with self._cache_invalidation_lock:
+            callbacks = list(self._cache_invalidation_callbacks.items())
+        cleared: list[str] = []
+        for name, callback in callbacks:
+            try:
+                callback()
+            except Exception as exc:
+                logger.warning(
+                    "[MemoryCompanion] 缓存失效回调失败，已跳过: name=%s reason=%s error=%s",
+                    name,
+                    reason,
+                    exc,
+                    exc_info=True,
+                )
+                continue
+            cleared.append(name)
+        return cleared
+
+    def _load_acl_projection_rows_sync(
+        self,
+    ) -> dict[tuple[str, str], tuple[bool | None, bool | None]]:
+        """Read the whole window policy table; callers must hold ``self._lock``."""
+        try:
+            rows = self._conn.execute(
+                "SELECT window_scope, window_id, capture_enabled, recall_enabled "
+                "FROM memory_acl_policies"
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "no such table" not in message and "no such column" not in message:
+                raise
+            return {}
+        projection: dict[tuple[str, str], tuple[bool | None, bool | None]] = {}
+        for row in rows:
+            scope = clean_text(row["window_scope"], 40)
+            window_id = clean_text(row["window_id"], 160)
+            if scope not in {"private", "group"} or not window_id:
+                continue
+            projection[(scope, window_id)] = (
+                None if row["capture_enabled"] is None else bool(row["capture_enabled"]),
+                None if row["recall_enabled"] is None else bool(row["recall_enabled"]),
+            )
+        return projection
+
+    def rebuild_acl_projection_sync(self) -> int:
+        """Reload the authoritative window ACL projection from the database."""
+        with self._lock:
+            projection = self._load_acl_projection_rows_sync()
+        with self._acl_projection_lock:
+            self._acl_feature_override_cache = projection
+        return len(projection)
+
+    def clear_acl_projection_sync(self) -> None:
+        """Drop the projection after the policy table itself was emptied."""
+        with self._acl_projection_lock:
+            self._acl_feature_override_cache = {}
+            self._acl_projection_pending = {}
+
+    def _publish_acl_projection_sync(
+        self,
+        key: tuple[str, str],
+        values: tuple[bool | None, bool | None],
+    ) -> None:
+        """Publish an override whose write transaction already committed."""
+        with self._acl_projection_lock:
+            self._acl_projection_pending.pop(key, None)
+        self._acl_feature_override_cache[key] = values
+
+    def _stage_acl_projection_sync(
+        self,
+        key: tuple[str, str],
+        values: tuple[bool | None, bool | None],
+    ) -> None:
+        """Hold an override until the transaction that wrote it commits."""
+        with self._acl_projection_lock:
+            self._acl_projection_pending[key] = values
+
+    def _flush_acl_projection_pending_sync(self) -> None:
+        with self._acl_projection_lock:
+            if not self._acl_projection_pending:
+                return
+            pending = self._acl_projection_pending
+            self._acl_projection_pending = {}
+        for key, values in pending.items():
+            self._acl_feature_override_cache[key] = values
+
+    def _discard_acl_projection_pending_sync(self) -> None:
+        with self._acl_projection_lock:
+            self._acl_projection_pending.clear()
+
+    def _restore_acl_projection_pending_sync(
+        self,
+        snapshot: dict[tuple[str, str], tuple[bool | None, bool | None]],
+    ) -> None:
+        with self._acl_projection_lock:
+            self._acl_projection_pending.clear()
+            self._acl_projection_pending.update(snapshot)
+
+    def reconcile_caches_sync(self, *, force: bool = False) -> dict[str, Any]:
+        """Rebuild projections and broadcast invalidation when data changed.
+
+        Runs in a worker thread: comparing the stored revision needs the store
+        lock, which must never be taken from the event loop thread.
+        """
+        revision = self._memory_revision_sync()
+        if not force and revision == self._acl_projection_revision:
+            return {
+                "revision": revision,
+                "changed": False,
+                "projection_entries": len(self._acl_feature_override_cache),
+                "caches": [],
+            }
+        projection_entries = self.rebuild_acl_projection_sync()
+        cleared = self.invalidate_registered_caches(reason="retrieval_revision")
+        self.haystack_cache.clear()
+        self._acl_projection_revision = revision
+        return {
+            "revision": revision,
+            "changed": True,
+            "projection_entries": projection_entries,
+            "caches": cleared,
+        }
 
     def initialize(self) -> None:
         if self._read_only:
@@ -1150,7 +1362,11 @@ class MemoryStore(SummaryBatchStore):
                 (self.SCHEMA_VERSION, utc_now()),
             )
             self._initialize_summary_batches()
+            self._initialize_recallable_memory_view()
             self._conn.commit()
+            self._migrate_summary_batch_retry_state_sync()
+            self.rebuild_acl_projection_sync()
+            self._acl_projection_revision = self._memory_revision_sync()
 
     def _cleanup_placeholder_memory_indexes_sync(self) -> int:
         """Remove historical placeholder entries from recall-only indexes.
@@ -2946,6 +3162,17 @@ class MemoryStore(SummaryBatchStore):
                 self._conn.backup(target_conn)
         return target
 
+    async def backup_async(self, suffix: str = "") -> Path:
+        """Copy the whole database without blocking the event loop.
+
+        ``sqlite3.Connection.backup`` rewrites every page while holding the
+        store write lock.  On a production-sized database that stalls the
+        event loop for the entire copy, so asynchronous callers must use this
+        wrapper; the synchronous variant stays for callers that already run
+        inside a worker thread.
+        """
+        return await asyncio.to_thread(self.backup, suffix)
+
     async def clear_all_memory_data(self) -> dict[str, Any]:
         return await asyncio.to_thread(self._clear_all_memory_data_sync)
 
@@ -2991,6 +3218,9 @@ class MemoryStore(SummaryBatchStore):
                             continue
                         raise
                     deleted[table] = int(cur.rowcount or 0)
+            # The policy table was just emptied; the projection has to follow,
+            # otherwise window switches would keep answering with deleted rows.
+            self.clear_acl_projection_sync()
         return {"backup": str(backup), "deleted": deleted}
 
     async def preview_scoped_memory_clear(
@@ -9548,11 +9778,24 @@ class MemoryStore(SummaryBatchStore):
         limit: int | None = 160,
         *,
         include_raw_events: bool = False,
+        include_archive: bool = False,
     ) -> list[dict[str, Any]]:
+        """Aggregate navigation buckets over recallable memories.
+
+        ``include_archive=False`` (the default) reads the
+        ``recallable_memories`` view, so storage-only ``bot_personal_bridge``
+        archive rows can never surface as ordinary private/group windows.
+        Callers that need the archive rows themselves (permission topology --
+        an admin has to be able to grant access to a window whose only rows are
+        archived) opt in explicitly.  Import targets deliberately do not: a
+        ``bot_personal:<digest>`` row is an internal synthetic session, not a
+        chat a user can import memories into.
+        """
         return await asyncio.to_thread(
             self._list_memory_buckets_sync,
             limit,
             include_raw_events,
+            include_archive,
         )
 
     async def preferred_private_session_id(self, user_id: str, bot_id: str = "") -> str:
@@ -9606,10 +9849,12 @@ class MemoryStore(SummaryBatchStore):
         self,
         limit: int | None,
         include_raw_events: bool = False,
+        include_archive: bool = False,
     ) -> list[dict[str, Any]]:
+        source = "memories" if include_archive else self.RECALLABLE_MEMORY_VIEW
         with self._lock:
             rows = self._conn.execute(
-                """
+                f"""
                 WITH normalized AS (
                     SELECT
                         scope,
@@ -9661,7 +9906,7 @@ class MemoryStore(SummaryBatchStore):
                             ELSE 0
                         END AS is_searchable,
                         occurred_at
-                    FROM memories
+                    FROM {source}
                     WHERE scope IN ('private', 'group')
                       AND review_status!='pending'
                 ), ranked AS (
@@ -10227,10 +10472,17 @@ class MemoryStore(SummaryBatchStore):
             ).fetchone()
             if _commit:
                 self._conn.commit()
-            self._acl_feature_override_cache[(window_scope, window_id)] = (
-                next_capture,
-                next_recall,
-            )
+                # Only a committed row may become the in-process authority; the
+                # transactional branch is staged until its writer commits.
+                self._publish_acl_projection_sync(
+                    (window_scope, window_id),
+                    (next_capture, next_recall),
+                )
+            else:
+                self._stage_acl_projection_sync(
+                    (window_scope, window_id),
+                    (next_capture, next_recall),
+                )
         return self._acl_policy_from_row(row) if row else data
 
     @staticmethod
@@ -10267,39 +10519,22 @@ class MemoryStore(SummaryBatchStore):
         return bool(value)
 
     def get_scope_feature_override_sync(self, scope: str, window_id: str) -> dict[str, bool | None]:
+        """Return the window override from the in-process ACL projection.
+
+        Synchronous callers (capture, recall and topology checks) run on the
+        event loop thread, so this must stay free of SQL I/O and of the store
+        write lock.  The projection is loaded once at startup, republished by
+        the write path after its commit, and reconciled in the background, so
+        a missing entry means the window genuinely has no stored policy.
+        """
         scope = clean_text(scope, 40)
         window_id = clean_text(window_id, 160)
         if scope not in {"private", "group"} or not window_id:
             return {"capture_enabled": None, "recall_enabled": None}
-        cache_key = (scope, window_id)
-        with self._lock:
-            cached = self._acl_feature_override_cache.get(cache_key)
-            if cached is not None:
-                capture_enabled, recall_enabled = cached
-                return {
-                    "capture_enabled": capture_enabled,
-                    "recall_enabled": recall_enabled,
-                }
-            try:
-                row = self._conn.execute(
-                    "SELECT capture_enabled, recall_enabled FROM memory_acl_policies "
-                    "WHERE window_scope=? AND window_id=?",
-                    (scope, window_id),
-                ).fetchone()
-            except sqlite3.OperationalError as exc:
-                if "no such column" not in str(exc).lower():
-                    raise
-                row = None
-            values = (
-                (None, None)
-                if not row
-                else (
-                    None if row["capture_enabled"] is None else bool(row["capture_enabled"]),
-                    None if row["recall_enabled"] is None else bool(row["recall_enabled"]),
-                )
-            )
-            self._acl_feature_override_cache[cache_key] = values
-        capture_enabled, recall_enabled = values
+        cached = self._acl_feature_override_cache.get((scope, window_id))
+        if cached is None:
+            return {"capture_enabled": None, "recall_enabled": None}
+        capture_enabled, recall_enabled = cached
         return {
             "capture_enabled": capture_enabled,
             "recall_enabled": recall_enabled,
