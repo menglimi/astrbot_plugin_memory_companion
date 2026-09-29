@@ -5819,10 +5819,21 @@ class MemoryCompanionService:
         dynamic_line = (
             f"本轮正常检索已选出 {selected_count} 条可见记忆；导航最多 {max_steps} 步，这是资源上限而不是目标步数。"
         )
-        contract = _RECONSTRUCTION_CONTRACT.replace(
-            _RECONSTRUCTION_CONTRACT_FOOTER,
-            f"{dynamic_line}\n{_RECONSTRUCTION_CONTRACT_FOOTER}",
-        )
+        # 逐轮变化的量不进 system_prompt：
+        # dynamic_line 里的 selected_count 每轮都可能不同，而 system prompt 是整条
+        # 请求里最应当恒定的前缀 —— 一旦逐轮变化，变化点之后的前缀缓存每轮都会失配
+        # （并被成本控制插件反复报 system_prompt_change）。改走
+        # extra_user_content_parts：它天然位于 system prompt 之后，且 mark_as_temp
+        # 保证不写进历史。
+        # 宿主未提供 TextPart 时 append_temp_text 会返回 False（tests/ 不导入
+        # astrbot，走的正是这条分支），此时保持改动前的行为，避免这行信息被静默丢弃。
+        if append_temp_text(req, dynamic_line):
+            contract = _RECONSTRUCTION_CONTRACT
+        else:
+            contract = _RECONSTRUCTION_CONTRACT.replace(
+                _RECONSTRUCTION_CONTRACT_FOOTER,
+                f"{dynamic_line}\n{_RECONSTRUCTION_CONTRACT_FOOTER}",
+            )
         req.system_prompt = f"{current}\n\n{contract}" if current else contract
 
     def _should_offer_memory_reconstruction(self, ctx: SessionContext) -> bool:
