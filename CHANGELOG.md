@@ -2,6 +2,87 @@
 
 本项目遵循面向用户体验的版本记录。日期使用北京时间。
 
+## 2.2.1 - 2026-10-05
+
+这一版只动面板与联动状态的**诚实性**，不动记忆逻辑。
+
+### 联动面板不再虚标「已安装」
+
+**原缺陷**：面板判断「陪伴插件装了没」读的是 `caps.available`。但那个字段在后端的
+含义是**记忆侧自己那份 contract 自检通过**——也就是「我准备好了、可以跟陪伴侧对话」，
+它恒为 `true`，跟 `astrbot_plugin_private_companion` 在不在宿主里毫无关系。
+结果就是：**根本没装陪伴插件，面板照样显示「已连接」。**
+
+**为什么之前没人发现**：`core/bridge.py` 的能力探测拿
+`capability_descriptor(available=True)`，参数是写死的。它只校验记忆侧那份
+`bot_personal_contract.py` 自洽不自洽，压根不问对面在不在。这个 `available`
+在 C4 契约里的原意就是「我方就绪」，把它当「对方已安装」是彻底的语义串线。
+
+**修法**：新增 `companion_installed` / `companion_plugin_name` 两个字段，由
+`core/capability_probe.py` 的 `detect_companion_plugin()` 真的去 import
+`data.plugins.astrbot_plugin_private_companion.main`，并要求
+`get_private_companion_api()` 返回非 `None`——它答的是「现在真的能用」，
+不是「磁盘上有这个目录」。模块能 import 但桥接没就绪，仍然报未装。
+
+`available` 一个字没改：C4 契约语义保持原样，面板改读新字段。
+所以旧宿主上后端还没升级时，`caps` 里没有 `companion_installed`，
+面板按未装处理——**宁可说没装，也不虚标一个用不了的联动。**
+
+### 内部码不再直接甩给用户
+
+联动页过去会把 `companion_api_unavailable`、`companion_p6_producer_stale`
+这类内部原因码原样打印出来，标成「原因码：xxx」，等于让用户自己查字典。
+现在统一走对照表翻译成中文（「未检测到陪伴插件 astrbot_plugin_private_companion」
+「陪伴插件状态已过期」），认不出来的码仍然原样显示——宁可难看也不吞，
+那说明后端又加了新码。`ready/degraded/unverifiable` 同样译为「正常/降级/无法核实」，
+原始值保留在 `title` 里，排查时还能看到。
+
+### 「兼容等级」不再恒为「完全兼容」
+
+`page_api.py` 过去把 `runtime` 写死成 `{"compatibility_level": "full"}`，
+于是不管陪伴插件装没装，「协调契约 · 兼容等级」恒显「正常 / 契约完全兼容」，
+和旁边那行「桥接状态：无法核实」自相矛盾。现在跟着桥接实际状态走：
+桥接真通了才叫完全兼容，其余一律降级。
+
+### 未安装态的显示
+
+「没装」和「坏了」分开画：新增 `is-off` 中性态（描边点 + 轻微降透明度），
+不再把「没装陪伴插件」标成红色错误。概览页联动卡片补一行说明
+「记忆功能不受影响，装上后这里会显示它的日程、相册与表达权威归属」；
+联动页在未安装时不再显示「查看 Bot 日程与相册」按钮——点了也只会把人送去一个空页面。
+概览页「外部写入接口」过去恒为绿色，实际是拿注入日志条数在撑，现在没日志就中性显示。
+
+### 开场动画
+
+面板打开时首屏直接给到「我会牢牢记住你」，随后淡出交给面板。
+三处刻意的取舍：
+
+- **指针恒不吃**（`pointer-events: none`）。带 `position:fixed; inset:0` 的遮罩
+  一旦吃了事件，动画期间面板就是死的，用户只会以为面板卡了。
+- **不靠 JS 收尾**。最后一帧 keyframe 自带 `visibility:hidden` + `forwards`，
+  脚本报错、被 CSP 拦掉、或后台标签页被冻结导致 `animationend` 不触发，
+  遮罩都会自己消失。JS 只负责把节点摘干净，并挂了 4 秒超时兜底。
+- **尊重 `prefers-reduced-motion`**，该模式下不播，CSS 直接 `display:none`。
+
+标题的渐变扫描光包在 `@supports (background-clip: text)` 里：不支持该特性的
+浏览器保留实色标题，不会因为 `-webkit-text-fill-color: transparent` 而整行字消失。
+每个浏览器会话只播一次（`sessionStorage`），刷新重开仍会看到。
+
+新版界面（Memory OS 三维终端）**没有**这次改动：它是 Vite 编译产物，
+仓库里只有 `assets/index-*.js` 而没有前端源码，改不了。默认的「旧版」界面才是本次对象。
+
+### 验证
+
+- 新增 `tests/test_panel_companion_honesty.py`：静态断言 + 把 `app.js` 里
+  **那段真实代码**截出来交给 node 跑，覆盖「旧后端只给 available」/「未装」/
+  「装了但没活性」/「真装了」四种输入。只做静态断言不够——写死 `false` 也能骗过 grep。
+- 新增 `tests/test_panel_intro_animation.py`：用最小 DOM 桩跑 `legacy.html` 里
+  真实的内联脚本，验证动画结束摘节点、超时兜底、减少动效提前返回、本会话不重播；
+  另断言遮罩不吃点击、末帧自带隐藏、标题有实色兜底。
+- `tests/test_c4_capability_probe.py` 补 `detect_companion_plugin` 的四种行为，
+  并锁住「纯快照永远不自称已装」。
+- 全量测试 749 项通过（pytest 9.1.1 / Python 3.11），另含 145 项 subtest。
+
 ## 2.2.0 - 2026-10-05
 
 ### 记忆从「对话记录库」变成两层

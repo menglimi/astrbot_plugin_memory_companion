@@ -606,7 +606,7 @@ class PluginPageApi:
             p6_raw, bridge = self._companion_p6_status(service)
             status = build_coordination_status(
                 config=getattr(service, "config", None),
-                runtime={"compatibility_level": "full"},
+                runtime={"compatibility_level": self._compatibility_level(bridge)},
                 bridge=bridge,
                 p6_raw=p6_raw,
             )
@@ -618,6 +618,18 @@ class PluginPageApi:
                 p6_raw=None,
             )
         return self._ok({"status": status})
+
+    @staticmethod
+    def _compatibility_level(bridge: Any) -> str:
+        """兼容等级必须跟着桥接的实际状态走。
+
+        以前这里写死 ``{"compatibility_level": "full"}``，于是不管陪伴插件装没装，
+        面板「协调契约 · 兼容等级」恒显「正常 / 契约完全兼容」——和旁边那行
+        「桥接状态：无法核实」自相矛盾，也是在替用户宣布一个没验证过的结论。
+        桥接真的通了才算完全兼容，其余一律降级。
+        """
+        health = bridge.get("health") if isinstance(bridge, dict) else ""
+        return "full" if health == "ready" else "degraded"
 
     def _companion_p6_status(self, service: Any) -> tuple[Any, dict[str, str]]:
         config = getattr(service, "config", None)

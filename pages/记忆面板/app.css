@@ -1424,6 +1424,9 @@ input, select, textarea { font: inherit; color: inherit; }
 .link-item.is-ok .link-dot { background: var(--ok); box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.14); }
 .link-item.is-bad .link-dot { background: var(--danger); box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.14); }
 .link-item.is-warn .link-dot { background: var(--warn); box-shadow: 0 0 0 3px rgba(251, 191, 36, 0.14); }
+/* 「没装」不是「坏了」：描边点 + 轻微降透明度，不跟红色抢。 */
+.link-item.is-off { opacity: 0.75; }
+.link-item.is-off .link-dot { background: transparent; box-shadow: inset 0 0 0 2px var(--text-3); }
 .link-item b { font-weight: 560; }
 .link-item span { color: var(--text-3); font-size: 11.5px; margin-left: auto; flex: none; }
 
@@ -2100,3 +2103,135 @@ html[data-ui-mode="cinema"] .starmap-card[data-theme="light"] { background: rgba
 @keyframes terminal-marquee { from { transform:translateX(0); } to { transform:translateX(-18%); } }
 @media (max-width: 760px) { .terminal-scene-wrap { height:250px; }.terminal-callout { margin:-94px 10px 0; width:auto; }.terminal-record { grid-template-columns:40px 1fr 16px; gap:8px; padding:0 8px; }.terminal-record-channel,.terminal-record-meta { display:none; }.terminal-feed-head { flex-wrap:wrap; }.terminal-feed-head label { width:100%; margin-left:0; }.terminal-controls { flex-wrap:wrap; gap:12px; }.terminal-hint { width:100%; margin-left:0; }.terminal-column span { min-width:100px; } }
 @media (prefers-reduced-motion: reduce) { .terminal-scanline,.terminal-marquee { animation:none; }.terminal-record { transition:none; } }
+/* ============================================================
+   开场动画
+   首屏直接把「我会牢牢记住你」给出来，再淡出交给面板。
+   两条硬约束：
+   1. 永远不吃点击 —— pointer-events 恒为 none，JS 挂了也不会把人拦在门外。
+   2. 不依赖 JS 收尾 —— 动画自身在最后一帧把 visibility 置 hidden，
+      所以就算脚本全废，遮罩也一定会自己消失。
+   ============================================================ */
+.intro {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  background:
+    radial-gradient(120% 90% at 50% 42%, var(--surface) 0%, var(--bg) 62%, var(--bg) 100%);
+  animation: intro-veil 2s var(--ease) forwards;
+}
+.intro::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 46px 46px;
+  mask-image: radial-gradient(70% 60% at 50% 45%, #000 0%, transparent 78%);
+  -webkit-mask-image: radial-gradient(70% 60% at 50% 45%, #000 0%, transparent 78%);
+  opacity: 0;
+  animation: intro-grid 2s var(--ease) forwards;
+}
+.intro-inner { position: relative; text-align: center; padding: 0 24px; }
+.intro-mark {
+  width: 34px;
+  height: 2px;
+  margin: 0 auto 20px;
+  background: var(--accent);
+  opacity: 0;
+  animation: intro-mark 2s var(--ease-out) forwards;
+}
+.intro-title {
+  margin: 0;
+  font-size: clamp(30px, 7.4vw, 60px);
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  line-height: 1.24;
+  color: var(--text);
+  opacity: 0;
+  animation: intro-title 2s var(--ease-out) forwards;
+}
+/* 放映机的光从字上扫过去，比单纯淡入更贴「放映馆」这个隐喻。
+   放在 @supports 里：不支持 background-clip:text 的浏览器会保留上面的实色标题，
+   不会因为 -webkit-text-fill-color:transparent 而整行字消失。 */
+@supports ((-webkit-background-clip: text) or (background-clip: text)) {
+  .intro-title {
+    background-image: linear-gradient(100deg, var(--text) 42%, var(--accent-2) 50%, var(--text) 58%);
+    background-size: 260% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+}
+.intro-sub {
+  margin: 16px 0 0;
+  font: 11px var(--font-mono);
+  letter-spacing: 0.34em;
+  text-indent: 0.34em;
+  color: var(--text-3);
+  opacity: 0;
+  animation: intro-sub 2s var(--ease) forwards;
+}
+.intro-rule {
+  width: min(240px, 52vw);
+  height: 1px;
+  margin: 22px auto 0;
+  background: var(--border-strong);
+  overflow: hidden;
+}
+.intro-rule i {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--accent-line);
+  transform: scaleX(0);
+  transform-origin: left center;
+  animation: intro-rule 2s var(--ease-out) forwards;
+}
+
+@keyframes intro-veil {
+  0% { opacity: 0; visibility: visible; }
+  9% { opacity: 1; }
+  68% { opacity: 1; }
+  90% { opacity: 0; }
+  100% { opacity: 0; visibility: hidden; }
+}
+@keyframes intro-grid {
+  0% { opacity: 0; }
+  20% { opacity: 1; }
+  62% { opacity: 1; }
+  90% { opacity: 0; }
+  100% { opacity: 0; visibility: hidden; }
+}
+@keyframes intro-mark {
+  0%, 6% { opacity: 0; transform: scaleX(0.2); }
+  22% { opacity: 1; transform: scaleX(1); }
+  72% { opacity: 1; }
+  100% { opacity: 0; }
+}
+@keyframes intro-title {
+  0%, 8% { opacity: 0; transform: translateY(16px); filter: blur(12px); }
+  34% { opacity: 1; transform: translateY(0); filter: blur(0); }
+  46% { background-position: 130% 0; }
+  78% { opacity: 1; background-position: -30% 0; }
+  100% { opacity: 0; transform: translateY(-6px); }
+}
+@keyframes intro-sub {
+  0%, 34% { opacity: 0; transform: translateY(8px); }
+  56% { opacity: 1; transform: translateY(0); }
+  78% { opacity: 1; }
+  100% { opacity: 0; }
+}
+@keyframes intro-rule {
+  0%, 40% { transform: scaleX(0); }
+  66%, 80% { transform: scaleX(1); }
+  100% { transform: scaleX(1); opacity: 0; }
+}
+
+/* 用户要求减少动效时直接不播：遮罩一开始就是隐藏的，面板立刻可用 */
+@media (prefers-reduced-motion: reduce) {
+  .intro { display: none; }
+}

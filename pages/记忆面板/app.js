@@ -275,21 +275,83 @@ function guardPayload(payload, path) {
 /* ------------------------------------------------------------
    陪伴插件联动状态的唯一取数入口
    每个字段只从声明了它的端点读取，视图不再直接摸 caps.* / personal.*：
-     available        ← /capabilities/bot-personal 或 /companion/personal-memory
+     installed        ← /capabilities/bot-personal · companion_installed
      pluginName       ← /companion/personal-memory · plugin_name
      dailyPlanEnabled ← /companion/personal-memory · daily_plan_enabled
      detailEnabled    ← /companion/personal-memory · detail_enabled
      reason           ← /companion/personal-memory · reason / bridge_reason
+
+   **installed 不能读 caps.available。** 那个字段的含义是「记忆侧自己的 contract
+   自检通过」，也就是「我准备好了、可以跟陪伴侧对话」，跟对方装没装毫无关系，
+   它恒为 true。过去面板拿它当「已安装」显示，于是根本没装
+   astrbot_plugin_private_companion 的宿主上也显示「已连接」。
+   installed 只认 companion_installed —— 那个字段由后端真的去 import 陪伴插件的
+   运行时入口 get_private_companion_api() 得到，答的是「现在真的能用」。
    ------------------------------------------------------------ */
+const REASON_TEXT = {
+  bridge_status_unavailable: "联动状态读取失败",
+  bridge_config_unavailable: "无法读取插件配置",
+  bridge_config_unreadable: "配置读取出错",
+  bridge_config_invalid: "配置格式不正确",
+  bridge_disabled: "联动已在配置中关闭",
+  companion_api_unavailable: "未检测到陪伴插件 astrbot_plugin_private_companion",
+  companion_p6_producer_unavailable: "陪伴插件未提供状态接口",
+  companion_p6_producer_unreadable: "陪伴插件状态接口读取失败",
+  companion_p6_producer_stale: "陪伴插件状态已过期",
+  companion_p6_unverifiable: "陪伴插件状态无法核实",
+  companion_bridge_available: "联动正常",
+  manifest_registry_unavailable: "扩展清单不可用",
+  coordination_input_unverifiable: "部分联动项无法核实",
+  coordination_degraded: "部分联动项降级",
+  coordination_ready: "联动正常",
+  runtime_compatible: "契约完全兼容",
+  runtime_degraded: "契约降级运行",
+  runtime_unsupported: "契约版本不受支持",
+  runtime_status_unavailable: "运行时状态不可读",
+};
+
+/* 内部原因码是给日志看的，直接甩到面板上等于让用户猜。认不出来的码原样返回，
+   宁可难看也不能吞掉——那说明后端又加了新码。 */
+function bridgeReasonText(code) {
+  const key = compact(code);
+  if (!key) return "";
+  return REASON_TEXT[key] || key;
+}
+
+const HEALTH_TEXT = { ready: "正常", degraded: "降级", unverifiable: "无法核实" };
+
+/* health 同样是内部词（ready/degraded/unverifiable），直接显示等于让用户查字典。
+   原始码仍保留在联动的 title 里，排查时看得到。 */
+function healthText(value) {
+  const key = compact(value);
+  return HEALTH_TEXT[key] || key || "未知";
+}
+
+function bridgeHealthText(bridge) {
+  if (!bridge || typeof bridge !== "object") return "未知";
+  return healthText(bridge.health);
+}
+
+function runtimeHealthText(runtime) {
+  if (!runtime || typeof runtime !== "object") return "未知";
+  const reason = bridgeReasonText(runtime.reason_code);
+  return reason ? healthText(runtime.health) + " · " + reason : healthText(runtime.health);
+}
+
 function companionStatus(capsPayload, personalPayload) {
   const caps = capsPayload && typeof capsPayload === "object" ? capsPayload : {};
   const personal = personalPayload && typeof personalPayload === "object" ? personalPayload : {};
+  const installed = caps.companion_installed === true;
+  const linked = personal.available === true;
   return {
-    available: caps.available === true || personal.available === true,
-    pluginName: compact(personal.plugin_name),
-    dailyPlanEnabled: personal.daily_plan_enabled === true,
-    detailEnabled: personal.detail_enabled === true,
-    reason: compact(personal.reason) || compact(personal.bridge_reason) || compact(caps.error_code),
+    installed: installed,
+    available: installed && linked,
+    pluginName: compact(personal.plugin_name) || (installed ? compact(caps.companion_plugin_name) : ""),
+    dailyPlanEnabled: installed && linked && personal.daily_plan_enabled === true,
+    detailEnabled: installed && linked && personal.detail_enabled === true,
+    reason: !installed
+      ? "未安装陪伴插件 astrbot_plugin_private_companion"
+      : compact(personal.reason) || bridgeReasonText(personal.bridge_reason) || (linked ? "" : "陪伴插件已安装，桥接尚未就绪"),
   };
 }
 
@@ -1122,21 +1184,37 @@ defineView("overview", {
 
     const bridges = [];
     const coordStatus = data.coord || {};
-    const bridgeHealth = compact(coordStatus.bridge && coordStatus.bridge.health) || "unknown";
-    bridges.push([
-      bridgeHealth === "ready" ? "is-ok" : bridgeHealth === "degraded" ? "is-warn" : "is-bad",
-      "陪伴插件联动",
-      bridgeHealth === "ready" ? "已连接" : compact(coordStatus.bridge && coordStatus.bridge.reason_code) || "未连接",
-    ]);
     const personalStatus = companionStatus(data.caps, data.personal);
+    const bridgeHealth = compact(coordStatus.bridge && coordStatus.bridge.health) || "unknown";
+    /* 联动要分三态，别把「没装」画成「坏了」：没装是与用户无关的中性灰点，
+       装了但桥接降级才是需要去看的黄点，全红留给真出错。 */
     bridges.push([
-      personalStatus.available ? "is-ok" : "is-bad",
-      "Bot 个人记忆",
-      personalStatus.available
-        ? (personalStatus.dailyPlanEnabled ? "日程已启用" : "日程未启用") + " · " + (personalStatus.detailEnabled ? "细化已启用" : "细化未启用")
-        : personalStatus.reason || "不可用",
+      !personalStatus.installed ? "is-off" : bridgeHealth === "ready" ? "is-ok" : bridgeHealth === "degraded" ? "is-warn" : "is-bad",
+      "陪伴插件联动",
+      !personalStatus.installed
+        ? "未安装陪伴插件"
+        : bridgeHealth === "ready" ? "已连接" : bridgeReasonText(coordStatus.bridge && coordStatus.bridge.reason_code) || "未连接",
     ]);
-    bridges.push(["is-ok", "外部写入接口", compact(stats.injection_logs) + " 条注入日志"]);
+    bridges.push([
+      !personalStatus.installed ? "is-off" : personalStatus.available ? "is-ok" : "is-warn",
+      "Bot 个人记忆",
+      !personalStatus.installed
+        ? "装上陪伴插件后可用"
+        : personalStatus.available
+          ? (personalStatus.dailyPlanEnabled ? "日程已启用" : "日程未启用") + " · " + (personalStatus.detailEnabled ? "细化已启用" : "细化未启用")
+          : personalStatus.reason || "不可用",
+    ]);
+    const injectionLogs = Number(stats.injection_logs) || 0;
+    bridges.push([
+      injectionLogs > 0 ? "is-ok" : "is-off",
+      "外部写入接口",
+      injectionLogs > 0 ? injectionLogs + " 条注入日志" : "暂无注入日志",
+    ]);
+    const linkageNote = personalStatus.installed
+      ? ""
+      : '<p class="section-note">未检测到 astrbot_plugin_private_companion。<b>记忆功能不受影响</b>，'
+        + '装上陪伴插件后这里会显示它的日程、相册与表达权威归属。'
+        + '<button class="btn is-sm" type="button" data-goto="companion" style="margin-left:8px">查看联动页</button></p>';
 
     return (
       '<div class="grid" style="gap:16px">' +
@@ -1150,7 +1228,7 @@ defineView("overview", {
             "陪伴插件与外部接口",
             '<div class="row-list" style="gap:6px">' +
               bridges.map((item) => '<div class="link-item ' + item[0] + '"><span class="link-dot"></span><b>' + esc(item[1]) + "</b><span>" + esc(item[2]) + "</span></div>").join("") +
-              "</div>"
+              "</div>" + linkageNote
           ) +
         "</div>" +
       "</div>" +
@@ -2910,28 +2988,31 @@ defineView("companion", {
     const bridge = coord.bridge || {};
     const status = companionStatus(data.caps, data.personal);
 
+    const installed = status.installed;
+    const offOr = (ok, warn) => (installed ? (ok ? "is-ok" : warn ? "is-warn" : "is-bad") : "is-off");
+
     const items = [];
     items.push([
-      status.available ? "is-ok" : "is-bad",
-      "插件加载",
-      status.available ? status.pluginName || "-" : status.reason || "未检测到",
+      installed ? (status.available ? "is-ok" : "is-warn") : "is-off",
+      "插件安装",
+      installed ? status.pluginName || "已安装" : "未安装 astrbot_plugin_private_companion",
     ]);
     items.push([
-      bridge.health === "ready" ? "is-ok" : bridge.health === "degraded" ? "is-warn" : "is-bad",
-      "桥接健康度",
-      compact(bridge.health) || "未知",
+      !installed ? "is-off" : bridge.health === "ready" ? "is-ok" : bridge.health === "degraded" ? "is-warn" : "is-bad",
+      "桥接状态",
+      !installed ? "需先安装陪伴插件" : bridgeHealthText(bridge),
     ]);
     items.push([
-      status.dailyPlanEnabled ? "is-ok" : "is-warn",
+      offOr(status.dailyPlanEnabled, true),
       "每日日程",
-      status.dailyPlanEnabled ? "已启用" : "未启用",
+      installed ? (status.dailyPlanEnabled ? "已启用" : "未启用") : "不可用",
     ]);
     items.push([
-      status.detailEnabled ? "is-ok" : "is-warn",
+      offOr(status.detailEnabled, true),
       "细化增强",
-      status.detailEnabled ? "已启用" : "未启用",
+      installed ? (status.detailEnabled ? "已启用" : "未启用") : "不可用",
     ]);
-    if (data.personal && data.personal.available) {
+    if (installed && data.personal && data.personal.available) {
       items.push(["is-ok", "可选日期", (data.personal.dates || []).length + " 天有记录"]);
       items.push(["is-ok", "相册", ((data.personal.snapshot || {}).album || []).length + " 张"]);
     }
@@ -2939,21 +3020,24 @@ defineView("companion", {
     const bridgeReason = compact(bridge.reason_code);
     const p6 = coord.p6 || null;
     const runtime = coord.runtime || {};
-    const runtimeLabel = compact(runtime.health)
-      ? compact(runtime.health) + " / " + (compact(runtime.reason_code) || "-")
-      : "-";
+    const runtimeLabel = runtimeHealthText(runtime);
 
     return (
       '<div class="grid" style="gap:16px">' +
       '<div class="grid split-2">' +
         card(
           "联动状态",
-          status.available ? "已连接" : "未连接",
+          !installed ? "未安装陪伴插件" : status.available ? "已连接" : "已安装但未连通",
           '<div class="row-list" style="gap:6px">' +
             items.map((item) => '<div class="link-item ' + item[0] + '"><span class="link-dot"></span><b>' + esc(item[1]) + "</b><span>" + esc(item[2]) + "</span></div>").join("") +
             "</div>" +
-            (bridgeReason ? '<p style="margin-top:12px;font-size:11.5px;color:var(--text-3)">原因码：' + esc(bridgeReason) + "</p>" : "") +
-            '<div class="pill-row" style="margin-top:12px"><button class="btn is-sm" type="button" data-goto="botlife">查看 Bot 日程与相册</button></div>'
+            (bridgeReason && installed
+              ? '<p class="section-note"' + (REASON_TEXT[bridgeReason] ? ' title="' + esc(bridgeReason) + '"' : "") + ">"
+                + esc(REASON_TEXT[bridgeReason] || bridgeReason) + "</p>"
+              : !installed ? '<p class="section-note">未安装陪伴插件 astrbot_plugin_private_companion。记忆与注入照常工作，日程、相册与表达权威归属需要它。安装并启用后本页会自动显示真实状态。</p>' : "") +
+            (installed
+              ? '<div class="pill-row" style="margin-top:12px"><button class="btn is-sm" type="button" data-goto="botlife">查看 Bot 日程与相册</button></div>'
+              : "")
         ) +
         card(
           "协调契约",
@@ -2962,8 +3046,10 @@ defineView("companion", {
             "<dt>契约版本</dt><dd>" + esc(compact(coord.schema_version) || "-") + "</dd>" +
             "<dt>契约指纹</dt><dd>" + esc(compact(coord.contract_fingerprint) || "-") + "</dd>" +
             "<dt>兼容等级</dt><dd>" + esc(runtimeLabel) + "</dd>" +
-            "<dt>桥接状态</dt><dd>" + esc(compact(bridge.health) || "-") + "</dd>" +
-            "<dt>表达权威</dt><dd>private_companion</dd>" +
+            "<dt>桥接状态</dt><dd>" + esc(bridgeHealthText(bridge)) + "</dd>" +
+            (installed
+              ? "<dt>表达权威</dt><dd>private_companion</dd>"
+              : "<dt>表达权威</dt><dd>无（未安装陪伴插件）</dd>") +
             "<dt>记忆角色</dt><dd>召回可见性与提及上限</dd>" +
             (p6 ? "<dt>P6 状态</dt><dd>" + esc(compact(p6.health) || compact(p6.state) || "-") + "</dd>" : "") +
             "</dl>"

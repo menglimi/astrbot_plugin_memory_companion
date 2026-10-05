@@ -11,7 +11,12 @@ from zoneinfo import ZoneInfo
 
 from . import bot_personal_contract
 from .bot_personal_dto import BotPersonalArchiveDTO, build_bot_personal_archive
-from .capability_probe import CapabilityCache, PROFILE_NAMES as C4_PROFILE_NAMES, build_capability_snapshot
+from .capability_probe import (
+    CapabilityCache,
+    PROFILE_NAMES as C4_PROFILE_NAMES,
+    build_capability_snapshot,
+    detect_companion_plugin,
+)
 from .context_consumer import consume_context_projection
 from .models import EntityRef, MemoryRecord, SessionContext, clean_text
 from .namespace_capability import namespace_capability_descriptor
@@ -1812,6 +1817,13 @@ class MemoryCompanionBridge:
         result["state"] = "available"
         result["degraded"] = False
         self._add_personal_capability_contract_aliases(result)
+        # ``available`` 到此为止只代表**记忆侧这份 contract 自检通过**，也就是
+        # 「我准备好了、可以跟陪伴侧对话」。它不代表陪伴插件装了——过去面板正是
+        # 把这两件事当成一件，才会在没装陪伴插件时显示「已连接」。
+        # 「装没装」必须真去问运行时，所以单独探测、单独两个字段。
+        companion = detect_companion_plugin()
+        result["companion_installed"] = bool(companion["companion_installed"])
+        result["companion_plugin_name"] = str(companion["companion_plugin_name"])
         c4_snapshot = build_capability_snapshot(
             available=True,
             state="available",
@@ -1819,6 +1831,8 @@ class MemoryCompanionBridge:
             methods=result.get("methods", []),
             profiles=C4_PROFILE_NAMES,
             warnings=result.get("warnings", []),
+            companion_installed=result["companion_installed"],
+            companion_plugin_name=result["companion_plugin_name"],
         )
         result.update(c4_snapshot)
         result["memory_domain"] = bot_personal_contract.BOT_PERSONAL_MEMORY_DOMAIN

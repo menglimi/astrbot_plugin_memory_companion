@@ -8,12 +8,51 @@ itself; callers can use the cache to decide when a probe is worth attempting.
 from __future__ import annotations
 
 import copy
+import importlib
 import time
 from collections.abc import Iterable, Mapping
 from typing import Any
 
 
 CAPABILITY_STATES = ("unprobed", "available", "degraded", "negative")
+
+# 陪伴插件在宿主里的两种模块名：AstrBot 加载插件时用的是 ``data.plugins.<插件名>``，
+# 直接按插件名 import 只在测试与脚本里成立。两者都要试。
+COMPANION_PLUGIN_MODULES = (
+    "data.plugins.astrbot_plugin_private_companion.main",
+    "astrbot_plugin_private_companion.main",
+)
+COMPANION_PLUGIN_ID = "astrbot_plugin_private_companion"
+
+
+def detect_companion_plugin() -> dict[str, object]:
+    """真实探测陪伴插件是否已装且已激活。
+
+    ``capability_descriptor(available=True)`` 只校验**记忆侧自己那份** contract 文件，
+    跟陪伴插件在不在宿主里毫无关系，所以它恒为真。面板若拿它当「已安装」显示，
+    就是一个无论装没装都说装了的话。
+
+    这里改成真去问陪伴插件的运行时入口：``get_private_companion_api()`` 在插件未加载、
+    未激活或桥接未就绪时返回 ``None``，因此它答的是「现在真的能用」而不是
+    「磁盘上有这个目录」。
+
+    探测不到就报未装。宁可显示「未安装」让用户去装，也不要虚标一个用不了的联动。
+    """
+    for module_name in COMPANION_PLUGIN_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        getter = getattr(module, "get_private_companion_api", None)
+        if not callable(getter):
+            continue
+        try:
+            api = getter()
+        except Exception:
+            continue
+        if api is not None:
+            return {"companion_installed": True, "companion_plugin_name": COMPANION_PLUGIN_ID}
+    return {"companion_installed": False, "companion_plugin_name": ""}
 
 # Stable C4 capability profiles.  Keep this tuple closed: callers may report
 # only profiles understood by both companion plugins.
@@ -40,6 +79,8 @@ _SNAPSHOT_KEYS = (
     "methods",
     "warnings",
     "error_code",
+    "companion_installed",
+    "companion_plugin_name",
 )
 _MAX_ITEMS = 64
 _MAX_TEXT = 256
@@ -119,8 +160,16 @@ def build_capability_snapshot(
     profiles: Iterable[object] = PROFILE_NAMES,
     warnings: Iterable[object] = (),
     error_code: object = "",
+    companion_installed: bool = False,
+    companion_plugin_name: object = "",
 ) -> dict[str, object]:
-    """Build a bounded, JSON-safe capability snapshot."""
+    """Build a bounded, JSON-safe capability snapshot.
+
+    Pure by design: it never imports plugin modules.  ``companion_installed``
+    therefore defaults to the conservative ``False`` and is filled in by
+    :func:`detect_companion_plugin` at the call site that is allowed to touch
+    the runtime.
+    """
 
     contract = _safe_contract_data(contract_module)
     resolved_state = _state(state)
@@ -148,6 +197,8 @@ def build_capability_snapshot(
         "methods": _unique_texts(methods),
         "warnings": _unique_texts(warnings),
         "error_code": _text(error_code),
+        "companion_installed": companion_installed is True,
+        "companion_plugin_name": _text(companion_plugin_name, limit=80),
     }
     return {key: result[key] for key in _SNAPSHOT_KEYS}
 
@@ -242,7 +293,10 @@ class _MappingContract:
 __all__ = [
     "CAPABILITY_SNAPSHOT_FIELDS",
     "CAPABILITY_STATES",
+    "COMPANION_PLUGIN_ID",
+    "COMPANION_PLUGIN_MODULES",
     "PROFILE_NAMES",
     "CapabilityCache",
     "build_capability_snapshot",
+    "detect_companion_plugin",
 ]

@@ -6,6 +6,7 @@ from core.capability_probe import (
     PROFILE_NAMES,
     CapabilityCache,
     build_capability_snapshot,
+    detect_companion_plugin,
 )
 
 
@@ -18,7 +19,56 @@ def test_snapshot_uses_contract_fingerprint_windows_and_types():
         "available", "state", "degraded", "pending", "contract_fingerprint",
         "contract_version", "schema_version", "windows", "memory_types", "domains",
         "profiles", "methods", "warnings", "error_code",
+        "companion_installed", "companion_plugin_name",
     }
+
+
+def test_snapshot_never_claims_the_companion_on_its_own():
+    """快照是纯函数，自己不探测运行时，所以默认值必须是保守的「未装」。"""
+    for snapshot in (build_capability_snapshot(), build_capability_snapshot(available=True)):
+        assert snapshot["companion_installed"] is False
+        assert snapshot["companion_plugin_name"] == ""
+
+
+def test_detect_companion_plugin_reports_not_installed_when_absent(monkeypatch):
+    import importlib
+
+    import core.capability_probe as probe
+
+    def missing(name, *args, **kwargs):
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(probe.importlib, "import_module", missing)
+    assert detect_companion_plugin() == {
+        "companion_installed": False,
+        "companion_plugin_name": "",
+    }
+
+
+def test_detect_companion_plugin_requires_an_active_api(monkeypatch):
+    """模块能 import 不等于能用：入口返回 None 或抛异常时都必须报「未装」。
+
+    原缺陷：面板把「记忆侧 contract 自检通过」当成「陪伴插件已安装」，
+    于是在根本没装 astrbot_plugin_private_companion 的宿主上也显示「已连接」。
+    """
+    import types
+
+    import core.capability_probe as probe
+
+    module = types.ModuleType("astrbot_plugin_private_companion.main")
+    for behaviour in (lambda: None, lambda: (_ for _ in ()).throw(RuntimeError("boom"))):
+        module.get_private_companion_api = behaviour
+        monkeypatch.setattr(
+            probe.importlib,
+            "import_module",
+            lambda name, _m=module: _m,
+        )
+        assert detect_companion_plugin()["companion_installed"] is False
+
+    module.get_private_companion_api = lambda: object()
+    found = detect_companion_plugin()
+    assert found["companion_installed"] is True
+    assert found["companion_plugin_name"] == probe.COMPANION_PLUGIN_ID
 
 
 def test_initial_cache_is_unprobed_and_pending():
