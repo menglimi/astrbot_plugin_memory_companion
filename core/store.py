@@ -40,6 +40,7 @@ from .models import (
     stable_fingerprint,
     utc_now,
 )
+from .assertions import ASSERTION_MEMORY_TYPE
 from .models import memory_embedding_text_hash
 from .portrait import cross_scene_whitelisted_fact
 from .profile_quality import normalize_profile_value, profile_quality_decision
@@ -3849,6 +3850,176 @@ class MemoryStore(SummaryBatchStore):
         if record.review_status == "pending":
             return "candidate"
         return "active"
+
+    async def upsert_assertion(self, record: MemoryRecord) -> dict[str, Any]:
+        """Merge one assertion into the canonical record for its claim slot.
+
+        Assertions are ordinary ``memories`` rows so recall, injection, ACL,
+        decay and the panel all apply to them without a second runtime.  What
+        this adds is the merge: the same claim extracted from ten conversations
+        must become one row with ten sources, not ten rows that compete for the
+        same injection slot.
+
+        Merging keys on (domain, dimension, polarity, normalized value).  A
+        single-value dimension also supersedes the previous value, because
+        "now lives in Beijing" really does replace "lived in Shanghai"; a
+        multi-value dimension never does, because two different habits are not
+        two versions of one habit.  A polarity flip on the same wording is
+        treated as a correction rather than a contradiction, and the older row
+        is kept with a pointer to its successor so past-tense questions can
+        still be answered.
+        """
+        record.ensure_defaults()
+        metadata = dict(record.metadata) if isinstance(record.metadata, dict) else {}
+        dimension = clean_text(metadata.get("profile_dimension"), 80).lower()
+        polarity = clean_text(metadata.get("profile_polarity"), 40).lower() or "positive"
+        normalized = normalize_profile_value(metadata.get("normalized_value"))
+        profile_value = clean_text(metadata.get("profile_value"), 240)
+        if (
+            clean_text(record.memory_type, 80).lower() != ASSERTION_MEMORY_TYPE
+            or not dimension
+            or not profile_value
+            or not normalized
+            or normalize_profile_value(profile_value) != normalized
+        ):
+            return {"ok": False, "code": "assertion_invalid", "memory_id": ""}
+
+        now = utc_now()
+        incoming_refs = [
+            clean_text(item, 160)
+            for item in (metadata.get("assertion_evidence_refs") or [])
+            if clean_text(item, 160)
+        ][:16]
+        cardinality = clean_text(metadata.get("profile_cardinality"), 20).lower() or "multi"
+        with self._lock:
+            with self._transaction_sync():
+                domain_rows = self._assertion_domain_rows_sync(record)
+                exact: list[MemoryRecord] = []
+                same_dimension: list[MemoryRecord] = []
+                for row in domain_rows:
+                    candidate = MemoryRecord.from_row(row)
+                    candidate_metadata = (
+                        candidate.metadata if isinstance(candidate.metadata, dict) else {}
+                    )
+                    candidate_dimension = clean_text(
+                        candidate_metadata.get("profile_dimension"), 80
+                    ).lower()
+                    if candidate_dimension != dimension:
+                        continue
+                    if clean_text(candidate_metadata.get("profile_polarity"), 40).lower() != polarity:
+                        # Same dimension, same value, opposite polarity: the
+                        # claim was corrected rather than duplicated.
+                        if normalize_profile_value(
+                            candidate_metadata.get("normalized_value")
+                        ) == normalized:
+                            exact.append(candidate)
+                        continue
+                    same_dimension.append(candidate)
+                    if normalize_profile_value(
+                        candidate_metadata.get("normalized_value")
+                    ) == normalized:
+                        exact.append(candidate)
+
+                canonical = exact[0] if exact else record
+                merged_metadata = dict(
+                    canonical.metadata if isinstance(canonical.metadata, dict) else {}
+                )
+                merged_refs = [
+                    clean_text(item, 160)
+                    for item in (
+                        merged_metadata.get("assertion_evidence_refs")
+                        if isinstance(merged_metadata.get("assertion_evidence_refs"), list)
+                        else []
+                    )
+                    if clean_text(item, 160)
+                ]
+                merged_refs = list(dict.fromkeys([*merged_refs, *incoming_refs]))[:32]
+                merged_metadata.update(metadata)
+                merged_metadata["assertion_evidence_refs"] = merged_refs
+                merged_metadata["assertion_evidence_count"] = len(merged_refs)
+                merged_metadata["profile_dimension"] = dimension
+                merged_metadata["profile_polarity"] = polarity
+                merged_metadata["normalized_value"] = normalized
+                merged_metadata["profile_cardinality"] = cardinality
+                merged_metadata["extraction_quality_score"] = round(
+                    max(
+                        float(merged_metadata.get("extraction_quality_score") or 0.0),
+                        float(metadata.get("extraction_quality_score") or 0.0),
+                    ),
+                    4,
+                )
+                if incoming_refs:
+                    merged_metadata["assertion_first_seen_at"] = clean_text(
+                        merged_metadata.get("assertion_first_seen_at") or record.created_at, 80
+                    ) or now
+                    merged_metadata["assertion_last_seen_at"] = now
+                canonical.metadata = merged_metadata
+                canonical.confidence = max(
+                    float(canonical.confidence or 0.0), float(record.confidence or 0.0)
+                )
+                canonical.importance = max(
+                    float(canonical.importance or 0.0), float(record.importance or 0.0)
+                )
+                canonical.merged_count = max(1, len(exact) + 1)
+                canonical.updated_at = now
+                canonical.content_fingerprint = ""
+                canonical.ensure_defaults()
+                self._write_memory_record_sync(canonical)
+
+                superseded: list[str] = []
+                if cardinality == "single":
+                    for other in same_dimension:
+                        if other.id == canonical.id:
+                            continue
+                        other_metadata = (
+                            dict(other.metadata) if isinstance(other.metadata, dict) else {}
+                        )
+                        other_metadata["profile_state"] = "superseded"
+                        other_metadata["assertion_superseded_by"] = canonical.id
+                        other_metadata["assertion_superseded_at"] = now
+                        other.metadata = other_metadata
+                        other.lifecycle = "archived"
+                        other.supersedes_id = canonical.id
+                        other.updated_at = now
+                        self._write_memory_record_sync(other)
+                        self._conn.execute(
+                            "DELETE FROM memory_embeddings WHERE memory_id=?", (other.id,)
+                        )
+                        self._conn.execute(
+                            "UPDATE review_queue SET status='superseded', updated_at=? "
+                            "WHERE memory_id=? AND status='pending'",
+                            (now, other.id),
+                        )
+                        superseded.append(other.id)
+        self._embedding_candidate_cache.clear()
+        self._embedding_candidate_cache_revision = ""
+        return {
+            "ok": True,
+            "memory_id": canonical.id,
+            "created": not exact,
+            "merged_sources": len(merged_refs),
+            "superseded": superseded,
+        }
+
+    def _assertion_domain_rows_sync(self, record: MemoryRecord) -> list[sqlite3.Row]:
+        """Rows sharing the assertion's owner/scope domain.
+
+        ``_profile_domain`` reads the owner from metadata, which nothing keeps in
+        sync with the column: reusing it made every lookup miss and turned each
+        re-extraction into a duplicate row.
+        """
+        domain = list(self._profile_domain(record))
+        domain[-1] = clean_text(record.owner_bot_id, 120)
+        return self._conn.execute(
+            """
+            SELECT * FROM memories
+            WHERE memory_type=?
+              AND platform=? AND subject_kind=? AND subject_id=?
+              AND object_kind=? AND object_id=? AND scope=? AND group_id=? AND visibility=?
+              AND owner_bot_id=?
+            """,
+            (ASSERTION_MEMORY_TYPE, *domain),
+        ).fetchall()
 
     async def upsert_profile_candidate(self, record: MemoryRecord) -> dict[str, Any]:
         return await self._run_recoverable_database_operation(
@@ -11367,8 +11538,8 @@ class MemoryStore(SummaryBatchStore):
                 """
                 SELECT *
                 FROM memories
-                WHERE lifecycle='stable_memory'
-                  AND review_status!='pending'
+                WHERE (lifecycle='stable_memory' AND review_status!='pending')
+                   OR (lifecycle='short_term_candidate' AND review_status='pending')
                 ORDER BY
                     COALESCE(NULLIF(occurred_at, ''), created_at) ASC,
                     created_at ASC
@@ -11427,23 +11598,55 @@ class MemoryStore(SummaryBatchStore):
         self,
         *,
         summarized_timeline_cutoff: str = "",
+        unsummarized_timeline_cutoff: str = "",
         injection_log_cutoff: str = "",
         limit: int = 2000,
     ) -> dict[str, int]:
         return await asyncio.to_thread(
             self._prune_retained_rows_sync,
             summarized_timeline_cutoff,
+            unsummarized_timeline_cutoff,
             injection_log_cutoff,
             limit,
         )
 
+    async def unsummarized_timeline_backlog(self) -> dict[str, Any]:
+        """Report how much raw history never became a memory, and how old it is."""
+        def read():
+            with self._lock:
+                row = self._conn.execute(
+                    """
+                    SELECT COUNT(*) AS total,
+                           MIN(COALESCE(NULLIF(occurred_at, ''), created_at)) AS oldest
+                    FROM timeline
+                    WHERE summarized_at=''
+                    """
+                ).fetchone()
+                frozen = self._conn.execute(
+                    """
+                    SELECT COUNT(*) FROM timeline t
+                    JOIN summary_batch_events e ON e.event_id=t.id
+                    JOIN summary_batches b ON b.id=e.batch_id
+                    WHERE t.summarized_at='' AND b.state='quarantined'
+                    """
+                ).fetchone()
+            return {
+                "unsummarized_events": int((row["total"] if row else 0) or 0),
+                "oldest_unsummarized_at": clean_text(row["oldest"] if row else "", 80),
+                "quarantined_frozen_events": int((frozen[0] if frozen else 0) or 0),
+            }
+
+        return await asyncio.to_thread(read)
+
     def _prune_retained_rows_sync(
         self,
         summarized_timeline_cutoff: str,
+        unsummarized_timeline_cutoff: str,
         injection_log_cutoff: str,
         limit: int,
     ) -> dict[str, int]:
         summarized_timeline_cutoff = clean_text(summarized_timeline_cutoff, 80)
+        unsummarized_timeline_cutoff = clean_text(unsummarized_timeline_cutoff, 80)
         injection_log_cutoff = clean_text(injection_log_cutoff, 80)
         safe_limit = max(1, int(limit or 1))
         deleted = {"timeline": 0, "injection_logs": 0}
@@ -11467,6 +11670,25 @@ class MemoryStore(SummaryBatchStore):
                         result: dict[str, int] = {}
                         self._delete_many_by_ids("timeline", "id", ids, result)
                         deleted["timeline"] = result.get("timeline", 0)
+                if unsummarized_timeline_cutoff:
+                    rows = self._conn.execute(
+                        """
+                        SELECT id
+                        FROM timeline
+                        WHERE summarized_at=''
+                          AND retention_class!='historical_archive'
+                          AND COALESCE(NULLIF(occurred_at, ''), created_at) < ?
+                          AND NOT EXISTS(SELECT 1 FROM summary_batch_events e WHERE e.event_id=timeline.id)
+                        ORDER BY COALESCE(NULLIF(occurred_at, ''), created_at) ASC
+                        LIMIT ?
+                        """,
+                        (unsummarized_timeline_cutoff, safe_limit),
+                    ).fetchall()
+                    ids = [row["id"] for row in rows]
+                    if ids:
+                        result: dict[str, int] = {}
+                        self._delete_many_by_ids("timeline", "id", ids, result)
+                        deleted["timeline"] = deleted.get("timeline", 0) + result.get("timeline", 0)
                 if injection_log_cutoff:
                     rows = self._conn.execute(
                         """
@@ -11484,6 +11706,71 @@ class MemoryStore(SummaryBatchStore):
                         self._delete_many_by_ids("injection_logs", "id", ids, result)
                         deleted["injection_logs"] = result.get("injection_logs", 0)
         return deleted
+
+    async def archive_stale_pending_memories(self, cutoff_at: str, limit: int = 500) -> int:
+        """Cold-archive review candidates nobody looked at within the window.
+
+        A pending candidate is excluded from every recall query and, before this,
+        from the decay pool as well, so a batch that could not be validated used
+        to hang in ``short_term_candidate``/``pending`` forever. Archiving keeps
+        it recoverable while letting the review queue drain.
+        """
+        cutoff_at = clean_text(cutoff_at, 80)
+        if not cutoff_at:
+            return 0
+        safe_limit = max(1, int(limit or 1))
+        with self._lock:
+            with self._transaction_sync():
+                rows = self._conn.execute(
+                    """
+                    SELECT id
+                    FROM memories
+                    WHERE review_status='pending'
+                      AND lifecycle='short_term_candidate'
+                      AND COALESCE(NULLIF(occurred_at, ''), created_at) < ?
+                    ORDER BY COALESCE(NULLIF(occurred_at, ''), created_at) ASC
+                    LIMIT ?
+                    """,
+                    (cutoff_at, safe_limit),
+                ).fetchall()
+                if not rows:
+                    return 0
+                ids = [row["id"] for row in rows]
+                now = utc_now()
+                archived = 0
+                for memory_id in ids:
+                    metadata_row = self._conn.execute(
+                        "SELECT metadata FROM memories WHERE id=?", (memory_id,)
+                    ).fetchone()
+                    metadata = json_loads(metadata_row["metadata"], {}) if metadata_row else {}
+                    metadata = metadata if isinstance(metadata, dict) else {}
+                    metadata["pending_review_expired"] = {
+                        "archived_at": now,
+                        "cutoff": cutoff_at,
+                    }
+                    cur = self._conn.execute(
+                        """
+                        UPDATE memories
+                        SET lifecycle='archived',
+                            validity_status='archived',
+                            metadata=?,
+                            updated_at=?
+                        WHERE id=? AND lifecycle!='archived'
+                        """,
+                        (json_dumps(metadata), now, memory_id),
+                    )
+                    archived += int(cur.rowcount or 0)
+                    self._conn.execute(
+                        "DELETE FROM memory_embeddings WHERE memory_id=?", (memory_id,)
+                    )
+                    self._conn.execute(
+                        "UPDATE review_queue SET status='superseded', updated_at=? "
+                        "WHERE memory_id=? AND status='pending'",
+                        (now, memory_id),
+                    )
+                self._embedding_candidate_cache.clear()
+                self._embedding_candidate_cache_revision = ""
+        return archived
 
     async def archive_memories(
         self,
@@ -11896,6 +12183,16 @@ class MemoryStore(SummaryBatchStore):
                 row["scope"]: row["count"]
                 for row in self._conn.execute("SELECT scope, COUNT(*) AS count FROM memories GROUP BY scope").fetchall()
             }
+            # Rows owned by a different Bot are invisible to recall by design, so
+            # an owner that drifted (a redeployed adapter, a second platform) used
+            # to look like missing memory. Surface the split next to the counts.
+            by_owner_bot = {
+                row["owner"] or "<empty>": row["count"]
+                for row in self._conn.execute(
+                    "SELECT owner_bot_id AS owner, COUNT(*) AS count FROM memories "
+                    "GROUP BY owner_bot_id ORDER BY count DESC LIMIT 20"
+                ).fetchall()
+            }
         current_wal_files = self._database_file_snapshot()
         last_wal_health = dict(self._last_wal_health)
         memory_storage = {
@@ -11920,6 +12217,7 @@ class MemoryStore(SummaryBatchStore):
             "injection_logs": injection_logs,
             "acl_rules": acl_rules,
             "by_scope": by_scope,
+            "by_owner_bot": by_owner_bot,
             "wal": {
                 **last_wal_health,
                 **current_wal_files,

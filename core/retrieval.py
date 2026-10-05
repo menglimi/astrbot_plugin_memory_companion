@@ -44,6 +44,8 @@ class RetrievalEngine:
         rerank_candidate_multiplier: int = 5,
         rerank_candidate_limit: int = 32,
         rerank_timeout_ms: int = 1200,
+        latency_budget_ms: int = 0,
+        query_vector_cache_ttl_seconds: float = 0.0,
         embedding_provider: Any = None,
         embedding_provider_id: str = "",
         embedding_enabled: bool = False,
@@ -75,6 +77,15 @@ class RetrievalEngine:
         self.rerank_candidate_multiplier = max(1, int(rerank_candidate_multiplier or 5))
         self.rerank_candidate_limit = max(1, int(rerank_candidate_limit or 32))
         self.rerank_timeout_ms = max(0, int(rerank_timeout_ms or 0))
+        # A latency budget is spent on optional model calls, never on results.
+        # Lowering top_k to go faster removes exactly the context this plugin
+        # exists to supply, so the speed has to come from somewhere else.
+        self.latency_budget_ms = max(0, int(latency_budget_ms or 0))
+        self._latency_started_at: float | None = None
+        self.query_vector_cache_ttl_seconds = max(
+            0.0, float(query_vector_cache_ttl_seconds or 0.0)
+        )
+        self._query_vector_cache: dict[str, tuple[float, list[float]]] = {}
         self.embedding_provider = embedding_provider
         self.embedding_provider_id = clean_text(embedding_provider_id, 160)
         self.embedding_enabled = bool(embedding_enabled)
@@ -271,6 +282,7 @@ class RetrievalEngine:
         *,
         time_intent: TimeIntent | None = None,
     ) -> tuple[list[SearchResult], list[dict[str, str]]]:
+        self.start_latency_budget()
         results, blocked = await self._rank_candidates(query, ctx, time_intent=time_intent)
         results = await self._maybe_rerank_results(query, results, max(1, int(top_k or 1)))
         # relax：内容级去重（规范化文本 difflib ratio >= 阈值时只留评分最高者）。
@@ -295,6 +307,7 @@ class RetrievalEngine:
         time_intent: TimeIntent | None = None,
         capped_slots: set[str] | None = None,
     ) -> tuple[list[SearchResult], list[dict[str, str]], dict[str, list[SearchResult]]]:
+        self.start_latency_budget()
         ranked, blocked = await self._rank_candidates(query, ctx, time_intent=time_intent)
         total = max(1, int(total_limit or 1))
         ranked = await self._maybe_rerank_results(query, ranked, total)
@@ -416,6 +429,18 @@ class RetrievalEngine:
         blocked.extend(source_blocked)
         return selected, blocked, {slot: items for slot, items in slot_map.items() if items}
 
+    def start_latency_budget(self) -> None:
+        """Begin one recall so optional model calls can be dropped once it is spent."""
+        self._latency_started_at = (
+            time.perf_counter() if self.latency_budget_ms > 0 else None
+        )
+
+    def latency_budget_spent(self) -> bool:
+        if self._latency_started_at is None or self.latency_budget_ms <= 0:
+            return False
+        elapsed_ms = (time.perf_counter() - self._latency_started_at) * 1000.0
+        return elapsed_ms >= float(self.latency_budget_ms)
+
     async def _maybe_rerank_results(
         self,
         query: str,
@@ -438,6 +463,18 @@ class RetrievalEngine:
                 "path": "basic",
                 "provider_id": self.rerank_provider_id,
                 "reason": "mode_basic",
+                "candidate_count": len(ranked),
+                **self._rank_path_info,
+            }
+            return ranked
+        if self.latency_budget_spent():
+            # Dropping the rerank call costs ordering quality, not coverage: the
+            # same candidates still reach the model.
+            self.last_path_info = {
+                "mode": self.retrieval_mode,
+                "path": "fallback_basic",
+                "provider_id": self.rerank_provider_id,
+                "reason": "latency_budget_spent",
                 "candidate_count": len(ranked),
                 **self._rank_path_info,
             }
@@ -1701,11 +1738,35 @@ class RetrievalEngine:
             for name in ("get_embedding", "get_embeddings", "get_embeddings_batch")
         )
 
+    def _cached_query_vector(self, text: str) -> list[float]:
+        """A repeated question should not pay for a second embedding call."""
+        if self.query_vector_cache_ttl_seconds <= 0 or not text:
+            return []
+        entry = self._query_vector_cache.get(text)
+        if entry is None:
+            return []
+        stored_at, vector = entry
+        if time.monotonic() - stored_at > self.query_vector_cache_ttl_seconds:
+            self._query_vector_cache.pop(text, None)
+            return []
+        return list(vector)
+
+    def _store_query_vector(self, text: str, vector: list[float]) -> None:
+        if self.query_vector_cache_ttl_seconds <= 0 or not text or not vector:
+            return
+        self._query_vector_cache[text] = (time.monotonic(), list(vector))
+        if len(self._query_vector_cache) > 64:
+            oldest = min(self._query_vector_cache.items(), key=lambda item: item[1][0])[0]
+            self._query_vector_cache.pop(oldest, None)
+
     async def _call_embedding_provider(self, text: str) -> list[float]:
         provider = self.embedding_provider
         text = clean_text(text, 2000)
         if provider is None:
             return []
+        cached = self._cached_query_vector(text)
+        if cached:
+            return cached
 
         async def maybe_wait(value: Any) -> Any:
             if inspect.isawaitable(value):
@@ -1727,13 +1788,17 @@ class RetrievalEngine:
                 called_provider = True
                 payload = await maybe_wait(get_embedding(text))
                 success = True
-                return self._coerce_vector(payload)
+                vector = self._coerce_vector(payload)
+                self._store_query_vector(text, vector)
+                return vector
 
             if callable(get_embeddings):
                 called_provider = True
                 payload = await maybe_wait(get_embeddings([text]))
                 success = True
-                return self._first_vector(payload)
+                vector = self._first_vector(payload)
+                self._store_query_vector(text, vector)
+                return vector
 
             if callable(get_embeddings_batch):
                 called_provider = True

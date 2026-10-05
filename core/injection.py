@@ -8,6 +8,7 @@ from typing import Any
 from .models import MemoryRecord, SearchResult, SessionContext, clean_text
 
 from .profile_quality import PROFILE_MEMORY_TYPES, profile_quality_decision
+from .turn_signal import message_terms
 
 MEMORY_COMPANION_INJECTION_HEADER = "<MemoryCompanion-Context>"
 MEMORY_COMPANION_INJECTION_FOOTER = "</MemoryCompanion-Context>"
@@ -193,6 +194,7 @@ class InjectionComposer:
             short_rest_check=bool(rest_check_hint),
             included_memory_ids=included_memory_ids,
             max_item_chars=max_item_chars,
+            query_text=clean_text(getattr(ctx, "message_text", ""), 400),
         )
         if memory_lines:
             lines.extend(memory_lines)
@@ -307,6 +309,7 @@ class InjectionComposer:
         short_rest_check: bool = False,
         included_memory_ids: list[str] | None = None,
         max_item_chars: int = 220,
+        query_text: str = "",
     ) -> list[str]:
         if short_rest_check:
             return self._build_short_rest_memory_lines(
@@ -392,6 +395,7 @@ class InjectionComposer:
                         slot_name=slot_name,
                         compact=compact,
                         detail_limit=item_limit,
+                        query=query_text,
                     )
                     if fits([*memory_lines, *opening, *item_lines, candidate_line, f"</{tag}>"]):
                         line = candidate_line
@@ -432,6 +436,34 @@ class InjectionComposer:
     def _append_memory_item(self, lines: list[str], item: SearchResult, *, slot_name: str, compact: bool = False) -> None:
         lines.append(self._memory_item_line(item, slot_name=slot_name, compact=compact))
 
+    @staticmethod
+    def _select_relevant_facts(
+        facts: list[Any],
+        *,
+        query: str = "",
+        limit: int = 4,
+    ) -> list[str]:
+        """Put the facts this question is about first.
+
+        Without a query every fact keeps its stored order, so the one that
+        matters can lose the character budget to whatever happened to be
+        written first.
+        """
+        cleaned = [clean_text(value, 120) for value in facts]
+        cleaned = [value for value in cleaned if value]
+        if not cleaned:
+            return [], []
+        terms = [term for term in message_terms(clean_text(query, 400), limit=24) if len(term) >= 2]
+        if not terms:
+            return cleaned[:limit]
+        return sorted(
+            cleaned,
+            key=lambda value: (
+                -sum(1 for term in terms if term in value),
+                cleaned.index(value),
+            ),
+        )[:limit]
+
     def _memory_item_line(
         self,
         item: SearchResult,
@@ -439,6 +471,7 @@ class InjectionComposer:
         slot_name: str,
         compact: bool = False,
         detail_limit: int | None = None,
+        query: str = "",
     ) -> str:
         memory = item.memory
         if self._expression_value(item) == "tone":
@@ -449,9 +482,13 @@ class InjectionComposer:
         metadata = self._metadata_dict(memory)
         key_facts = metadata.get("key_facts")
         if isinstance(key_facts, list):
+            # Ordering by storage position meant the fact that answers the
+            # question could be cut off by unrelated earlier ones, even after
+            # the total budget was raised. Rank by the current question first.
+            selected = self._select_relevant_facts(key_facts, query=query)
             fact_text = "；".join(
                 self._redact_sensitive_text(clean_text(value, 120))
-                for value in key_facts
+                for value in selected
                 if clean_text(value, 120)
             )
         else:

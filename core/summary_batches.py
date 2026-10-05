@@ -14,6 +14,7 @@ class SummaryBatchStore:
     """Batch queue state; the store owns the transaction and the clock."""
 
     BUDGET_RETRY_REASON = "budget"
+    REPAIR_RETRY_REASON = "repair_used"
 
     @classmethod
     def _due_clause(cls, alias: str = "") -> str:
@@ -286,8 +287,25 @@ class SummaryBatchStore:
                 if not force:
                     if row['state'] == 'quarantined':
                         return False
-                    if row['automatic_calls'] >= max_calls or (repair and row['repair_used']):
-                        self._conn.execute("UPDATE summary_batches SET state='quarantined',updated_at=? WHERE id=?", (utc_now(), batch_id))
+                    if row['automatic_calls'] >= max_calls:
+                        # The lifetime call budget is final: this batch is out
+                        # of attempts, so freeze it with its events still owned
+                        # rather than selecting it again on every message.
+                        self._conn.execute(
+                            "UPDATE summary_batches SET state='quarantined',updated_at=? WHERE id=?",
+                            (utc_now(), batch_id),
+                        )
+                        return False
+                    if repair and row['repair_used']:
+                        # A spent repair budget ends the round, not the batch.
+                        # Freezing it here kept owning the events forever, so the
+                        # conversation could never become memory and its timeline
+                        # rows could never be cleaned up. The caller decides what
+                        # to do with the last response, and records the refusal.
+                        self._conn.execute(
+                            "UPDATE summary_batches SET retry_reason=?,updated_at=? WHERE id=?",
+                            (self.REPAIR_RETRY_REASON, utc_now(), batch_id),
+                        )
                         return False
                     window = self._conn.execute('''SELECT COUNT(*),MIN(attempted_at) FROM summary_batch_calls
                         WHERE session_id=? AND automatic=1 AND attempted_at>?''',

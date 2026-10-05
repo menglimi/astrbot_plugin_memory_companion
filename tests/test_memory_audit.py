@@ -119,7 +119,7 @@ class MemoryAuditTests(unittest.IsolatedAsyncioTestCase):
     def test_structured_fact_requires_existing_supporting_reference(self) -> None:
         summarizer = MemorySummarizer()
         rows = [{"id": "event-1", "content": "小王喜欢无糖拿铁。"}]
-        facts, traced = summarizer._normalize_key_facts(
+        traced, warnings, errors = summarizer._normalize_key_facts(
             [
                 {"fact": "小王喜欢无糖拿铁", "refs": ["event-1"]},
                 {"fact": "小王喜欢红茶", "refs": ["missing"]},
@@ -127,17 +127,18 @@ class MemoryAuditTests(unittest.IsolatedAsyncioTestCase):
             ],
             rows,
         )
-        self.assertEqual(["小王喜欢无糖拿铁"], facts)
         self.assertEqual([{"fact": "小王喜欢无糖拿铁", "refs": ["event-1"]}], traced)
+        # An invented event id is a contract failure: rewording cannot fix it.
+        self.assertTrue(any("event_id" in item for item in errors))
 
-    def test_legacy_string_fact_remains_untraced(self) -> None:
+    def test_legacy_string_fact_is_attributed_instead_of_dropped(self) -> None:
         summarizer = MemorySummarizer()
-        facts, traced = summarizer._normalize_key_facts(
+        traced, warnings, errors = summarizer._normalize_key_facts(
             ["小王喜欢无糖拿铁"],
             [{"id": "event-1", "content": "小王喜欢无糖拿铁。"}],
         )
-        self.assertEqual(["小王喜欢无糖拿铁"], facts)
-        self.assertEqual([], traced)
+        self.assertEqual([{"fact": "小王喜欢无糖拿铁", "refs": ["event-1"]}], traced)
+        self.assertEqual([], errors)
 
     async def test_preview_does_not_mutate_memory(self) -> None:
         proposal = {

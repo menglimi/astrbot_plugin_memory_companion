@@ -28,6 +28,11 @@
     })();
   </script>
   <link rel="stylesheet" href="./app.css?v=2.1.0-ui-v1" />
+  <!-- app.js 挂载三维档案阵列与装配查看器时只认 window.MemoryCinema3D，而全仓库
+       只有 cinema-3d.bundle.js 会定义它。缺了这个标签，面板会等满 8 秒再显示
+       "ARCHIVE SCENE / UNAVAILABLE"，且重试按钮永远无效。放在 head 里让下载提前
+       开始；该包是自包含的 ES module，不依赖 assets/ 下的 three.js 与 loader。 -->
+  <script type="module" src="./assets/cinema-3d.bundle.js"></script>
 </head>
 <body>
   <div class="shell" id="shell">
