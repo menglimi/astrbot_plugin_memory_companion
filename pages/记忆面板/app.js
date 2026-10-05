@@ -453,6 +453,30 @@ function showInlineConfirmation(title, message, confirmLabel) {
 /* ------------------------------------------------------------
    主题
    ------------------------------------------------------------ */
+/* appearance.theme 过去是纯死配置：后端把 14 个中国传统色名映射成 key 传给前端，
+   前端谁都没读，配了也不变色。这里把 key 打到 <html> 上，由 app.css 的
+   [data-palette="…"] 规则接管。index.html 在跳转前也会打一次，避免首帧闪色。 */
+const PALETTE_KEYS = new Set([
+  "huangbaiyou", "tianpiao", "haitianxia", "yingying", "oubi", "qingming",
+  "zipu", "shanlan", "qielan", "tuihong", "congqing", "yuebai", "mocan", "gupiao",
+]);
+
+function applyPalette(key) {
+  const value = compact(key).toLowerCase();
+  if (PALETTE_KEYS.has(value)) {
+    document.documentElement.dataset.palette = value;
+    return value;
+  }
+  delete document.documentElement.dataset.palette;
+  return "";
+}
+
+async function syncPalette() {
+  const payload = await apiTry(() => apiGet("/ui-preferences"), null);
+  if (!payload) return;
+  applyPalette(payload.palette);
+}
+
 function applyTheme(theme) {
   state.theme = theme === "light" ? "light" : "dark";
   document.documentElement.dataset.theme = state.theme;
@@ -3802,6 +3826,8 @@ defineView("config", {
           await apiPost("/config/module/update", { module: moduleId, values });
           toast("已保存 " + (MODULE_LABELS[moduleId] || moduleId), "ok");
           invalidatePool();
+          // 配色改完当场生效，不用刷新页面——不然用户会以为这项又没生效
+          if (moduleId === "appearance") syncPalette();
           go("config");
         });
       });
@@ -4453,6 +4479,8 @@ async function boot() {
 
   state.ready = true;
   await go(target);
+  // 配色放最后：不阻塞首屏，失败也不影响面板可用
+  syncPalette();
 }
 
 if (document.readyState === "loading") {

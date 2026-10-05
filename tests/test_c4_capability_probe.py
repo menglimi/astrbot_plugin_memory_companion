@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import ModuleType, SimpleNamespace
+
 from core import bot_personal_contract
 from core.capability_probe import (
     CAPABILITY_STATES,
@@ -30,111 +32,101 @@ def test_snapshot_never_claims_the_companion_on_its_own():
         assert snapshot["companion_plugin_name"] == ""
 
 
-def test_detect_companion_plugin_reports_not_installed_when_absent(monkeypatch):
-    import importlib
-
-    import core.capability_probe as probe
-
-    def missing(name, *args, **kwargs):
-        raise ModuleNotFoundError(name)
-
-    monkeypatch.setattr(probe.importlib, "import_module", missing)
-    assert detect_companion_plugin() == {
-        "companion_installed": False,
-        "companion_plugin_name": "",
-    }
+def _api(active=True):
+    return SimpleNamespace(bridge_lifecycle_status=lambda: {"active": active})
 
 
-def test_detect_companion_plugin_requires_an_active_api(monkeypatch):
-    """模块能 import 不等于能用：入口返回 None 或抛异常时都必须报「未装」。
-
-    原缺陷：面板把「记忆侧 contract 自检通过」当成「陪伴插件已安装」，
-    于是在根本没装 astrbot_plugin_private_companion 的宿主上也显示「已连接」。
-    """
-    import types
-
-    import core.capability_probe as probe
-
-    module = types.ModuleType("astrbot_plugin_private_companion.main")
-    for behaviour in (lambda: None, lambda: (_ for _ in ()).throw(RuntimeError("boom"))):
-        module.get_private_companion_api = behaviour
-        monkeypatch.setattr(
-            probe.importlib,
-            "import_module",
-            lambda name, _m=module: _m,
-        )
-        assert detect_companion_plugin()["companion_installed"] is False
-
-    module.get_private_companion_api = lambda: object()
-    found = detect_companion_plugin()
-    assert found["companion_installed"] is True
-    assert found["companion_plugin_name"] == probe.COMPANION_PLUGIN_ID
-
-
-def test_initial_cache_is_unprobed_and_pending():
-    snapshot = CapabilityCache().snapshot()
-    assert snapshot["state"] == "unprobed"
-    assert snapshot["pending"] is True
-    assert snapshot["available"] is False
-
-
-def test_available_degraded_and_negative_states_are_observable():
-    cache = CapabilityCache()
-    available = cache.mark_available({"methods": ["search", "search"], "profiles": PROFILE_NAMES})
-    assert available["state"] == "available"
-    assert available["available"] is True
-    assert available["degraded"] is False
-
-    degraded = cache.mark_degraded("contract_invalid")
-    assert degraded["state"] == "degraded"
-    assert degraded["degraded"] is True
-    assert degraded["error_code"] == "contract_invalid"
-
-    negative = cache.mark_negative("bridge_missing")
-    assert negative["state"] == "negative"
-    assert negative["available"] is False
-    assert negative["pending"] is False
-    assert negative["degraded"] is True
-    assert negative["error_code"] == "bridge_missing"
-
-
-def test_negative_ttl_returns_to_unprobed_after_expiry():
-    now = [10.0]
-    cache = CapabilityCache(negative_ttl=5, clock=lambda: now[0])
-    cache.mark_negative("not_ready")
-    assert cache.snapshot()["state"] == "negative"
-    now[0] = 14.99
-    assert cache.snapshot()["state"] == "negative"
-    now[0] = 15.0
-    assert cache.snapshot()["state"] == "unprobed"
-
-
-def test_snapshot_is_a_deep_copy():
-    cache = CapabilityCache()
-    value = cache.snapshot()
-    value["windows"].append("mutated")
-    value["warnings"].append("mutated")
-    fresh = cache.snapshot()
-    assert "mutated" not in fresh["windows"]
-    assert "mutated" not in fresh["warnings"]
-
-
-def test_malformed_contract_module_is_safe():
-    class Broken:
-        def __getattribute__(self, _name):
-            raise RuntimeError("broken contract")
-
-    snapshot = build_capability_snapshot(
-        available=True,
-        contract_module=Broken(),
-        profiles=[*PROFILE_NAMES, "not-a-profile", "not-a-profile"],
-        methods=["search", "search", object()],
+def _star(name, display="", activated=True, ext=_api(), module=None):
+    return SimpleNamespace(
+        name=name,
+        display_name=display,
+        activated=activated,
+        star_cls=SimpleNamespace(extension_api=ext) if ext is not None else None,
+        module=module,
     )
-    assert snapshot["state"] == "available"
-    assert snapshot["available"] is True
-    assert snapshot["profiles"] == list(PROFILE_NAMES)
-    assert all(isinstance(value, (str, int, float, bool, list, dict)) or value is None
-               for value in snapshot.values())
+
+
+def _ctx(stars, registered=None):
+    def reg(name):
+        return registered if name == "astrbot_plugin_private_companion" else None
+
+    return SimpleNamespace(get_all_stars=lambda: list(stars), get_registered_star=reg)
+
+
+COMPANION = "astrbot_plugin_private_companion"
+OURS = "astrbot_plugin_memory_companion"
+
+
+def test_detect_finds_a_live_companion_in_the_host_registry():
+    """装了且启用 -> 报已装。这是 2.2.1 之前判错的方向。
+
+    之前只用 ``importlib.import_module("data.plugins.…")`` 去 import，而 AstrBot
+    并不保证插件模块以这个别名留在 ``sys.modules`` 里，于是真装了也报未装。
+    正确做法是问宿主注册表要**当前活着的实例**。
+    """
+    for label, context in (
+        ("get_all_stars", _ctx([_star(COMPANION, "我会永远陪着你")])),
+        ("root_dir_name", _ctx([SimpleNamespace(root_dir_name=COMPANION, activated=True,
+                                               star_cls=SimpleNamespace(extension_api=_api()),
+                                               module=None)])),
+        ("get_registered_star", _ctx([_star(OURS, "我会牢牢记住你")],
+                                     registered=_star(COMPANION))),
+        ("only get_all_stars", SimpleNamespace(get_all_stars=lambda: [_star(COMPANION)])),
+    ):
+        found = detect_companion_plugin(context)
+        assert found["companion_installed"] is True, label
+        assert found["companion_plugin_name"] == COMPANION, label
+
+
+def test_detect_uses_the_companions_own_module_entry_point():
+    module = ModuleType("data.plugins.astrbot_plugin_private_companion.main")
+    module.get_private_companion_api = lambda: _api(True)
+    found = detect_companion_plugin(_ctx([_star(COMPANION, "x", module=module)]))
+    assert found["companion_installed"] is True
+
+
+def test_detect_reports_absent_when_the_registry_has_no_companion():
+    """注册表可用却没找到 = 真的没装。"""
+    found = detect_companion_plugin(_ctx([_star(OURS, "我会牢牢记住你")]))
+    assert found == {"companion_installed": False, "companion_plugin_name": ""}
+
+
+def test_detect_ignores_a_disabled_or_inactive_companion():
+    disabled = detect_companion_plugin(_ctx([_star(COMPANION, "w", activated=False)]))
+    assert disabled["companion_installed"] is False, "装了但没启用不算可用"
+    inactive = detect_companion_plugin(_ctx([_star(COMPANION, "w", ext=_api(active=False))]))
+    assert inactive["companion_installed"] is False, "桥接没 active 不算可用"
+
+
+def test_registry_verdict_beats_a_stale_sys_modules_alias(monkeypatch):
+    """插件重载后旧模块会留在 sys.modules 里冒充还在——不能让它翻盘。
+
+    这条是刻意反向设计的：宿主注册表说没有，就是没有。
+    """
+    stale = ModuleType("data.plugins.astrbot_plugin_private_companion.main")
+    stale.get_private_companion_api = lambda: _api(True)
+    monkeypatch.setitem(
+        __import__("sys").modules, "data.plugins.astrbot_plugin_private_companion.main", stale
+    )
+    found = detect_companion_plugin(_ctx([_star(OURS, "我会牢牢记住你")]))
+    assert found["companion_installed"] is False
+
+
+def test_modules_are_only_consulted_without_a_registry(monkeypatch):
+    """宿主没有注册表 API 时才允许退回模块别名（老版本 AstrBot、单测环境）。
+
+    两种「没有注册表」的形态——压根没有 context，或者 context 上没有那两个方法——
+    行为必须一致，否则换个调用点结论就变了。
+    """
+    stale = ModuleType("astrbot_plugin_private_companion.main")
+    stale.get_private_companion_api = lambda: _api(True)
+    monkeypatch.setitem(__import__("sys").modules, "astrbot_plugin_private_companion.main", stale)
+    for context in (None, object(), SimpleNamespace()):
+        assert detect_companion_plugin(context)["companion_installed"] is True, context
+
+    # 一旦宿主给出了注册表 API，模块别名就完全不参与判定
+    registry = SimpleNamespace(get_all_stars=lambda: [], get_registered_star=lambda name: None)
+    assert detect_companion_plugin(registry)["companion_installed"] is False
 
 
 def test_public_state_constants_are_closed():

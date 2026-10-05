@@ -21,6 +21,16 @@
       return null;
     }
 
+    /* 配色必须在跳转前就打到 <html> 上，否则新页面第一帧还是默认色，用户会看到
+       一次「颜色跳一下」。appearance.theme 这个配置项过去从来没被任何前端消费过
+       ——这就是它「配了但没用」的原因。 */
+    function applyPalette(payload) {
+      const key = payload?.palette ?? payload?.data?.palette;
+      if (typeof key === "string" && /^[a-z]{2,16}$/.test(key)) {
+        document.documentElement.dataset.palette = key;
+      }
+    }
+
     async function resolveStyle() {
       const bridge = getBridge();
       if (bridge && typeof bridge.apiGet === "function") {
@@ -34,6 +44,7 @@
             bridge.apiGet("page/ui-preferences"),
             wait(2500).then(() => { throw new Error("bridge timeout"); }),
           ]);
+          applyPalette(payload);
           const value = payload?.ui_style ?? payload?.data?.ui_style;
           return value === "modern" || value === "new" || value === "新版" ? "modern" : "legacy";
         } catch (_) {}
@@ -49,6 +60,7 @@
           const response = await fetch(endpoint, { credentials: "same-origin", cache: "no-store" });
           if (!response.ok) continue;
           const payload = await response.json();
+          applyPalette(payload);
           const value = payload?.ui_style ?? payload?.data?.ui_style;
           return value === "modern" || value === "new" || value === "新版" ? "modern" : "legacy";
         } catch (_) {}

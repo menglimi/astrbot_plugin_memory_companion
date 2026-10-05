@@ -2,6 +2,147 @@
 
 本项目遵循面向用户体验的版本记录。日期使用北京时间。
 
+## 2.2.2 - 2026-10-05
+
+这一版是「面板与配置的全项体检」，不碰记忆算法。起因是三条使用反馈：
+联动装了也说不认、皮肤配色配了不生效、开场动画闪一下。
+
+### 联动识别：装与不装都认不出来了
+
+2.2.1 只修好了「没装却说装了」这一个方向，装上之后仍然显示未安装。根因换了方向：
+探测用的是 `importlib.import_module("data.plugins.astrbot_plugin_private_companion.main")`，
+而 **AstrBot 并不保证插件模块以这个别名留在 `sys.modules` 里**，于是真装了也 import 不到。
+
+陪伴插件那边识别记忆插件用的是另一套办法——查宿主注册表要**当前活着的实例**
+（`context.get_all_stars()` / `get_registered_star()`），这才是权威来源。
+现在改成同一套，并且照搬了对方一条很关键的设计：
+
+> 注册表可用却没找到，就是真的没有，**到此为止**，不再去翻 `sys.modules`。
+
+理由很实在：插件重载后旧模块会留在 `sys.modules` 里冒充还在，
+而 `import_module` 更糟——根本没装时它会凭空造一个空模块出来。
+只有宿主压根没有注册表 API（老版本 AstrBot、单测）才退回模块别名。
+
+判定标准仍然是陪伴插件的 `get_private_companion_api()` 返回非 `None`，
+它答的是「现在真的能用」，不是「磁盘上有这个目录」。
+
+另外面板不再吃启动快照：以前那张快照是 `__init__` 时拍的，
+用户装完或启用陪伴插件后要等重启 AstrBot 面板才会变。现在每次打开都现探。
+
+### 皮肤配色：14 个选项以前全是空壳
+
+`appearance.theme` 列了 14 个中国传统色，后端也把色名映射成了 key，
+但**前端从来没有消费过那个 key，项目里甚至不存在任何一份配色定义**——
+配置里能选，选了不生效。这一版把它接上：
+
+- `index.html` 在跳转前就调 `/ui-preferences`，拿到 `palette` 先打到 `<html>` 上，
+  所以第一帧就是对的颜色，不会「先紫后青」闪一下。
+- `app.css` 新增 14 套 `[data-palette]`，深浅两套共 28 组。
+- 面板里改完配色当场生效，不用刷新。
+
+配色取自《中国传统色：故宫里的色彩美学》的 384 色体系。
+需要说明两点：常见的那几个转载站不是三个独立考据，是同一套书被抄了三遍；
+**墨黪 / 青冥 / 紫蒲** 在深色背景上原本只有 2~4:1，已由生成脚本按色相提亮到达标，
+28 组配色全部过了 WCAG 4.5:1。
+
+### 开场动画不再闪
+
+幕布原来是 `0% → 9%` 淡入的，于是面板先露一脸、再被盖住，用户看到的就是
+「突然闪一下」。现在幕布**从第一帧就是不透明的**，只让里面的字动；
+面板本体则在幕布抬起时柔和现身（`body.intro-played` 驱动）。
+跳过开场的两种情况（减少动效、本会话已播过）下面板立刻可用，不会白等。
+
+### 面板整体精简
+
+简洁管理界面整体偏松：22/30px 的内容边距、16px 的卡片间距、236px 的侧栏，
+一屏能放的信息太少。这一版整体收紧约 25%——只动留白与字号，不动配色、不动信息层级。
+
+**刻意用 `:not([data-ui-mode="cinema"])` 圈起来**：放映馆/终端模式有自己那套
+空间语言（三维终端是 70 处 `data-ui-mode="cinema"` 规则），压它会毁掉那套效果，
+所以这一段对三维终端完全不生效。
+
+### 全项配置体检
+
+按「每一个开关都要有用、他用不用得上」把 201 个叶子项逐个核了一遍，
+**叶子项实际是 201 个，不是之前以为的 188 个**。结果与处理：
+
+| 类别 | 数量 | 处理 |
+| --- | --- | --- |
+| 确认在生效 | 194 | — |
+| 声明了但零引用（假开关） | 4 | 移除 |
+| 只有面板在读 | 3 | 1 项修好（配色）、1 项本就是面板开关、1 项假开关已移除 |
+| 读出来但没生效 | 0 | — |
+
+**移除的 4 个假开关**（`portrait` 组）：`context_char_limit`、`context_message_limit`、
+`token_budget_per_person_day`、`token_budget_global_day`。四个在 `.py` / `.js` 里
+一次都没出现过，面板上却各摆着一个滑块。后两个的 hint 自己写着「预留」「当前不调用
+画像 LLM」——功能没做，控件先摆上了。接线就得凭空发明一套取用规则，
+所以选择删掉，而不是留一个调了没用的开关。
+
+**移除的 1 个描述与实现分裂的开关**：`private_companion_bridge.preserve_external_prompt_context`。
+它只出现在 `page_api` 的配置回显里，控不住任何行为；它 hint 描述的那套清理
+其实由 `clean_proactive_history` 实现。已删除，并把它的说明并进后者。
+
+**6 个默认值与代码 fallback 不一致**（真 bug）：schema 声明的是 2.2.0 有意调高的新值，
+代码里的 fallback 还是旧数。代码 fallback 只在配置项缺失时生效，所以
+「从旧版升级上来、老配置里没这个键」的用户会吃到另一套参数——同一份逻辑两种行为。
+已把 25 处 fallback 对齐到 schema：
+
+| 键 | 旧 fallback | 现 fallback |
+| --- | --- | --- |
+| `memory_injection.top_k` | 6 | 10 |
+| `memory_injection.max_chars` | 1800 | 4000 |
+| `memory_injection.max_item_chars` | 220 | 400 |
+| `memory_summary.min_events` | 8 | 20 |
+| `memory_summary.trigger_event_count` | 12 | 20 |
+| `maintenance.retention_raw_event_days` | 7 | 30 |
+
+`core/operations.py` 的三个预设（轻量/标准/陪伴）里仍是旧数字。**预设是相对档位，
+刻意不等于默认值**，所以这次没动它们——它们是有效配置，不是死开关。
+
+**p5 闸门读错了键名**：`_P5_B_FLAGS` 只写裸名 `enable_p5_b1_recall_gate`，
+而 schema 里的真实键是 `private_companion_bridge.enable_p5_b1_recall_gate`，
+于是五个闸门永远读到 False，面板的「attestation_read」恒显 `default_off`——
+哪怕用户真把闸门打开了。已改成全限定名。另外三个（tool_recall / b2_archive_read /
+b2_cross_user_read）从来没进过配置，属于没实现的占位，一并去掉，
+`total_count` 从 5 变成 2 是如实反映。
+
+**补声明 9 个「代码在读、schema 没写」的键**：它们此前只能手改 config.json，
+面板里根本看不到。已按代码里的 fallback 补齐声明与默认值：
+`retrieval.embedding_index_pending`、`visibility.hide_pending_review`、
+`context_orchestration.contextual_query_{expansion_enabled,recent_events,anchor_limit}`、
+`maintenance.memory_decay_{scan_limit,include_bot_self}`、
+`memory_injection.injection_cache_ttl_seconds`、`memory_injection.hook_request_budget_seconds`。
+
+**顺带修掉一处 JSON 重复键**：`memory_summary.candidate_valid_days` 在 schema 里
+出现了两次（逐字相同）。JSON 允许重复键、后者覆盖前者，所以一直没人发现；
+任何按行 diff 的人工审计都会把它当成两项。已合并。
+
+**两处如实保留**：`core/p5c_guard.py` 与 `core/p5d_security_events.py` 在仓库里
+根本不存在，所以协调契约里的 `sink_boundary` / `security_recovery` 两组会一直显示
+`contract_not_available`。面板说的是「拿不到」而不是「正常」，没有虚标，
+补齐它需要新增两个模块，超出这次范围。
+`core/service.py` 的 `_summary_window_after_failure` 是死代码，但不影响任何配置项，
+一并留着没动。
+
+### 防复发
+
+配置体检这种东西只做一次没意义，加了两条会一直红的检查：
+
+- `tests/test_config_no_dead_keys.py`：任何 schema 叶子项若在全仓库找不到字面量引用
+  就报错。f-string 拼出来的键由显式展开清单兜底（清单里每条都写了推导依据）。
+  已用注入一个假开关的方式验证过它真的会报警。
+- 全量测试 **760 项通过**（pytest 9.1.1 / Python 3.11），另含 145 项 subtest。
+  新增 13 项：配置无死开关 2 项、配色接线 10 项、联动诚实性 3 项、开场动画 7 项
+  （部分与上一版重叠计数）。探测逻辑的 8 种情形（注册表命中 / `get_registered_star`
+  / 按目录名 / 桥接未 active / 未启用 / 陈旧 `sys.modules` 别名 / 无注册表回退）
+  逐条跑过；28 组配色全部通过 WCAG 4.5:1 计算校验。
+
+- `tests/test_config_appearance_wired.py`：schema 里有 `options` 的键，
+  必须同时满足「后端有映射 + CSS 有对应规则 + 前端会把 key 打到 DOM 上」，
+  少一条就红。另含重复键、缺 type、缺 default、默认值不在 options 里等形状检查。
+
+
 ## 2.2.1 - 2026-10-05
 
 这一版只动面板与联动状态的**诚实性**，不动记忆逻辑。

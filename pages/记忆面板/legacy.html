@@ -68,6 +68,10 @@
         if (sessionStorage.getItem(KEY) === "1") return;
         sessionStorage.setItem(KEY, "1");
       } catch (_) { return; }
+      // 面板本体在幕布抬起时柔和现身（见 app.css 的 .intro-played .shell）。
+      // 这个 class 必须在动画开始前就加上，而且只在真的开播时加——
+      // 跳过开场的两种情况下面板必须立刻可用。
+      document.body.classList.add("intro-played");
       node = document.getElementById("intro");
       if (!node) return;
       // 动画自己会收尾，这里只是把节点摘干净；两条兜底防的是标签页被冻结时

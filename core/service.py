@@ -2573,7 +2573,7 @@ class MemoryCompanionService:
         if not gate.get("ok"):
             return []
         ctx = self.session_context_from_bridge(session_context)
-        results = await self.search(query, ctx, top_k or self.config.int("memory_injection.top_k", 6))
+        results = await self.search(query, ctx, top_k or self.config.int("memory_injection.top_k", 10))
         serialized = [serialize_memory(item.memory, item.score, item.reason) for item in results]
         snapshot = gate.get("snapshot")
         if snapshot is not None:
@@ -2608,8 +2608,8 @@ class MemoryCompanionService:
         return await self._compose_memory_injection(
             ctx,
             explicit_query=query_text,
-            top_k=top_k or self.config.int("memory_injection.top_k", 6),
-            max_chars=max_chars or self.config.int("memory_injection.max_chars", 1800),
+            top_k=top_k or self.config.int("memory_injection.top_k", 10),
+            max_chars=max_chars or self.config.int("memory_injection.max_chars", 4000),
             note="bridge_injection",
             write_log=False,
             companion_bot_mood=companion_bot_mood,
@@ -2709,10 +2709,10 @@ class MemoryCompanionService:
             return self.injection.compose(
                 ctx,
                 [],
-                max_chars or self.config.int("memory_injection.max_chars", 1800),
+                max_chars or self.config.int("memory_injection.max_chars", 4000),
                 core_memories=core_memories,
                 core_memory_max_chars=core_memory_max_chars,
-                max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
+                max_item_chars=self.config.int("memory_injection.max_item_chars", 400),
             )
 
         schedule_types = {"schedule_fragment", "persona_life", "companion_note"}
@@ -2847,10 +2847,10 @@ class MemoryCompanionService:
             return self.injection.compose(
                 ctx,
                 [],
-                max_chars or self.config.int("memory_injection.max_chars", 1800),
+                max_chars or self.config.int("memory_injection.max_chars", 4000),
                 core_memories=core_memories,
                 core_memory_max_chars=core_memory_max_chars,
-                max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
+                max_item_chars=self.config.int("memory_injection.max_item_chars", 400),
             )
 
         slot_map: dict[str, list[SearchResult]] = {"self_timeline": [], "user_profile": []}
@@ -2889,7 +2889,7 @@ class MemoryCompanionService:
         injection = self.injection.compose(
             ctx,
             results,
-            max_chars or self.config.int("memory_injection.max_chars", 1800),
+            max_chars or self.config.int("memory_injection.max_chars", 4000),
             intent_context=intent_context,
             slot_sections=self._slot_sections(slot_map),
             compact_memory=True,
@@ -2900,7 +2900,7 @@ class MemoryCompanionService:
             address_hint="" if outfit_focus else self._address_hint_for_injection(ctx),
             core_memories=core_memories,
             core_memory_max_chars=core_memory_max_chars,
-            max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
+            max_item_chars=self.config.int("memory_injection.max_item_chars", 400),
         )
         logger.info(
             "[MemoryCompanion] %s快速上下文已生成: session=%s candidates=%s selected=%s chars=%s elapsed_ms=%s",
@@ -4610,12 +4610,12 @@ class MemoryCompanionService:
 
     def _summary_window_ready(self, window: dict[str, Any], *, force: bool) -> bool:
         total = int(window.get("total") or 0)
-        min_events = self.config.int("memory_summary.min_events", 8)
+        min_events = self.config.int("memory_summary.min_events", 20)
         if total < (1 if force else min_events):
             return False
         if force:
             return True
-        trigger_count = self.config.int("memory_summary.trigger_event_count", 12)
+        trigger_count = self.config.int("memory_summary.trigger_event_count", 20)
         if total >= max(min_events, trigger_count):
             return True
         return self.summarizer.interval_elapsed(
@@ -7235,7 +7235,7 @@ class MemoryCompanionService:
 
     async def _run_raw_event_retention(self) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
-        raw_days = self.config.int("maintenance.retention_raw_event_days", 7)
+        raw_days = self.config.int("maintenance.retention_raw_event_days", 30)
         timeline_days = self.config.int("maintenance.retention_summarized_timeline_days", 30)
         # Rows whose batch never produced a memory were outside the summarized
         # cleanup, so the table could only grow.  Off unless the operator opts
@@ -7922,7 +7922,7 @@ class MemoryCompanionService:
             return self.injection.compose(
                 ctx,
                 [],
-                max_chars or self.config.int("memory_injection.max_chars", 1800),
+                max_chars or self.config.int("memory_injection.max_chars", 4000),
                 intent_context=intent_context,
                 emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"),
                 intimacy_level=getattr(turn_signal, "intimacy_level", 0.0),
@@ -7934,7 +7934,7 @@ class MemoryCompanionService:
                 core_memories=core_memories,
                 core_memory_max_chars=core_memory_max_chars,
                 included_memory_ids=static_included_memory_ids,
-                max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
+                max_item_chars=self.config.int("memory_injection.max_item_chars", 400),
             )
 
         if decision.suppress_long_memory:
@@ -8094,7 +8094,7 @@ class MemoryCompanionService:
             included_memory_ids=included_memory_ids,
             core_memories=core_memories,
             core_memory_max_chars=core_memory_max_chars,
-            max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
+            max_item_chars=self.config.int("memory_injection.max_item_chars", 400),
         )
         injection_omissions, _diagnostic_included_memory_ids = self.injection.diagnostic_snapshot()
         blocked.extend(injection_omissions)
@@ -8278,7 +8278,7 @@ class MemoryCompanionService:
                 injection = self.injection.compose(
                     ctx,
                     [],
-                    self.config.int("memory_injection.max_chars", 1800),
+                    self.config.int("memory_injection.max_chars", 4000),
                     intent_context=intent_context,
                     emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"),
                     intimacy_level=getattr(turn_signal, "intimacy_level", 0.0),
@@ -8290,7 +8290,7 @@ class MemoryCompanionService:
                     core_memories=core_memories,
                     core_memory_max_chars=core_memory_max_chars,
                     included_memory_ids=actual_injected_memory_ids,
-                    max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
+                    max_item_chars=self.config.int("memory_injection.max_item_chars", 400),
                 )
             self._log_injection_debug(
                 ctx=ctx,
@@ -8460,7 +8460,7 @@ class MemoryCompanionService:
             included_memory_ids=actual_injected_memory_ids,
             core_memories=core_memories,
             core_memory_max_chars=core_memory_max_chars,
-            max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
+            max_item_chars=self.config.int("memory_injection.max_item_chars", 400),
         )
         injection_omissions, _diagnostic_included_memory_ids = self.injection.diagnostic_snapshot()
         blocked.extend(injection_omissions)
@@ -11018,7 +11018,7 @@ class MemoryCompanionService:
         return clean_text(query, 1400)
 
     def _retrieval_top_k_for_query(self, ctx: SessionContext, query: str, *, time_intent: TimeIntent | None = None) -> int:
-        base = self.config.int("memory_injection.top_k", 6)
+        base = self.config.int("memory_injection.top_k", 10)
         if (time_intent is not None and time_intent.active) or self._message_requests_temporal_aggregate(ctx.message_text or query):
             if time_intent is not None and time_intent.summary_like:
                 return max(base, 12)
@@ -11026,7 +11026,7 @@ class MemoryCompanionService:
         return base
 
     def _injection_max_chars_for_query(self, ctx: SessionContext, query: str, *, time_intent: TimeIntent | None = None) -> int:
-        base = self.config.int("memory_injection.max_chars", 1800)
+        base = self.config.int("memory_injection.max_chars", 4000)
         if (time_intent is not None and time_intent.active) or self._message_requests_temporal_aggregate(ctx.message_text or query):
             return max(base, self.config.int("memory_injection.temporal_aggregate_max_chars", 3600))
         return base
@@ -11993,4 +11993,4 @@ class MemoryCompanionService:
         finally:
             self._closed = True
 
-
+

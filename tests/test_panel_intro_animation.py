@@ -49,20 +49,24 @@ function run({ reduceMotion, alreadyShown, fireAnimationEnd, advanceToTimeout })
     addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
   };
   const store = alreadyShown ? { getItem: () => "1", setItem() {} } : { getItem: () => null, setItem() {} };
+  const bodyClasses = [];
   const sandbox = {
     window: {
       matchMedia: (q) => ({ matches: reduceMotion && String(q).includes("reduce") }),
       setTimeout: (fn) => { timers.push(fn); return timers.length; },
     },
     sessionStorage: store,
-    document: { getElementById: (id) => (id === "intro" ? node : null) },
+    document: {
+      getElementById: (id) => (id === "intro" ? node : null),
+      body: { classList: { add: (c) => bodyClasses.push(c) } },
+    },
   };
   const names = Object.keys(sandbox);
   const values = names.map((n) => sandbox[n]);
   new Function(...names, code)(...values);
   if (fireAnimationEnd) (listeners.animationend || []).forEach((fn) => fn());
   if (advanceToTimeout) timers.forEach((fn) => fn());
-  return { removed: node.removed, timerCount: timers.length };
+  return { removed: node.removed, timerCount: timers.length, classes: bodyClasses };
 }
 
 const out = {
@@ -164,6 +168,12 @@ class IntroAnimationTests(unittest.TestCase):
             out["alreadyShownThisSession"]["removed"],
             "本会话已经播过就不该再摘一次（说明它提前返回了）",
         )
+
+        # body.intro-played 驱动面板本体的现身动画。少了它面板就是被硬切出来的；
+        # 跳过开场时多加了它，面板会白等 1.3 秒才可见。
+        self.assertIn("intro-played", out["normalThenAnimationEnd"]["classes"])
+        self.assertEqual([], out["reduceMotion"]["classes"], "跳过开场不该触发现身动画")
+        self.assertEqual([], out["alreadyShownThisSession"]["classes"])
 
 
 if __name__ == "__main__":

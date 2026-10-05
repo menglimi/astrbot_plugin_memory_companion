@@ -17,7 +17,7 @@ from .core.models import json_dumps
 from .core.service import MemoryCompanionService
 
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
-PLUGIN_VERSION = "2.2.1"
+PLUGIN_VERSION = "2.2.2"
 
 _ACTIVE_BRIDGE: MemoryCompanionBridge | None = None
 
@@ -56,7 +56,7 @@ class MemoryCompanionPlugin(Star):
         )
         self.memory_companion = MemoryCompanionBridge(self.service)
         self.memory_companion.bind_cache_invalidation(self.service.store)
-        self.bot_personal_capabilities = self.memory_companion.probe_capability_snapshot()
+        self.bot_personal_capabilities = self.memory_companion.probe_capability_snapshot(self.context)
         if not self.bot_personal_capabilities.get("available", False):
             logger.warning(
                 "[MemoryCompanion] Bot Personal capability probe degraded: %s",
@@ -77,6 +77,22 @@ class MemoryCompanionPlugin(Star):
         self.service._ensure_portrait_daily_dispatcher()
 
     def bot_personal_capability_status(self) -> dict[str, Any]:
+        """现探，不吃启动时拍的那张快照。
+
+        快照是 __init__ 时拍的。用户装完或启用陪伴插件之后，面板必须**立刻**显示
+        「已连接」，而不是要等重启 AstrBot 才变——「明明装了却一直说没装」正是
+        这么来的：快照永远停留在插件启动那一刻的状态。
+
+        探测失败就退回启动快照，至少不返回空。
+        """
+        probe = getattr(self.memory_companion, "probe_capability_snapshot", None)
+        if callable(probe):
+            try:
+                fresh = probe(self.context)
+            except Exception:
+                fresh = None
+            if isinstance(fresh, dict) and fresh:
+                return fresh
         return dict(self.bot_personal_capabilities)
 
     def _register_page_api_if_available(self) -> None:

@@ -39,12 +39,16 @@ COORDINATION_STATUS_FIELDS = (
     "four_package",
 )
 _HEALTH = frozenset({"ready", "degraded", "unverifiable"})
+# 必须写全限定名。schema 里的真实键是 private_companion_bridge.enable_p5_b1_*，
+# 原来这里只写裸名，getter() 读的一直是不存在的键，五个闸门永远读到 False，
+# 面板的「attestation_read」恒显 default_off，哪怕用户真把闸门打开了。
+#
+# 只留 schema 里真实存在的两个。另外三个（tool_recall / b2_archive_read /
+# b2_cross_user_read）从来没进过配置，属于没实现的占位，报上去只会让用户以为
+# 有开关可调却找不到。
 _P5_B_FLAGS = (
-    "enable_p5_b1_recall_gate",
-    "enable_p5_b1_bridge_gate",
-    "enable_p5_b1_tool_recall_gate",
-    "enable_p5_b2_archive_read_gate",
-    "enable_p5_b2_cross_user_read_gate",
+    "private_companion_bridge.enable_p5_b1_recall_gate",
+    "private_companion_bridge.enable_p5_b1_bridge_gate",
 )
 _P6_FIELDS = ("profiles", "identity_links", "audit_events", "operations")
 _P6_REASON_CODES = frozenset({"", "registry_status_unavailable", "invalid_reason_code"})
