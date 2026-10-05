@@ -4,67 +4,120 @@
 
 ## 2.2.2 - 2026-10-05
 
-这一版是「面板与配置的全项体检」，不碰记忆算法。起因是三条使用反馈：
-联动装了也说不认、皮肤配色配了不生效、开场动画闪一下。
+这一版是「面板与配置的全项体检」，不碰记忆算法。起因是四条反馈：
+**联动装了也说不认、皮肤配色配了不生效、开场动画闪一下、面板整体太大。**
+其中第一条是 2.2.1 挖出的坑——那一版只修好了一个方向。
 
-### 联动识别：装与不装都认不出来了
+---
 
-2.2.1 只修好了「没装却说装了」这一个方向，装上之后仍然显示未安装。根因换了方向：
-探测用的是 `importlib.import_module("data.plugins.astrbot_plugin_private_companion.main")`，
-而 **AstrBot 并不保证插件模块以这个别名留在 `sys.modules` 里**，于是真装了也 import 不到。
+### 一、联动识别：装与不装都认不出来
 
-陪伴插件那边识别记忆插件用的是另一套办法——查宿主注册表要**当前活着的实例**
-（`context.get_all_stars()` / `get_registered_star()`），这才是权威来源。
-现在改成同一套，并且照搬了对方一条很关键的设计：
+**2.2.1 的修法本身有问题。** 那一版用
+`importlib.import_module("data.plugins.astrbot_plugin_private_companion.main")`
+去找陪伴插件。而 **AstrBot 并不保证插件模块以这个别名留在 `sys.modules` 里**，
+所以真装了也 import 不到。于是同一个字段，两个方向的错法：
 
-> 注册表可用却没找到，就是真的没有，**到此为止**，不再去翻 `sys.modules`。
+| 版本 | 判定依据 | 真实含义 | 后果 |
+| --- | --- | --- | --- |
+| 2.2.1 之前 | `caps.available` | 记忆侧 contract 自检通过（恒 true） | 没装却说装了 |
+| 2.2.1 | `importlib.import_module(...)` | —— | **装了也认不出** |
 
-理由很实在：插件重载后旧模块会留在 `sys.modules` 里冒充还在，
-而 `import_module` 更糟——根本没装时它会凭空造一个空模块出来。
-只有宿主压根没有注册表 API（老版本 AstrBot、单测）才退回模块别名。
+**正确做法是问宿主要当前活着的实例。** 陪伴插件识别记忆插件用的正是这个
+（查注册表：`context.get_all_stars()` / `context.get_registered_star()`），
+所以直接对齐它的写法：
 
-判定标准仍然是陪伴插件的 `get_private_companion_api()` 返回非 `None`，
-它答的是「现在真的能用」，不是「磁盘上有这个目录」。
+- 匹配 `metadata` 的 `name` / `display_name` / `root_dir_name` / `module_path`；
+- 要求 `metadata.activated` 为真；
+- API 优先从模块级 `get_private_companion_api()` 取（那是陪伴插件对外的正式入口，
+  它自己就做完了活性检查，判定标准不会在我们这边走样），
+  其次从 `star_cls.extension_api` 取，并按对方同样的口径自己校验
+  `bridge_lifecycle_status().active is True`。
 
-另外面板不再吃启动快照：以前那张快照是 `__init__` 时拍的，
-用户装完或启用陪伴插件后要等重启 AstrBot 面板才会变。现在每次打开都现探。
+**最关键的一条设计，必须一起抄**：
 
-### 皮肤配色：14 个选项以前全是空壳
+> 注册表可用却没找到，就是真的没有，**到此为止**——不再去翻 `sys.modules`。
 
-`appearance.theme` 列了 14 个中国传统色，后端也把色名映射成了 key，
-但**前端从来没有消费过那个 key，项目里甚至不存在任何一份配色定义**——
-配置里能选，选了不生效。这一版把它接上：
+理由很实在：插件重载后旧模块会留在 `sys.modules` 里冒充还在；
+而 `import_module` 更糟——根本没装时它会**凭空造一个空模块**出来，
+于是又变回「没装却说装了」。只有宿主压根没有注册表 API（老版本 AstrBot、单测环境）
+才退回模块别名，而且只查 `sys.modules.get(...)`，不主动 import。
 
-- `index.html` 在跳转前就调 `/ui-preferences`，拿到 `palette` 先打到 `<html>` 上，
-  所以第一帧就是对的颜色，不会「先紫后青」闪一下。
-- `app.css` 新增 14 套 `[data-palette]`，深浅两套共 28 组。
-- 面板里改完配色当场生效，不用刷新。
+**另外一个自己踩的坑**：第一版把 context 写成
+`getattr(self._plugin, "context", None)`，结果打碎了 `probe_capability_snapshot`
+的一条硬约束——**这个探测不许碰 `self._plugin` 任何属性**
+（`tests/test_c1_bridge_probe.py` 用一个「摸一下就 AssertionError」的假插件守着）。
+改成由调用方传进去：`probe_capability_snapshot(context=None)`。
 
-配色取自《中国传统色：故宫里的色彩美学》的 384 色体系。
-需要说明两点：常见的那几个转载站不是三个独立考据，是同一套书被抄了三遍；
-**墨黪 / 青冥 / 紫蒲** 在深色背景上原本只有 2~4:1，已由生成脚本按色相提亮到达标，
-28 组配色全部过了 WCAG 4.5:1。
+**还有一处会让人以为没修好**：面板读的是 `__init__` 时拍的那张快照。
+用户装完或启用陪伴插件后，要等重启 AstrBot 面板才会变。
+改成 `bot_personal_capability_status()` 每次现探，探测失败才退回启动快照。
 
-### 开场动画不再闪
+---
 
-幕布原来是 `0% → 9%` 淡入的，于是面板先露一脸、再被盖住，用户看到的就是
-「突然闪一下」。现在幕布**从第一帧就是不透明的**，只让里面的字动；
-面板本体则在幕布抬起时柔和现身（`body.intro-played` 驱动）。
-跳过开场的两种情况（减少动效、本会话已播过）下面板立刻可用，不会白等。
+### 二、皮肤配色：14 个选项以前全是空壳
 
-### 面板整体精简
+`appearance.theme` 列了 14 个中国传统色，后端 `page_api.THEME_NAME_TO_KEY`
+也把色名映射成了 key，但——
+
+> **前端从来没有消费过那个 key，项目里甚至不存在任何一份配色定义。**
+
+所以配置里能选，选了不生效。这不是「回退到默认」，是根本没有这条链路。
+接线分三步：
+
+1. `/ui-preferences` 端点返回 `palette` / `theme` / `available_palettes`。
+2. `index.html` 在**跳转之前**就调这个端点，拿到 `palette` 先打到 `<html>` 的
+   `data-palette` 上。放在跳转前是关键：否则新页面第一帧还是默认色，
+   用户会看到一次「颜色跳一下」。
+3. `app.css` 新增 14 套 `[data-palette]` 规则，深浅两套共 **28 组**。
+4. 面板里改完配色当场调 `syncPalette()`，不用刷新页面——不然用户会以为这项又没生效。
+
+**取色与取值口径**（值得记一笔）：来自《中国传统色：故宫里的色彩美学》的 384 色体系。
+两点如实说明——常见的那几个转载站**不是三个独立考据**，是同一套书被抄了三遍；
+**墨黪 / 青冥 / 紫蒲** 在深色背景上原本只有 2~4:1，直接当强调色不可用，
+已由生成脚本按色相提亮。**28 组配色全部过了 WCAG 4.5:1 的计算校验**，
+不是靠眼睛看。
+
+---
+
+### 三、开场动画不再闪
+
+幕布原来是 `0% → 9%` 淡入的。于是面板先完整露一脸，再被幕布盖住，
+用户看到的就是「突然闪一下」。改法：
+
+- 幕布**从第一帧就是不透明的**（`0% { opacity: 1 }`），只让里面的字动，幕布本身不动；
+- 幕布退场从 90% 收到 68%→92%，缩短「看不见却能点到」的窗口；
+- 面板本体在幕布抬起时柔和现身（`body.intro-played` 触发的 `shell-reveal`）。
+  **这个 class 只在真的开播时加**——跳过开场的两种情况（减少动效、本会话已播过）
+  面板必须立刻可用，不能白等 1.3 秒。
+
+---
+
+### 四、面板整体精简
 
 简洁管理界面整体偏松：22/30px 的内容边距、16px 的卡片间距、236px 的侧栏，
-一屏能放的信息太少。这一版整体收紧约 25%——只动留白与字号，不动配色、不动信息层级。
+一屏能放的信息太少。这一版整体收紧约 25%——**只动留白与字号，不动配色、不动信息层级**。
 
-**刻意用 `:not([data-ui-mode="cinema"])` 圈起来**：放映馆/终端模式有自己那套
-空间语言（三维终端是 70 处 `data-ui-mode="cinema"` 规则），压它会毁掉那套效果，
-所以这一段对三维终端完全不生效。
+**刻意用 `html:not([data-ui-mode="cinema"])` 圈起来。** 放映馆/终端模式有自己那套
+空间语言（`app.css` 里 70 处 `data-ui-mode="cinema"` 规则），
+压它会毁掉三维终端那套效果，所以这一段对那个模式**完全不生效**——
+三维终端按用户要求原样保留。
 
-### 全项配置体检
+---
 
-按「每一个开关都要有用、他用不用得上」把 201 个叶子项逐个核了一遍，
-**叶子项实际是 201 个，不是之前以为的 188 个**。结果与处理：
+### 五、配置全项体检
+
+按「每一个开关都要有用、他用不用得上」把叶子项逐个核了一遍。
+**先纠正一个统计口径：叶子项实际是 201 个，不是之前以为的 188 个。**
+
+判定时的三个陷阱（不避开就会得出「零死开关」的错误结论）：
+
+1. `page_api._schema_config_values()` 遍历 `_conf_schema.json` 本身回显当前值——
+   grep 全部 schema 键会在那里 201 项全中。那是**显示**，不是行为控制。
+2. `core/config.py` 的 `ConfigView.ALIASES`（48 条旧→新映射）让 34 个 `*_advanced` 键
+   在代码里以**旧名**出现。只 grep schema 键会把这 34 项全判成 DEAD。
+   而且别名是**单向的、没有反向**——删掉 ALIASES 会让这 34 项同时变 DEAD，
+   静态分析完全看不出区别。这是这套配置最大的结构性风险点。
+3. `core/operations.py` 的 `PRESETS` 是默认值表，算「被读到」。
 
 | 类别 | 数量 | 处理 |
 | --- | --- | --- |
@@ -73,20 +126,23 @@
 | 只有面板在读 | 3 | 1 项修好（配色）、1 项本就是面板开关、1 项假开关已移除 |
 | 读出来但没生效 | 0 | — |
 
-**移除的 4 个假开关**（`portrait` 组）：`context_char_limit`、`context_message_limit`、
-`token_budget_per_person_day`、`token_budget_global_day`。四个在 `.py` / `.js` 里
-一次都没出现过，面板上却各摆着一个滑块。后两个的 hint 自己写着「预留」「当前不调用
-画像 LLM」——功能没做，控件先摆上了。接线就得凭空发明一套取用规则，
-所以选择删掉，而不是留一个调了没用的开关。
+**（1）移除 4 个零引用的假开关**（`portrait` 组）：`context_char_limit`、
+`context_message_limit`、`token_budget_per_person_day`、`token_budget_global_day`。
+四个在 `.py` / `.js` 里一次都没出现过，面板上却各摆着一个滑块。
+后两个的 hint 自己写着「**预留**」「**当前不调用画像 LLM**」——功能没做，控件先摆上了。
+接线就得凭空发明一套取用规则，所以选择删掉，而不是留一个调了没用的开关。
 
-**移除的 1 个描述与实现分裂的开关**：`private_companion_bridge.preserve_external_prompt_context`。
-它只出现在 `page_api` 的配置回显里，控不住任何行为；它 hint 描述的那套清理
-其实由 `clean_proactive_history` 实现。已删除，并把它的说明并进后者。
+**（2）移除 1 个描述与实现分裂的开关**：
+`private_companion_bridge.preserve_external_prompt_context`。
+它只出现在 `page_api` 的配置回显里，控不住任何行为；
+而它 hint 描述的那套清理，实际由 `clean_proactive_history` 实现
+（`astrbot_compat.sanitize_request_history` 只有这一个门）。
+已删除，并把它的说明并进后者，信息没丢。
 
-**6 个默认值与代码 fallback 不一致**（真 bug）：schema 声明的是 2.2.0 有意调高的新值，
-代码里的 fallback 还是旧数。代码 fallback 只在配置项缺失时生效，所以
-「从旧版升级上来、老配置里没这个键」的用户会吃到另一套参数——同一份逻辑两种行为。
-已把 25 处 fallback 对齐到 schema：
+**（3）6 个默认值与代码 fallback 不一致**（真 bug）：schema 声明的是 2.2.0
+**有意调高**的新值，代码里的 fallback 还是旧数。代码 fallback 只在配置项缺失时生效，
+所以**从旧版升级上来、老配置里没这个键的用户会吃到另一套参数**——
+同一份逻辑两种行为。已把 25 处 fallback 对齐：
 
 | 键 | 旧 fallback | 现 fallback |
 | --- | --- | --- |
@@ -97,132 +153,253 @@
 | `memory_summary.trigger_event_count` | 12 | 20 |
 | `maintenance.retention_raw_event_days` | 7 | 30 |
 
-`core/operations.py` 的三个预设（轻量/标准/陪伴）里仍是旧数字。**预设是相对档位，
-刻意不等于默认值**，所以这次没动它们——它们是有效配置，不是死开关。
+`core/operations.py` 的三个预设（轻量/标准/陪伴）里仍是旧数字。
+**预设是相对档位、刻意不等于默认值**，是有效配置而不是死开关，所以这次没动。
 
-**p5 闸门读错了键名**：`_P5_B_FLAGS` 只写裸名 `enable_p5_b1_recall_gate`，
+**（4）p5 闸门读错了键名**：`_P5_B_FLAGS` 只写裸名 `enable_p5_b1_recall_gate`，
 而 schema 里的真实键是 `private_companion_bridge.enable_p5_b1_recall_gate`，
-于是五个闸门永远读到 False，面板的「attestation_read」恒显 `default_off`——
-哪怕用户真把闸门打开了。已改成全限定名。另外三个（tool_recall / b2_archive_read /
-b2_cross_user_read）从来没进过配置，属于没实现的占位，一并去掉，
-`total_count` 从 5 变成 2 是如实反映。
+于是五个闸门永远读到 False，面板的「attestation_read」恒显 `default_off`
+——**哪怕用户真把闸门打开了**。已改成全限定名。
+另外三个（tool_recall / b2_archive_read / b2_cross_user_read）从来没进过配置，
+属于没实现的占位，一并去掉，`total_count` 从 5 变成 2 是如实反映。
 
-**补声明 9 个「代码在读、schema 没写」的键**：它们此前只能手改 config.json，
-面板里根本看不到。已按代码里的 fallback 补齐声明与默认值：
+**（5）补声明 9 个「代码在读、schema 没写」的键**：它们此前只能手改 `config.json`，
+面板里根本看不到。已按代码里的 fallback 补齐声明、类型与默认值：
 `retrieval.embedding_index_pending`、`visibility.hide_pending_review`、
 `context_orchestration.contextual_query_{expansion_enabled,recent_events,anchor_limit}`、
 `maintenance.memory_decay_{scan_limit,include_bot_self}`、
 `memory_injection.injection_cache_ttl_seconds`、`memory_injection.hook_request_budget_seconds`。
 
-**顺带修掉一处 JSON 重复键**：`memory_summary.candidate_valid_days` 在 schema 里
+**（6）修掉一处 JSON 重复键**：`memory_summary.candidate_valid_days` 在 schema 里
 出现了两次（逐字相同）。JSON 允许重复键、后者覆盖前者，所以一直没人发现；
-任何按行 diff 的人工审计都会把它当成两项。已合并。
+而任何按行 diff 的人工审计都会把它当成两项。已合并（合并前逐字比对确认两份完全相同，
+所以不改变任何语义）。
 
-**两处如实保留**：`core/p5c_guard.py` 与 `core/p5d_security_events.py` 在仓库里
-根本不存在，所以协调契约里的 `sink_boundary` / `security_recovery` 两组会一直显示
-`contract_not_available`。面板说的是「拿不到」而不是「正常」，没有虚标，
-补齐它需要新增两个模块，超出这次范围。
-`core/service.py` 的 `_summary_window_after_failure` 是死代码，但不影响任何配置项，
-一并留着没动。
+---
 
-### 防复发
+### 防复发：两条会一直红的守卫
 
-配置体检这种东西只做一次没意义，加了两条会一直红的检查：
+配置体检这种东西只做一次没意义，下次加配置的人照样会忘。所以立了两条检查：
 
-- `tests/test_config_no_dead_keys.py`：任何 schema 叶子项若在全仓库找不到字面量引用
-  就报错。f-string 拼出来的键由显式展开清单兜底（清单里每条都写了推导依据）。
-  已用注入一个假开关的方式验证过它真的会报警。
-- 全量测试 **760 项通过**（pytest 9.1.1 / Python 3.11），另含 145 项 subtest。
-  新增 13 项：配置无死开关 2 项、配色接线 10 项、联动诚实性 3 项、开场动画 7 项
-  （部分与上一版重叠计数）。探测逻辑的 8 种情形（注册表命中 / `get_registered_star`
-  / 按目录名 / 桥接未 active / 未启用 / 陈旧 `sys.modules` 别名 / 无注册表回退）
-  逐条跑过；28 组配色全部通过 WCAG 4.5:1 计算校验。
+- **`tests/test_config_no_dead_keys.py`**（新增 2 项）：任何 schema 叶子项若在
+  全仓库（非测试的 `.py` / `.js` / `.html` / `.css`）找不到字面量引用就报错。
+  f-string 拼出来的键由 `DYNAMIC_FAMILIES` 显式展开清单兜底，
+  清单里每一条都写了推导依据（在哪一行、展开成哪几个），
+  **不靠猜**——这份清单错一条，整条检查就失去意义。
+- **`tests/test_config_appearance_wired.py`**（新增 10 项）：凡是 schema 里声明成
+  `options` 列表的键，必须同时满足三条：后端有 name→key 映射、
+  `app.css` 里有对应的 `[data-palette=...]` 规则、前端会把 key 打到 DOM 上。少一条就红。
+  另含 JSON 重复键、缺 `type`、缺 `default`、默认值不在 `options` 里等形状检查。
 
-- `tests/test_config_appearance_wired.py`：schema 里有 `options` 的键，
-  必须同时满足「后端有映射 + CSS 有对应规则 + 前端会把 key 打到 DOM 上」，
-  少一条就红。另含重复键、缺 type、缺 default、默认值不在 options 里等形状检查。
+**两条守卫都验证过「真的会报警」**：往 schema 里注入一个纯装饰的
+`visibility.totally_fake_switch`，`test_config_no_dead_keys` 如期报出它；
+移除 28 组 CSS 之前，`test_config_appearance_wired` 的三条 CSS 相关用例也是红的。
+不验证的守卫可能只是在空转。
+
+---
+
+### 怎么测的
+
+| 手段 | 覆盖什么 | 结果 |
+| --- | --- | --- |
+| 既有全量测试 | 回归 | 全绿 |
+| **探测逻辑逐情形手测**（8 种） | 见下 | 全对 |
+| `tests/test_config_no_dead_keys.py`（新增 2 项） | 零引用守卫 + 清单自检 | — |
+| `tests/test_config_appearance_wired.py`（新增 10 项） | 配色链路三段 + schema 形状 | — |
+| `tests/test_c4_capability_probe.py`（重写，9 项） | 注册表探测的 8 种情形 | — |
+| `tests/test_panel_intro_animation.py`（+1 项） | 幕布不透明 + `intro-played` 只在开播时加 | — |
+| **配色对比度计算校验** | 28 组 × 深浅，按 WCAG 算相对亮度与比值 | 全部 ≥ 4.5:1 |
+| **从解压的 zip 里重跑全量测试** | 发出去的那一份本身自洽 | 760 项通过 |
+
+合计 **760 项通过**（2.2.1 的 749 + 新增守卫），另含 145 项 subtest。
+
+**探测逻辑的 8 种输入**逐条跑过：注册表 `get_all_stars` 命中、
+只靠 `get_registered_star` 命中、按 `root_dir_name` 命中、
+只有 `get_all_stars` 可用、走模块级正式入口、桥接 `active` 为 false、
+插件 `activated` 为 false、注册表里只有记忆插件自己。
+外加两条兼容性情形：**陈旧 `sys.modules` 别名不得翻盘**、
+无注册表 API 时才允许退回模块别名。
+
+**配色生成器自己也踩了两个坑，都记在脚本里**：
+一是把饱和度百分比（18）直接当 0~1 传给 `colorsys`，结果每个 surface 都变成刺眼的原色；
+二是「提高对比度」的步进方向搞反了——深色系（墨黪）在深色背景上要**提亮**，
+浅色系（黄白游）要**压暗**，固定朝一个方向走会让墨黪一路走到纯黑然后除零。
+正确写法是永远朝「远离背景亮度」的方向走。
+
+---
+
+### 边界与如实说明
+
+- `core/p5c_guard.py` 与 `core/p5d_security_events.py` **在仓库里根本不存在**，
+  所以协调契约里的 `sink_boundary` / `security_recovery` 两组会一直显示
+  `contract_not_available`。面板说的是「拿不到」而不是「正常」，**没有虚标**；
+  补齐需要新增两个模块，超出这次范围。
+- `core/service.py` 的 `_summary_window_after_failure` 是死代码（定义后无人调用），
+  但它影响的配置项在别处仍有活跃读取点，所以没有配置项因此变成空转。
+  一并留着没动。
+- **一行 diff 噪音需要如实说明**：这一版我用脚本改 `core/service.py`、
+  `page_api.py`、`core/coordination_status.py`、`core/bridge.py`、`main.py` 时，
+  走了 `pathlib.read_text()` / `write_text()`，而 `read_text()` 会把 `
+` 归一成 `
+`。
+  结果这几个文件的换行符被整体转成了 LF，功能上没有任何影响（Python 两种都认），
+  但提交里 `core/service.py` 显示成 `+11684 / -11684` 的整文件重写，
+  实际改动只有 25 处 fallback 的数值。**看 diff 时需要留意这一点。**
+- 审计报告里列的「11 个未声明键」有 2 个经我核实不成立：
+  `startup.background_grace_seconds` 只在开发脚本里出现、
+  `livingmemory_migration.default_review_status` 是往 dict 写入而不是从配置读。
+  只补了核实过的 9 个。
+- 叶子项从 201 变成 205（删 5 增 9）。
 
 
 ## 2.2.1 - 2026-10-05
 
-这一版只动面板与联动状态的**诚实性**，不动记忆逻辑。
+这一版只动面板与联动状态的**诚实性**，不碰记忆算法。起因是一条反馈：**没装陪伴插件，
+面板顶部却显示「已连接」。** 查下来的结论是：问题不在前端取错了字段，而在后端把两个
+完全不同的概念塞进了同一个字段。
 
-### 联动面板不再虚标「已安装」
+---
 
-**原缺陷**：面板判断「陪伴插件装了没」读的是 `caps.available`。但那个字段在后端的
-含义是**记忆侧自己那份 contract 自检通过**——也就是「我准备好了、可以跟陪伴侧对话」，
-它恒为 `true`，跟 `astrbot_plugin_private_companion` 在不在宿主里毫无关系。
-结果就是：**根本没装陪伴插件，面板照样显示「已连接」。**
+### 一、联动面板把「我方就绪」当成了「对方已安装」
 
-**为什么之前没人发现**：`core/bridge.py` 的能力探测拿
-`capability_descriptor(available=True)`，参数是写死的。它只校验记忆侧那份
-`bot_personal_contract.py` 自洽不自洽，压根不问对面在不在。这个 `available`
-在 C4 契约里的原意就是「我方就绪」，把它当「对方已安装」是彻底的语义串线。
+**根因链条**（从后端一路走到前端）：
 
-**修法**：新增 `companion_installed` / `companion_plugin_name` 两个字段，由
-`core/capability_probe.py` 的 `detect_companion_plugin()` 真的去 import
-`data.plugins.astrbot_plugin_private_companion.main`，并要求
-`get_private_companion_api()` 返回非 `None`——它答的是「现在真的能用」，
-不是「磁盘上有这个目录」。模块能 import 但桥接没就绪，仍然报未装。
+1. `core/bridge.py` 的 `probe_capability_snapshot()` 调
+   `bot_personal_contract.capability_descriptor(available=True, read_only=False)`——
+   **`available` 这个参数是写死的**。
+2. 它随后只跑 `bot_personal_contract.contract_self_check()`，校验的是
+   **记忆侧自己那份** `bot_personal_contract.py` 的自洽性（指纹、窗口覆盖、别名指向）。
+   全程**没有任何一行代码检查 `astrbot_plugin_private_companion` 是否加载**。
+3. 而在 C4 契约设计里，`available` 的原意是
+   **「记忆侧就绪、可以开始和陪伴侧对话」**，它本来就该恒为 true。
+4. 前端 `app.js` 的 `companionStatus()` 写的是
+   `available: caps.available === true || personal.available === true`
+   ——把「我准备好了」读成了「对面装好了」。**这是语义串线，不是显示 bug。**
 
-`available` 一个字没改：C4 契约语义保持原样，面板改读新字段。
-所以旧宿主上后端还没升级时，`caps` 里没有 `companion_installed`，
-面板按未装处理——**宁可说没装，也不虚标一个用不了的联动。**
+所以面板从来没骗人，它只是忠实地显示了一个被赋错义的字段。
 
-### 内部码不再直接甩给用户
+**为什么没有直接改 `available` 的含义**：`available` 是跨插件契约的一部分，
+C1/C4 的启动自检、`test_c6_dual_plugin_boundary` 等一批用例都依赖它。
+改语义会波及整条契约链。正确做法是**让「装没装」有独立的取值来源**：
+
+- `core/capability_probe.py` 新增 `detect_companion_plugin()`，并新增两个快照字段
+  `companion_installed` / `companion_plugin_name`。
+- `build_capability_snapshot()` **保持纯函数**——它不 import 任何插件模块
+  （该模块的文档字符串明确写了这条边界），新字段默认 `False`，
+  由允许碰运行时的 `bridge` 在调用点填入。
+- 判定用陪伴插件的 `get_private_companion_api()` 是否返回非 `None`。
+  选它是因为它答的是「**现在真的能用**」，而不是「磁盘上有这个目录」：
+  模块能 import 但插件未激活、桥接未就绪时它同样返回 `None`。
+
+**一个必须注意的坑**：新字段必须同时加进 `CAPABILITY_SNAPSHOT_FIELDS`
+（= `_SNAPSHOT_KEYS`）。`tests/test_v3_regression_contracts.py` 会扫 `app.js` 里
+所有 `caps.<字段>` 引用，逐个核对它是否在 `page_api.ENDPOINT_FIELD_CONTRACT`
+声明的范围内。不声明就直接以「面板读取了后端未声明的字段」把测试打红。
+
+**改动清单**：
+
+| 文件 | 改法 |
+| --- | --- |
+| `core/capability_probe.py` | 新增 `detect_companion_plugin()` + 两个快照字段；`CAPABILITY_STATES`/`_SNAPSHOT_KEYS` 扩容 |
+| `core/bridge.py` | `probe_capability_snapshot()` 里探测一次并回填两个字段，`available` 语义一个字未动 |
+| `page_api.py` | 新增 `_compatibility_level()`，替掉写死的 `{"compatibility_level": "full"}` |
+| `pages/记忆面板/app.js` | 重写 `companionStatus()`；新增 `REASON_TEXT` 对照表与 `healthText`/`bridgeHealthText`/`runtimeHealthText`；概览页与联动页改三态 |
+| `pages/记忆面板/app.css` | 新增 `.link-item.is-off` 中性态 |
+| `pages/记忆面板/legacy.html` | 新增开场遮罩与收尾脚本 |
+
+---
+
+### 二、「协调契约 · 兼容等级」恒显「契约完全兼容」
+
+`page_api.py` 的 `coordination_status()` 过去把 runtime 写死成
+`{"compatibility_level": "full"}`。于是不管陪伴插件装没装，「兼容等级」永远是
+「正常 / 契约完全兼容」，而它正下方那行「桥接状态：无法核实」在自我否定。
+
+改法：新增 `_compatibility_level(bridge)`，桥接真的通了才叫完全兼容，其余一律降级。
+
+---
+
+### 三、内部原因码直接甩给用户
 
 联动页过去会把 `companion_api_unavailable`、`companion_p6_producer_stale`
-这类内部原因码原样打印出来，标成「原因码：xxx」，等于让用户自己查字典。
-现在统一走对照表翻译成中文（「未检测到陪伴插件 astrbot_plugin_private_companion」
-「陪伴插件状态已过期」），认不出来的码仍然原样显示——宁可难看也不吞，
-那说明后端又加了新码。`ready/degraded/unverifiable` 同样译为「正常/降级/无法核实」，
-原始值保留在 `title` 里，排查时还能看到。
+这类**内部标识符**原样打印成「原因码：xxx」；`ready` / `degraded` / `unverifiable`
+也直接显示。等于让用户自己查字典。
 
-### 「兼容等级」不再恒为「完全兼容」
+改法：加 `REASON_TEXT` 对照表统一译成中文（「未检测到陪伴插件 astrbot_plugin_private_companion」
+「陪伴插件状态已过期」），原始码保留在 `title` 属性里以便排查。
+**认不出来的码原样返回**——宁可难看也不吞，那说明后端又加了新码，吞掉等于把它藏起来。
 
-`page_api.py` 过去把 `runtime` 写死成 `{"compatibility_level": "full"}`，
-于是不管陪伴插件装没装，「协调契约 · 兼容等级」恒显「正常 / 契约完全兼容」，
-和旁边那行「桥接状态：无法核实」自相矛盾。现在跟着桥接实际状态走：
-桥接真通了才叫完全兼容，其余一律降级。
+---
 
-### 未安装态的显示
+### 四、「没装」不再画成「坏了」
 
-「没装」和「坏了」分开画：新增 `is-off` 中性态（描边点 + 轻微降透明度），
-不再把「没装陪伴插件」标成红色错误。概览页联动卡片补一行说明
-「记忆功能不受影响，装上后这里会显示它的日程、相册与表达权威归属」；
-联动页在未安装时不再显示「查看 Bot 日程与相册」按钮——点了也只会把人送去一个空页面。
-概览页「外部写入接口」过去恒为绿色，实际是拿注入日志条数在撑，现在没日志就中性显示。
+新增 `.is-off` 中性态（描边点 + 轻微降透明度）。过去没装陪伴插件会被标成红色错误，
+但那只是与你无关，不是故障。概览页联动卡片补一行说明
+「未安装陪伴插件 astrbot_plugin_private_companion。记忆功能不受影响」，
+并在联动页未安装时**不再显示**「查看 Bot 日程与相册」按钮——点了也只会把人送去一个空页面。
+概览页「外部写入接口」过去恒为绿色，实际是拿注入日志条数在撑，没日志时改为中性显示。
 
-### 开场动画
+---
 
-面板打开时首屏直接给到「我会牢牢记住你」，随后淡出交给面板。
-三处刻意的取舍：
+### 五、开场动画（新增）
+
+面板打开时首屏直接给到「我会牢牢记住你」，随后淡出交给面板。三处刻意的取舍：
 
 - **指针恒不吃**（`pointer-events: none`）。带 `position:fixed; inset:0` 的遮罩
   一旦吃了事件，动画期间面板就是死的，用户只会以为面板卡了。
-- **不靠 JS 收尾**。最后一帧 keyframe 自带 `visibility:hidden` + `forwards`，
+- **不靠 JS 收尾**。最后一帧 keyframe 自带 `visibility:hidden` + `forwards`。
   脚本报错、被 CSP 拦掉、或后台标签页被冻结导致 `animationend` 不触发，
-  遮罩都会自己消失。JS 只负责把节点摘干净，并挂了 4 秒超时兜底。
+  遮罩都必须自己消失。JS 只负责把节点摘干净，并挂了 4 秒超时兜底。
 - **尊重 `prefers-reduced-motion`**，该模式下不播，CSS 直接 `display:none`。
 
-标题的渐变扫描光包在 `@supports (background-clip: text)` 里：不支持该特性的
-浏览器保留实色标题，不会因为 `-webkit-text-fill-color: transparent` 而整行字消失。
-每个浏览器会话只播一次（`sessionStorage`），刷新重开仍会看到。
+标题的渐变扫描光包在 `@supports (background-clip: text)` 里：不支持该特性的浏览器
+保留实色标题，不会因为 `-webkit-text-fill-color: transparent` 而整行字消失——
+而这个标题恰恰是点名要第一眼看到的字，不能押在特性支持上。
 
-新版界面（Memory OS 三维终端）**没有**这次改动：它是 Vite 编译产物，
-仓库里只有 `assets/index-*.js` 而没有前端源码，改不了。默认的「旧版」界面才是本次对象。
+**新版界面未改动**：Memory OS 三维终端是 Vite 编译产物，仓库里只有
+`assets/index-*.js` 而没有前端源码，改不了。默认的「旧版」界面才是本次对象。
 
-### 验证
+---
 
-- 新增 `tests/test_panel_companion_honesty.py`：静态断言 + 把 `app.js` 里
-  **那段真实代码**截出来交给 node 跑，覆盖「旧后端只给 available」/「未装」/
-  「装了但没活性」/「真装了」四种输入。只做静态断言不够——写死 `false` 也能骗过 grep。
-- 新增 `tests/test_panel_intro_animation.py`：用最小 DOM 桩跑 `legacy.html` 里
-  真实的内联脚本，验证动画结束摘节点、超时兜底、减少动效提前返回、本会话不重播；
-  另断言遮罩不吃点击、末帧自带隐藏、标题有实色兜底。
-- `tests/test_c4_capability_probe.py` 补 `detect_companion_plugin` 的四种行为，
-  并锁住「纯快照永远不自称已装」。
-- 全量测试 749 项通过（pytest 9.1.1 / Python 3.11），另含 145 项 subtest。
+### 怎么测的
+
+| 手段 | 覆盖什么 | 结果 |
+| --- | --- | --- |
+| 既有全量测试 | 736 项回归 | 全绿，证明没碰坏记忆逻辑 |
+| `tests/test_panel_companion_honesty.py`（新增 3 项） | 见下 | — |
+| `tests/test_panel_intro_animation.py`（新增 7 项） | 见下 | — |
+| `tests/test_c4_capability_probe.py`（新增 3 项） | `detect_companion_plugin` 四种行为 + 「纯快照永远不自称已装」 | — |
+| **把 `app.js` 那段真实代码截出来交给 node 跑** | 面板判定 | 4 种输入全对 |
+| 最小 DOM 桩跑 `legacy.html` 里真实的内联脚本 | 动画收尾 | 5 种情形全对 |
+| **从解压的 zip 里重跑全量测试** | 发出去的那一份本身自洽 | 749 项通过 |
+
+合计 **749 项通过**（原 736 + 新增 13），另含 145 项 subtest。
+
+**两个刻意的测试设计**，值得单独说：
+
+1. **只做静态断言不够**。最早想的是 grep `app.js` 有没有读 `caps.companion_installed`，
+   但那样写死 `available: false` 也能骗过 grep。所以改成
+   **从 `app.js` 里截出「原因码表 + 健康度文案 + `companionStatus`」这一段真实代码，
+   交给 node 执行**，再喂四种输入：旧后端只给 `available=true`（必须报未装）、
+   显式未装、装了但桥接未就绪、真装了。第一种专门用来防「后端还没升级的老宿主」。
+2. **动画不能只断言 CSS 里有关键字**。`tests/test_panel_intro_animation.py` 用一个
+   最小 DOM 桩（自己实现的 `matchMedia` / `sessionStorage` / `setTimeout`）
+   去跑 `legacy.html` 里那段**真实的内联脚本**，验证动画结束摘节点、
+   超时兜底能摘、减少动效时提前返回且不挂定时器、本会话不重播；
+   另外断言遮罩不吃点击、末帧自带隐藏、标题有实色兜底。
+
+---
+
+### 边界与如实说明
+
+- 面板**没有**重新验证「跨函数数据流」——静态分析判断不出「读出来的值传给了
+  一个自己不消费它的下游函数」。这一版的结论建立在「读到且在同函数内被使用」，
+  以及抽查了若干跨模块存字段的情况上。
+- 新增的检测依赖 `importlib` 按模块名找插件。**这个前提在 2.2.2 被证明不可靠**，
+  真实宿主上装了也可能 import 不到，详见 2.2.2 的第一条。
+- 197 项配置叶子（当时统计口径）未逐项复核，只核了本次改动涉及的那几个。
+  全项体检放在 2.2.2。
+
 
 ## 2.2.0 - 2026-10-05
 
