@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 
 try:
@@ -421,6 +421,46 @@ class ActiveReconstructionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, recall_req.system_prompt.count("<MemoryCompanion-Reconstruction-Contract>"))
         self.assertIn("正常检索已选出 2 条", recall_req.system_prompt)
         self.assertIn("获得足够证据后立即停止", recall_req.system_prompt)
+
+    def test_dynamic_line_leaves_system_prompt_when_temp_parts_available(self) -> None:
+        """宿主提供 TextPart 时，逐轮变化的动态行不再进 system_prompt。
+
+        system prompt 是整条请求里最应当恒定的前缀，逐轮变化会让变化点之后的
+        前缀缓存每轮都失配。tests/ 不导入 astrbot，所以这里注入一个假 TextPart
+        来覆盖真实宿主那条分支。
+        """
+
+        class _FakeTextPart:
+            def __init__(self, text: str) -> None:
+                self.text = text
+                self.temp = False
+
+            def mark_as_temp(self) -> "_FakeTextPart":
+                self.temp = True
+                return self
+
+        service = self.make_service()
+        recall = self.private_context()
+        recall_req = SimpleNamespace(
+            system_prompt="原始提示",
+            memory_companion_injection_state={"selected_memory_ids": ["m1", "m2"]},
+        )
+        with patch(
+            "astrbot_plugin_memory_companion.core.astrbot_compat.TextPart",
+            _FakeTextPart,
+        ):
+            service._apply_reconstruction_contract(recall_req, recall)
+
+        self.assertEqual(
+            1, recall_req.system_prompt.count("<MemoryCompanion-Reconstruction-Contract>")
+        )
+        self.assertIn("获得足够证据后立即停止", recall_req.system_prompt)
+        self.assertNotIn("正常检索已选出 2 条", recall_req.system_prompt)
+
+        parts = getattr(recall_req, "extra_user_content_parts", [])
+        self.assertEqual(1, len(parts))
+        self.assertIn("正常检索已选出 2 条", parts[0].text)
+        self.assertTrue(getattr(parts[0], "temp", False))
 
     def test_tool_and_configuration_are_registered(self) -> None:
         main = (ROOT / "main.py").read_text(encoding="utf-8")
