@@ -6,6 +6,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from contextlib import contextmanager
+from unittest.mock import patch
 
 
 try:
@@ -645,6 +647,138 @@ class StoreConsistencyTests(unittest.IsolatedAsyncioTestCase):
         finally:
             store._closed = True
         self.assertFalse(store.db_path.exists())
+
+    async def test_memory_ordering_uses_absolute_time_for_mixed_offsets(self) -> None:
+        store = self.make_store()
+        records = [
+            MemoryRecord(
+                id="mixed-offset-older",
+                memory_type="conversation_summary",
+                subject=EntityRef(kind="user", id="u1"),
+                scope="private",
+                session_id="qq:FriendMessage:u1",
+                platform="qq",
+                visibility="private_pair",
+                lifecycle="stable_memory",
+                content="older event",
+                importance=0.5,
+                owner_bot_id="b1",
+                metadata={"owner_bot_id": "b1"},
+                occurred_at="2026-08-01T22:00:00+08:00",
+            ),
+            MemoryRecord(
+                id="mixed-offset-newer",
+                memory_type="conversation_summary",
+                subject=EntityRef(kind="user", id="u1"),
+                scope="private",
+                session_id="qq:FriendMessage:u1",
+                platform="qq",
+                visibility="private_pair",
+                lifecycle="stable_memory",
+                content="newer event",
+                importance=0.5,
+                owner_bot_id="b1",
+                metadata={"owner_bot_id": "b1"},
+                occurred_at="2026-08-01T20:00:00+00:00",
+            ),
+        ]
+        for record in records:
+            await store.insert_memory(record)
+
+        listed = await store.list_memories(
+            limit=10,
+            include_pending=False,
+            scope="private",
+            lifecycle="stable_memory",
+            session_id="qq:FriendMessage:u1",
+        )
+        candidates = await store.list_candidate_memories(limit=10)
+        buckets = await store.list_memory_buckets(limit=10)
+
+        self.assertEqual(
+            ["mixed-offset-newer", "mixed-offset-older"],
+            [record.id for record in listed],
+        )
+        self.assertEqual(
+            ["mixed-offset-newer", "mixed-offset-older"],
+            [record.id for record in candidates],
+        )
+        self.assertEqual("2026-08-01T20:00:00+00:00", buckets[0]["latest_at"])
+
+    async def test_maintenance_repair_commits_fingerprint_work_in_batches(self) -> None:
+        store = self.make_store()
+        store.MAINTENANCE_REPAIR_BATCH_SIZE = 2
+        for index in range(5):
+            await store.insert_memory(
+                MemoryRecord(
+                    id=f"repair-batch-{index}",
+                    memory_type="observation",
+                    subject=EntityRef(kind="user", id="u1"),
+                    scope="private",
+                    session_id="qq:FriendMessage:u1",
+                    visibility="private_pair",
+                    lifecycle="stable_memory",
+                    content=f"repair batch row {index}",
+                )
+            )
+        with store._lock:
+            store._conn.execute(
+                "UPDATE memories SET content_fingerprint='', merged_count=0 WHERE id LIKE 'repair-batch-%'"
+            )
+            store._conn.commit()
+
+        original_transaction = store._transaction_sync
+        transaction_entries = 0
+
+        @contextmanager
+        def counted_transaction():
+            nonlocal transaction_entries
+            transaction_entries += 1
+            with original_transaction():
+                yield
+
+        with patch.object(store, "_transaction_sync", counted_transaction):
+            result = await store.maintenance_repair()
+
+        self.assertEqual(5, result["fingerprint_fixed"])
+        self.assertGreaterEqual(transaction_entries, 5)
+        rows = store._conn.execute(
+            "SELECT content_fingerprint, merged_count FROM memories WHERE id LIKE 'repair-batch-%'"
+        ).fetchall()
+        self.assertTrue(all(row["content_fingerprint"] and row["merged_count"] >= 1 for row in rows))
+
+    async def test_maintenance_repair_does_not_rebuild_fts_for_archived_rows(self) -> None:
+        store = self.make_store()
+        if not store._fts_enabled:
+            self.skipTest("SQLite FTS5 is unavailable")
+        await store.insert_memory(
+            MemoryRecord(
+                id="fts-visible",
+                memory_type="observation",
+                subject=EntityRef(kind="user", id="u1"),
+                scope="private",
+                session_id="qq:FriendMessage:u1",
+                visibility="private_pair",
+                lifecycle="stable_memory",
+                content="visible row",
+            )
+        )
+        await store.insert_memory(
+            MemoryRecord(
+                id="fts-archived",
+                memory_type="observation",
+                subject=EntityRef(kind="user", id="u1"),
+                scope="private",
+                session_id="qq:FriendMessage:u1",
+                visibility="private_pair",
+                lifecycle="archived",
+                content="archived row",
+            )
+        )
+
+        result = await store.maintenance_repair()
+
+        self.assertEqual(0, result["fts_rebuilt"])
 
 
 if __name__ == "__main__":

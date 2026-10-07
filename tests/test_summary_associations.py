@@ -84,7 +84,7 @@ class SummaryAssociationTests(unittest.IsolatedAsyncioTestCase):
             result["associations"],
         )
 
-    def test_unreferenced_facts_and_associations_are_rejected(self) -> None:
+    def test_unreferenced_fact_is_attributed_and_unsupported_body_is_rejected(self) -> None:
         summarizer = MemorySummarizer()
         normalized = summarizer._normalize_payload(
             {
@@ -103,8 +103,29 @@ class SummaryAssociationTests(unittest.IsolatedAsyncioTestCase):
             self.rows(),
         )
 
-        self.assertEqual([], normalized["key_facts"])
+        # A fact without refs of its own is attributed to the message that
+        # actually supports it, so it keeps a real source instead of failing the
+        # batch. An association cannot be attributed that way and stays out.
+        self.assertEqual(
+            [{"fact": "小王喜欢无糖拿铁", "refs": ["event-1"]}],
+            normalized["key_facts_with_refs"],
+        )
         self.assertEqual([], normalized["associations"])
+        self.assertEqual([], normalized["_validation_errors"])
+        self.assertEqual("normal", summarizer.summary_quality(normalized))
+
+    def test_body_without_any_grounding_in_the_window_is_rejected(self) -> None:
+        """A body nothing in the batch supports stays a contract failure."""
+        summarizer = MemorySummarizer()
+        normalized = summarizer._normalize_payload(
+            {
+                "summary": "我记得小王养了三只仓鼠，每天早上都要喂食。",
+                "summary_refs": ["event-1"],
+                "key_facts": [],
+            },
+            self.rows(),
+        )
+        self.assertTrue(normalized["_validation_errors"])
         self.assertEqual("low", summarizer.summary_quality(normalized))
 
     async def test_complete_association_rich_json_is_not_truncated_before_parse(self) -> None:

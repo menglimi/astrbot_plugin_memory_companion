@@ -17,7 +17,7 @@ def memory_emotion_refs(memory: Any, ctx: Any) -> dict[str, dict[str, str]] | No
     user_id = clean_text(getattr(ctx, "user_id", ""), 160)
     bot_id = clean_text(getattr(ctx, "bot_id", ""), 160)
     if (
-        not all((memory_session, current_session, memory_platform, current_platform, user_id, bot_id))
+        not all((memory_session, current_session, memory_platform, current_platform, user_id))
         or memory_session != current_session
         or memory_scope != "private"
         or current_scope != "private"
@@ -35,21 +35,27 @@ def memory_emotion_refs(memory: Any, ctx: Any) -> dict[str, dict[str, str]] | No
     target = getattr(memory, "object", None)
     target_kind = clean_text(getattr(target, "kind", ""), 24)
     target_id = clean_text(getattr(target, "id", ""), 160)
-    if owner_bot_id:
-        if owner_bot_id != bot_id:
+    if bot_id:
+        if owner_bot_id:
+            if owner_bot_id not in {"self", bot_id}:
+                return None
+        elif target_kind != "bot" or target_id != bot_id:
             return None
-    elif target_kind != "bot" or target_id != bot_id:
-        # A legacy record without an explicit owner must at least name this Bot.
-        return None
+        expected_bot_id = bot_id
+    else:
+        # Without a runtime ID, only the context-bound self sentinel is verifiable.
+        if owner_bot_id not in {"", "self"} or target_kind != "bot" or target_id != "self":
+            return None
+        expected_bot_id = "self"
     if target_id and (
-        (target_kind == "bot" and target_id != bot_id)
+        (target_kind == "bot" and target_id not in {expected_bot_id, "self" if owner_bot_id == "self" else expected_bot_id})
         or (target_kind == "user" and target_id != user_id)
         or target_kind not in {"bot", "user"}
     ):
         return None
     return {
         "actor_ref": {"kind": "user", "id": subject_id, "role": clean_text(getattr(subject, "role", ""), 40)},
-        "target_ref": {"kind": "bot", "id": bot_id, "role": "bot_self"},
+        "target_ref": {"kind": "bot", "id": expected_bot_id, "role": "bot_self"},
         "quoted_target_ref": {"kind": "unknown", "id": "", "role": ""},
     }
 

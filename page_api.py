@@ -369,9 +369,24 @@ class PluginPageApi:
         )
 
     async def ui_preferences(self):
-        style = clean_text(self.plugin.service.config.get("appearance.ui_style", "旧版"), 20).lower()
+        """拓展页首屏要用的偏好：走哪套界面 + 用哪套配色。
+
+        ``palette`` 必须在这里返回，而不是让面板自己再去读配置：``index.html`` 是在
+        跳转**之前**调这个端点的，拿到就能先把 ``data-palette`` 打到 ``<html>`` 上，
+        于是配色在第一帧就是对的，不会有「先紫后青」那种闪。
+        """
+        config = self.plugin.service.config
+        style = clean_text(config.get("appearance.ui_style", "旧版"), 20).lower()
         modern = style in {"modern", "new", "新版"}
-        return self._ok({"ui_style": "modern" if modern else "legacy"})
+        theme_name = str(config.get("appearance.theme", DEFAULT_THEME_NAME))
+        return self._ok(
+            {
+                "ui_style": "modern" if modern else "legacy",
+                "palette": self._theme_key(theme_name),
+                "theme": theme_name,
+                "available_palettes": list(THEME_NAME_TO_KEY.keys()),
+            }
+        )
 
     async def stats(self):
         stats = await self.plugin.service.store.stats()
@@ -606,7 +621,7 @@ class PluginPageApi:
             p6_raw, bridge = self._companion_p6_status(service)
             status = build_coordination_status(
                 config=getattr(service, "config", None),
-                runtime={"compatibility_level": "full"},
+                runtime={"compatibility_level": self._compatibility_level(bridge)},
                 bridge=bridge,
                 p6_raw=p6_raw,
             )
@@ -618,6 +633,18 @@ class PluginPageApi:
                 p6_raw=None,
             )
         return self._ok({"status": status})
+
+    @staticmethod
+    def _compatibility_level(bridge: Any) -> str:
+        """兼容等级必须跟着桥接的实际状态走。
+
+        以前这里写死 ``{"compatibility_level": "full"}``，于是不管陪伴插件装没装，
+        面板「协调契约 · 兼容等级」恒显「正常 / 契约完全兼容」——和旁边那行
+        「桥接状态：无法核实」自相矛盾，也是在替用户宣布一个没验证过的结论。
+        桥接真的通了才算完全兼容，其余一律降级。
+        """
+        health = bridge.get("health") if isinstance(bridge, dict) else ""
+        return "full" if health == "ready" else "degraded"
 
     def _companion_p6_status(self, service: Any) -> tuple[Any, dict[str, str]]:
         config = getattr(service, "config", None)
@@ -1605,8 +1632,8 @@ class PluginPageApi:
                 "memory_injection": {
                     "enabled": config.bool("memory_injection.enabled", True),
                     "features_removed": False,
-                    "top_k": config.int("memory_injection.top_k", 6),
-                    "max_chars": config.int("memory_injection.max_chars", 1800),
+                    "top_k": config.int("memory_injection.top_k", 10),
+                    "max_chars": config.int("memory_injection.max_chars", 4000),
                     "temporal_aggregate_max_chars": config.int(
                         "memory_injection.temporal_aggregate_max_chars",
                         3600,
@@ -1643,8 +1670,8 @@ class PluginPageApi:
                     "group_fallback_provider_id": str(
                         config.get("memory_summary.group_fallback_provider_id", "") or ""
                     ),
-                    "min_events": config.int("memory_summary.min_events", 8),
-                    "trigger_event_count": config.int("memory_summary.trigger_event_count", 12),
+                    "min_events": config.int("memory_summary.min_events", 20),
+                    "trigger_event_count": config.int("memory_summary.trigger_event_count", 20),
                     "trigger_interval_minutes": config.int("memory_summary.trigger_interval_minutes", 60),
                     "max_events_per_summary": config.int("memory_summary.max_events_per_summary", 40),
                     "max_retries": config.int("memory_summary.max_retries", 3),
@@ -1670,10 +1697,6 @@ class PluginPageApi:
                         "private_companion_bridge.prefer_memory_companion_memory",
                         True,
                     ),
-                    "preserve_external_prompt_context": config.bool(
-                        "private_companion_bridge.preserve_external_prompt_context",
-                        True,
-                    ),
                     "clean_proactive_history": config.bool("private_companion_bridge.clean_proactive_history", True),
                     "suppress_self_timeline_when_companion_seen": config.bool(
                         "private_companion_bridge.suppress_self_timeline_when_companion_seen",
@@ -1691,7 +1714,7 @@ class PluginPageApi:
                     "enable_acl_rules": config.bool("visibility.enable_acl_rules", True),
                 },
                 "maintenance": {
-                    "retention_raw_event_days": config.int("maintenance.retention_raw_event_days", 7),
+                    "retention_raw_event_days": config.int("maintenance.retention_raw_event_days", 30),
                     "retention_raw_event_limit": config.int("maintenance.retention_raw_event_limit", 1000),
                     "retention_summarized_timeline_days": config.int(
                         "maintenance.retention_summarized_timeline_days", 30
@@ -1707,7 +1730,6 @@ class PluginPageApi:
                         "maintenance.memory_decay_max_importance_percent",
                         74,
                     ),
-                    "memory_decay_max_access_count": config.int("maintenance.memory_decay_max_access_count", 2),
                     "memory_decay_score_threshold_percent": config.int(
                         "maintenance.memory_decay_score_threshold_percent",
                         75,
@@ -3498,14 +3520,8 @@ class PluginPageApi:
                     merged = None
             add(merged or provider_config)
 
-        config_path = self._astrbot_cmd_config_path()
-        if config_path.exists():
-            try:
-                data = json.loads(config_path.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-            for provider_config in data.get("provider", []) if isinstance(data, dict) else []:
-                add(provider_config)
+        for provider_config in self._cmd_config_provider_configs():
+            add(provider_config)
         return rows
 
     def _configured_embedding_providers(self, manager: Any) -> list[dict[str, Any]]:
@@ -3539,14 +3555,8 @@ class PluginPageApi:
                     merged = None
             add(merged or provider_config)
 
-        config_path = self._astrbot_cmd_config_path()
-        if config_path.exists():
-            try:
-                data = json.loads(config_path.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-            for provider_config in data.get("provider", []) if isinstance(data, dict) else []:
-                add(provider_config)
+        for provider_config in self._cmd_config_provider_configs():
+            add(provider_config)
         return rows
 
     @staticmethod
@@ -3674,3 +3684,34 @@ class PluginPageApi:
         if isinstance(value, str):
             return value.strip().lower() not in {"0", "false", "off", "no", "否", "关"}
         return bool(value)
+
+    def _cmd_config_provider_configs(self) -> list[dict[str, Any]]:
+        config_path = self._astrbot_cmd_config_path()
+        if not config_path.exists():
+            return []
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            return []
+        if not isinstance(data, dict):
+            return []
+
+        source_configs = data.get("provider_sources")
+        if not isinstance(source_configs, list):
+            source_configs = []
+        provider_configs = data.get("provider")
+        if not isinstance(provider_configs, list):
+            return []
+
+        sources = {
+            clean_text(source.get("id"), 160): source
+            for source in source_configs
+            if isinstance(source, dict) and clean_text(source.get("id"), 160)
+        }
+        rows: list[dict[str, Any]] = []
+        for provider in provider_configs:
+            if not isinstance(provider, dict):
+                continue
+            source = sources.get(clean_text(provider.get("provider_source_id"), 160))
+            rows.append({**(source or {}), **provider})
+        return rows

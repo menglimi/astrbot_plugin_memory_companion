@@ -28,8 +28,24 @@
     })();
   </script>
   <link rel="stylesheet" href="./app.css?v=2.1.0-ui-v1" />
+  <!-- app.js 挂载三维档案阵列与装配查看器时只认 window.MemoryCinema3D，而全仓库
+       只有 cinema-3d.bundle.js 会定义它。缺了这个标签，面板会等满 8 秒再显示
+       "ARCHIVE SCENE / UNAVAILABLE"，且重试按钮永远无效。放在 head 里让下载提前
+       开始；该包是自包含的 ES module，不依赖 assets/ 下的 three.js 与 loader。 -->
+  <script type="module" src="./assets/cinema-3d.bundle.js"></script>
 </head>
 <body>
+  <!-- 开场遮罩。指针恒不吃（见 app.css 的 .intro），且不依赖 JS 收尾：
+       动画最后一帧自带 visibility:hidden，脚本失效也会自己消失。
+       文案就是插件的 display_name（metadata.yaml 里那个），首屏直接给到。 -->
+  <div class="intro" id="intro" aria-hidden="true">
+    <div class="intro-inner">
+      <div class="intro-mark"></div>
+      <h1 class="intro-title">我会牢牢记住你</h1>
+      <p class="intro-sub">MEMORY COMPANION · 记忆中枢</p>
+      <div class="intro-rule"><i></i></div>
+    </div>
+  </div>
   <div class="shell" id="shell">
     <aside class="rail" id="rail" aria-label="主导航">
       <div class="rail-brand"><span class="brand-mark" aria-hidden="true"></span><span class="brand-copy"><b>记忆面板</b><small>我会牢牢记住你</small></span></div>
@@ -43,6 +59,28 @@
   </div>
   <aside class="drawer" id="drawer" aria-hidden="true" aria-label="记忆详情"><div class="drawer-head"><div><p class="eyebrow" id="drawerEyebrow">记忆</p><h2 id="drawerTitle">未选择</h2></div><button class="icon-btn" id="drawerClose" type="button" aria-label="关闭详情"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg></button></div><div class="drawer-body" id="drawerBody"></div></aside>
   <div class="scrim" id="scrim" hidden></div><div class="busy-layer" id="busyLayer" aria-hidden="true"><span class="busy-ring"></span><b id="busyText">正在处理…</b></div><div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script>
+    (() => {
+      const KEY = "memory_companion_intro_shown";
+      let node = null;
+      try {
+        if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+        if (sessionStorage.getItem(KEY) === "1") return;
+        sessionStorage.setItem(KEY, "1");
+      } catch (_) { return; }
+      // 面板本体在幕布抬起时柔和现身（见 app.css 的 .intro-played .shell）。
+      // 这个 class 必须在动画开始前就加上，而且只在真的开播时加——
+      // 跳过开场的两种情况下面板必须立刻可用。
+      document.body.classList.add("intro-played");
+      node = document.getElementById("intro");
+      if (!node) return;
+      // 动画自己会收尾，这里只是把节点摘干净；两条兜底防的是标签页被冻结时
+      // animationend 不触发，节点就一直留在 DOM 里。
+      const drop = () => { if (node && node.parentNode) node.parentNode.removeChild(node); };
+      node.addEventListener("animationend", drop, { once: true });
+      window.setTimeout(drop, 4000);
+    })();
+  </script>
   <script src="/api/plugin/page/bridge-sdk.js"></script><script src="./app.js?v=2.1.4-summary"></script>
 </body>
 </html>

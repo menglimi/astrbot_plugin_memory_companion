@@ -17,7 +17,7 @@ from .core.models import json_dumps
 from .core.service import MemoryCompanionService
 
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
-PLUGIN_VERSION = "2.1.4"
+PLUGIN_VERSION = "2.2.3"
 
 _ACTIVE_BRIDGE: MemoryCompanionBridge | None = None
 
@@ -53,10 +53,11 @@ class MemoryCompanionPlugin(Star):
             config=config or {},
             plugin_root=Path(__file__).resolve().parent,
             data_dir=data_dir,
+            defer_database_initialization=True,
         )
         self.memory_companion = MemoryCompanionBridge(self.service)
         self.memory_companion.bind_cache_invalidation(self.service.store)
-        self.bot_personal_capabilities = self.memory_companion.probe_capability_snapshot()
+        self.bot_personal_capabilities = self.memory_companion.probe_capability_snapshot(self.context)
         if not self.bot_personal_capabilities.get("available", False):
             logger.warning(
                 "[MemoryCompanion] Bot Personal capability probe degraded: %s",
@@ -73,10 +74,27 @@ class MemoryCompanionPlugin(Star):
 
     async def initialize(self):
         """Start retained maintenance workers after AstrBot owns the event loop."""
+        await self.service.initialize_database()
         self.service._ensure_lifecycle_maintenance_dispatcher()
         self.service._ensure_portrait_daily_dispatcher()
 
     def bot_personal_capability_status(self) -> dict[str, Any]:
+        """现探，不吃启动时拍的那张快照。
+
+        快照是 __init__ 时拍的。用户装完或启用陪伴插件之后，面板必须**立刻**显示
+        「已连接」，而不是要等重启 AstrBot 才变——「明明装了却一直说没装」正是
+        这么来的：快照永远停留在插件启动那一刻的状态。
+
+        探测失败就退回启动快照，至少不返回空。
+        """
+        probe = getattr(self.memory_companion, "probe_capability_snapshot", None)
+        if callable(probe):
+            try:
+                fresh = probe(self.context)
+            except Exception:
+                fresh = None
+            if isinstance(fresh, dict) and fresh:
+                return fresh
         return dict(self.bot_personal_capabilities)
 
     def _register_page_api_if_available(self) -> None:
@@ -99,6 +117,7 @@ class MemoryCompanionPlugin(Star):
         配置为正数时，整个钩子被 ``asyncio.wait_for`` 包裹，超时即降级放行
         （本轮无记忆注入），绝不拖死全轮对话。默认值 0 = 关闭，完全向后兼容。
         """
+        await self.service.initialize_database()
         budget = self.service.config.float("hook_request_budget_seconds", 0.0)
         if budget <= 0:
             await self.service.handle_llm_request(event, req)
@@ -120,10 +139,12 @@ class MemoryCompanionPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
     async def on_group_message(self, event: AstrMessageEvent):
+        await self.service.initialize_database()
         await self.service.handle_group_message(event)
 
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
+        await self.service.initialize_database()
         await self.service.handle_llm_response(event, resp)
 
     @filter.llm_tool(name="memory_companion_recall")

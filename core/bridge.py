@@ -11,7 +11,12 @@ from zoneinfo import ZoneInfo
 
 from . import bot_personal_contract
 from .bot_personal_dto import BotPersonalArchiveDTO, build_bot_personal_archive
-from .capability_probe import CapabilityCache, PROFILE_NAMES as C4_PROFILE_NAMES, build_capability_snapshot
+from .capability_probe import (
+    CapabilityCache,
+    PROFILE_NAMES as C4_PROFILE_NAMES,
+    build_capability_snapshot,
+    detect_companion_plugin,
+)
 from .context_consumer import consume_context_projection
 from .models import EntityRef, MemoryRecord, SessionContext, clean_text
 from .namespace_capability import namespace_capability_descriptor
@@ -1753,12 +1758,20 @@ class MemoryCompanionBridge:
             companion_available=companion_available,
         )
 
-    def probe_capability_snapshot(self) -> dict[str, Any]:
+    def probe_capability_snapshot(self, context: Any = None) -> dict[str, Any]:
         """Return the C4 capability snapshot without touching plugin state or storage.
 
         The probe is intentionally based only on the shared contract module. It
         must remain safe to call from ordinary chat paths even when the contract
         is stale or the local module is otherwise malformed.
+
+        ``context`` is passed in rather than read from ``self._plugin`` on
+        purpose: the capability probe must never touch plugin state -- callers
+        use it before the service is safe to query, and C1 guarantees no storage
+        access.  Reading ``self._plugin.context`` here broke that invariant
+        (tests/test_c1_bridge_probe.py asserts it).  Callers that know the context
+        hand it in; everyone else falls back to a module-alias probe, which is
+        the right conservative answer when there is no host registry to ask.
         """
         if not self._active:
             return self._negative_personal_capability_probe("bridge_inactive")
@@ -1812,6 +1825,13 @@ class MemoryCompanionBridge:
         result["state"] = "available"
         result["degraded"] = False
         self._add_personal_capability_contract_aliases(result)
+        # ``available`` 到此为止只代表**记忆侧这份 contract 自检通过**，也就是
+        # 「我准备好了、可以跟陪伴侧对话」。它不代表陪伴插件装了——过去面板正是
+        # 把这两件事当成一件，才会在没装陪伴插件时显示「已连接」。
+        # 「装没装」必须真去问运行时，所以单独探测、单独两个字段。
+        companion = detect_companion_plugin(context)
+        result["companion_installed"] = bool(companion["companion_installed"])
+        result["companion_plugin_name"] = str(companion["companion_plugin_name"])
         c4_snapshot = build_capability_snapshot(
             available=True,
             state="available",
@@ -1819,6 +1839,8 @@ class MemoryCompanionBridge:
             methods=result.get("methods", []),
             profiles=C4_PROFILE_NAMES,
             warnings=result.get("warnings", []),
+            companion_installed=result["companion_installed"],
+            companion_plugin_name=result["companion_plugin_name"],
         )
         result.update(c4_snapshot)
         result["memory_domain"] = bot_personal_contract.BOT_PERSONAL_MEMORY_DOMAIN
@@ -1834,10 +1856,10 @@ class MemoryCompanionBridge:
         result.setdefault("warnings", [])
         return result
 
-    def probe_bot_personal_memory_capabilities(self) -> dict[str, Any]:
+    def probe_bot_personal_memory_capabilities(self, context: Any = None) -> dict[str, Any]:
         """Backward-compatible C1 probe; C4 state is exposed as capability_state."""
 
-        result = dict(self.probe_capability_snapshot())
+        result = dict(self.probe_capability_snapshot(context))
         if result.get("capability_state") == "available":
             result["state"] = "ready"
         result["legacy_state"] = result.get("state", "degraded")

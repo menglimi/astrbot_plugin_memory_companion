@@ -125,3 +125,28 @@ class PageMemoryVisibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(album))
         self.assertTrue(album[0]["exists"])
         self.assertEqual("图书馆窗边自拍", album[0]["prompt"])
+
+    def test_configured_provider_fallback_reads_utf8_bom(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory) / "data" / "plugin_data" / "astrbot_plugin_memory_companion"
+            data_dir.mkdir(parents=True)
+            config_path = data_dir.parent.parent / "cmd_config.json"
+            config_path.write_text(
+                '{"provider_sources":['
+                '{"id":"embed-source","type":"sample_embedding","provider_type":"embedding"},'
+                '{"id":"rerank-source","type":"sample_rerank","provider_type":"rerank"}],'
+                '"provider":[{"id":"embed-test","provider_source_id":"embed-source"},'
+                '{"id":"rerank-test","provider_source_id":"rerank-source"}]}',
+                encoding="utf-8-sig",
+            )
+            api = PluginPageApi(SimpleNamespace(service=SimpleNamespace(data_dir=data_dir)))
+            manager = SimpleNamespace(providers_config=[])
+
+            self.assertEqual(
+                ["rerank-test"],
+                [row["id"] for row in api._configured_rerank_providers(manager)],
+            )
+            self.assertEqual(
+                ["embed-test"],
+                [row["id"] for row in api._configured_embedding_providers(manager)],
+            )
