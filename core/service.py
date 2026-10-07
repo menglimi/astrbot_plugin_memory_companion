@@ -24,6 +24,14 @@ from .astrbot_compat import (
     remove_temp_text,
     sanitize_request_history,
 )
+from .assertions import (
+    ASSERTION_MEMORY_TYPE,
+    CROSS_SCENE_DIMENSIONS,
+    MAX_ASSERTIONS_PER_BATCH,
+    assertion_is_promotable,
+    cardinality_for,
+    normalize_assertion,
+)
 from .audit import MemoryAuditManager
 from .bridge import (
     consume_authenticated_companion_projection,
@@ -2565,7 +2573,7 @@ class MemoryCompanionService:
         if not gate.get("ok"):
             return []
         ctx = self.session_context_from_bridge(session_context)
-        results = await self.search(query, ctx, top_k or self.config.int("memory_injection.top_k", 6))
+        results = await self.search(query, ctx, top_k or self.config.int("memory_injection.top_k", 10))
         serialized = [serialize_memory(item.memory, item.score, item.reason) for item in results]
         snapshot = gate.get("snapshot")
         if snapshot is not None:
@@ -2600,8 +2608,8 @@ class MemoryCompanionService:
         return await self._compose_memory_injection(
             ctx,
             explicit_query=query_text,
-            top_k=top_k or self.config.int("memory_injection.top_k", 6),
-            max_chars=max_chars or self.config.int("memory_injection.max_chars", 1800),
+            top_k=top_k or self.config.int("memory_injection.top_k", 10),
+            max_chars=max_chars or self.config.int("memory_injection.max_chars", 4000),
             note="bridge_injection",
             write_log=False,
             companion_bot_mood=companion_bot_mood,
@@ -2701,10 +2709,10 @@ class MemoryCompanionService:
             return self.injection.compose(
                 ctx,
                 [],
-                max_chars or self.config.int("memory_injection.max_chars", 1800),
+                max_chars or self.config.int("memory_injection.max_chars", 4000),
                 core_memories=core_memories,
                 core_memory_max_chars=core_memory_max_chars,
-                max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
+                max_item_chars=self.config.int("memory_injection.max_item_chars", 400),
             )
 
         schedule_types = {"schedule_fragment", "persona_life", "companion_note"}
@@ -2839,10 +2847,10 @@ class MemoryCompanionService:
             return self.injection.compose(
                 ctx,
                 [],
-                max_chars or self.config.int("memory_injection.max_chars", 1800),
+                max_chars or self.config.int("memory_injection.max_chars", 4000),
                 core_memories=core_memories,
                 core_memory_max_chars=core_memory_max_chars,
-                max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
+                max_item_chars=self.config.int("memory_injection.max_item_chars", 400),
             )
 
         slot_map: dict[str, list[SearchResult]] = {"self_timeline": [], "user_profile": []}
@@ -2881,7 +2889,7 @@ class MemoryCompanionService:
         injection = self.injection.compose(
             ctx,
             results,
-            max_chars or self.config.int("memory_injection.max_chars", 1800),
+            max_chars or self.config.int("memory_injection.max_chars", 4000),
             intent_context=intent_context,
             slot_sections=self._slot_sections(slot_map),
             compact_memory=True,
@@ -2892,7 +2900,7 @@ class MemoryCompanionService:
             address_hint="" if outfit_focus else self._address_hint_for_injection(ctx),
             core_memories=core_memories,
             core_memory_max_chars=core_memory_max_chars,
-            max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
+            max_item_chars=self.config.int("memory_injection.max_item_chars", 400),
         )
         logger.info(
             "[MemoryCompanion] %s快速上下文已生成: session=%s candidates=%s selected=%s chars=%s elapsed_ms=%s",
@@ -3264,6 +3272,10 @@ class MemoryCompanionService:
             "rerank_candidate_multiplier": self.config.int("retrieval.rerank_candidate_multiplier", 5),
             "rerank_candidate_limit": self.config.int("retrieval.rerank_candidate_limit", 32),
             "rerank_timeout_ms": self.config.int("retrieval.rerank_timeout_ms", 1200),
+            "latency_budget_ms": self.config.int("retrieval_advanced.recall_latency_budget_ms", 0),
+            "query_vector_cache_ttl_seconds": self.config.float(
+                "retrieval_advanced.query_vector_cache_ttl_seconds", 0.0
+            ),
             "embedding_enabled": self.config.bool("retrieval.embedding_enabled", False),
             "embedding_provider_id": clean_text(self.config.get("retrieval.embedding_provider_id", ""), 160),
             "embedding_candidate_limit": self.config.int("retrieval.embedding_candidate_limit", 1200),
@@ -3589,6 +3601,10 @@ class MemoryCompanionService:
             rerank_candidate_multiplier=self.config.int("retrieval.rerank_candidate_multiplier", 5),
             rerank_candidate_limit=self.config.int("retrieval.rerank_candidate_limit", 32),
             rerank_timeout_ms=self.config.int("retrieval.rerank_timeout_ms", 1200),
+            latency_budget_ms=self.config.int("retrieval_advanced.recall_latency_budget_ms", 0),
+            query_vector_cache_ttl_seconds=self.config.float(
+                "retrieval_advanced.query_vector_cache_ttl_seconds", 0.0
+            ),
             embedding_provider=embedding_provider,
             embedding_provider_id=embedding_provider_id,
             embedding_enabled=embedding_enabled,
@@ -4594,12 +4610,12 @@ class MemoryCompanionService:
 
     def _summary_window_ready(self, window: dict[str, Any], *, force: bool) -> bool:
         total = int(window.get("total") or 0)
-        min_events = self.config.int("memory_summary.min_events", 8)
+        min_events = self.config.int("memory_summary.min_events", 20)
         if total < (1 if force else min_events):
             return False
         if force:
             return True
-        trigger_count = self.config.int("memory_summary.trigger_event_count", 12)
+        trigger_count = self.config.int("memory_summary.trigger_event_count", 20)
         if total >= max(min_events, trigger_count):
             return True
         return self.summarizer.interval_elapsed(
@@ -4702,6 +4718,7 @@ class MemoryCompanionService:
             attempt_index = 0
             # Manual runs get a bounded new round, without resetting automatic counters.
             round_calls = 0
+            provider_failed = False
             try:
                 while attempt_index < len(summary_attempts) and round_calls < max_calls:
                     attempt = summary_attempts[attempt_index]
@@ -4730,48 +4747,86 @@ class MemoryCompanionService:
                         feedback = "; ".join(errors)
                         previous_response = json_dumps(payload or {})
                     except Exception as exc:
+                        provider_failed = True
                         feedback = self._describe_exception(exc)
                         if self._summary_failure_is_transient(feedback):
                             current = await self.store.get_summary_batch(batch_id)
                             exhausted = not force and current["automatic_calls"] >= max_calls
                             await self.store.defer_summary_batch(
                                 batch_id, "repair:" + feedback if repair else feedback,
-                                quarantine=exhausted or repair,
+                                quarantine=exhausted,
                                 delay=self._summary_retry_backoff_seconds(current["automatic_calls"]),
                             )
-                            if repair or exhausted:
+                            if exhausted:
                                 return ""
                             attempt_index += 1
                             continue
                         previous_response = getattr(exc, "response", "")
                     current = await self.store.get_summary_batch(batch_id)
                     exhausted = not force and current["automatic_calls"] >= max_calls
+                    if provider_failed:
+                        # The provider itself is unusable for this round, so the
+                        # batch is frozen rather than retried forever. Its events
+                        # stay owned and auditable instead of being consumed.
+                        await self.store.defer_summary_batch(
+                            batch_id, "repair:" + feedback, quarantine=exhausted or repair,
+                            delay=self._summary_retry_backoff_seconds(current["automatic_calls"]),
+                        )
+                        if repair or exhausted:
+                            break
+                        repair = True
+                        continue
+                    # A citation problem is not a reason to freeze the window.
+                    # Quarantining here kept owning the events forever, so the
+                    # conversation never became memory and its timeline rows
+                    # never became eligible for cleanup either.  Retry until the
+                    # call budget is spent, then keep the body as a candidate.
+                    provider_failed = False
                     await self.store.defer_summary_batch(
-                        batch_id, "repair:" + feedback, quarantine=repair or exhausted,
+                        batch_id, "repair:" + feedback, quarantine=False,
                         delay=self._summary_retry_backoff_seconds(current["automatic_calls"]),
                     )
-                    if repair or exhausted:
+                    if exhausted:
                         break
-                    # Repeat once with actionable validation feedback, never the unchanged prompt.
+                    # Repeat with actionable validation feedback, never the unchanged prompt.
                     repair = True
             finally:
                 if not force:
                     self._summary_call_semaphore.release()
             if not payload or self.summarizer.validation_errors(payload):
-                # Quarantine is not "waiting": the batch keeps owning its
-                # events, so they stay frozen until a human releases them.
                 current = await self.store.get_summary_batch(batch_id)
-                if str((current or {}).get("state") or "") == "quarantined":
+                state = str((current or {}).get("state") or "")
+                if state == "quarantined":
                     logger.warning(
                         "[MemoryCompanion] 阶段总结批次已隔离，本批原始事件冻结等待复核释放: session=%s batch=%s",
                         ctx.session_id, batch_id,
                     )
-                else:
+                    return ""
+                if self.summarizer.compose_memory_content(payload or {}):
+                    # The model did return a body, so the conversation is worth
+                    # keeping even when its citations do not hold up.
                     logger.warning(
-                        "[MemoryCompanion] 阶段总结批次等待修复，后续消息继续处理: session=%s batch=%s",
-                        ctx.session_id, batch_id,
+                        "[MemoryCompanion] 阶段总结校验未通过，转为待复核候选保留本批内容: session=%s batch=%s error=%s",
+                        ctx.session_id, batch_id, feedback,
                     )
+                    return await self._store_summary_evidence_candidate(ctx, batch_id, rows, payload, feedback)
+                spent = not force and int((current or {}).get("automatic_calls") or 0) >= max_calls
+                no_more_attempts = spent or str((current or {}).get("retry_reason") or "") == self.store.REPAIR_RETRY_REASON
+                if no_more_attempts:
+                    # Nothing usable came back and this batch is out of attempts,
+                    # so freeze it instead of consuming events of unproven value.
+                    logger.warning(
+                        "[MemoryCompanion] 阶段总结无可用正文，批次隔离等待复核: session=%s batch=%s error=%s",
+                        ctx.session_id, batch_id, feedback,
+                    )
+                    await self.store.defer_summary_batch(batch_id, "repair:" + feedback, quarantine=True, delay=0)
+                    return ""
+                logger.warning(
+                    "[MemoryCompanion] 阶段总结批次保留等待后续触发: session=%s batch=%s",
+                    ctx.session_id, batch_id,
+                )
                 return ""
+
 
             consumed_ids = {
                 clean_text(item, 160)
@@ -4876,6 +4931,7 @@ class MemoryCompanionService:
             self.importance.calibrate(record, source="conversation_summary")
             memory_id = await self.store.finish_summary_batch(batch_id, [str(row["id"]) for row in rows], record=record)
             self._schedule_memory_embedding(memory_id, record)
+            await self._persist_assertions(ctx, payload or {}, memory_id, rows)
             await self._record_verified_group_bot_self_facts(ctx, rows, payload or {}, memory_id)
             await self._index_summary_knowledge_graph(ctx, record, payload or {}, memory_id)
             marked = len(rows)
@@ -4887,6 +4943,209 @@ class MemoryCompanionService:
                 marked,
             )
             return memory_id
+
+    async def _store_summary_evidence_candidate(
+        self,
+        ctx: SessionContext,
+        batch_id: str,
+        rows: list[dict[str, Any]],
+        payload: dict[str, Any] | None,
+        feedback: str,
+    ) -> str:
+        """Keep a batch whose summary could not be validated instead of freezing it.
+
+        Quarantine is the right answer only when the provider itself is broken.
+        When the model did return a body, discarding it lost the conversation for
+        good: the batch kept owning its events, so those messages could never
+        reach memory and their timeline rows could never be cleaned up either.
+        The batch is therefore stored as a pending evidence candidate -- visible
+        in the panel and reviewable, but never injected as a stable memory.
+        """
+        body = self.summarizer.compose_memory_content(payload or {})
+        valid_days = max(
+            1,
+            self.config.int("memory_summary.candidate_valid_days", 30),
+        )
+        record = MemoryRecord(
+            id=self.stable_id("summary_batch", batch_id),
+            memory_type="conversation_summary",
+            subject=self._bot_entity(ctx) if ctx.scope == "group" else EntityRef(kind="user", id=ctx.user_id, name=ctx.user_name, role="conversation_partner"),
+            object=EntityRef(kind="group", id=ctx.group_id, name=ctx.group_name, role="group") if ctx.scope == "group" else self._bot_entity(ctx),
+            scope=ctx.scope,
+            session_id=ctx.session_id,
+            platform=ctx.platform,
+            group_id=ctx.group_id,
+            visibility="group_public" if ctx.scope == "group" else "private_pair",
+            sayability="direct",
+            reality_level="llm_summary",
+            lifecycle="short_term_candidate",
+            content=body,
+            evidence="\n".join(
+                clean_text(row.get("content"), 220)
+                for row in rows[: self.config.int("memory_summary.evidence_events", 12)]
+                if clean_text(row.get("content"), 220)
+            ),
+            confidence=0.4,
+            importance=0.3,
+            review_status="pending",
+            tags=["summary", "evidence_candidate", "summary_validation_failed", ctx.scope],
+            owner_bot_id=self._bot_subject_id(ctx),
+            valid_to=(datetime.now(timezone.utc) + timedelta(days=valid_days)).isoformat(timespec="seconds"),
+            durability="short",
+            sensitivity="internal",
+            metadata={
+                "summary_batch_id": batch_id,
+                "summary_event_count": len(rows),
+                "degraded_summary": True,
+                "summary_validation_error": clean_text(feedback, 1800),
+                "summary_refs": (payload or {}).get("summary_refs", []),
+                "key_facts_with_refs": (payload or {}).get("key_facts_with_refs", []),
+                "topics": (payload or {}).get("topics", []),
+                "raw_timeline_preserved": True,
+                "owner_bot_id": self._bot_subject_id(ctx),
+                "policy_version": "memory_capture_v1",
+                "source_event_ids": [
+                    clean_text(row.get("id"), 160)
+                    for row in rows
+                    if clean_text(row.get("id"), 160)
+                ],
+            },
+        )
+        memory_id = await self.store.finish_summary_batch(
+            batch_id, [str(row["id"]) for row in rows], record=record,
+        )
+        await self._persist_assertions(ctx, payload or {}, memory_id, rows)
+        logger.warning(
+            "[MemoryCompanion] 阶段总结已降级为待复核候选: session=%s batch=%s memory=%s",
+            ctx.session_id, batch_id, memory_id,
+        )
+        return memory_id
+
+    async def _persist_assertions(
+        self,
+        ctx: SessionContext,
+        payload: dict[str, Any],
+        summary_memory_id: str,
+        rows: list[dict[str, Any]],
+    ) -> list[str]:
+        """Store what this window says is true about the person, merged by slot.
+
+        A summary records what was discussed; an assertion records what is
+        true, which is the only part a later conversation can be answered from.
+        Both come out of the single summary call, so this adds no latency and
+        no extra model cost.
+
+        Failures are contained on purpose: a summary that has already landed
+        must never be retried or rolled back because one assertion could not be
+        stored.
+        """
+        if not self.config.bool("memory_assertions.enabled", True):
+            return []
+        raw = payload.get("assertions")
+        if not isinstance(raw, list) or not raw:
+            return []
+        limit = max(1, self.config.int("memory_assertions.max_per_batch", MAX_ASSERTIONS_PER_BATCH))
+        row_by_id = {
+            clean_text(row.get("id"), 160): row
+            for row in rows
+            if clean_text(row.get("id"), 160)
+        }
+        stored: list[str] = []
+        promoted = 0
+        for item in raw[:limit]:
+            assertion = normalize_assertion(item)
+            if not assertion:
+                continue
+            evidence = [
+                clean_text(row_by_id[ref].get("content"), 220)
+                for ref in assertion["refs"]
+                if ref in row_by_id and clean_text(row_by_id[ref].get("content"), 220)
+            ]
+            promotable = assertion_is_promotable(assertion, evidence)
+            record = self._assertion_record(ctx, assertion, summary_memory_id, evidence, promotable)
+            try:
+                result = await self.store.upsert_assertion(record)
+            except Exception as exc:
+                logger.warning(
+                    "[MemoryCompanion] 断言写入失败，已跳过该条: session=%s dimension=%s error=%s",
+                    ctx.session_id, assertion["dimension"], self._describe_exception(exc),
+                )
+                continue
+            if not result.get("ok"):
+                continue
+            stored.append(clean_text(result.get("memory_id"), 120))
+            promoted += 1 if promotable else 0
+        if stored:
+            logger.info(
+                "[MemoryCompanion] 已提炼断言: session=%s stored=%s promoted=%s",
+                ctx.session_id, len(stored), promoted,
+            )
+        return stored
+
+    def _assertion_record(
+        self,
+        ctx: SessionContext,
+        assertion: dict[str, Any],
+        summary_memory_id: str,
+        evidence: list[str],
+        promotable: bool,
+    ) -> MemoryRecord:
+        """Build one assertion row, scoped exactly like the conversation it came from.
+
+        Visibility mirrors the source window: a fact distilled from a private
+        chat stays inside that private pair, so no later step can surface it in
+        a group.  Only the already-whitelisted preference dimensions are marked
+        cross-scene, and only for the user themselves.
+        """
+        dimension = assertion["dimension"]
+        cross_scene = ctx.scope != "group" and dimension in CROSS_SCENE_DIMENSIONS
+        value = assertion["value"]
+        qualifier = assertion["qualifier"]
+        content = f"{qualifier}：{value}" if qualifier else value
+        return MemoryRecord(
+            id=self.stable_id("assertion", ctx.user_id, dimension, assertion["polarity"], value),
+            memory_type=ASSERTION_MEMORY_TYPE,
+            subject=EntityRef(kind="user", id=ctx.user_id, name=ctx.user_name, role="assertion_subject"),
+            object=self._bot_entity(ctx),
+            scope=ctx.scope,
+            session_id=ctx.session_id,
+            platform=ctx.platform,
+            group_id=ctx.group_id,
+            visibility="private_pair" if ctx.scope != "group" else "group_public",
+            sayability="direct",
+            reality_level="llm_assertion",
+            lifecycle="stable_memory" if promotable else "short_term_candidate",
+            content=content,
+            evidence="\n".join(evidence),
+            confidence=0.78 if promotable else 0.5,
+            importance=0.6 if promotable else 0.3,
+            review_status="auto" if promotable else "pending",
+            tags=[
+                "assertion",
+                dimension,
+                assertion["polarity"],
+                "long_term" if promotable else "evidence_candidate",
+            ],
+            owner_bot_id=self._bot_subject_id(ctx),
+            durability="normal" if promotable else "short",
+            sensitivity="internal",
+            metadata={
+                "profile_dimension": dimension,
+                "profile_polarity": assertion["polarity"],
+                "profile_value": value,
+                "normalized_value": assertion["normalized_value"],
+                "profile_cardinality": cardinality_for(dimension),
+                "profile_state": "active" if promotable else "candidate",
+                "assertion_durability": assertion["durability"],
+                "assertion_evidence_refs": list(assertion["refs"]),
+                "assertion_source_summary_id": summary_memory_id,
+                "assertion_cross_scene": cross_scene,
+                "assertion_extractor": "summary_assertion_v1",
+                "extraction_quality_score": 0.78 if promotable else 0.5,
+                "owner_bot_id": self._bot_subject_id(ctx),
+                "policy_version": "memory_assertion_v1",
+            },
+        )
 
     async def _record_verified_group_bot_self_facts(
         self,
@@ -6976,19 +7235,37 @@ class MemoryCompanionService:
 
     async def _run_raw_event_retention(self) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
-        raw_days = self.config.int("maintenance.retention_raw_event_days", 7)
+        raw_days = self.config.int("maintenance.retention_raw_event_days", 30)
         timeline_days = self.config.int("maintenance.retention_summarized_timeline_days", 30)
+        # Rows whose batch never produced a memory were outside the summarized
+        # cleanup, so the table could only grow.  Off unless the operator opts
+        # in, because this deletes raw conversation.
+        unsummarized_days = self.config.int("maintenance.retention_unsummarized_timeline_days", 0)
         injection_log_days = self.config.int("maintenance.retention_injection_log_days", 14)
+        pending_days = self.config.int("maintenance.pending_review_max_age_days", 30)
         archived = 0
         if raw_days > 0:
             archived = await self.store.archive_raw_events_older_than(
                 (now - timedelta(days=raw_days)).isoformat(timespec="seconds"),
                 limit=self.config.int("maintenance.retention_raw_event_limit", 1000),
             )
+        # A pending candidate is excluded from recall and, without this, from the
+        # decay pool too, so it used to stay pending forever.
+        pending_archived = 0
+        if pending_days > 0:
+            pending_archived = await self.store.archive_stale_pending_memories(
+                (now - timedelta(days=pending_days)).isoformat(timespec="seconds"),
+                limit=self.config.int("maintenance.retention_cleanup_limit", 2000),
+            )
         pruned = await self.store.prune_retained_rows(
             summarized_timeline_cutoff=(
                 (now - timedelta(days=timeline_days)).isoformat(timespec="seconds")
                 if timeline_days > 0
+                else ""
+            ),
+            unsummarized_timeline_cutoff=(
+                (now - timedelta(days=unsummarized_days)).isoformat(timespec="seconds")
+                if unsummarized_days > 0
                 else ""
             ),
             injection_log_cutoff=(
@@ -6998,15 +7275,21 @@ class MemoryCompanionService:
             ),
             limit=self.config.int("maintenance.retention_cleanup_limit", 2000),
         )
-        enabled = any(days > 0 for days in (raw_days, timeline_days, injection_log_days))
+        enabled = any(
+            days > 0 for days in (raw_days, timeline_days, unsummarized_days, injection_log_days)
+        )
         return {
             "enabled": enabled,
             "raw_event_days": raw_days,
             "archived": archived,
+            "pending_review_max_age_days": pending_days,
+            "pending_candidates_archived": pending_archived,
             "summarized_timeline_days": timeline_days,
+            "unsummarized_timeline_days": unsummarized_days,
             "timeline_deleted": pruned.get("timeline", 0),
             "injection_log_days": injection_log_days,
             "injection_logs_deleted": pruned.get("injection_logs", 0),
+            "unsummarized_backlog": await self.store.unsummarized_timeline_backlog(),
         }
 
     async def _run_memory_decay(self) -> dict[str, Any]:
@@ -7639,7 +7922,7 @@ class MemoryCompanionService:
             return self.injection.compose(
                 ctx,
                 [],
-                max_chars or self.config.int("memory_injection.max_chars", 1800),
+                max_chars or self.config.int("memory_injection.max_chars", 4000),
                 intent_context=intent_context,
                 emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"),
                 intimacy_level=getattr(turn_signal, "intimacy_level", 0.0),
@@ -7651,7 +7934,7 @@ class MemoryCompanionService:
                 core_memories=core_memories,
                 core_memory_max_chars=core_memory_max_chars,
                 included_memory_ids=static_included_memory_ids,
-                max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
+                max_item_chars=self.config.int("memory_injection.max_item_chars", 400),
             )
 
         if decision.suppress_long_memory:
@@ -7811,7 +8094,7 @@ class MemoryCompanionService:
             included_memory_ids=included_memory_ids,
             core_memories=core_memories,
             core_memory_max_chars=core_memory_max_chars,
-            max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
+            max_item_chars=self.config.int("memory_injection.max_item_chars", 400),
         )
         injection_omissions, _diagnostic_included_memory_ids = self.injection.diagnostic_snapshot()
         blocked.extend(injection_omissions)
@@ -7995,7 +8278,7 @@ class MemoryCompanionService:
                 injection = self.injection.compose(
                     ctx,
                     [],
-                    self.config.int("memory_injection.max_chars", 1800),
+                    self.config.int("memory_injection.max_chars", 4000),
                     intent_context=intent_context,
                     emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"),
                     intimacy_level=getattr(turn_signal, "intimacy_level", 0.0),
@@ -8007,7 +8290,7 @@ class MemoryCompanionService:
                     core_memories=core_memories,
                     core_memory_max_chars=core_memory_max_chars,
                     included_memory_ids=actual_injected_memory_ids,
-                    max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
+                    max_item_chars=self.config.int("memory_injection.max_item_chars", 400),
                 )
             self._log_injection_debug(
                 ctx=ctx,
@@ -8177,7 +8460,7 @@ class MemoryCompanionService:
             included_memory_ids=actual_injected_memory_ids,
             core_memories=core_memories,
             core_memory_max_chars=core_memory_max_chars,
-            max_item_chars=self.config.int("memory_injection.max_item_chars", 220),
+            max_item_chars=self.config.int("memory_injection.max_item_chars", 400),
         )
         injection_omissions, _diagnostic_included_memory_ids = self.injection.diagnostic_snapshot()
         blocked.extend(injection_omissions)
@@ -10735,7 +11018,7 @@ class MemoryCompanionService:
         return clean_text(query, 1400)
 
     def _retrieval_top_k_for_query(self, ctx: SessionContext, query: str, *, time_intent: TimeIntent | None = None) -> int:
-        base = self.config.int("memory_injection.top_k", 6)
+        base = self.config.int("memory_injection.top_k", 10)
         if (time_intent is not None and time_intent.active) or self._message_requests_temporal_aggregate(ctx.message_text or query):
             if time_intent is not None and time_intent.summary_like:
                 return max(base, 12)
@@ -10743,7 +11026,7 @@ class MemoryCompanionService:
         return base
 
     def _injection_max_chars_for_query(self, ctx: SessionContext, query: str, *, time_intent: TimeIntent | None = None) -> int:
-        base = self.config.int("memory_injection.max_chars", 1800)
+        base = self.config.int("memory_injection.max_chars", 4000)
         if (time_intent is not None and time_intent.active) or self._message_requests_temporal_aggregate(ctx.message_text or query):
             return max(base, self.config.int("memory_injection.temporal_aggregate_max_chars", 3600))
         return base
@@ -11709,3 +11992,5 @@ class MemoryCompanionService:
             logger.warning("[MemoryCompanion] 关闭记忆库连接失败: %s", exc, exc_info=True)
         finally:
             self._closed = True
+
+

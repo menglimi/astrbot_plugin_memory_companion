@@ -193,6 +193,11 @@ def normalize_profile_value(value: Any) -> str:
     return re.sub(r"\s+", " ", _clean_value(value, limit=80).casefold()).strip()
 
 
+def reported_speech_prefix(prefix: str) -> bool:
+    """Whether a clause reports somebody else's words rather than the user's."""
+    return _reported_prefix(prefix)
+
+
 def _reported_prefix(prefix: str) -> bool:
     compact = re.sub(r"\s+", "", prefix)
     if not compact:

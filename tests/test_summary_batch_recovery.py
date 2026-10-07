@@ -178,7 +178,35 @@ class SummaryBatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.service.store.reserve_summary_call(batch_id, max_calls=3, hourly_limit=6, repair=True))
         batch = await self.service.store.get_summary_batch(batch_id)
         self.assertEqual(1, batch['automatic_calls'])
-        self.assertEqual('quarantined', batch['state'])
+        # A spent repair budget ends the round, not the batch.  Freezing it here
+        # kept owning the events forever, so those messages could never become
+        # memory and their timeline rows could never be cleaned up; the caller
+        # decides whether to keep the body or freeze, and records the refusal.
+        self.assertEqual('retry_pending', batch['state'])
+        self.assertEqual('repair_used', batch['retry_reason'])
+        self.assertTrue(
+            self.service.store._conn.execute(
+                'SELECT 1 FROM summary_batch_events WHERE batch_id=?', (batch_id,)
+            ).fetchone()
+        )
+
+    async def test_unverifiable_citations_keep_the_batch_as_a_reviewable_candidate(self):
+        """A summary the gate distrusts must not be thrown away, nor freeze the window."""
+        event_id = await self.event()
+        # Unsupported every round: the body never matches the cited messages.
+        bad = self.payload(event_id)
+        bad.update(summary='小王养了三只仓鼠，每天早上都要喂。')
+        provider = Provider([bad, bad, bad])
+        self.use(provider)
+        memory_id = await self.service.maybe_summarize_session(self.ctx)
+        self.assertTrue(memory_id)
+        row = self.service.store._conn.execute(
+            'SELECT lifecycle,review_status FROM memories WHERE id=?', (memory_id,)
+        ).fetchone()
+        self.assertEqual(('short_term_candidate', 'pending'), tuple(row))
+        self.assertEqual('completed', self.batches()[0]['state'])
+        # The events were represented, so the window is not stuck behind them.
+        self.assertTrue((await self.service.store.get_timeline_by_ids([event_id]))[event_id]['summarized_at'])
 
     async def test_completion_releases_unconsumed_events(self):
         ids = [await self.event(), await self.event()]
