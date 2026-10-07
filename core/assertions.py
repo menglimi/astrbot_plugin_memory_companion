@@ -17,6 +17,7 @@ store already uses to fold repeated facts into one canonical record.
 from __future__ import annotations
 
 import re
+from difflib import SequenceMatcher
 from typing import Any
 
 from .models import clean_text
@@ -70,15 +71,31 @@ def claim_is_personal_fact(
     text = clean_text(value, 200)
     if not text or not subject:
         return False, "subject_mismatch"
-    sources = [clean_text(item, 300) for item in (evidence or []) if clean_text(item, 300)]
+    sources = [clean_text(item, 2000) for item in (evidence or []) if clean_text(item, 2000)]
     if not sources:
         sources = [text]
     claim_compact = re.sub(r"\s+", "", text)
-    evidence_compact = [re.sub(r"\s+", "", item) for item in sources]
+    evidence_compact = []
+    for item in sources:
+        clauses = [part for part in re.split(r"[。．.!！?？;；,，\n]+|\s+(?=[\u4e00-\u9fff])", item) if part.strip()]
+        compact_clauses = [re.sub(r"\s+", "", part) for part in clauses]
+        if not compact_clauses:
+            continue
+        scores = [SequenceMatcher(None, claim_compact, part, autojunk=False).find_longest_match().size for part in compact_clauses]
+        best = max(range(len(scores)), key=scores.__getitem__)
+        relevant = compact_clauses[best]
+        # Preserve an explicit framing prefix such as "角色扮演：...", while
+        # allowing a separate sentence about today's plan or fatigue to coexist
+        # with a supported long-term habit in the same message.
+        if best and compact_clauses[best - 1].strip("（）()[]【】:") in {
+            *ROLE_PLAY_MARKERS, *REPORTED_SPEECH_MARKERS,
+        }:
+            relevant = compact_clauses[best - 1] + relevant
+        evidence_compact.append(relevant)
     combined = [claim_compact, *evidence_compact]
 
     for compact in combined:
-        if any(marker in compact for marker in ROLE_PLAY_MARKERS):
+        if any(marker in compact for marker in ROLE_PLAY_MARKERS if marker != "rp") or re.search(r"(?<![a-z])rp(?![a-z])", compact.lower()):
             return False, "role_play"
         if reported_speech_prefix(compact) or any(
             marker in compact for marker in REPORTED_SPEECH_MARKERS
@@ -108,6 +125,7 @@ ASSERTION_DIMENSIONS: frozenset[str] = frozenset({
     "occupation",
     "education",
     "preferred_address",
+    "residence",
     "zodiac",
     "blood_type",
     "preference",
@@ -133,6 +151,7 @@ SINGLE_VALUE_DIMENSIONS: frozenset[str] = frozenset({
     "major",
     "name",
     "preferred_address",
+    "residence",
     "zodiac",
     "zodiac_or_blood_type",
     "blood_type",
@@ -195,9 +214,13 @@ def normalize_predicate(raw: Any) -> str:
         "illness": "health",
         "dislikes": "dislike",
         "hate": "dislike",
-        "address": "preferred_address",
-        "home": "preferred_address",
-        "住址": "preferred_address",
+        "address": "residence",
+        "home": "residence",
+        "住址": "residence",
+        "居住地": "residence",
+        "nickname": "preferred_address",
+        "preferred_name": "preferred_address",
+        "称呼": "preferred_address",
         "职业": "occupation",
         "job": "occupation",
         "profession": "occupation",
@@ -255,7 +278,7 @@ def normalize_assertion(raw: Any) -> dict[str, Any]:
     polarity = normalize_polarity(raw.get("polarity"), value=value)
     durability = clean_text(raw.get("durability"), 20).lower()
     if durability not in {"stable", "situational"}:
-        durability = "stable"
+        durability = "situational"
     refs = raw.get("refs")
     refs = [refs] if isinstance(refs, str) else refs
     if not isinstance(refs, list):

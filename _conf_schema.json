@@ -923,20 +923,20 @@
         "default": true
       },
       "contextual_query_expansion_enabled": {
-        "description": "上下文查询扩展",
-        "hint": "按同窗口的近期事件扩展当前问题，用于消歧「他说的那个人」。",
+        "description": "启用上下文查询扩展",
+        "hint": "将当前消息与本轮前文合并提取少量锚点；时间查询和没有明确上下文时不扩展。",
         "type": "bool",
         "default": true
       },
       "contextual_query_recent_events": {
-        "description": "查询扩展取多少条近期事件",
-        "hint": "扩展时从当前窗口尾部往前取的 event 条数。",
+        "description": "上下文扩展读取消息数",
+        "hint": "最多读取当前请求上下文中的最近消息数。",
         "type": "int",
         "default": 12
       },
       "contextual_query_anchor_limit": {
-        "description": "查询扩展取多少个锚点",
-        "hint": "从近期事件里挑出的实体/关键词锚点上限。",
+        "description": "上下文查询锚点上限",
+        "hint": "每轮最多提取多少个前文实体或主题锚点。",
         "type": "int",
         "default": 8
       }
@@ -1210,6 +1210,16 @@
         "hint": "留空则自动扫描常见位置。建议先执行 /mcomp import_livingmemory preview。",
         "type": "string",
         "default": ""
+      },
+      "default_review_status": {
+        "description": "导入记忆的默认状态",
+        "hint": "auto 直接参与正常召回；pending 导入为待复核状态。",
+        "type": "string",
+        "options": [
+          "auto",
+          "pending"
+        ],
+        "default": "auto"
       }
     }
   },
@@ -1435,6 +1445,37 @@
         "hint": "衰减压缩生成的新长期摘要最大字数。",
         "type": "int",
         "default": 900
+      },
+      "memory_decay_scan_limit": {
+        "description": "衰减候选扫描池",
+        "hint": "候选筛选前最多扫描的稳定记忆数；实际扫描至少为候选上限的 12 倍。",
+        "type": "int",
+        "default": 2000
+      },
+      "memory_decay_include_bot_self": {
+        "description": "允许衰减 Bot 自身记忆",
+        "hint": "关闭时 Bot 自身时间线不会进入自然衰减。",
+        "type": "bool",
+        "default": false
+      },
+      "memory_decay_include_tool_memories": {
+        "description": "允许衰减工具写入记忆",
+        "hint": "关闭时由记忆工具明确写入的内容不会进入自然衰减。",
+        "type": "bool",
+        "default": false
+      }
+    }
+  },
+  "startup": {
+    "description": "启动行为",
+    "hint": "控制插件启动后后台任务的延迟，避免与宿主启动迁移竞争资源。",
+    "type": "object",
+    "items": {
+      "background_grace_seconds": {
+        "description": "后台任务启动宽限期（秒）",
+        "hint": "插件启动后的这段时间内不创建后台任务。",
+        "type": "int",
+        "default": 60
       }
     }
   }

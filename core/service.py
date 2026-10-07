@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+import threading
 from collections import Counter, defaultdict
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import hashlib
 import inspect
@@ -180,6 +181,8 @@ _CORE_MEMORY_TOOL_CONTRACT = "\n".join(
 
 _RECONSTRUCTION_CONTRACT_HEADER = "<MemoryCompanion-Reconstruction-Contract>"
 _RECONSTRUCTION_CONTRACT_FOOTER = "</MemoryCompanion-Reconstruction-Contract>"
+_RECONSTRUCTION_DYNAMIC_HEADER = "<MemoryCompanion-Reconstruction-Turn-State>"
+_RECONSTRUCTION_DYNAMIC_FOOTER = "</MemoryCompanion-Reconstruction-Turn-State>"
 _RECONSTRUCTION_CONTRACT = "\n".join(
     (
         _RECONSTRUCTION_CONTRACT_HEADER,
@@ -251,7 +254,7 @@ class MemoryCompanionService:
     # missed write-path update self-heals within one interval.
     _ACL_RECONCILE_INTERVAL_SECONDS = 60.0
 
-    def __init__(self, *, context: Any, config: Any, plugin_root: Path, data_dir: Path):
+    def __init__(self, *, context: Any, config: Any, plugin_root: Path, data_dir: Path, defer_database_initialization: bool = False):
         self.context = context
         self.config = ConfigView(config)
         self.plugin_root = Path(plugin_root)
@@ -267,33 +270,12 @@ class MemoryCompanionService:
         )
 
         self.store = MemoryStore(self.data_dir / "memory_companion.db")
-        try:
-            self.store.initialize()
-        except Exception as exc:
-            self.store.close()
-            raise RuntimeError(
-                f"记忆主库初始化失败 [primary_store.initialize]: {type(exc).__name__}: {exc}"
-            ) from exc
-        try:
-            self.scoped_store = ScopedStore(self.data_dir / "req041_scoped.db")
-        except Exception as exc:
-            self.store.close()
-            raise RuntimeError(
-                f"作用域记忆库初始化失败 [scoped_store.initialize]: {type(exc).__name__}: {exc}"
-            ) from exc
+        self.scoped_store = ScopedStore(self.data_dir / "req041_scoped.db", initialize=False)
+        self._database_init_lock = threading.Lock()
+        self._database_initialized = False
+        if not defer_database_initialization:
+            self._initialize_database_sync()
         self.portraits = PortraitService(self.store, self.config)
-        try:
-            normalized = self.store.normalize_legacy_manual_visibility()
-            if normalized:
-                logger.info("[MemoryCompanion] 已收回早期过宽的手动记忆可见性: count=%s", normalized)
-            internal_normalized = self.store.normalize_internal_bot_self_scopes()
-            if internal_normalized:
-                logger.info("[MemoryCompanion] 已将内部 Bot 梦境移出私聊用户范围: count=%s", internal_normalized)
-        except Exception as exc:
-            self.store.close()
-            raise RuntimeError(
-                f"旧记忆规范化失败 [legacy_memory.normalize]: {type(exc).__name__}: {exc}"
-            ) from exc
 
         self.identity = IdentityResolver(self._resolve_default_bot_id)
         self.reply_chain = ReplyChainResolver()
@@ -4731,6 +4713,7 @@ class MemoryCompanionService:
                     round_calls += 1
                     payload = None
                     content = ""
+                    provider_failed = False
                     try:
                         payload = await self.summarizer.summarize_with_provider(
                             attempt["provider"], rows=rows, session_label=ctx.label,
@@ -5056,13 +5039,21 @@ class MemoryCompanionService:
             assertion = normalize_assertion(item)
             if not assertion:
                 continue
+            cited = [row_by_id[ref] for ref in assertion["refs"] if ref in row_by_id]
+            if not cited or any(ref not in row_by_id for ref in assertion["refs"]):
+                continue
+            if self.summarizer.citation_check(assertion["value"], cited)[0] != "supported":
+                continue
+            subject_ctx = self._assertion_subject_context(ctx, assertion, cited)
+            if subject_ctx is None:
+                continue
             evidence = [
-                clean_text(row_by_id[ref].get("content"), 220)
-                for ref in assertion["refs"]
-                if ref in row_by_id and clean_text(row_by_id[ref].get("content"), 220)
+                clean_text(row.get("content"), 2000)
+                for row in cited
+                if clean_text(row.get("content"), 2000)
             ]
             promotable = assertion_is_promotable(assertion, evidence)
-            record = self._assertion_record(ctx, assertion, summary_memory_id, evidence, promotable)
+            record = self._assertion_record(subject_ctx, assertion, summary_memory_id, evidence, promotable)
             try:
                 result = await self.store.upsert_assertion(record)
             except Exception as exc:
@@ -5081,6 +5072,39 @@ class MemoryCompanionService:
                 ctx.session_id, len(stored), promoted,
             )
         return stored
+
+    def _assertion_subject_context(
+        self,
+        ctx: SessionContext,
+        assertion: dict[str, Any],
+        cited: list[dict[str, Any]],
+    ) -> SessionContext | None:
+        """Bind a personal assertion to its cited speaker, including group turns."""
+        subject = clean_text(assertion.get("subject"), 160).casefold()
+        speakers: dict[str, str] = {}
+        for row in cited:
+            if clean_text(row.get("event_type"), 40) != "user_message":
+                continue
+            actor_id = clean_text(row.get("subject_id"), 160)
+            actor_name = clean_text(row.get("subject_name"), 160)
+            # Older private timeline rows may omit the actor, but the pair still
+            # identifies them. Group rows need an explicit speaker.
+            if not actor_id and ctx.scope != "group":
+                actor_id, actor_name = ctx.user_id, ctx.user_name
+            if not actor_id:
+                continue
+            aliases = {actor_id.casefold(), actor_name.casefold()}
+            if actor_id == ctx.user_id:
+                aliases.add(clean_text(ctx.user_name, 160).casefold())
+            if subject in aliases and subject:
+                if ctx.scope != "group" and actor_id != ctx.user_id:
+                    continue
+                if self.summarizer.citation_check(assertion["value"], [row])[0] == "supported":
+                    speakers[actor_id] = actor_name or (ctx.user_name if actor_id == ctx.user_id else actor_id)
+        if len(speakers) != 1:
+            return None
+        actor_id, actor_name = next(iter(speakers.items()))
+        return replace(ctx, user_id=actor_id, user_name=actor_name)
 
     def _assertion_record(
         self,
@@ -5103,7 +5127,11 @@ class MemoryCompanionService:
         qualifier = assertion["qualifier"]
         content = f"{qualifier}：{value}" if qualifier else value
         return MemoryRecord(
-            id=self.stable_id("assertion", ctx.user_id, dimension, assertion["polarity"], value),
+            id=self.stable_id(
+                "assertion", self._bot_subject_id(ctx), ctx.platform, ctx.scope,
+                ctx.session_id, ctx.user_id, dimension, assertion["polarity"], value,
+                summary_memory_id,
+            ),
             memory_type=ASSERTION_MEMORY_TYPE,
             subject=EntityRef(kind="user", id=ctx.user_id, name=ctx.user_name, role="assertion_subject"),
             object=self._bot_entity(ctx),
@@ -6065,6 +6093,7 @@ class MemoryCompanionService:
             _RECONSTRUCTION_CONTRACT_HEADER,
             _RECONSTRUCTION_CONTRACT_FOOTER,
         )
+        remove_temp_text(req, _RECONSTRUCTION_DYNAMIC_HEADER, _RECONSTRUCTION_DYNAMIC_FOOTER)
         if not self._should_offer_memory_reconstruction(ctx):
             req.system_prompt = current
             return
@@ -6074,9 +6103,12 @@ class MemoryCompanionService:
             injection_state = self._memory_companion_injection_payload(event)
         selected_ids = injection_state.get("selected_memory_ids") if isinstance(injection_state, dict) else []
         selected_count = len(selected_ids) if isinstance(selected_ids, list) else 0
+        injected_ids = injection_state.get("injected_memory_ids") if isinstance(injection_state, dict) else None
+        injected_label = str(len(injected_ids)) if isinstance(injected_ids, list) else "未确认"
         max_steps = self._reconstruction_max_steps()
         dynamic_line = (
-            f"本轮正常检索已选出 {selected_count} 条可见记忆；导航最多 {max_steps} 步，这是资源上限而不是目标步数。"
+            f"本轮正常检索已选出 {selected_count} 条候选，实际注入条数：{injected_label}；"
+            f"导航最多 {max_steps} 步，这是资源上限而不是目标步数。候选数不代表本轮看到了这些证据，注入成功也不表示它们回答了当前问题；无关条目可以忽略。"
         )
         # 逐轮变化的量不进 system_prompt：
         # dynamic_line 里的 selected_count 每轮都可能不同，而 system prompt 是整条
@@ -6086,7 +6118,8 @@ class MemoryCompanionService:
         # 保证不写进历史。
         # 宿主未提供 TextPart 时 append_temp_text 会返回 False（tests/ 不导入
         # astrbot，走的正是这条分支），此时保持改动前的行为，避免这行信息被静默丢弃。
-        if append_temp_text(req, dynamic_line):
+        dynamic_text = f"{_RECONSTRUCTION_DYNAMIC_HEADER}{dynamic_line}{_RECONSTRUCTION_DYNAMIC_FOOTER}"
+        if append_temp_text(req, dynamic_text):
             contract = _RECONSTRUCTION_CONTRACT
         else:
             contract = _RECONSTRUCTION_CONTRACT.replace(
@@ -8077,6 +8110,13 @@ class MemoryCompanionService:
         # Merge companion emotional state: explicit params take priority, fall back to intent-extracted values
         merged_bot_mood = companion_bot_mood or getattr(intent, "companion_bot_mood", "") or ""
         merged_bot_energy = companion_bot_energy or getattr(intent, "companion_bot_energy", 0.0) or 0.0
+        scene_time_of_day = self._compute_time_of_day()
+        slot_map = self._apply_scar_scene_gate(
+            ctx, slot_map,
+            companion_bot_energy=merged_bot_energy,
+            time_of_day=scene_time_of_day,
+        )
+        results = self._flatten_slot_map(slot_map)
         injection_max_chars = max_chars or self._injection_max_chars_for_query(
             ctx,
             retrieval_query,
@@ -8097,7 +8137,7 @@ class MemoryCompanionService:
             intimacy_level=getattr(turn_signal, "intimacy_level", 0.0),
             companion_bot_mood=merged_bot_mood,
             companion_bot_energy=merged_bot_energy,
-            time_of_day=self._compute_time_of_day(),
+            time_of_day=scene_time_of_day,
             cross_window_emotional_hint=self._get_cross_window_emotional_hint(ctx),
             address_hint=self._address_hint_for_injection(ctx),
             recent_fact_context=recent_fact_context,
@@ -8447,6 +8487,13 @@ class MemoryCompanionService:
 
         _bot_mood = getattr(intent, "companion_bot_mood", "") or ""
         _bot_energy = getattr(intent, "companion_bot_energy", 0.0) or 0.0
+        scene_time_of_day = self._compute_time_of_day()
+        slot_map = self._apply_scar_scene_gate(
+            ctx, slot_map,
+            companion_bot_energy=_bot_energy,
+            time_of_day=scene_time_of_day,
+        )
+        results = self._flatten_slot_map(slot_map)
         injection_max_chars = self._injection_max_chars_for_query(ctx, retrieval_query, time_intent=time_intent)
         if short_reply_anchor:
             injection_max_chars = min(injection_max_chars, 1050)
@@ -8463,7 +8510,7 @@ class MemoryCompanionService:
             intimacy_level=getattr(turn_signal, "intimacy_level", 0.0),
             companion_bot_mood=_bot_mood,
             companion_bot_energy=_bot_energy,
-            time_of_day=self._compute_time_of_day(),
+            time_of_day=scene_time_of_day,
             cross_window_emotional_hint=self._get_cross_window_emotional_hint(ctx),
             address_hint=self._address_hint_for_injection(ctx),
             recent_fact_context=recent_fact_context,
@@ -12004,4 +12051,45 @@ class MemoryCompanionService:
         finally:
             self._closed = True
 
+    def _initialize_database_sync(self) -> None:
+        with self._database_init_lock:
+            if self._database_initialized:
+                return
+            try:
+                self.store.initialize()
+            except Exception as exc:
+                self.store.close()
+                raise RuntimeError(
+                    f"记忆主库初始化失败 [primary_store.initialize]: {type(exc).__name__}: {exc}"
+                ) from exc
+            try:
+                self.scoped_store.initialize()
+            except Exception as exc:
+                self.store.close()
+                raise RuntimeError(
+                    f"作用域记忆库初始化失败 [scoped_store.initialize]: {type(exc).__name__}: {exc}"
+                ) from exc
+            try:
+                normalized = self.store.normalize_legacy_manual_visibility()
+                if normalized:
+                    logger.info(
+                        "[MemoryCompanion] 已收回早期过宽的手动记忆可见性: count=%s",
+                        normalized,
+                    )
+                internal_normalized = self.store.normalize_internal_bot_self_scopes()
+                if internal_normalized:
+                    logger.info(
+                        "[MemoryCompanion] 已将内部 Bot 梦境移出私聊用户范围: count=%s",
+                        internal_normalized,
+                    )
+            except Exception as exc:
+                self.store.close()
+                raise RuntimeError(
+                    f"旧记忆规范化失败 [legacy_memory.normalize]: {type(exc).__name__}: {exc}"
+                ) from exc
+            self._database_initialized = True
 
+    async def initialize_database(self) -> None:
+        """Initialize or upgrade databases without blocking AstrBot's loop."""
+        if not self._database_initialized:
+            await asyncio.to_thread(self._initialize_database_sync)

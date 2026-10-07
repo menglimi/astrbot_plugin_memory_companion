@@ -1730,7 +1730,6 @@ class PluginPageApi:
                         "maintenance.memory_decay_max_importance_percent",
                         74,
                     ),
-                    "memory_decay_max_access_count": config.int("maintenance.memory_decay_max_access_count", 2),
                     "memory_decay_score_threshold_percent": config.int(
                         "maintenance.memory_decay_score_threshold_percent",
                         75,
@@ -3521,14 +3520,8 @@ class PluginPageApi:
                     merged = None
             add(merged or provider_config)
 
-        config_path = self._astrbot_cmd_config_path()
-        if config_path.exists():
-            try:
-                data = json.loads(config_path.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-            for provider_config in data.get("provider", []) if isinstance(data, dict) else []:
-                add(provider_config)
+        for provider_config in self._cmd_config_provider_configs():
+            add(provider_config)
         return rows
 
     def _configured_embedding_providers(self, manager: Any) -> list[dict[str, Any]]:
@@ -3562,14 +3555,8 @@ class PluginPageApi:
                     merged = None
             add(merged or provider_config)
 
-        config_path = self._astrbot_cmd_config_path()
-        if config_path.exists():
-            try:
-                data = json.loads(config_path.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-            for provider_config in data.get("provider", []) if isinstance(data, dict) else []:
-                add(provider_config)
+        for provider_config in self._cmd_config_provider_configs():
+            add(provider_config)
         return rows
 
     @staticmethod
@@ -3697,3 +3684,34 @@ class PluginPageApi:
         if isinstance(value, str):
             return value.strip().lower() not in {"0", "false", "off", "no", "否", "关"}
         return bool(value)
+
+    def _cmd_config_provider_configs(self) -> list[dict[str, Any]]:
+        config_path = self._astrbot_cmd_config_path()
+        if not config_path.exists():
+            return []
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            return []
+        if not isinstance(data, dict):
+            return []
+
+        source_configs = data.get("provider_sources")
+        if not isinstance(source_configs, list):
+            source_configs = []
+        provider_configs = data.get("provider")
+        if not isinstance(provider_configs, list):
+            return []
+
+        sources = {
+            clean_text(source.get("id"), 160): source
+            for source in source_configs
+            if isinstance(source, dict) and clean_text(source.get("id"), 160)
+        }
+        rows: list[dict[str, Any]] = []
+        for provider in provider_configs:
+            if not isinstance(provider, dict):
+                continue
+            source = sources.get(clean_text(provider.get("provider_source_id"), 160))
+            rows.append({**(source or {}), **provider})
+        return rows

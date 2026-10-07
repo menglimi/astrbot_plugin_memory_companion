@@ -51,6 +51,21 @@ from .sensitive_data import redact_sensitive_text, redact_sensitive_value
 _ACL_UNSET = object()
 
 
+def _memory_time_sql(
+    alias: str = "",
+    *,
+    include_updated: bool = False,
+    include_valid_from: bool = False,
+) -> str:
+    prefix = f"{alias}." if alias else ""
+    columns = (["valid_from"] if include_valid_from else []) + ["occurred_at"]
+    if include_updated:
+        columns.append("updated_at")
+    columns.append("created_at")
+    values = [f"julianday(NULLIF({prefix}{column}, ''))" for column in columns]
+    return f"COALESCE({', '.join(values)}, 0)"
+
+
 class SharedTextCache:
     """Bounded, thread-safe text cache owned by the store.
 
@@ -137,6 +152,9 @@ class MemoryStore(SummaryBatchStore):
     # Redaction is idempotent but scanning the whole history at every startup
     # is needlessly expensive for large installations.  Bump this when the
     # storage redaction rules change so existing data gets one fresh pass.
+    MAINTENANCE_REPAIR_BATCH_SIZE = 200
+    MAINTENANCE_FINGERPRINT_REPAIR_VERSION = "v1"
+    MEMORY_ATOM_BACKFILL_VERSION = "v1"
     SENSITIVE_REDACTION_VERSION = "storage-redaction-v1"
 
     PROFILE_MEMORY_TYPES = frozenset({"user_profile", "user_preference", "user_habit"})
@@ -1209,7 +1227,7 @@ class MemoryStore(SummaryBatchStore):
             self._ensure_portrait_columns_sync()
             self._ensure_memory_fts_sync()
             self._ensure_knowledge_trgm_sync()
-            self._ensure_redaction_tracking_triggers_sync()
+            self._remove_legacy_redaction_tracking_triggers_sync()
             self._ensure_retrieval_revision_sync()
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_fingerprint ON memories(content_fingerprint)"
@@ -1972,6 +1990,7 @@ class MemoryStore(SummaryBatchStore):
             for row in self._conn.execute("PRAGMA table_info(memories)").fetchall()
         }
         salience_added = "salience" not in existing
+        columns_added = False
         additions = {
             "content_fingerprint": "TEXT NOT NULL DEFAULT ''",
             "merged_count": "INTEGER NOT NULL DEFAULT 1",
@@ -2006,7 +2025,28 @@ class MemoryStore(SummaryBatchStore):
         for name, ddl in additions.items():
             if name not in existing:
                 self._conn.execute(f"ALTER TABLE memories ADD COLUMN {name} {ddl}")
+                columns_added = True
+
+        marker = self._conn.execute(
+            "SELECT value FROM schema_metadata WHERE key='memory_atom_v2_backfill_version'"
+        ).fetchone()
+        needs_backfill = (
+            columns_added
+            or marker is None
+            or clean_text(marker["value"], 40) != self.MEMORY_ATOM_BACKFILL_VERSION
+        )
+        if not needs_backfill:
+            return
+
         self._backfill_memory_atom_v2_sync(restore_legacy_salience=salience_added)
+        self._conn.execute(
+            """
+            INSERT INTO schema_metadata(key,value,updated_at)
+            VALUES('memory_atom_v2_backfill_version',?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+            """,
+            (self.MEMORY_ATOM_BACKFILL_VERSION, utc_now()),
+        )
 
     def _backfill_memory_atom_v2_sync(self, *, restore_legacy_salience: bool = False) -> int:
         """Populate v2 atom columns without rewriting legacy content or timestamps."""
@@ -3852,6 +3892,11 @@ class MemoryStore(SummaryBatchStore):
         return "active"
 
     async def upsert_assertion(self, record: MemoryRecord) -> dict[str, Any]:
+        return await self._run_recoverable_database_operation(
+            self._upsert_assertion_sync, deepcopy(record),
+        )
+
+    def _upsert_assertion_sync(self, record: MemoryRecord) -> dict[str, Any]:
         """Merge one assertion into the canonical record for its claim slot.
 
         Assertions are ordinary ``memories`` rows so recall, injection, ACL,
@@ -3896,8 +3941,11 @@ class MemoryStore(SummaryBatchStore):
                 domain_rows = self._assertion_domain_rows_sync(record)
                 exact: list[MemoryRecord] = []
                 same_dimension: list[MemoryRecord] = []
+                corrected: list[MemoryRecord] = []
                 for row in domain_rows:
                     candidate = MemoryRecord.from_row(row)
+                    if candidate.lifecycle == "archived" or candidate.validity_status != "active":
+                        continue
                     candidate_metadata = (
                         candidate.metadata if isinstance(candidate.metadata, dict) else {}
                     )
@@ -3912,7 +3960,7 @@ class MemoryStore(SummaryBatchStore):
                         if normalize_profile_value(
                             candidate_metadata.get("normalized_value")
                         ) == normalized:
-                            exact.append(candidate)
+                            corrected.append(candidate)
                         continue
                     same_dimension.append(candidate)
                     if normalize_profile_value(
@@ -3921,6 +3969,12 @@ class MemoryStore(SummaryBatchStore):
                         exact.append(candidate)
 
                 canonical = exact[0] if exact else record
+                incoming_stable = record.lifecycle == "stable_memory" and record.review_status != "pending"
+                if exact and incoming_stable:
+                    canonical.lifecycle = record.lifecycle
+                    canonical.review_status = record.review_status
+                    canonical.content = record.content
+                    canonical.sayability = record.sayability
                 merged_metadata = dict(
                     canonical.metadata if isinstance(canonical.metadata, dict) else {}
                 )
@@ -3934,6 +3988,12 @@ class MemoryStore(SummaryBatchStore):
                     if clean_text(item, 160)
                 ]
                 merged_refs = list(dict.fromkeys([*merged_refs, *incoming_refs]))[:32]
+                if exact and not incoming_stable and canonical.review_status != "pending":
+                    # An uncertain repeat may add provenance without demoting a
+                    # previously supported fact or replacing its active state.
+                    metadata = {key: value for key, value in metadata.items() if key not in {
+                        "profile_state", "assertion_durability", "extraction_quality_score",
+                    }}
                 merged_metadata.update(metadata)
                 merged_metadata["assertion_evidence_refs"] = merged_refs
                 merged_metadata["assertion_evidence_count"] = len(merged_refs)
@@ -3960,15 +4020,16 @@ class MemoryStore(SummaryBatchStore):
                 canonical.importance = max(
                     float(canonical.importance or 0.0), float(record.importance or 0.0)
                 )
-                canonical.merged_count = max(1, len(exact) + 1)
+                canonical.merged_count = max(1, int(canonical.merged_count or 1) + (1 if exact else 0))
                 canonical.updated_at = now
                 canonical.content_fingerprint = ""
                 canonical.ensure_defaults()
                 self._write_memory_record_sync(canonical)
 
                 superseded: list[str] = []
-                if cardinality == "single":
-                    for other in same_dimension:
+                if incoming_stable:
+                    replaced = same_dimension if cardinality == "single" else []
+                    for other in [*replaced, *corrected]:
                         if other.id == canonical.id:
                             continue
                         other_metadata = (
@@ -3979,6 +4040,7 @@ class MemoryStore(SummaryBatchStore):
                         other_metadata["assertion_superseded_at"] = now
                         other.metadata = other_metadata
                         other.lifecycle = "archived"
+                        other.validity_status = "superseded"
                         other.supersedes_id = canonical.id
                         other.updated_at = now
                         self._write_memory_record_sync(other)
@@ -4463,7 +4525,7 @@ class MemoryStore(SummaryBatchStore):
                 f"""
                 SELECT * FROM memories
                 WHERE {" AND ".join(where)}
-                ORDER BY subject_id, scope, occurred_at, created_at, id
+                ORDER BY subject_id, scope, {_memory_time_sql()}, created_at, id
                 LIMIT ? OFFSET ?
                 """,
                 [*params, safe_limit, safe_offset],
@@ -7384,7 +7446,7 @@ class MemoryStore(SummaryBatchStore):
                   )
                 ORDER BY
                   CASE WHEN COALESCE(import_batch_id, '')='' THEN 0 ELSE 1 END,
-                  COALESCE(NULLIF(occurred_at, ''), created_at) DESC
+                  {_memory_time_sql()} DESC
                 LIMIT 1
                 """,
                 params,
@@ -8217,10 +8279,10 @@ class MemoryStore(SummaryBatchStore):
     def _list_chat_import_memories_sync(self, batch_id: str) -> list[MemoryRecord]:
         with self._lock:
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT * FROM memories
                 WHERE import_batch_id=? AND lifecycle!='archived'
-                ORDER BY importance DESC, COALESCE(NULLIF(occurred_at, ''), created_at) ASC
+                ORDER BY importance DESC, {_memory_time_sql()} ASC
                 """,
                 (clean_text(batch_id, 120),),
             ).fetchall()
@@ -8256,7 +8318,7 @@ class MemoryStore(SummaryBatchStore):
                 LEFT JOIN memory_embeddings e
                   ON e.memory_id=m.id AND e.provider_id=?
                 WHERE {where} AND (e.memory_id IS NULL OR e.text_hash='')
-                ORDER BY m.importance DESC, COALESCE(NULLIF(m.occurred_at, ''), m.created_at) ASC
+                ORDER BY m.importance DESC, {_memory_time_sql('m')} ASC
                 """,
                 (clean_text(provider_id, 160), clean_text(batch_id, 120)),
             ).fetchall()
@@ -8982,7 +9044,7 @@ class MemoryStore(SummaryBatchStore):
             f"""
             SELECT * FROM memories
             WHERE {where}
-            ORDER BY importance DESC, occurred_at DESC
+            ORDER BY importance DESC, {_memory_time_sql()} DESC
             LIMIT ?
             """,
             params + [max(1, int(limit))],
@@ -9220,7 +9282,7 @@ class MemoryStore(SummaryBatchStore):
                         ROW_NUMBER() OVER (
                             PARTITION BY memory_type
                             ORDER BY
-                                COALESCE(NULLIF(occurred_at, ''), NULLIF(updated_at, ''), created_at) DESC,
+                                {_memory_time_sql(include_updated=True)} DESC,
                                 importance DESC
                         ) AS fast_type_rank
                     FROM memories
@@ -9230,7 +9292,7 @@ class MemoryStore(SummaryBatchStore):
                 FROM ranked
                 WHERE fast_type_rank<=?
                 ORDER BY
-                    COALESCE(NULLIF(occurred_at, ''), NULLIF(updated_at, ''), created_at) DESC,
+                    {_memory_time_sql(include_updated=True)} DESC,
                     importance DESC
                 """,
                 [*params, per_type_limit],
@@ -9308,7 +9370,7 @@ class MemoryStore(SummaryBatchStore):
             FROM memories
             WHERE {where}
             ORDER BY importance DESC,
-                     COALESCE(NULLIF(occurred_at, ''), NULLIF(updated_at, ''), created_at) DESC
+                     {_memory_time_sql(include_updated=True)} DESC
             LIMIT ?
             """,
             params + [max(1, int(limit or 1))],
@@ -9362,12 +9424,12 @@ class MemoryStore(SummaryBatchStore):
             FROM memories
             WHERE {where}
               AND (
-                (occurred_at >= ? AND occurred_at < ?)
-                OR (created_at >= ? AND created_at < ?)
-                OR (updated_at >= ? AND updated_at < ?)
+                (julianday(occurred_at) >= julianday(?) AND julianday(occurred_at) < julianday(?))
+                OR (julianday(created_at) >= julianday(?) AND julianday(created_at) < julianday(?))
+                OR (julianday(updated_at) >= julianday(?) AND julianday(updated_at) < julianday(?))
               )
             ORDER BY
-                COALESCE(NULLIF(occurred_at, ''), NULLIF(updated_at, ''), created_at) DESC,
+                {_memory_time_sql(include_updated=True)} DESC,
                 importance DESC
             LIMIT ?
             """,
@@ -9513,7 +9575,7 @@ class MemoryStore(SummaryBatchStore):
                 WHERE memory_fts MATCH ?
                   AND {where}
                 ORDER BY bm25(memory_fts), m.importance DESC,
-                         COALESCE(NULLIF(m.occurred_at, ''), m.created_at) DESC
+                         {_memory_time_sql('m')} DESC
                 LIMIT ?
                 """,
                 params + [max(1, int(limit or 1))],
@@ -9765,7 +9827,7 @@ class MemoryStore(SummaryBatchStore):
                 f"""
                 SELECT * FROM memories
                 WHERE {where}
-                ORDER BY occurred_at DESC, created_at DESC
+                ORDER BY {_memory_time_sql()} DESC, created_at DESC, id DESC
                 LIMIT ? OFFSET ?
                 """,
                 params + [max(1, int(limit)), max(0, int(offset))],
@@ -9833,7 +9895,7 @@ class MemoryStore(SummaryBatchStore):
                 FROM memories
                 WHERE {' AND '.join(where)}
                 ORDER BY salience DESC, importance DESC,
-                         COALESCE(NULLIF(valid_from, ''), NULLIF(occurred_at, ''), created_at) DESC
+                         {_memory_time_sql(include_valid_from=True)} DESC
                 LIMIT ? OFFSET ?
                 """,
                 [*params, max(1, int(limit or 1)), max(0, int(offset or 0))],
@@ -9905,7 +9967,7 @@ class MemoryStore(SummaryBatchStore):
                 f"""
                 SELECT * FROM memories
                 WHERE {where}
-                ORDER BY occurred_at DESC, created_at DESC
+                ORDER BY {_memory_time_sql()} DESC, created_at DESC, id DESC
                 LIMIT ?
                 """,
                 [*params, safe_limit],
@@ -9999,7 +10061,7 @@ class MemoryStore(SummaryBatchStore):
                     session_id,
                     SUM(CASE WHEN COALESCE(import_batch_id, '')='' THEN 1 ELSE 0 END) AS native_count,
                     COUNT(*) AS total_count,
-                    MAX(COALESCE(NULLIF(occurred_at, ''), created_at)) AS latest_at
+                    MAX({_memory_time_sql()}) AS latest_at
                 FROM memories
                 WHERE scope='private' AND session_id!=''
                   AND (subject_id=? OR object_id=? OR session_id LIKE ? ESCAPE '\\')
@@ -10076,7 +10138,8 @@ class MemoryStore(SummaryBatchStore):
                             THEN 1
                             ELSE 0
                         END AS is_searchable,
-                        occurred_at
+                        occurred_at,
+                        {_memory_time_sql()} AS sort_time
                     FROM {source}
                     WHERE scope IN ('private', 'group')
                       AND review_status!='pending'
@@ -10090,16 +10153,20 @@ class MemoryStore(SummaryBatchStore):
                                     WHEN is_searchable=1 THEN 0
                                     ELSE 1
                                 END ASC,
-                                occurred_at DESC,
+                                sort_time DESC,
                                 sample_session_id DESC
                         ) AS sample_rank,
                         ROW_NUMBER() OVER (
                             PARTITION BY scope, target_id, sample_bot_id
                             ORDER BY
                                 CASE WHEN target_name!='' THEN 0 ELSE 1 END ASC,
-                                occurred_at DESC,
+                                sort_time DESC,
                                 sample_session_id DESC
-                        ) AS name_rank
+                        ) AS name_rank,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY scope, target_id, sample_bot_id
+                            ORDER BY sort_time DESC, sample_session_id DESC
+                        ) AS latest_rank
                     FROM normalized
                     WHERE target_id!=''
                 )
@@ -10108,6 +10175,7 @@ class MemoryStore(SummaryBatchStore):
                     target_id,
                     MAX(CASE WHEN name_rank=1 THEN target_name ELSE '' END) AS target_name,
                     MAX(CASE WHEN name_rank=1 THEN occurred_at ELSE '' END) AS name_latest_at,
+                    MAX(CASE WHEN name_rank=1 THEN sort_time ELSE 0 END) AS name_latest_sort,
                     MAX(CASE WHEN sample_rank=1 THEN sample_session_id ELSE '' END) AS sample_session_id,
                     MAX(CASE WHEN sample_rank=1 THEN sample_group_id ELSE '' END) AS sample_group_id,
                     sample_bot_id,
@@ -10116,38 +10184,17 @@ class MemoryStore(SummaryBatchStore):
                     SUM(
                         is_searchable
                     ) AS searchable_count,
-                    MAX(
-                        CASE
-                            WHEN is_searchable=1 THEN occurred_at
-                            ELSE ''
-                        END
-                    ) AS active_latest_at,
-                    MAX(occurred_at) AS latest_at
+                    MAX(CASE WHEN sample_rank=1 AND is_searchable=1 THEN occurred_at ELSE '' END) AS active_latest_at,
+                    MAX(CASE WHEN is_searchable=1 THEN sort_time ELSE 0 END) AS active_latest_sort,
+                    MAX(CASE WHEN latest_rank=1 THEN occurred_at ELSE '' END) AS latest_at,
+                    MAX(sort_time) AS latest_sort
                 FROM ranked
                 GROUP BY scope, target_id, sample_bot_id
                 ORDER BY
                     scope ASC,
-                    CASE
-                        WHEN MAX(
-                            CASE
-                                WHEN is_searchable=1 THEN occurred_at
-                                ELSE ''
-                            END
-                        )!='' THEN 0
-                        ELSE 1
-                    END ASC,
-                    COALESCE(
-                        NULLIF(
-                            MAX(
-                                CASE
-                                    WHEN is_searchable=1 THEN occurred_at
-                                    ELSE ''
-                                END
-                            ),
-                            ''
-                        ),
-                        MAX(occurred_at)
-                    ) DESC
+                    CASE WHEN MAX(is_searchable)>0 THEN 0 ELSE 1 END ASC,
+                    MAX(CASE WHEN is_searchable=1 THEN sort_time ELSE 0 END) DESC,
+                    MAX(sort_time) DESC
                 """,
                 (1 if include_raw_events else 0,),
             ).fetchall()
@@ -10169,41 +10216,42 @@ class MemoryStore(SummaryBatchStore):
                     "searchable_count": int(bucket.get("searchable_count") or 0),
                     "active_latest_at": clean_text(bucket.get("active_latest_at"), 80),
                     "latest_at": clean_text(bucket.get("latest_at"), 80),
+                    "active_latest_sort": float(bucket.get("active_latest_sort") or 0),
+                    "latest_sort": float(bucket.get("latest_sort") or 0),
                 }
                 candidate_priority = (
                     bool(sample_context["active_latest_at"]),
-                    sample_context["active_latest_at"] or sample_context["latest_at"],
+                    sample_context["active_latest_sort"] or sample_context["latest_sort"],
                 )
                 current = merged.get(key)
                 if current is None:
                     bucket["target_id"] = target_id
                     bucket["sample_contexts"] = [sample_context]
                     bucket["_sample_has_active"] = candidate_priority[0]
-                    bucket["_sample_latest_at"] = candidate_priority[1]
+                    bucket["_sample_latest_sort"] = candidate_priority[1]
                     bucket["_name_latest_at"] = clean_text(bucket.get("name_latest_at"), 80)
+                    bucket["_name_latest_sort"] = float(bucket.get("name_latest_sort") or 0)
                     merged[key] = bucket
                     continue
                 current["memory_count"] = int(current.get("memory_count") or 0) + int(bucket.get("memory_count") or 0)
                 current["archived_count"] = int(current.get("archived_count") or 0) + int(bucket.get("archived_count") or 0)
                 current["searchable_count"] = int(current.get("searchable_count") or 0) + int(bucket.get("searchable_count") or 0)
-                current["active_latest_at"] = max(
-                    clean_text(current.get("active_latest_at"), 80),
-                    clean_text(bucket.get("active_latest_at"), 80),
-                )
-                current["latest_at"] = max(
-                    clean_text(current.get("latest_at"), 80),
-                    clean_text(bucket.get("latest_at"), 80),
-                )
+                if sample_context["active_latest_sort"] > float(current.get("active_latest_sort") or 0):
+                    current["active_latest_at"] = sample_context["active_latest_at"]
+                    current["active_latest_sort"] = sample_context["active_latest_sort"]
+                if sample_context["latest_sort"] > float(current.get("latest_sort") or 0):
+                    current["latest_at"] = sample_context["latest_at"]
+                    current["latest_sort"] = sample_context["latest_sort"]
                 current_priority = (
                     bool(current.get("_sample_has_active")),
-                    clean_text(current.get("_sample_latest_at"), 80),
+                    float(current.get("_sample_latest_sort") or 0),
                 )
                 if candidate_priority > current_priority:
                     current["sample_session_id"] = bucket.get("sample_session_id")
                     current["sample_group_id"] = bucket.get("sample_group_id")
                     current["sample_bot_id"] = bucket.get("sample_bot_id")
                     current["_sample_has_active"] = candidate_priority[0]
-                    current["_sample_latest_at"] = candidate_priority[1]
+                    current["_sample_latest_sort"] = candidate_priority[1]
                 contexts = current.setdefault("sample_contexts", [])
                 existing_context = next(
                     (
@@ -10218,54 +10266,57 @@ class MemoryStore(SummaryBatchStore):
                 else:
                     existing_priority = (
                         bool(clean_text(existing_context.get("active_latest_at"), 80)),
-                        clean_text(existing_context.get("active_latest_at"), 80)
-                        or clean_text(existing_context.get("latest_at"), 80),
+                        float(existing_context.get("active_latest_sort") or 0)
+                        or float(existing_context.get("latest_sort") or 0),
                     )
                     existing_context["memory_count"] = int(existing_context.get("memory_count") or 0) + sample_context["memory_count"]
                     existing_context["archived_count"] = int(existing_context.get("archived_count") or 0) + sample_context["archived_count"]
                     existing_context["searchable_count"] = int(existing_context.get("searchable_count") or 0) + sample_context["searchable_count"]
-                    existing_context["active_latest_at"] = max(
-                        clean_text(existing_context.get("active_latest_at"), 80),
-                        sample_context["active_latest_at"],
-                    )
-                    existing_context["latest_at"] = max(
-                        clean_text(existing_context.get("latest_at"), 80),
-                        sample_context["latest_at"],
-                    )
+                    if sample_context["active_latest_sort"] > float(existing_context.get("active_latest_sort") or 0):
+                        existing_context["active_latest_at"] = sample_context["active_latest_at"]
+                        existing_context["active_latest_sort"] = sample_context["active_latest_sort"]
+                    if sample_context["latest_sort"] > float(existing_context.get("latest_sort") or 0):
+                        existing_context["latest_at"] = sample_context["latest_at"]
+                        existing_context["latest_sort"] = sample_context["latest_sort"]
                     if candidate_priority > existing_priority:
                         existing_context["session_id"] = sample_context["session_id"]
                         existing_context["group_id"] = sample_context["group_id"]
                 candidate_name = clean_text(bucket.get("target_name"), 120)
                 candidate_name_at = clean_text(bucket.get("name_latest_at"), 80)
+                candidate_name_sort = float(bucket.get("name_latest_sort") or 0)
                 current_name = clean_text(current.get("target_name"), 120)
                 current_name_at = clean_text(current.get("_name_latest_at"), 80)
+                current_name_sort = float(current.get("_name_latest_sort") or 0)
                 if (
                     candidate_name
                     and candidate_name not in {target_id, clean_text(bucket.get("sample_session_id"), 200)}
-                    and (not current_name or candidate_name_at > current_name_at)
+                    and (not current_name or candidate_name_sort > current_name_sort)
                 ):
                     current["target_name"] = candidate_name
                     current["_name_latest_at"] = candidate_name_at
+                    current["_name_latest_sort"] = candidate_name_sort
             buckets = list(merged.values())
             for bucket in buckets:
                 contexts = bucket.get("sample_contexts") or []
                 contexts.sort(
                     key=lambda item: (
                         bool(clean_text(item.get("active_latest_at"), 80)),
-                        clean_text(item.get("active_latest_at"), 80)
-                        or clean_text(item.get("latest_at"), 80),
+                        float(item.get("active_latest_sort") or 0)
+                        or float(item.get("latest_sort") or 0),
                     ),
                     reverse=True,
                 )
                 bucket.pop("_sample_has_active", None)
-                bucket.pop("_sample_latest_at", None)
+                bucket.pop("_sample_latest_sort", None)
                 bucket.pop("_name_latest_at", None)
+                bucket.pop("_name_latest_sort", None)
                 bucket.pop("name_latest_at", None)
+                bucket.pop("name_latest_sort", None)
             buckets.sort(
                 key=lambda item: (
                     bool(int(item.get("searchable_count") or 0)),
-                    clean_text(item.get("active_latest_at"), 80)
-                    or clean_text(item.get("latest_at"), 80),
+                    float(item.get("active_latest_sort") or 0)
+                    or float(item.get("latest_sort") or 0),
                     clean_text(item.get("scope"), 40),
                     clean_text(item.get("target_id"), 160),
                 ),
@@ -10275,8 +10326,12 @@ class MemoryStore(SummaryBatchStore):
                 buckets = buckets[: max(1, int(limit))]
             for bucket in buckets:
                 bucket.pop("active_latest_at", None)
+                bucket.pop("active_latest_sort", None)
+                bucket.pop("latest_sort", None)
                 for context in bucket.get("sample_contexts") or []:
                     context.pop("active_latest_at", None)
+                    context.pop("active_latest_sort", None)
+                    context.pop("latest_sort", None)
                 bucket["target_name"] = self._resolve_bucket_target_name_sync(
                     clean_text(bucket.get("scope"), 40),
                     clean_text(bucket.get("target_id"), 160),
@@ -11434,21 +11489,41 @@ class MemoryStore(SummaryBatchStore):
         return await asyncio.to_thread(self._maintenance_repair_sync)
 
     def _maintenance_repair_sync(self) -> dict[str, Any]:
+        with self._lock, self._transaction_sync():
+            manual_fixed = self._normalize_legacy_manual_visibility_sync()
+            internal_bot_self_fixed = self._normalize_internal_bot_self_scopes_sync()
+            utterance_fixed_cur = self._conn.execute(
+                """
+                UPDATE memories
+                SET reality_level='observed_utterance', updated_at=?
+                WHERE memory_type='conversation_event' AND reality_level='real_user_fact'
+                """,
+                (utc_now(),),
+            )
+            utterance_fixed = int(utterance_fixed_cur.rowcount or 0)
+
+        fingerprint_fixed = 0
+        batch_size = max(1, int(self.MAINTENANCE_REPAIR_BATCH_SIZE))
         with self._lock:
-            with self._transaction_sync():
-                manual_fixed = self._normalize_legacy_manual_visibility_sync()
-                internal_bot_self_fixed = self._normalize_internal_bot_self_scopes_sync()
-                utterance_fixed_cur = self._conn.execute(
-                    """
-                    UPDATE memories
-                    SET reality_level='observed_utterance', updated_at=?
-                    WHERE memory_type='conversation_event' AND reality_level='real_user_fact'
-                    """,
-                    (utc_now(),),
+            marker = self._conn.execute(
+                "SELECT value FROM schema_metadata WHERE key='maintenance_fingerprint_repair_version'"
+            ).fetchone()
+        full_fingerprint_audit = (
+            marker is None
+            or clean_text(marker["value"], 40) != self.MAINTENANCE_FINGERPRINT_REPAIR_VERSION
+        )
+        last_rowid = 0
+        while True:
+            with self._lock, self._transaction_sync():
+                fingerprint_filter = "" if full_fingerprint_audit else (
+                    " AND (content_fingerprint='' OR COALESCE(merged_count, 0)<1)"
                 )
-                all_rows = self._conn.execute("SELECT * FROM memories").fetchall()
-                fingerprint_fixed = 0
-                for row in all_rows:
+                rows = self._conn.execute(
+                    "SELECT rowid AS _repair_rowid, * FROM memories "
+                    f"WHERE rowid>?{fingerprint_filter} ORDER BY rowid LIMIT ?",
+                    (last_rowid, batch_size),
+                ).fetchall()
+                for row in rows:
                     record = MemoryRecord.from_row(row)
                     old_fingerprint = record.content_fingerprint
                     record.content_fingerprint = ""
@@ -11459,71 +11534,93 @@ class MemoryStore(SummaryBatchStore):
                             (record.content_fingerprint, utc_now(), record.id),
                         )
                         fingerprint_fixed += 1
+                if rows:
+                    last_rowid = int(rows[-1]["_repair_rowid"])
+            if len(rows) < batch_size:
+                break
+            time.sleep(0)
 
-                duplicates = self._conn.execute(
+        with self._lock, self._transaction_sync():
+            duplicates = self._conn.execute(
+                """
+                SELECT content_fingerprint, COUNT(*) AS count
+                FROM memories
+                WHERE content_fingerprint!='' AND lifecycle!='archived'
+                GROUP BY content_fingerprint
+                HAVING count > 1
+                """
+            ).fetchall()
+            merged = 0
+            for dup in duplicates:
+                rows = self._conn.execute(
                     """
-                    SELECT content_fingerprint, COUNT(*) AS count
+                    SELECT id, importance, confidence, merged_count, created_at
                     FROM memories
-                    WHERE content_fingerprint!='' AND lifecycle!='archived'
-                    GROUP BY content_fingerprint
-                    HAVING count > 1
-                    """
+                    WHERE content_fingerprint=? AND lifecycle!='archived'
+                    ORDER BY merged_count DESC, importance DESC, created_at ASC
+                    """,
+                    (dup["content_fingerprint"],),
                 ).fetchall()
-                merged = 0
-                for dup in duplicates:
-                    rows = self._conn.execute(
+                keep = rows[0]
+                for row in rows[1:]:
+                    self._conn.execute(
                         """
-                        SELECT id, importance, confidence, merged_count, created_at
-                        FROM memories
-                        WHERE content_fingerprint=? AND lifecycle!='archived'
-                        ORDER BY merged_count DESC, importance DESC, created_at ASC
+                        UPDATE memories
+                        SET lifecycle='archived', validity_status='archived', supersedes_id=?, updated_at=?
+                        WHERE id=?
                         """,
-                        (dup["content_fingerprint"],),
-                    ).fetchall()
-                    keep = rows[0]
-                    for row in rows[1:]:
+                        (keep["id"], utc_now(), row["id"]),
+                    )
+                    self._conn.execute(
+                        """
+                        UPDATE memories
+                        SET importance=max(importance, ?),
+                            confidence=max(confidence, ?),
+                            merged_count=COALESCE(merged_count, 1) + COALESCE(?, 1),
+                            updated_at=?
+                        WHERE id=?
+                        """,
+                        (
+                            row["importance"],
+                            row["confidence"],
+                            row["merged_count"],
+                            utc_now(),
+                            keep["id"],
+                        ),
+                    )
+                    if self._fts_enabled:
                         self._conn.execute(
-                            """
-                            UPDATE memories
-                            SET lifecycle='archived', validity_status='archived', supersedes_id=?, updated_at=?
-                            WHERE id=?
-                            """,
-                            (keep["id"], utc_now(), row["id"]),
+                            "DELETE FROM memory_fts WHERE memory_id=?",
+                            (row["id"],),
                         )
-                        self._conn.execute(
-                            """
-                            UPDATE memories
-                            SET importance=max(importance, ?),
-                                confidence=max(confidence, ?),
-                                merged_count=COALESCE(merged_count, 1) + COALESCE(?, 1),
-                                updated_at=?
-                            WHERE id=?
-                            """,
-                            (
-                                row["importance"],
-                                row["confidence"],
-                                row["merged_count"],
-                                utc_now(),
-                                keep["id"],
-                            ),
-                        )
-                        merged += 1
-                # A repair pass runs automatically shortly after startup.  Rebuilding
-                # the complete FTS table on every pass needlessly holds the write lock
-                # and can starve the event loop while other plugins are active.  Only
-                # rebuild when repair changed indexed content, or when the row counts
-                # show that an index is genuinely incomplete.  Explicit index rebuilds
-                # remain available through ``rebuild_memory_indexes``.
-                fts_rebuild_needed = bool(fingerprint_fixed or merged)
-                if self._fts_enabled and not fts_rebuild_needed:
-                    memory_count = int(self._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] or 0)
-                    fts_count = int(self._conn.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0] or 0)
-                    fts_rebuild_needed = memory_count != fts_count
-                fts_rebuilt = self._rebuild_memory_fts_sync() if self._fts_enabled and fts_rebuild_needed else 0
+                    merged += 1
+            if full_fingerprint_audit:
+                self._conn.execute(
+                    """
+                    INSERT INTO schema_metadata(key,value,updated_at)
+                    VALUES('maintenance_fingerprint_repair_version',?,?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+                    """,
+                    (self.MAINTENANCE_FINGERPRINT_REPAIR_VERSION, utc_now()),
+                )
+            # Fingerprint fixes do not affect FTS text, and archived duplicates
+            # are removed from the index above. Rebuild only if the searchable
+            # row count still differs from the index.
+            fts_rebuild_needed = False
+            if self._fts_enabled:
+                recallable_count = int(
+                    self._conn.execute(
+                        f"SELECT COUNT(*) FROM memories WHERE {self._recallable_memory_sql()}"
+                    ).fetchone()[0]
+                    or 0
+                )
+                fts_count = int(self._conn.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0] or 0)
+                fts_rebuild_needed = recallable_count != fts_count
+            fts_rebuilt = self._rebuild_memory_fts_sync() if self._fts_enabled and fts_rebuild_needed else 0
         return {
             "manual_visibility_fixed": manual_fixed,
             "internal_bot_self_scope_fixed": internal_bot_self_fixed,
-            "utterance_reality_fixed": int(utterance_fixed_cur.rowcount or 0),
+            "utterance_reality_fixed": utterance_fixed,
             "fingerprint_fixed": fingerprint_fixed,
             "duplicates_archived": merged,
             "fts_rebuilt": fts_rebuilt,
@@ -11535,13 +11632,13 @@ class MemoryStore(SummaryBatchStore):
     def _list_decay_candidate_pool_sync(self, limit: int) -> list[MemoryRecord]:
         with self._lock:
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT *
                 FROM memories
                 WHERE (lifecycle='stable_memory' AND review_status!='pending')
                    OR (lifecycle='short_term_candidate' AND review_status='pending')
                 ORDER BY
-                    COALESCE(NULLIF(occurred_at, ''), created_at) ASC,
+                    {_memory_time_sql()} ASC,
                     created_at ASC
                 LIMIT ?
                 """,
@@ -11564,8 +11661,8 @@ class MemoryStore(SummaryBatchStore):
                     SELECT id, metadata
                     FROM memories
                     WHERE lifecycle='raw_event'
-                      AND COALESCE(NULLIF(occurred_at, ''), created_at) < ?
-                    ORDER BY COALESCE(NULLIF(occurred_at, ''), created_at) ASC
+                      AND COALESCE(julianday(NULLIF(occurred_at, '')), julianday(NULLIF(created_at, '')), 0) < julianday(?)
+                    ORDER BY COALESCE(julianday(NULLIF(occurred_at, '')), julianday(NULLIF(created_at, '')), 0) ASC
                     LIMIT ?
                     """,
                     (cutoff_at, max(1, int(limit or 1))),
@@ -11974,7 +12071,7 @@ class MemoryStore(SummaryBatchStore):
                 FROM memory_embeddings e
                 JOIN memories m ON m.id=e.memory_id
                 WHERE {where}
-                ORDER BY m.importance DESC, COALESCE(NULLIF(m.occurred_at, ''), m.created_at) DESC
+                ORDER BY m.importance DESC, {_memory_time_sql('m')} DESC
                 LIMIT ?
                 """,
                 params + [safe_limit],
@@ -12075,7 +12172,7 @@ class MemoryStore(SummaryBatchStore):
                 LEFT JOIN memory_embeddings e
                   ON e.memory_id=m.id AND e.provider_id=?
                 WHERE {where}
-                  ORDER BY m.importance DESC, COALESCE(NULLIF(m.occurred_at, ''), m.created_at) DESC
+                  ORDER BY m.importance DESC, {_memory_time_sql('m')} DESC
                   LIMIT ?
                   OFFSET ?
                 """,
@@ -13051,3 +13148,20 @@ class MemoryStore(SummaryBatchStore):
         result.pop("created_at", None)
         result["schema_version"] = "companion_emotion_event.v1"
         return result
+
+    def _remove_legacy_redaction_tracking_triggers_sync(self) -> None:
+        """Remove legacy triggers that made every safe write rescan the full store.
+
+        Store write APIs redact text and metadata before persistence. The old
+        triggers could not distinguish those safe writes from legacy data, so
+        one new chat message invalidated the marker and forced an O(N) scan on
+        the next startup.
+        """
+        self._conn.executescript(
+            """
+            DROP TRIGGER IF EXISTS trg_redaction_memories_insert;
+            DROP TRIGGER IF EXISTS trg_redaction_memories_update;
+            DROP TRIGGER IF EXISTS trg_redaction_timeline_insert;
+            DROP TRIGGER IF EXISTS trg_redaction_timeline_update;
+            """
+        )

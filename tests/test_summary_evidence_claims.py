@@ -133,8 +133,9 @@ class SummaryEvidenceClaimTests(unittest.TestCase):
             ["2026-07-15 晚上小林说不想研究这个方案。"],
             normalized["key_facts"],
         )
-        errors = normalized["_validation_errors"]
-        self.assertTrue(any("2026-07-14" in error for error in errors), errors)
+        self.assertEqual([], normalized["_validation_errors"])
+        warnings = normalized["_validation_warnings"]
+        self.assertTrue(any("2026-07-14" in warning for warning in warnings), warnings)
 
 
 if __name__ == "__main__":

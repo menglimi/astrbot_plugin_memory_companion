@@ -17,7 +17,7 @@ from .core.models import json_dumps
 from .core.service import MemoryCompanionService
 
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
-PLUGIN_VERSION = "2.2.2"
+PLUGIN_VERSION = "2.2.3"
 
 _ACTIVE_BRIDGE: MemoryCompanionBridge | None = None
 
@@ -53,6 +53,7 @@ class MemoryCompanionPlugin(Star):
             config=config or {},
             plugin_root=Path(__file__).resolve().parent,
             data_dir=data_dir,
+            defer_database_initialization=True,
         )
         self.memory_companion = MemoryCompanionBridge(self.service)
         self.memory_companion.bind_cache_invalidation(self.service.store)
@@ -73,6 +74,7 @@ class MemoryCompanionPlugin(Star):
 
     async def initialize(self):
         """Start retained maintenance workers after AstrBot owns the event loop."""
+        await self.service.initialize_database()
         self.service._ensure_lifecycle_maintenance_dispatcher()
         self.service._ensure_portrait_daily_dispatcher()
 
@@ -115,6 +117,7 @@ class MemoryCompanionPlugin(Star):
         配置为正数时，整个钩子被 ``asyncio.wait_for`` 包裹，超时即降级放行
         （本轮无记忆注入），绝不拖死全轮对话。默认值 0 = 关闭，完全向后兼容。
         """
+        await self.service.initialize_database()
         budget = self.service.config.float("hook_request_budget_seconds", 0.0)
         if budget <= 0:
             await self.service.handle_llm_request(event, req)
@@ -136,10 +139,12 @@ class MemoryCompanionPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
     async def on_group_message(self, event: AstrMessageEvent):
+        await self.service.initialize_database()
         await self.service.handle_group_message(event)
 
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
+        await self.service.initialize_database()
         await self.service.handle_llm_response(event, resp)
 
     @filter.llm_tool(name="memory_companion_recall")

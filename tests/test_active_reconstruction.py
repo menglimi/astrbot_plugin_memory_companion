@@ -415,8 +415,9 @@ class ActiveReconstructionTests(unittest.IsolatedAsyncioTestCase):
             system_prompt="原始提示",
             memory_companion_injection_state={"selected_memory_ids": ["m1", "m2"]},
         )
-        service._apply_reconstruction_contract(recall_req, recall)
-        service._apply_reconstruction_contract(recall_req, recall)
+        with patch("astrbot_plugin_memory_companion.core.astrbot_compat.TextPart", None):
+            service._apply_reconstruction_contract(recall_req, recall)
+            service._apply_reconstruction_contract(recall_req, recall)
 
         self.assertEqual(1, recall_req.system_prompt.count("<MemoryCompanion-Reconstruction-Contract>"))
         self.assertIn("正常检索已选出 2 条", recall_req.system_prompt)
@@ -474,6 +475,68 @@ class ActiveReconstructionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("memory_tools.enable_reconstruction_tool", main)
         self.assertIn('"memory_reconstruction"', schema)
+
+    def test_reconstruction_prompt_separates_selected_and_injected_counts(self):
+        service = self.make_service()
+        req = SimpleNamespace(system_prompt="", memory_companion_injection_state={
+            "selected_memory_ids": ["m1", "m2", "m3"], "injected_memory_ids": ["m1"],
+        })
+        service._apply_reconstruction_contract(req, self.private_context())
+        turn_state = "\n".join(
+            getattr(part, "text", "")
+            for part in getattr(req, "extra_user_content_parts", [])
+        )
+        self.assertIn("已选出 3 条候选，实际注入条数：1", req.system_prompt + turn_state)
+
+    def test_turn_state_is_temporary_and_does_not_change_system_prompt(self):
+        class FakeTextPart:
+            def __init__(self, text: str) -> None:
+                self.text = text
+                self.temporary = False
+
+            def mark_as_temp(self):
+                self.temporary = True
+                return self
+
+        service = self.make_service()
+        ctx = self.private_context()
+        req = SimpleNamespace(
+            system_prompt="原始提示",
+            memory_companion_injection_state={
+                "selected_memory_ids": ["m1", "m2"],
+                "injected_memory_ids": ["m1"],
+            },
+        )
+        with patch(
+            "astrbot_plugin_memory_companion.core.astrbot_compat.TextPart",
+            FakeTextPart,
+        ):
+            service._apply_reconstruction_contract(req, ctx)
+            first_prompt = req.system_prompt
+            service._apply_reconstruction_contract(req, ctx)
+
+        self.assertEqual(first_prompt, req.system_prompt)
+        self.assertNotIn("已选出 2 条候选", req.system_prompt)
+        parts = getattr(req, "extra_user_content_parts", [])
+        self.assertEqual(1, len(parts))
+        self.assertIn("已选出 2 条候选，实际注入条数：1", parts[0].text)
+        self.assertTrue(parts[0].temporary)
+
+    def test_scar_scene_gate_marks_high_scar_memory_before_injection(self):
+        service = self.make_service()
+        memory = self.summary_memory()
+        memory.metadata.update({"scar_weight": 0.7, "mention_policy": "soft_echo"})
+        item = SearchResult(memory=memory, score=1.0)
+
+        result = service._apply_scar_scene_gate(
+            self.private_context(),
+            {"stable_memory": [item]},
+            companion_bot_energy=25,
+            time_of_day="afternoon",
+        )
+
+        self.assertEqual("tone_only", result["stable_memory"][0].memory.metadata["mention_policy"])
+        self.assertTrue(result["stable_memory"][0].memory.metadata["_scene_gated"])
 
 
 if __name__ == "__main__":

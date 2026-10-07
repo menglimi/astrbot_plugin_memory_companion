@@ -418,14 +418,19 @@ class MemorySummarizer:
             "所以要求高于摘要，且必须先于摘要产出：\n"
             "- 每项要能独立回答「谁、什么对象、哪一项、什么值」。value 写成可直接展示的短句，不要写成段落；\n"
             "- predicate 只能取 birthday（生日）、occupation（职业）、education（学历）、"
-            "preferred_address（住址）、zodiac（星座）、blood_type（血型）、"
+            "preferred_address（希望被怎样称呼）、residence（居住地）、zodiac（星座）、blood_type（血型）、"
             "preference（偏好）、dietary_restriction（饮食禁忌）、habit（习惯）、"
             "boundary（边界/雷区）、commitment（约定/承诺）、health（身体状况）、"
             "relation（重要的人）、schedule（安排）、dislike（厌恶）之一；"
             "不确定归哪类时选最接近的一类，不要自创新词；\n"
             "- polarity 必须是 positive 或 negative，且与原文完全一致，原文没有说的一律不许补；\n"
             "- durability 区分 stable（长期成立）和 situational（临时或只在本窗口成立），只有 stable 会进入长期断言库；\n"
-            "- 必须区分五类：用户本人的事实、第三方转述、角色扮演台词、只是意图、以及已完成的行为；只有前两类可以提炼；\n"
+            "- subject 必须使用直接陈述者的稳定 subject_id；群聊逐个核对说话者，不要把别人的事实归到本轮触发总结的用户。\n"
+            "- 必须区分用户本人的事实、第三方转述、角色扮演台词、只是意图、以及已完成的行为。"
+            "第三方、角色扮演、未经完成确认的计划留在摘要；临时状态标 situational，不要改写成 stable。\n"
+            "- 每条断言只判断直接支持该事实的分句；同一条消息的其他临时状态、计划和否定不应改变这条事实。"
+            "住址用 residence，希望被怎样称呼用 preferred_address，不要混合两者；"
+            "缺少归属或持续性的证据时留在摘要。\n"
             "- refs 必须列出直接支持它的 event_id，没有直接证据就不要输出这一项；\n"
             "- 同一件事的不同属性或不同有效时间不要互相覆盖（家庭地址与公司地址、过去计划与已经完成），要分别写成独立项；"
             "同一属性改了口（原来住上海、现在住北京）写成同一条的新值，系统会自动接上修订关系；\n"
@@ -435,7 +440,7 @@ class MemorySummarizer:
             "输出前先在心里检查所有字段是否闭合、所有字符串是否使用双引号且已转义；"
             "请只输出一个 JSON 对象，不要 Markdown 代码围栏、不要解释、不要前后缀。格式：\n"
             "{\n"
-            '  "assertions": [{"subject": "具体昵称或稳定ID", "predicate": "birthday|occupation|education|preferred_address|zodiac|blood_type|preference|dietary_restriction|habit|boundary|commitment|health|relation|schedule|dislike", "value": "可直接展示的短句", "polarity": "positive|negative", "durability": "stable|situational", "refs": ["event_id"]}],\n'
+            '  "assertions": [{"subject": "直接陈述者的subject_id", "predicate": "birthday|occupation|education|preferred_address|residence|zodiac|blood_type|preference|dietary_restriction|habit|boundary|commitment|health|relation|schedule|dislike", "value": "可直接展示的短句", "polarity": "positive|negative", "durability": "stable|situational", "refs": ["event_id"]}],\n'
             '  "outcome": "memory|no_memory",\n'
             '  "summary_refs": ["支持正文的 event_id"],\n'
             '  "no_memory_reason": "仅 no_memory 时填写原因，否则为空",\n'
@@ -725,7 +730,7 @@ class MemorySummarizer:
         }
         kept: list[dict[str, Any]] = []
         warnings: list[str] = []
-        seen: set[tuple[str, str, str]] = set()
+        seen: set[tuple[str, str, str, str]] = set()
         dropped = 0
         overflow = 0
         # Validate everything before applying the cap: breaking out at the cap
@@ -743,7 +748,7 @@ class MemorySummarizer:
             if any(ref not in row_by_id for ref in assertion["refs"]) or cls.citation_check(assertion["value"], cited)[0] != "supported":
                 dropped += 1
                 continue
-            key = (assertion["dimension"], assertion["polarity"], assertion["normalized_value"])
+            key = (assertion["subject"], assertion["dimension"], assertion["polarity"], assertion["normalized_value"])
             if key in seen:
                 continue
             seen.add(key)
@@ -854,8 +859,11 @@ class MemorySummarizer:
             fact_end = fact_index_map[fact_start_index + size - 1] + 1
             source_start = index_map[source_start_index]
             source_end = index_map[source_start_index + size - 1] + 1
-            fact_window = compact_fact[max(0, fact_start - 1): fact_end + 1]
-            source_window = source[max(0, source_start - 1): source_end + 1]
+            # A following negation can qualify the next phrase ("喜欢冰美式，
+            # 不加糖"). Include negations inside or before this aligned span,
+            # without attaching the next phrase's polarity to it.
+            fact_window = compact_fact[max(0, fact_start - 1): fact_end]
+            source_window = source[max(0, source_start - 1): source_end]
             if any(char in fact_window for char in _NEGATION_CHARS) != any(
                 char in source_window for char in _NEGATION_CHARS
             ):
@@ -1404,7 +1412,8 @@ class MemorySummarizer:
         - 只校验**完整日期**（YYYY-MM-DD / M/D / M月D日）与**周几**——正文里被讨论的
           日期、消息自身时间戳、以及「明天/明年/月底」这类相对说法的换算结果都算有依据；
         - 无从判定的写法（只有月、只有日）不参与拒绝；
-        - 时段/钟点（上午/晚上/22点）不参与拒绝——转述里常跨事件漂移，且它们不构成硬事实。
+        - 日期紧接时段的时间前缀须有正文或时间戳支持；独立时段/钟点不作硬校验，
+          避免把所描述事件的时间强行等同于消息发送时间。
         """
         if not _TIME_CLAIM_RE.search(compact_fact):
             return ""
@@ -1424,6 +1433,15 @@ class MemorySummarizer:
         ]
         missing.extend("周%s" % weekday for weekday in sorted(claim_weekdays)
                        if weekday not in evidence_weekdays)
+        if time_evidence:
+            for pattern, _ in _DATE_PATTERNS:
+                dated_period = re.compile(
+                    pattern.pattern + r"(?P<period>上午|下午|早上|晚上|凌晨|中午|傍晚|深夜)"
+                )
+                for match in dated_period.finditer(compact_fact):
+                    period = match.group("period")
+                    if period not in text + time_evidence:
+                        missing.append(period)
         return "、".join(dict.fromkeys(missing))
 
     @classmethod
@@ -1446,10 +1464,10 @@ class MemorySummarizer:
             return "断言内容过短"
         time_evidence = cls._rows_time_evidence(rows)
         source = text + time_evidence
-        if len(compact_fact) >= 4 and compact_fact in source:
-            return ""
         if cls._polarity_conflict(compact_fact, text):
             return "与所引用原文的否定状态不一致"
+        if len(compact_fact) >= 4 and compact_fact in source:
+            return ""
         mismatch = cls._time_claim_mismatch(compact_fact, text, time_evidence, rows)
         if mismatch:
             return "提到的 %s 在所引用消息中找不到依据" % mismatch

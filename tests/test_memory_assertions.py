@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
+
 import asyncio
 import json
 import tempfile
@@ -393,7 +395,7 @@ class LatencyBudgetTests(unittest.IsolatedAsyncioTestCase):
 
 class AssertionPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_window_produces_both_the_summary_and_the_assertions(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as cleanup:
             config = {
                 "startup": {"background_grace_seconds": 60},
                 "memory_summary": {
@@ -404,7 +406,7 @@ class AssertionPipelineTests(unittest.IsolatedAsyncioTestCase):
             }
             service = MemoryCompanionService(
                 context=None, config=config, plugin_root=ROOT, data_dir=Path(tmp))
-            self.addCleanup(service.close)
+            cleanup.callback(service.close)
             service._schedule_memory_embedding = lambda *args: None
             event_ids = []
             for index, content in enumerate(CHAT):
@@ -443,7 +445,7 @@ class AssertionPipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(0, cross["health"])
 
     async def test_disabling_the_layer_falls_back_to_the_old_behaviour(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as cleanup:
             config = {
                 "startup": {"background_grace_seconds": 60},
                 "memory_assertions": {"enabled": False},
@@ -455,7 +457,7 @@ class AssertionPipelineTests(unittest.IsolatedAsyncioTestCase):
             }
             service = MemoryCompanionService(
                 context=None, config=config, plugin_root=ROOT, data_dir=Path(tmp))
-            self.addCleanup(service.close)
+            cleanup.callback(service.close)
             service._schedule_memory_embedding = lambda *args: None
             event_ids = []
             for index, content in enumerate(CHAT):
