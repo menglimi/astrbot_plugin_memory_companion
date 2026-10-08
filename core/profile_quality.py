@@ -65,6 +65,10 @@ _QUESTION_WORD_RE = re.compile(
     r"(?:什么|啥|多少|哪(?:个|种|些)?|谁|怎么|为何|为什么|干嘛|是否|还是|"
     r"几(?:月|号|日|点|岁|次|个|种|些|本|杯|碗|年|天|周|位|条|件|份|时|分))"
 )
+_SECOND_PERSON_ONLY_RE = re.compile(
+    r"(?:你们?|您们?|you)(?:自己|本人)?(?:呀|啊|呢|哦|嘛|啦|喔|咯|呗|哟|吧)*",
+    re.IGNORECASE,
+)
 _ADDRESS_ACTION_RE = re.compile(r"(?:去|来|跟车|跟着|跟|上班|工作|做|让我)")
 _ADDRESS_REJECT_RE = re.compile(
     r"(?:不许|不准|不能|别|不要|禁止|怎么还|为何还|为什么还|老是|总是|"
@@ -261,6 +265,8 @@ def _is_question(clause: str, sentence_is_question: bool) -> bool:
 
 def _valid_general_value(value: str, *, maximum: int = 40) -> bool:
     if not value or len(value) > maximum:
+        return False
+    if _SECOND_PERSON_ONLY_RE.fullmatch(value.strip()):
         return False
     if _QUESTION_WORD_RE.search(value):
         return False
