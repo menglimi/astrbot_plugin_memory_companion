@@ -119,7 +119,7 @@ class MemoryAuditTests(unittest.IsolatedAsyncioTestCase):
     def test_structured_fact_requires_existing_supporting_reference(self) -> None:
         summarizer = MemorySummarizer()
         rows = [{"id": "event-1", "content": "小王喜欢无糖拿铁。"}]
-        facts, traced = summarizer._normalize_key_facts(
+        traced, warnings, errors = summarizer._normalize_key_facts(
             [
                 {"fact": "小王喜欢无糖拿铁", "refs": ["event-1"]},
                 {"fact": "小王喜欢红茶", "refs": ["missing"]},

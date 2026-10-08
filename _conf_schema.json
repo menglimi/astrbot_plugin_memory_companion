@@ -720,7 +720,7 @@
         "description": "最大注入字数",
         "hint": "限制单轮注入长度，避免拖慢主链和污染上下文。原默认 1800 会把注入压成精简模式，每条只剩两百多字。",
         "type": "int",
-        "default": 1800
+        "default": 4000
       },
       "max_item_chars": {
         "description": "单条记忆内容上限",
