@@ -93,7 +93,7 @@ UI_MODES = (
     {"id": "cinema", "label": "放映馆界面"},
 )
 UI_VIEW_ENDPOINTS = {
-    "overview": ("/stats", "/buckets"),
+    "overview": ("/stats", "/buckets", "/logs"),
     "users": (
         "/memories",
         "/memory",
@@ -215,7 +215,7 @@ UI_ENDPOINT_EXPOSURE = {
     "/graph": {"exposure": "compat", "reason": "旧知识图谱数据入口，面板改用 /memories 结果本地构图，保留兼容读取"},
     "/threads": {"exposure": "compat", "reason": "旧开放线程列表入口，面板改用 /stats 与 /memories 聚合，保留兼容读取"},
     "/thread/status": {"exposure": "advanced", "reason": "线程开闭状态写入，面板不提供按钮，保留给管理员直接维护未闭环线程"},
-    "/logs": {"exposure": "compat", "reason": "注入日志明细，面板只显示 /stats 的条数汇总，保留给排障直连读取"},
+    "/logs": {"exposure": "visible", "reason": "总览与 Memory OS 展示最近注入轮次，内容为脱敏后的诊断摘要"},
     "/context/config": {"exposure": "compat", "reason": "上下文编排配置读取，面板统一走 /config/schema 的 context_orchestration 模块"},
     "/retrieval/config/update": {"exposure": "compat", "reason": "检索配置写入，面板统一走 /config/module/update 的 retrieval 模块"},
     "/memory/rebind-owner": {"exposure": "compat", "reason": "记忆归属改绑，面板统一走 /memory/update 表单，保留兼容修复入口"},

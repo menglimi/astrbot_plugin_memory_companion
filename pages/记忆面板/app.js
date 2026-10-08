@@ -1135,7 +1135,7 @@ defineView("overview", {
   eyebrow: "Overview",
   hint: "记忆库规模、范围分布与联动状态的整体快照",
   async load() {
-    const [statsPayload, buckets, core, caps, coord, memories, personal] = await Promise.all([
+    const [statsPayload, buckets, core, caps, coord, memories, personal, injectionLogs] = await Promise.all([
       apiGet("/stats"),
       apiTry(() => apiGet("/buckets?limit=160"), { buckets: [] }),
       apiTry(() => apiGet("/core-memory"), { blocks: [] }),
@@ -1143,11 +1143,21 @@ defineView("overview", {
       apiTry(() => apiGet("/coordination/status"), { status: {} }),
       apiTry(() => apiGet("/memories?limit=80"), { memories: [] }),
       apiTry(() => apiGet("/companion/personal-memory?limit=1"), null),
+      apiTry(() => apiGet("/logs?limit=12"), { items: [] }),
     ]);
     const stats = (statsPayload && statsPayload.stats) || {};
     state.stats = stats;
     state.buckets = Array.isArray(buckets.buckets) ? buckets.buckets : [];
-    return { stats, buckets: state.buckets, core: core.blocks || [], caps, personal, coord: coord.status || {}, memories: memories.memories || [] };
+    return {
+      stats,
+      buckets: state.buckets,
+      core: core.blocks || [],
+      caps,
+      personal,
+      coord: coord.status || {},
+      memories: memories.memories || [],
+      injectionLogs: Array.isArray(injectionLogs.items) ? injectionLogs.items : [],
+    };
   },
   render(data) {
     if (state.mode === "cinema") return renderCinemaOverview(data);
@@ -1228,17 +1238,52 @@ defineView("overview", {
           ? (personalStatus.dailyPlanEnabled ? "日程已启用" : "日程未启用") + " · " + (personalStatus.detailEnabled ? "细化已启用" : "细化未启用")
           : personalStatus.reason || "不可用",
     ]);
-    const injectionLogs = Number(stats.injection_logs) || 0;
+    const injectionLogCount = Number(stats.injection_logs) || 0;
     bridges.push([
-      injectionLogs > 0 ? "is-ok" : "is-off",
+      injectionLogCount > 0 ? "is-ok" : "is-off",
       "外部写入接口",
-      injectionLogs > 0 ? injectionLogs + " 条注入日志" : "暂无注入日志",
+      injectionLogCount > 0 ? injectionLogCount + " 条注入日志" : "暂无注入日志",
     ]);
     const linkageNote = personalStatus.installed
       ? ""
       : '<p class="section-note">未检测到 astrbot_plugin_private_companion。<b>记忆功能不受影响</b>，'
         + '装上陪伴插件后这里会显示它的日程、相册与表达权威归属。'
         + '<button class="btn is-sm" type="button" data-goto="companion" style="margin-left:8px">查看联动页</button></p>';
+
+    const injectionLogs = Array.isArray(data.injectionLogs) ? data.injectionLogs : [];
+    const injectionRows = injectionLogs
+      .slice(0, 12)
+      .map((item) => {
+        const selected = Array.isArray(item.selected_memories) ? item.selected_memories : [];
+        const blocked = Array.isArray(item.blocked_reasons) ? item.blocked_reasons : [];
+        const query = compact(item.query) || "无检索词";
+        const selectedText = selected.length
+          ? selected.slice(0, 2).map((memory) => memoryTitle(memory)).join("；")
+          : blocked.length
+            ? "未注入记忆 · 过滤 " + blocked.length + " 项"
+            : "未注入记忆";
+        return (
+          '<div class="row" style="cursor:default;align-items:flex-start">' +
+            '<div class="row-main" style="min-width:0">' +
+              '<div class="row-title" title="' + esc(query) + '">' + esc(clip(query, 72)) + "</div>" +
+              '<div class="row-sub">' + esc(fmtTime(item.created_at)) + " · " +
+                esc(selected.length + " 条记忆 · " + int(item.injection_chars) + " 字") + "</div>" +
+              '<div class="section-note" style="margin-top:5px;white-space:normal">' + esc(clip(selectedText, 180)) + "</div>" +
+            "</div>" +
+            '<div class="row-meta">' +
+              badge(selected.length ? "已注入" : "未注入", selected.length ? "ok" : "warn") +
+              (blocked.length ? badge("过滤 " + blocked.length, "") : "") +
+            "</div>" +
+          "</div>"
+        );
+      })
+      .join("");
+    const injectionCard = card(
+      "最近注入",
+      injectionLogs.length ? "最近 12 轮主链注入记录" : "暂无可展示的注入记录",
+      injectionRows || emptyState("暂无注入记录", "开启记忆注入并产生请求后，这里会显示最近轮次。"),
+      '<button class="btn is-sm is-ghost" type="button" data-refresh-injection>刷新</button>'
+    );
 
     return (
       '<div class="grid" style="gap:16px">' +
@@ -1262,10 +1307,12 @@ defineView("overview", {
         kpi("关系边", fmtInt(stats.relationships), "实体间关系", "relation") +
         kpi("ACL 规则", fmtInt(stats.acl_rules), "跨窗口读写授权", "gold") +
       "</div>" +
+      injectionCard +
       "</div>"
     );
   },
   mount(node) {
+    $("[data-refresh-injection]", node)?.addEventListener("click", () => refresh());
     const sceneRoot = $("#cinemaScene", node);
     if (sceneRoot) {
       const mountScene = () => window.MemoryCinema3D && window.MemoryCinema3D.mountArchiveScene(sceneRoot);
