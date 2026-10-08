@@ -119,7 +119,7 @@ class MemoryAuditTests(unittest.IsolatedAsyncioTestCase):
     def test_structured_fact_requires_existing_supporting_reference(self) -> None:
         summarizer = MemorySummarizer()
         rows = [{"id": "event-1", "content": "小王喜欢无糖拿铁。"}]
-        traced, warnings, errors = summarizer._normalize_key_facts(
+        traced, warnings, errors = summarizer._normalize_key_facts_with_validation(
             [
                 {"fact": "小王喜欢无糖拿铁", "refs": ["event-1"]},
                 {"fact": "小王喜欢红茶", "refs": ["missing"]},
@@ -127,7 +127,7 @@ class MemoryAuditTests(unittest.IsolatedAsyncioTestCase):
             ],
             rows,
         )
-        self.assertEqual(["小王喜欢无糖拿铁"], facts)
+        self.assertEqual(["小王喜欢无糖拿铁"], [item["fact"] for item in traced])
         self.assertEqual(
             [{
                 "fact": "小王喜欢无糖拿铁",
@@ -136,6 +136,8 @@ class MemoryAuditTests(unittest.IsolatedAsyncioTestCase):
             }],
             traced,
         )
+        self.assertTrue(any("event_id" in error for error in errors))
+        self.assertTrue(any("不受原文支持" in warning for warning in warnings))
 
     def test_legacy_string_fact_is_attributed_instead_of_dropped(self) -> None:
         summarizer = MemorySummarizer()

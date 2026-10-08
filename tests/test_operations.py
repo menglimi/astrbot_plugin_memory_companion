@@ -54,9 +54,10 @@ class OperationPresetTests(unittest.TestCase):
         schema = json.loads((Path(__file__).resolve().parents[1] / "_conf_schema.json").read_text(encoding="utf-8"))
         injection = schema["memory_injection"]["items"]
         self.assertEqual(4, injection["top_k"]["default"])
-        self.assertEqual(1800, injection["max_chars"]["default"])
+        self.assertEqual(4000, injection["max_chars"]["default"])
         self.assertEqual(320, injection["max_item_chars"]["default"])
         self.assertEqual(4, PRESETS["standard"]["memory_injection.top_k"])
+        self.assertEqual(1800, PRESETS["standard"]["memory_injection.max_chars"])
         self.assertEqual(320, PRESETS["standard"]["memory_injection.max_item_chars"])
         self.assertEqual(5, schema["memory_summary"]["items"]["max_retries"]["default"])
         self.assertEqual(24, schema["memory_summary"]["items"]["max_calls_per_session_hour"]["default"])
