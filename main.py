@@ -19,7 +19,7 @@ from .core.query_session import bind_query_tool_schema, bind_query_tool_v3_schem
 from .core.service import MemoryCompanionService
 
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
-PLUGIN_VERSION = "2.3.0"
+PLUGIN_VERSION = "2.3.1"
 
 _ACTIVE_BRIDGE: MemoryCompanionBridge | None = None
 
@@ -76,7 +76,8 @@ class MemoryCompanionPlugin(Star):
 
     async def initialize(self):
         """Start retained maintenance workers after AstrBot owns the event loop."""
-        await self.service.initialize_database()
+        if not await self.service.initialize_database():
+            return
         if not bind_event_tool_schema(self.context.get_llm_tool_manager(), type(self).__module__):
             logger.warning("[MemoryCompanion] event query tool schema binding unavailable")
         if not bind_query_tool_schema(self.context.get_llm_tool_manager(), type(self).__module__):
@@ -128,7 +129,8 @@ class MemoryCompanionPlugin(Star):
         配置为正数时，整个钩子被 ``asyncio.wait_for`` 包裹，超时即降级放行
         （本轮无记忆注入），绝不拖死全轮对话。默认值 0 = 关闭，完全向后兼容。
         """
-        await self.service.initialize_database()
+        if not await self.service.initialize_database():
+            return
         budget = self.service.config.float("hook_request_budget_seconds", 0.0)
         if budget <= 0:
             await self.service.handle_llm_request(event, req)
@@ -150,12 +152,13 @@ class MemoryCompanionPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
     async def on_group_message(self, event: AstrMessageEvent):
-        await self.service.initialize_database()
+        if not await self.service.initialize_database():
+            return
         await self.service.handle_group_message(event)
-
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
-        await self.service.initialize_database()
+        if not await self.service.initialize_database():
+            return
         await self.service.handle_llm_response(event, resp)
 
     @filter.llm_tool(name="memory_companion_recall")

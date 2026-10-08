@@ -345,7 +345,11 @@ class MemoryCompanionService:
         self._database_init_lock = threading.Lock()
         self._database_initialized = False
         if not defer_database_initialization:
-            self._initialize_database_sync()
+            try:
+                self._initialize_database_sync()
+            except BaseException:
+                self.store.close()
+                raise
         self.portraits = PortraitService(self.store, self.config)
 
         self.identity = IdentityResolver(self._resolve_default_bot_id)
@@ -13455,11 +13459,15 @@ class MemoryCompanionService:
         self._summary_pending_reasons.clear()
         self._save_token_usage(force=True)
         try:
-            self.store.close()
+            self._close_store_sync()
         except Exception as exc:
             logger.warning("[MemoryCompanion] 关闭记忆库连接失败: %s", exc, exc_info=True)
         finally:
             self._closed = True
+
+    def _close_store_sync(self) -> None:
+        with self._database_init_lock:
+            self.store.close()
 
     def shutdown_evidence(self) -> dict[str, Any]:
         """Return structured resource state for the shutdown completion log."""
@@ -13509,27 +13517,27 @@ class MemoryCompanionService:
         self._summary_pending_reasons.clear()
         self._save_token_usage(force=True)
         try:
-            await asyncio.to_thread(self.store.close)
+            await asyncio.to_thread(self._close_store_sync)
         except Exception as exc:
             logger.warning("[MemoryCompanion] 关闭记忆库连接失败: %s", exc, exc_info=True)
         finally:
             self._closed = True
 
-    def _initialize_database_sync(self) -> None:
+    def _initialize_database_sync(self) -> bool:
         with self._database_init_lock:
+            if getattr(self, "_closing", False) or getattr(self, "_closed", False):
+                return False
             if self._database_initialized:
-                return
+                return True
             try:
                 self.store.initialize()
             except Exception as exc:
-                self.store.close()
                 raise RuntimeError(
                     f"记忆主库初始化失败 [primary_store.initialize]: {type(exc).__name__}: {exc}"
                 ) from exc
             try:
                 self.scoped_store.initialize()
             except Exception as exc:
-                self.store.close()
                 raise RuntimeError(
                     f"作用域记忆库初始化失败 [scoped_store.initialize]: {type(exc).__name__}: {exc}"
                 ) from exc
@@ -13547,13 +13555,24 @@ class MemoryCompanionService:
                         internal_normalized,
                     )
             except Exception as exc:
-                self.store.close()
                 raise RuntimeError(
                     f"旧记忆规范化失败 [legacy_memory.normalize]: {type(exc).__name__}: {exc}"
                 ) from exc
             self._database_initialized = True
+            return True
 
-    async def initialize_database(self) -> None:
+    async def initialize_database(self) -> bool:
         """Initialize or upgrade databases without blocking AstrBot's loop."""
+        if self._closing or self._closed:
+            return False
         if not self._database_initialized:
-            await asyncio.to_thread(self._initialize_database_sync)
+            initialized = await asyncio.to_thread(self._initialize_database_sync)
+            if not initialized:
+                return False
+        if self._closing or self._closed:
+            return False
+        if self.capture is None:
+            from .capture_runtime import CaptureRuntime
+
+            self.capture = CaptureRuntime(self)
+        return True
