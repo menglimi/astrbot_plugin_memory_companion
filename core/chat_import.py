@@ -101,7 +101,7 @@ FIELD_METADATA_LABELS = frozenset(
         "message_id",
     }
 )
-OPENING_MARKERS = ("早", "早安", "早上好", "在吗", "醒了吗", "新年快乐")
+OPENING_MARKERS = ("早安", "早上好", "在吗", "醒了吗", "新年快乐")
 CLOSING_MARKERS = ("晚安", "睡吧", "先这样", "回聊", "不聊了", "下次聊", "拜拜", "再见")
 
 

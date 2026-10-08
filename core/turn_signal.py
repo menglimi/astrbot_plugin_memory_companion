@@ -72,6 +72,7 @@ REACTION_TOKENS = {
     "了解",
     "明白",
     "知道啦",
+    "没错",
     "好嘞",
     "好滴",
     "嗯呢",
@@ -88,7 +89,6 @@ CORRECTION_TOKENS = {
     "不对呀",
     "不是呀",
     "并不是",
-    "没错",
 }
 CORRECTION_MARKERS = (
     "你说错",
