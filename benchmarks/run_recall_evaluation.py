@@ -13,7 +13,10 @@ Workflow:
 
 2. Label the file: for each line fill ``relevant_ids`` with the memory ids a
    perfect assistant should recall (comma-free strings). Mark queries that
-   should return nothing with ``["__none__"]``. Delete uninteresting lines.
+   should return nothing with ``["__none__"]``. Optional ``expected_evidence``
+   lists source phrases that should survive injection; ``answer_text`` plus
+   ``answer_claims`` scores whether annotated claims had their evidence in the
+   final context. Delete uninteresting lines.
 
 3. Score the current engine and compare across code/weight changes::
 
@@ -40,6 +43,7 @@ except ImportError:
 ROOT = bootstrap_package()
 
 from astrbot_plugin_memory_companion.core.identity import session_target_id
+from astrbot_plugin_memory_companion.core.injection import InjectionComposer
 from astrbot_plugin_memory_companion.core.models import EntityRef, MemoryRecord, SessionContext
 from astrbot_plugin_memory_companion.core.retrieval import RetrievalEngine
 from astrbot_plugin_memory_companion.core.store import MemoryStore
@@ -94,11 +98,22 @@ async def _metrics(
 ) -> dict:
     recall_values: list[float] = []
     reciprocal_ranks: list[float] = []
+    injected_recall_values: list[float] = []
+    injection_distractors = 0
+    injection_items = 0
+    expected_evidence_count = 0
+    included_evidence_count = 0
+    answer_claims_scored = 0
+    answer_claims_grounded = 0
+    unanswerable_count = 0
+    unanswerable_injected = 0
+    unanswerable_claims = 0
     hit1 = 0
     scored_queries = 0
     empty_expected = 0
     empty_expected_returned = 0
     per_query: list[dict] = []
+    composer = InjectionComposer()
 
     for item in cases:
         relevant = {str(value) for value in item.get("relevant_ids", [])}
@@ -110,6 +125,55 @@ async def _metrics(
             str(item["query"]), ctx, top_k
         )
         returned_ids = [result.memory.id for result in results]
+        ctx.message_text = str(item["query"])
+        included_ids: list[str] = []
+        injected_text = composer.compose(
+            ctx,
+            results,
+            max_chars=max(300, int(item.get("max_injection_chars") or 1800)),
+            included_memory_ids=included_ids,
+        )
+        expected_evidence_values = item.get("expected_evidence", [])
+        if isinstance(expected_evidence_values, str):
+            expected_evidence_values = [expected_evidence_values]
+        expected_evidence = [
+            str(value) for value in expected_evidence_values if str(value)
+        ] if isinstance(expected_evidence_values, list) else []
+        expected_evidence_count += len(expected_evidence)
+        present_evidence = [
+            phrase for phrase in expected_evidence if _contains_text(injected_text, phrase)
+        ]
+        included_evidence_count += len(present_evidence)
+        unsupported_claims = 0
+        answer_text = str(item.get("answer_text") or "")
+        for claim in item.get("answer_claims", []) if isinstance(item.get("answer_claims"), list) else []:
+            if isinstance(claim, str):
+                claim = {"text": claim}
+            if not isinstance(claim, dict):
+                continue
+            claim_text = str(claim.get("text") or "").strip()
+            if not claim_text:
+                continue
+            if answer_text and claim_text and not _contains_text(answer_text, claim_text):
+                continue
+            evidence_ids = claim.get("evidence_ids") or claim.get("supported_by_ids") or []
+            if isinstance(evidence_ids, str):
+                evidence_ids = [evidence_ids]
+            if not isinstance(evidence_ids, (list, tuple, set)):
+                evidence_ids = []
+            evidence_ids = {str(value) for value in evidence_ids}
+            answer_claims_scored += 1
+            if evidence_ids.intersection(included_ids):
+                answer_claims_grounded += 1
+            else:
+                unsupported_claims += 1
+
+        is_unanswerable = bool(item.get("unanswerable")) or expects_none
+        if is_unanswerable:
+            unanswerable_count += 1
+            unanswerable_injected += int(bool(included_ids))
+            unanswerable_claims += unsupported_claims
+
         if expects_none:
             empty_expected += 1
             if returned_ids:
@@ -119,6 +183,10 @@ async def _metrics(
                     "query": item["query"],
                     "status": "expected_empty",
                     "returned": len(returned_ids),
+                    "injected_ids": included_ids,
+                    "expected_evidence": len(expected_evidence),
+                    "included_evidence": len(present_evidence),
+                    "unsupported_answer_claims": unsupported_claims,
                 }
             )
             continue
@@ -130,6 +198,10 @@ async def _metrics(
         hits = [index for index, value in enumerate(returned_ids) if value in relevant]
         recall = len(hits) / len(relevant)
         recall_values.append(recall)
+        injected_hits = len(relevant.intersection(included_ids))
+        injected_recall_values.append(injected_hits / len(relevant))
+        injection_items += len(included_ids)
+        injection_distractors += sum(memory_id not in relevant for memory_id in included_ids)
         rank = min(hits) + 1 if hits else 0
         # A complete miss contributes zero to MRR and stays in the denominator.
         reciprocal_ranks.append(1.0 / rank if rank else 0.0)
@@ -142,6 +214,11 @@ async def _metrics(
                 "relevant": sorted(relevant),
                 "returned": returned_ids,
                 "recall": recall,
+                "injected_recall": injected_hits / len(relevant),
+                "injected_ids": included_ids,
+                "expected_evidence": len(expected_evidence),
+                "included_evidence": len(present_evidence),
+                "unsupported_answer_claims": unsupported_claims,
                 "first_rank": rank,
                 "top_blocked": [
                     str(entry.get("reason", ""))[:80] for entry in blocked[:2]
@@ -160,9 +237,25 @@ async def _metrics(
         f"recall@{top_k}": round(mean(recall_values), 4),
         "mrr": round(mean(reciprocal_ranks), 4),
         "hit@1": round(hit1 / scored_queries, 4) if scored_queries else 0.0,
+        "injected_recall": round(mean(injected_recall_values), 4),
+        "injection_distractor_rate": round(injection_distractors / injection_items, 4) if injection_items else 0.0,
+        "expected_evidence": expected_evidence_count,
+        "injection_evidence_coverage": round(included_evidence_count / expected_evidence_count, 4) if expected_evidence_count else 0.0,
+        "unanswerable_cases": unanswerable_count,
+        "unanswerable_injection_rate": round(unanswerable_injected / unanswerable_count, 4) if unanswerable_count else 0.0,
+        "answer_claims_scored": answer_claims_scored,
+        "answer_claim_grounding_rate": round(answer_claims_grounded / answer_claims_scored, 4) if answer_claims_scored else 0.0,
+        "unsupported_answer_claim_rate": round((answer_claims_scored - answer_claims_grounded) / answer_claims_scored, 4) if answer_claims_scored else 0.0,
+        "unanswerable_answer_claims": unanswerable_claims,
         "store_memories": int(stats.get("total_memories", 0) or 0),
         "per_query": per_query,
     }
+
+
+def _contains_text(text: str, phrase: str) -> bool:
+    compact_text = "".join(str(text or "").split()).casefold()
+    compact_phrase = "".join(str(phrase or "").split()).casefold()
+    return bool(compact_phrase and compact_phrase in compact_text)
 
 
 def _build_engine(store: MemoryStore, mode: str) -> RetrievalEngine:
@@ -274,8 +367,25 @@ async def run_synthetic(decoys: int, top_k: int) -> None:
                         "session_id": session,
                         "bot_id": "eval-bot",
                         "relevant_ids": [memory_id],
+                        "expected_evidence": [content],
+                        "answer_text": content,
+                        "answer_claims": [
+                            {"text": content, "evidence_ids": [memory_id]}
+                        ],
                     }
                 )
+            cases.append(
+                {
+                    "query": "量子退相干时间是多少？",
+                    "scope": "private",
+                    "session_id": session,
+                    "bot_id": "eval-bot",
+                    "relevant_ids": [NONE_MARKER],
+                    "unanswerable": True,
+                    "answer_text": "我还没有这方面的记录。",
+                    "answer_claims": [],
+                }
+            )
             engine = _build_engine(store, "basic")
             report = await _metrics(cases, engine, store, top_k)
             summary = {key: value for key, value in report.items() if key != "per_query"}

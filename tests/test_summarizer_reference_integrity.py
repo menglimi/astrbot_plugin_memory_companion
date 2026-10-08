@@ -124,6 +124,86 @@ class SummarizerReferenceIntegrityTests(unittest.IsolatedAsyncioTestCase):
             MemorySummarizer.fact_supported_by_rows("2026-08-01 中午小王喝了无糖拿铁", rows)
         )
 
+    def test_message_timestamp_supports_date_weekday_and_time_period(self) -> None:
+        rows = [
+            {
+                "id": "event-1",
+                "event_type": "user_message",
+                "scope": "private",
+                "subject_id": "u1",
+                "content": "我不想研究这个方案了。",
+                "occurred_at": "2026-07-15T14:27:30+00:00",
+            }
+        ]
+
+        self.assertTrue(
+            MemorySummarizer.fact_supported_by_rows(
+                "2026-07-15 周三晚上，我不想研究这个方案了。", rows
+            )
+        )
+        self.assertFalse(
+            MemorySummarizer.fact_supported_by_rows(
+                "2026-07-14 周二晚上，我不想研究这个方案了。", rows
+            )
+        )
+        self.assertFalse(
+            MemorySummarizer.fact_supported_by_rows(
+                "2026-07-15 周四晚上，我不想研究这个方案了。", rows
+            )
+        )
+        # Time-of-day wording may describe the referenced event rather than
+        # the message timestamp, so it does not trigger a hard rejection.
+        self.assertTrue(
+            MemorySummarizer.fact_supported_by_rows(
+                "2026-07-15 周三早上，我不想研究这个方案了。", rows
+            )
+        )
+
+    def test_unrelated_negation_does_not_poison_a_supported_fact(self) -> None:
+        rows = [
+            {
+                "id": "event-1",
+                "content": "小王今天很累。会议没有新方案，不过讨论已经结束。",
+                "occurred_at": "2026-07-15T14:27:30+00:00",
+            }
+        ]
+        self.assertTrue(
+            MemorySummarizer.fact_supported_by_rows("小王今天很累，会议讨论结束了。", rows)
+        )
+
+    def test_polarity_flip_is_rejected_for_the_matching_claim(self) -> None:
+        negative_rows = [{"id": "event-1", "content": "小王不喜欢香菜。"}]
+        positive_rows = [{"id": "event-2", "content": "小王喜欢香菜。"}]
+        self.assertFalse(MemorySummarizer.fact_supported_by_rows("小王喜欢香菜。", negative_rows))
+        self.assertFalse(MemorySummarizer.fact_supported_by_rows("小王不喜欢香菜。", positive_rows))
+
+    def test_unsupported_fact_is_dropped_without_failing_the_summary(self) -> None:
+        summarizer = MemorySummarizer()
+        normalized = summarizer._normalize_payload(
+            {
+                "summary": "小王喝了无糖拿铁，心情很好。",
+                "summary_refs": ["event-1"],
+                "key_facts": [
+                    {
+                        "fact": "小王喝了无糖拿铁",
+                        "refs": ["event-1"],
+                        "evidence": [{"ref": "event-1", "quote": "小王喝了无糖拿铁"}],
+                    },
+                    {
+                        "fact": "小王准备去北京旅行",
+                        "refs": ["event-1"],
+                        "evidence": [{"ref": "event-1", "quote": "小王喝了无糖拿铁"}],
+                    },
+                ],
+            },
+            [{"id": "event-1", "content": "小王喝了无糖拿铁，心情很好。"}],
+        )
+
+        self.assertEqual(["小王喝了无糖拿铁"], normalized["key_facts"])
+        self.assertEqual([], normalized["_validation_errors"])
+        self.assertEqual("low", summarizer.summary_quality(normalized))
+        self.assertIn("已剔除", normalized["_quality_warnings"][0])
+
     async def test_summary_refs_are_normalized_like_key_fact_refs(self) -> None:
         """§6.8-4: summary_refs must be normalized with the same helper as key_facts refs.
 

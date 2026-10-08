@@ -1,0 +1,336 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:memory:local-query-session:result:v1",
+  "title": "Original owner result and optional turn progress",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "profile": {
+      "const": "memory.local-query-session.v1"
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "operation": {
+      "type": "string",
+      "enum": [
+        "status",
+        "recall",
+        "sources",
+        "navigate",
+        "events"
+      ]
+    },
+    "error": {
+      "type": "string",
+      "maxLength": 160
+    },
+    "operation_id": {
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
+    "result": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Unmodified owner result: sources/events retain their paired v1 contracts; recall/navigation use their legacy types."
+    },
+    "progress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": [
+            "empty",
+            "unavailable",
+            "ready"
+          ]
+        },
+        "session": {
+          "type": "string",
+          "maxLength": 40,
+          "pattern": "^mq_"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "completed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "in_flight": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "steps": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "used": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "remaining": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "used",
+            "limit",
+            "remaining"
+          ]
+        },
+        "recall_calls": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "recall_item_limit": {
+          "const": 10
+        },
+        "read_sources": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "valid_sources": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "partial_sources": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "continuations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "current_context": {
+          "const": "unknown"
+        },
+        "recent": {
+          "type": "array",
+          "maxItems": 24,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "operation": {
+                "type": "string",
+                "enum": [
+                  "recall",
+                  "sources",
+                  "navigate",
+                  "events"
+                ]
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "running",
+                  "succeeded",
+                  "rejected",
+                  "failed",
+                  "cancelled"
+                ]
+              },
+              "reserved_steps": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "query": {
+                "type": "string",
+                "maxLength": 80
+              },
+              "error": {
+                "type": "string",
+                "maxLength": 160
+              },
+              "parameters": {
+                "type": "object"
+              },
+              "parameters_omitted": {
+                "type": "boolean"
+              },
+              "source_refs": {
+                "type": "array",
+                "maxItems": 96,
+                "items": {
+                  "type": "string",
+                  "maxLength": 180
+                }
+              },
+              "memory_refs": {
+                "type": "array",
+                "maxItems": 96,
+                "items": {
+                  "type": "string",
+                  "maxLength": 160
+                }
+              },
+              "elapsed_ms": {
+                "type": "number",
+                "minimum": 0
+              },
+              "usage": {
+                "type": "object"
+              },
+              "usage_known": {
+                "type": "boolean"
+              },
+              "result_count": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "id",
+              "operation",
+              "state",
+              "reserved_steps"
+            ]
+          }
+        },
+        "omitted_operations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "display_omitted": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sources": {
+          "type": "array",
+          "maxItems": 96,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "ref": {
+                "type": "string",
+                "maxLength": 180
+              },
+              "version": {
+                "type": "string",
+                "maxLength": 128
+              },
+              "spans": {
+                "type": "array",
+                "items": {
+                  "type": "array",
+                  "prefixItems": [
+                    {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  ],
+                  "minItems": 2,
+                  "maxItems": 2
+                }
+              },
+              "next_excerpt_offset": {
+                "type": ["integer", "null"],
+                "minimum": 0
+              },
+              "expires_in_seconds": {
+                "type": "number",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "ref",
+              "version",
+              "spans",
+              "next_excerpt_offset",
+              "expires_in_seconds"
+            ]
+          }
+        },
+        "cursors": {
+          "type": "array",
+          "maxItems": 96,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "cursor": {
+                "type": "string",
+                "maxLength": 160
+              },
+              "query": {
+                "type": "object"
+              },
+              "expires_in_seconds": {
+                "type": "number",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "cursor",
+              "query",
+              "expires_in_seconds"
+            ]
+          }
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "ready"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "session",
+              "revision",
+              "completed",
+              "in_flight",
+              "steps",
+              "recall_calls",
+              "recall_item_limit",
+              "read_sources",
+              "valid_sources",
+              "partial_sources",
+              "continuations",
+              "current_context",
+              "recent",
+              "omitted_operations"
+            ]
+          },
+          "else": {
+            "maxProperties": 1
+          }
+        }
+      ]
+    }
+  },
+  "required": [
+    "profile",
+    "ok",
+    "operation",
+    "operation_id",
+    "error",
+    "result",
+    "progress"
+  ]
+}

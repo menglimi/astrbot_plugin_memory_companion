@@ -114,6 +114,13 @@ class C7RetrievalBoundaryTests(unittest.TestCase):
         )
         self.assertIn('const result = await apiTry(() => apiGet("/conversation-import/status"), null);', panel)
 
+    def test_panel_fetches_import_status_on_navigation_and_manual_refresh(self) -> None:
+        panel = (ROOT / "pages" / "记忆面板" / "app.js").read_text(encoding="utf-8")
+        self.assertIn('apiGet("/conversation-import/status?batch_id="', panel)
+        self.assertIn('apiGet("/conversation-import/status")', panel)
+        self.assertIn('const recentRefresh = $("#recentRefreshBtn", node);', panel)
+        self.assertIn('recentRefresh.addEventListener("click"', panel)
+
 
 class C7PerformanceBoundaryTests(unittest.IsolatedAsyncioTestCase):
     async def test_embedding_candidate_cache_is_bounded(self) -> None:

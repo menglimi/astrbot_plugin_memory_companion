@@ -7,14 +7,14 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-if "astrabot_plugin_remember_you" not in sys.modules:
-    package = types.ModuleType("astrabot_plugin_remember_you")
+if "astrbot_plugin_remember_you" not in sys.modules:
+    package = types.ModuleType("astrbot_plugin_remember_you")
     package.__path__ = [str(ROOT)]
-    sys.modules["astrabot_plugin_remember_you"] = package
+    sys.modules["astrbot_plugin_remember_you"] = package
 if str(ROOT.parent) not in sys.path:
     sys.path.insert(0, str(ROOT.parent))
 
-from astrabot_plugin_remember_you.core import bot_personal_contract as contract
+from astrbot_plugin_remember_you.core import bot_personal_contract as contract
 
 
 class C1ContractTests(unittest.TestCase):

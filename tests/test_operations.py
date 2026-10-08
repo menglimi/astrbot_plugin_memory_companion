@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ from astrbot_plugin_memory_companion.core.config import ConfigView
 from astrbot_plugin_memory_companion.core.models import EntityRef, MemoryRecord
 from astrbot_plugin_memory_companion.core.operations import (
     PORTABLE_FORMAT,
+    PRESETS,
     PortableMemoryArchive,
     apply_preset,
     detect_preset,
@@ -47,6 +49,18 @@ class OperationPresetTests(unittest.TestCase):
         self.assertEqual("rerank-1", raw["retrieval"]["rerank_provider_id"])
         self.assertEqual("summary-1", raw["memory_summary"]["provider_id"])
         self.assertEqual("light", detect_preset(ConfigView(raw)))
+
+    def test_standard_preset_defaults_to_fewer_complete_memories(self) -> None:
+        schema = json.loads((Path(__file__).resolve().parents[1] / "_conf_schema.json").read_text(encoding="utf-8"))
+        injection = schema["memory_injection"]["items"]
+        self.assertEqual(4, injection["top_k"]["default"])
+        self.assertEqual(1800, injection["max_chars"]["default"])
+        self.assertEqual(320, injection["max_item_chars"]["default"])
+        self.assertEqual(4, PRESETS["standard"]["memory_injection.top_k"])
+        self.assertEqual(320, PRESETS["standard"]["memory_injection.max_item_chars"])
+        self.assertEqual(5, schema["memory_summary"]["items"]["max_retries"]["default"])
+        self.assertEqual(24, schema["memory_summary"]["items"]["max_calls_per_session_hour"]["default"])
+        self.assertEqual(300, schema["memory_summary"]["items"]["provider_timeout_seconds"]["default"])
 
     def test_persist_runtime_config_is_utf8_and_atomic_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

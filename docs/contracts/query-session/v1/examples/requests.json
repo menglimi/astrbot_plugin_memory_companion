@@ -1,0 +1,25 @@
+[
+  {
+    "operation": "sources",
+    "parameters": {
+      "terms": [
+        "浅紫色"
+      ]
+    }
+  },
+  {
+    "operation": "sources",
+    "parameters": {
+      "cursor": "src_example"
+    }
+  },
+  {
+    "operation": "recall",
+    "parameters": {
+      "query": "当时的说法"
+    }
+  },
+  {
+    "operation": "status"
+  }
+]

@@ -28,12 +28,11 @@ class HookStageTimerTests(unittest.TestCase):
         self.assertFalse(timer.enabled)
 
     def test_enabled_timer_records_marks(self):
-        # mark() 记录的是「距上一次 mark 的整毫秒截断」，因此用真实 sleep 断言耗时
-        # 会依赖墙钟精度：Windows 上 time.sleep(0.005) 常只睡到 4.x ms，3.12 尤其明显，
-        # 于是 total_ms() 在 4 / 5 之间抖动（上游 pristine 提交上 6 次有 4 次失败）。
-        # 改为注入受控时钟，既消除抖动，又把截断语义钉死。
-        with patch("astrbot_plugin_memory_companion.core.service.time") as clock:
-            clock.monotonic.side_effect = [1000.0, 1000.0005, 1005.0]
+        # Inject the nanosecond clock so rounding behavior is deterministic.
+        with patch(
+            "astrbot_plugin_memory_companion.core.service.time.perf_counter_ns",
+            side_effect=[1_000_000_000, 1_000_400_000, 5_999_800_000],
+        ):
             timer = _HookStageTimer(True)
             timer.mark("first")
             timer.mark("second")

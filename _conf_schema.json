@@ -182,18 +182,6 @@
         "default": 5,
         "hint": "窗口外只收集哈希化证据，不整理智能画像。"
       },
-      "token_budget_per_person_day": {
-        "description": "单用户每日画像 Token 预算",
-        "type": "int",
-        "default": 4000,
-        "hint": "预留给后续经批准的批量推断；当前确定性证据聚合不调用画像 LLM。"
-      },
-      "token_budget_global_day": {
-        "description": "全局每日画像 Token 预算",
-        "type": "int",
-        "default": 40000,
-        "hint": "预留给后续经批准的批量推断；预算不足时必须跳过而不是降级为逐消息调用。"
-      },
       "usage_min_confidence": {
         "description": "智能画像使用置信度",
         "type": "float",
@@ -205,18 +193,25 @@
         "type": "int",
         "default": 90,
         "hint": "超过期限的智能推断停止使用，等待新的独立证据。"
+      }
+    }
+  },
+  "memory_assertions": {
+    "type": "object",
+    "description": "断言层：从对话里提炼「关于这个人什么是真的」，与对话摘要并列的第二层记忆。",
+    "hint": "摘要是「我们聊了什么」，断言是「这个人什么是真的、依据在哪」。断言复用阶段总结的那一次模型调用，不额外增加调用次数与延迟。相同断言会自动合并为一条并累积来源，单值属性改口会接上修订关系。",
+    "items": {
+      "enabled": {
+        "description": "启用断言层",
+        "hint": "关闭后退回只有对话摘要的行为。断言是普通记忆记录，召回、权限、衰减、面板全部沿用现有机制。",
+        "type": "bool",
+        "default": true
       },
-      "context_message_limit": {
-        "description": "画像上下文消息上限",
+      "max_per_batch": {
+        "description": "每批最多提炼断言数",
+        "hint": "单批对话最多写入多少条断言。更多条目会显著增加输出 token 与耗时；只提炼真正长期成立的，宁少勿多。",
         "type": "int",
-        "default": 8,
-        "hint": "后续需要语义消歧时只允许使用同场景最小窗口；第三方消息不能作为事实证据。"
-      },
-      "context_char_limit": {
-        "description": "画像上下文字符上限",
-        "type": "int",
-        "default": 6000,
-        "hint": "上下文仅作当场解释，不写入画像表，也不跨场景拼接。"
+        "default": 6
       }
     }
   },
@@ -313,7 +308,7 @@
         "description": "总结模型超时秒数",
         "hint": "单次调用总结模型的最长等待时间。超时会尝试备用模型并保留未总结时间线。0 表示不限制。",
         "type": "int",
-        "default": 180
+        "default": 300
       },
       "evidence_events": {
         "description": "证据事件条数",
@@ -321,11 +316,17 @@
         "type": "int",
         "default": 12
       },
+      "candidate_valid_days": {
+        "description": "降级候选有效期天数",
+        "hint": "总结正文没能通过引用校验、但模型确实写出了正文时，该批会存为待复核候选而不是被丢弃。这批候选的有效期由本项决定，到期后不再参与召回，记录本身仍保留、可人工复核。",
+        "type": "int",
+        "default": 30
+      },
       "max_retries": {
         "description": "每批自动调用上限",
-        "hint": "同一批次自动调用模型的总次数上限（含首次、备用模型及一次纠正）。达到后仅挂起该批，后续消息继续；次数持久化，重启不重置。默认 3。",
+        "hint": "同一批次自动调用模型的总次数上限（含首次、备用模型及预算内纠正）。达到后隔离该批，后续消息继续；次数持久化，重启不重置。默认 5。",
         "type": "int",
-        "default": 3
+        "default": 5
       },
       "retry_backoff_seconds": {
         "description": "自动重试退避秒数",
@@ -341,15 +342,15 @@
       },
       "non_transient_retry_cooldown_minutes": {
         "description": "内容错误冷却分钟",
-        "hint": "用于迁移旧版内容错误批次后的恢复等待时间。新版内容或引用错误只自动纠正一次，不再周期性反复调用；后续消息继续处理。",
+        "hint": "用于迁移旧版内容错误批次后的恢复等待时间。新版内容或引用错误会在每批调用预算内继续纠正，耗尽后隔离并继续处理后续消息。",
         "type": "int",
         "default": 30
       },
       "max_calls_per_session_hour": {
         "description": "每会话每小时自动调用上限",
-        "hint": "实际调用次数预算，首次、备用模型和纠正共用；达到后暂停到后续触发，原文和待处理批次保留。重启不重置。默认 6，活跃会话可按需调整。",
+        "hint": "实际调用次数预算，首次、备用模型和纠正共用；达到后暂停到后续触发，原文和待处理批次保留。重启不重置。默认 24，活跃会话可按需调整。",
         "type": "int",
-        "default": 6
+        "default": 24
       },
       "max_concurrent_calls": {
         "description": "全局总结并发上限",
@@ -495,23 +496,41 @@
         "hint": "每轮最多送入重排模型的候选记忆数量。建议 24-40。",
         "type": "int",
         "default": 32
+      },
+      "embedding_index_pending": {
+        "description": "待复核记忆也建向量索引",
+        "hint": "关闭时 review_status=pending 的记忆不进向量索引，召回时也不会因为它被跳过。默认关闭。",
+        "type": "bool",
+        "default": false
       }
     }
   },
   "retrieval_advanced": {
     "description": "检索高级参数",
-    "hint": "向量扫描上限、相似度阈值、超时和补索引等高级调优参数。日常使用可保持默认。",
+    "hint": "向量比较批量、相似度阈值、超时和补索引等高级调优参数。日常使用可保持默认。",
     "type": "object",
     "items": {
+      "recall_latency_budget_ms": {
+        "description": "召回延迟预算（毫秒）",
+        "hint": "每轮召回的时间预算。超预算后跳过可选的模型调用（精排），但候选数量不变——变慢的是排序质量，不是召回内容。想提速请用这一项，而不是调低注入条数：调低条数会直接删掉这个插件存在的意义。0 表示不限制。",
+        "type": "int",
+        "default": 0
+      },
+      "query_vector_cache_ttl_seconds": {
+        "description": "问句向量缓存秒数",
+        "hint": "开启向量检索时，每轮都要为当前问题算一次向量。同一句话重复追问是很常见的，这里按 TTL 缓存，避免重复的模型调用。0 表示关闭。",
+        "type": "float",
+        "default": 0.0
+      },
       "embedding_candidate_limit": {
-        "description": "向量扫描上限",
-        "hint": "每轮最多从本地向量索引中扫描多少条候选。记忆库很大时可适当降低；想提高旧记忆召回覆盖面可提高。",
+        "description": "向量比较批量",
+        "hint": "每批处理的向量数，沿用原配置键。会分批比较全部当前允许读取且有效的已索引记忆；降低批量可减少临时内存，不再截掉较早的记忆。",
         "type": "int",
         "default": 1200
       },
       "embedding_top_k": {
         "description": "向量合并数量",
-        "hint": "向量相似度最高的多少条会并入本地候选池，再经过权限过滤、本地评分和可选重排。",
+        "hint": "当前授权集合内向量相似度最高的多少条会并入本地候选池，再重验来源、本地评分和可选重排。",
         "type": "int",
         "default": 32
       },
@@ -607,6 +626,79 @@
       }
     }
   },
+  "source_semantic": {
+    "description": "原文语义索引",
+    "hint": "可选地为当前会话的可读原文生成语义候选索引。默认关闭；必须显式绑定嵌入 Provider、模型修订和维度。历史回填另行启用并受每次维护额度限制。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用原文语义建库",
+        "hint": "允许将当前来源范围内的脱敏原文片段发送给指定 Embedding Provider。关闭时不创建 generation，也不发送原文。",
+        "type": "bool",
+        "default": false
+      },
+      "provider_id": {
+        "description": "原文语义 Provider",
+        "hint": "必须填写具体的 AstrBot Embedding Provider ID；不会自动挑选第一个 Provider。",
+        "type": "string",
+        "default": ""
+      },
+      "model_revision": {
+        "description": "模型修订标识",
+        "hint": "填写可识别模型空间的修订标识。Provider 未提供可信模型修订时，变更模型后请手动更新此值。",
+        "type": "string",
+        "default": ""
+      },
+      "dimensions": {
+        "description": "向量维度",
+        "hint": "填写所选 Embedding Provider 实际返回的维度；不匹配时本批不会提交。",
+        "type": "int",
+        "default": 0
+      },
+      "history_backfill_enabled": {
+        "description": "回填当前会话历史",
+        "hint": "开启后按稳定来源 ID 对当前会话的已有原文逐页补齐；关闭时只处理建库启用后触发的来源。每次调度仍受批次额度限制。",
+        "type": "bool",
+        "default": false
+      },
+      "sources_per_run": {
+        "description": "每次维护来源数",
+        "hint": "单次后台唤醒最多检查的来源数，取值会限制在 1-32。",
+        "type": "int",
+        "default": 4
+      },
+      "provider_calls_per_run": {
+        "description": "每次 Provider 调用上限",
+        "hint": "单次后台唤醒最多新增的 Embedding 请求数，取值会限制在 1-32。已就绪且内容未变的投影不重复调用。",
+        "type": "int",
+        "default": 8
+      },
+      "fragment_target_chars": {
+        "description": "原文片段目标长度",
+        "hint": "按 Unicode 码点切分的单片段目标长度。",
+        "type": "int",
+        "default": 600
+      },
+      "fragment_overlap_chars": {
+        "description": "原文片段重叠长度",
+        "hint": "相邻片段保留的重叠码点数，必须小于片段目标长度。",
+        "type": "int",
+        "default": 80
+      },
+      "window_max_chars": {
+        "description": "邻近窗口最大长度",
+        "hint": "单个片段与可用邻近消息拼接后的总码点上限。",
+        "type": "int",
+        "default": 1800
+      },
+      "processing_version": {
+        "description": "原文投影修订",
+        "hint": "来源脱敏或可读投影策略改变时更新此标识，避免新旧片段偏移共用 generation。",
+        "type": "string",
+        "default": "source-redaction-v1"
+      }
+    }
+  },
   "memory_injection": {
     "description": "记忆注入包",
     "hint": "控制每轮主链请求前注入多少记忆、最多多少字，以及是否记录注入日志。",
@@ -620,21 +712,21 @@
       },
       "top_k": {
         "description": "注入条数",
-        "hint": "每轮最多注入多少条记忆。建议 3-8。",
+        "hint": "每轮最多注入多少条记忆。默认 4 条，优先保留最相关内容；时间聚合问题可按需增加。",
         "type": "int",
-        "default": 6
+        "default": 4
       },
       "max_chars": {
         "description": "最大注入字数",
-        "hint": "限制单轮注入长度，避免拖慢主链和污染上下文。",
+        "hint": "限制单轮注入长度，避免拖慢主链和污染上下文。原默认 1800 会把注入压成精简模式，每条只剩两百多字。",
         "type": "int",
         "default": 1800
       },
       "max_item_chars": {
         "description": "单条记忆内容上限",
-        "hint": "每条注入记忆的内容最多保留多少字符（默认 220）。对话总结等长记忆默认会被截断到该上限、细节需靠 navigate/recall 工具补；若工具使用率低、希望注入里保留更多原文可调大（注入包总长仍受「最大注入字数」限制）。",
+        "hint": "每条注入记忆的内容最多保留多少字符（默认 320）。注入条数较少时可保留更完整的摘要片段，整包仍受「最大注入字数」限制。",
         "type": "int",
-        "default": 220
+        "default": 320
       },
       "temporal_aggregate_max_chars": {
         "description": "时间聚合注入字数",
@@ -677,6 +769,18 @@
         "hint": "默认开启（作者逻辑）：被判定为 tone 的记忆只给语气提示、不给正文。关闭后所有记忆直接以正文注入（跳过 tone 检查，统一按条件候选处理），用于避免对话总结等记忆主力被折叠成占位提示、模型无法引用。",
         "type": "bool",
         "default": true
+      },
+      "injection_cache_ttl_seconds": {
+        "description": "注入结果缓存秒数",
+        "hint": "同一轮内多次请求复用注入结果的时长。0 = 不缓存。",
+        "type": "float",
+        "default": 0.0
+      },
+      "hook_request_budget_seconds": {
+        "description": "注入钩子超时预算（秒）",
+        "hint": "正数时整个注入钩子被 wait_for 包裹，超时即降级放行（本轮不注入），绝不拖死全轮对话。0 = 关闭。",
+        "type": "float",
+        "default": 0.0
       }
     }
   },
@@ -890,6 +994,24 @@
         "hint": "开启后，今天穿什么、现在在干嘛、吃什么、心情怎样这类当前状态问题，只允许直接命中对应锚点的长期记忆进入注入包，避免旧阶段总结抢答。",
         "type": "bool",
         "default": true
+      },
+      "contextual_query_expansion_enabled": {
+        "description": "启用上下文查询扩展",
+        "hint": "将当前消息与本轮前文合并提取少量锚点；时间查询和没有明确上下文时不扩展。",
+        "type": "bool",
+        "default": true
+      },
+      "contextual_query_recent_events": {
+        "description": "上下文扩展读取消息数",
+        "hint": "最多读取当前请求上下文中的最近消息数。",
+        "type": "int",
+        "default": 12
+      },
+      "contextual_query_anchor_limit": {
+        "description": "上下文查询锚点上限",
+        "hint": "每轮最多提取多少个前文实体或主题锚点。",
+        "type": "int",
+        "default": 8
       }
     }
   },
@@ -989,12 +1111,6 @@
         "type": "bool",
         "default": true
       },
-      "preserve_external_prompt_context": {
-        "description": "保留外部临时片段",
-        "hint": "整理 AstrBot 原始历史时只保留真正带临时/不保存标记的外部片段；历史里遗留的 private_companion HTML 动态块会被清理，避免状态、引用链或工具提示写入会话历史后反复污染主链。",
-        "type": "bool",
-        "default": true
-      },
       "cross_window_emotional_continuity_enabled": {
         "description": "跨窗口情绪连续性",
         "hint": "默认关闭。开启后其他会话中触发的情绪余波可影响当前窗口，但不会注入原始记忆内容。",
@@ -1008,8 +1124,8 @@
         "default": true
       },
       "clean_proactive_history": {
-        "description": "清理主动消息历史提示",
-        "hint": "注入前清理 AstrBot 原始上下文中残留的主动消息生成提示、send_message_to_user 工具说明、主动承接占位和 TTS/定时控制标签，只保留用户可见的干净聊天内容。",
+        "description": "清理主动消息历史提示与外部残留块",
+        "hint": "注入前清理 AstrBot 原始上下文中残留的主动消息生成提示、send_message_to_user 工具说明、主动承接占位和 TTS/定时控制标签，只保留用户可见的干净聊天内容。同时只保留真正带临时/不保存标记的外部片段，历史里遗留的 private_companion HTML 动态块会被清理，避免状态、引用链或工具提示写入会话历史后反复污染主链。",
         "type": "bool",
         "default": true
       },
@@ -1049,6 +1165,12 @@
         "hint": "开启后，可在私聊/群聊卡片中配置跨窗口读取权限；默认隔离仍然生效，只有显式授权的窗口会被额外放行。",
         "type": "bool",
         "default": true
+      },
+      "hide_pending_review": {
+        "description": "默认隐藏待复核记忆",
+        "hint": "关闭后待复核的记忆会像正常记忆一样出现在面板列表与检索结果里。",
+        "type": "bool",
+        "default": true
       }
     }
   },
@@ -1057,6 +1179,18 @@
     "hint": "允许模型在需要时主动回忆、记忆和整理 Bot 自己的陪伴笔记。",
     "type": "object",
     "items": {
+      "enable_query_progress": {
+        "description": "查询时附带简短进度",
+        "hint": "查询时附上已读资料和可续查信息，帮助减少重复查找；不增加额外总结。关闭后使用原查询工具。",
+        "type": "bool",
+        "default": true
+      },
+      "enable_query_notes": {
+        "description": "查询时可保留简短理解",
+        "hint": "在查询进度开启时，允许模型随原文查询保留本轮理解和来源，按需回看；不写长期记忆，也不另加总结模型。",
+        "type": "bool",
+        "default": true
+      },
       "enable_recall_tool": {
         "description": "启用主动回忆工具",
         "hint": "开启后模型可调用 memory_companion_recall，按当前会话可见性主动检索记忆。",
@@ -1080,6 +1214,12 @@
         "hint": "开启后，模型可在普通召回证据不足时调用 memory_companion_navigate，按当前证据逐步补查；每一步仍会重新检查窗口、平台、Bot、权限和群发言者边界。",
         "type": "bool",
         "default": true
+      },
+      "enable_source_query_v2": {
+        "description": "启用原文范围批读",
+        "hint": "默认关闭。完成工具能力绑定后可按消息时间正序批读，长消息连续分片；仍共用导航步数和全局版本校验，不代表事件查全。",
+        "type": "bool",
+        "default": false
       }
     }
   },
@@ -1111,6 +1251,30 @@
         "hint": "每步最多扫描多少条关联路径，再按当前权限过滤并截取可见证据。默认 96。",
         "type": "int",
         "default": 96
+      },
+      "range_batch_max_bytes": {
+        "description": "原文批读返回字节上限",
+        "hint": "默认 12288 字节。按 source-query 完整 JSON 的 UTF-8 体积计量，含正文和引用；外层查询进度另计，不等于模型 Token 预算。",
+        "type": "int",
+        "default": 12288
+      },
+      "range_batch_max_messages": {
+        "description": "原文批读消息上限",
+        "hint": "每批最多处理的授权消息数，默认 48；SQL 额外预取一条只判断续页，不计已展示。",
+        "type": "int",
+        "default": 48
+      },
+      "range_batch_max_fragments": {
+        "description": "原文批读片段上限",
+        "hint": "每批最多返回的片段数，默认 64；长消息可以连续返回多个片段。",
+        "type": "int",
+        "default": 64
+      },
+      "range_batch_excerpt_chars": {
+        "description": "原文批读单片段字符上限",
+        "hint": "默认 800 字符，最大 800；实际输出还受 UTF-8 字节预算限制，未返回正文保留游标偏移。",
+        "type": "int",
+        "default": 800
       }
     }
   },
@@ -1161,6 +1325,16 @@
         "hint": "留空则自动扫描常见位置。建议先执行 /mcomp import_livingmemory preview。",
         "type": "string",
         "default": ""
+      },
+      "default_review_status": {
+        "description": "导入记忆的默认状态",
+        "hint": "auto 直接参与正常召回；pending 导入为待复核状态。",
+        "type": "string",
+        "options": [
+          "auto",
+          "pending"
+        ],
+        "default": "auto"
       }
     }
   },
@@ -1185,7 +1359,19 @@
         "description": "原始事件保留天数",
         "hint": "原始流水事件超过该天数后可进入清理。0 表示暂不自动清理。",
         "type": "int",
-        "default": 7
+        "default": 30
+      },
+      "retention_unsummarized_timeline_days": {
+        "description": "未总结时间线保留天数",
+        "hint": "从未成功写入长期总结的原始消息，超过该天数后在睡眠维护时删除；仍被待处理批次占有的行会跳过。这些行多半来自总结失败或被隔离的批次，不设上限的话时间线只会一直增长。默认 0 表示不自动删除——删的是原始对话，不可逆，确认不再需要后再开启。",
+        "type": "int",
+        "default": 0
+      },
+      "pending_review_max_age_days": {
+        "description": "待复核候选最长保留天数",
+        "hint": "一直停在待复核队列、既不被注入也不被衰减的候选记忆，超过该天数后转入可恢复冷区并关闭其复核条目，避免永远悬挂。0 表示不自动处理。",
+        "type": "int",
+        "default": 30
       },
       "retention_raw_event_limit": {
         "description": "原始事件单次归档上限",
@@ -1258,6 +1444,18 @@
         "hint": "没有可用总结模型或候选过少时，将达到严格衰减阈值的碎片放入可恢复冷区；不会物理删除。",
         "type": "bool",
         "default": true
+      },
+      "memory_decay_scan_limit": {
+        "description": "自然衰减扫描上限",
+        "hint": "每轮衰减最多扫描多少条候选；实际上限还会与 候选数×12 取大者。",
+        "type": "int",
+        "default": 2000
+      },
+      "memory_decay_include_bot_self": {
+        "description": "衰减包含 Bot 自我记录",
+        "hint": "默认只衰减用户相关记忆，Bot 自己的时间线不参与。",
+        "type": "bool",
+        "default": false
       }
     }
   },
@@ -1362,6 +1560,37 @@
         "hint": "衰减压缩生成的新长期摘要最大字数。",
         "type": "int",
         "default": 900
+      },
+      "memory_decay_scan_limit": {
+        "description": "衰减候选扫描池",
+        "hint": "候选筛选前最多扫描的稳定记忆数；实际扫描至少为候选上限的 12 倍。",
+        "type": "int",
+        "default": 2000
+      },
+      "memory_decay_include_bot_self": {
+        "description": "允许衰减 Bot 自身记忆",
+        "hint": "关闭时 Bot 自身时间线不会进入自然衰减。",
+        "type": "bool",
+        "default": false
+      },
+      "memory_decay_include_tool_memories": {
+        "description": "允许衰减工具写入记忆",
+        "hint": "关闭时由记忆工具明确写入的内容不会进入自然衰减。",
+        "type": "bool",
+        "default": false
+      }
+    }
+  },
+  "startup": {
+    "description": "启动行为",
+    "hint": "控制插件启动后后台任务的延迟，避免与宿主启动迁移竞争资源。",
+    "type": "object",
+    "items": {
+      "background_grace_seconds": {
+        "description": "后台任务启动宽限期（秒）",
+        "hint": "插件启动后的这段时间内不创建后台任务。",
+        "type": "int",
+        "default": 60
       }
     }
   }

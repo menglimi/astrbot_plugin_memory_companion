@@ -128,16 +128,23 @@ class MemoryAuditTests(unittest.IsolatedAsyncioTestCase):
             rows,
         )
         self.assertEqual(["小王喜欢无糖拿铁"], facts)
-        self.assertEqual([{"fact": "小王喜欢无糖拿铁", "refs": ["event-1"]}], traced)
+        self.assertEqual(
+            [{
+                "fact": "小王喜欢无糖拿铁",
+                "refs": ["event-1"],
+                "evidence": [{"ref": "event-1", "quote": "小王喜欢无糖拿铁"}],
+            }],
+            traced,
+        )
 
-    def test_legacy_string_fact_remains_untraced(self) -> None:
+    def test_legacy_string_fact_is_attributed_instead_of_dropped(self) -> None:
         summarizer = MemorySummarizer()
-        facts, traced = summarizer._normalize_key_facts(
+        traced, warnings, errors = summarizer._normalize_key_facts_with_validation(
             ["小王喜欢无糖拿铁"],
             [{"id": "event-1", "content": "小王喜欢无糖拿铁。"}],
         )
-        self.assertEqual(["小王喜欢无糖拿铁"], facts)
-        self.assertEqual([], traced)
+        self.assertEqual([{"fact": "小王喜欢无糖拿铁", "refs": ["event-1"], "evidence": [{"ref": "event-1", "quote": "小王喜欢无糖拿铁"}]}], traced)
+        self.assertEqual([], errors)
 
     async def test_preview_does_not_mutate_memory(self) -> None:
         proposal = {
@@ -303,6 +310,14 @@ class MemoryAuditTests(unittest.IsolatedAsyncioTestCase):
         page = (ROOT / "page_api.py").read_text(encoding="utf-8")
         self.assertIn('"/maintenance/audit/preview"', page)
         self.assertIn('"/maintenance/audit/rollback"', page)
+    def test_legacy_string_fact_remains_untraced(self) -> None:
+        summarizer = MemorySummarizer()
+        facts, traced = summarizer._normalize_key_facts(
+            ["小王喜欢无糖拿铁"],
+            [{"id": "event-1", "content": "小王喜欢无糖拿铁。"}],
+        )
+        self.assertEqual(["小王喜欢无糖拿铁"], facts)
+        self.assertEqual([], traced)
 
 
 if __name__ == "__main__":

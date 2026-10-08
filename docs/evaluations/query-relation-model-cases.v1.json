@@ -1,0 +1,260 @@
+{
+  "schema_version": "query-relation-model-cases.v1",
+  "source_kind": "synthetic_fixture_not_user_history",
+  "now": "2026-09-13T22:30:00+08:00",
+  "recent_context": [
+    {
+      "role": "user",
+      "content": "气象台说今晚有大风。"
+    },
+    {
+      "role": "assistant",
+      "content": "嗯，记得关好门窗，出门注意安全。"
+    }
+  ],
+  "cases": [
+    {
+      "id": "ordinary_chat",
+      "question": "晚上好呀，今天也辛苦啦。",
+      "expected": {
+        "required_evidence": [],
+        "rule": "自然回应当前寒暄，不调用记忆工具、不编造过去的具体经历"
+      },
+      "sources": []
+    },
+    {
+      "id": "date_and_answer",
+      "question": "上次穿蕾丝胖次是什么时候？当时怎么说的？",
+      "expected": {
+        "date": "2026-09-08",
+        "answer_source": "target-a",
+        "required_evidence": [
+          "target-q",
+          "target-a"
+        ],
+        "rule": "依据同次问答回答9月8日和当日原话；旧同句和后来回忆问题不改写事件日期；有限资料不宣称全库查全"
+      },
+      "sources": [
+        {
+          "key": "old-q",
+          "role": "user",
+          "at": "2026-08-25T03:40:00+08:00",
+          "text": "今天穿的胖次是什么样？"
+        },
+        {
+          "key": "old-a",
+          "role": "assistant",
+          "at": "2026-08-25T03:41:00+08:00",
+          "text": "今天是浅紫色带细蕾丝边的。"
+        },
+        {
+          "key": "target-q",
+          "role": "user",
+          "at": "2026-09-08T03:40:00+08:00",
+          "text": "你今天穿的胖次是什么颜色和款式？"
+        },
+        {
+          "key": "target-a",
+          "role": "assistant",
+          "at": "2026-09-08T03:41:00+08:00",
+          "text": "今天是浅紫色带细蕾丝边的。"
+        },
+        {
+          "key": "recall-q",
+          "role": "user",
+          "at": "2026-09-13T16:10:00+08:00",
+          "text": "你还记得之前聊的蕾丝胖次吗？"
+        },
+        {
+          "key": "weather",
+          "role": "assistant",
+          "at": "2026-09-13T21:00:00+08:00",
+          "text": "气象台说有大风，记得关好门窗。"
+        }
+      ]
+    },
+    {
+      "id": "missing_answer",
+      "question": "9月8日我问你胖次的时候，你当时回答的颜色和款式是什么？",
+      "expected": {
+        "date": "2026-09-08",
+        "answer_source": null,
+        "required_evidence": [
+          "target-q"
+        ],
+        "rule": "能定位9月8日问题，但说明对应回答资料缺失；不拿8月25日同话题回答或9月13日无依据月份填补"
+      },
+      "sources": [
+        {
+          "key": "old-q",
+          "role": "user",
+          "at": "2026-08-25T03:40:00+08:00",
+          "text": "今天的胖次什么颜色？"
+        },
+        {
+          "key": "old-a",
+          "role": "assistant",
+          "at": "2026-08-25T03:41:00+08:00",
+          "text": "今天是浅紫色带细蕾丝边的。"
+        },
+        {
+          "key": "target-q",
+          "role": "user",
+          "at": "2026-09-08T03:40:00+08:00",
+          "text": "你今天穿的胖次是什么颜色和款式？"
+        },
+        {
+          "key": "later-q",
+          "role": "user",
+          "at": "2026-09-13T16:10:00+08:00",
+          "text": "上次穿蕾丝胖次是什么时候？"
+        },
+        {
+          "key": "wrong-answer",
+          "role": "assistant",
+          "at": "2026-09-13T16:11:00+08:00",
+          "text": "好像是上上个月啦，具体哪天我记不太清啦。"
+        }
+      ]
+    },
+    {
+      "id": "cross_midnight",
+      "question": "上次我问你胖次，你哪天回的？你说穿的是哪天的？",
+      "expected": {
+        "question_date": "2026-09-08",
+        "reply_date": "2026-09-09",
+        "event_date": "2026-09-08",
+        "required_evidence": [
+          "target-q",
+          "target-a"
+        ],
+        "rule": "分清8日晚询问、9日零点回答和回答中昨天所指8日，不能都算9日"
+      },
+      "sources": [
+        {
+          "key": "target-q",
+          "role": "user",
+          "at": "2026-09-08T23:59:00+08:00",
+          "text": "你今天穿的胖次是什么样的？"
+        },
+        {
+          "key": "target-a",
+          "role": "assistant",
+          "at": "2026-09-09T00:02:00+08:00",
+          "text": "刚才那个问题呀，已经过零点了；昨天穿的是淡蓝色纯棉的。"
+        }
+      ]
+    },
+    {
+      "id": "week_pairs",
+      "question": "9月7日到13日我问过你哪几次胖次？每次最终答的是什么？按询问日期整理，没记录的别补。",
+      "expected": {
+        "question_dates": [
+          "2026-09-07",
+          "2026-09-10",
+          "2026-09-12"
+        ],
+        "required_evidence": [
+          "q7",
+          "a7",
+          "q10",
+          "a10",
+          "correction10",
+          "q12"
+        ],
+        "rule": "7日蓝色纯棉；10日最终白色纯棉，原答粉色蕾丝已纠正；12日只有问题缺回答；问答次数3，不能说只有2次或空白日期一定没问"
+      },
+      "sources": [
+        {
+          "key": "q7",
+          "role": "user",
+          "at": "2026-09-07T09:00:00+08:00",
+          "text": "今天的胖次是什么样？"
+        },
+        {
+          "key": "a7",
+          "role": "assistant",
+          "at": "2026-09-07T09:01:00+08:00",
+          "text": "蓝色纯棉的。"
+        },
+        {
+          "key": "q10",
+          "role": "user",
+          "at": "2026-09-10T09:00:00+08:00",
+          "text": "今天穿哪条胖次了？"
+        },
+        {
+          "key": "a10",
+          "role": "assistant",
+          "at": "2026-09-10T09:01:00+08:00",
+          "text": "粉色带蕾丝的。"
+        },
+        {
+          "key": "correction10",
+          "role": "assistant",
+          "at": "2026-09-10T09:02:00+08:00",
+          "text": "刚说错了，是白色纯棉的，没有蕾丝，前面那句更正一下。"
+        },
+        {
+          "key": "q12",
+          "role": "user",
+          "at": "2026-09-12T09:00:00+08:00",
+          "text": "今天的胖次是什么款式？"
+        }
+      ]
+    },
+    {
+      "id": "appointment_changes",
+      "question": "上周预约看房这件事，一开始定的哪天，后来改了几次，最后约到哪天几点？别把另一套房子的预约混在一起。",
+      "expected": {
+        "required_evidence": [
+          "initial",
+          "change1",
+          "change2"
+        ],
+        "initial": "9月10日15:00",
+        "final": "9月12日10:30",
+        "changes": 2,
+        "rule": "保留同一套江湾房子的两次变更；学府那套是另一预约，不算第三次改期。不把计划说成已到场。"
+      },
+      "sources": [
+        {
+          "key": "initial",
+          "role": "user",
+          "at": "2026-09-07T09:00:00+08:00",
+          "text": "江湾那套看房预约好了，9月10日下午三点。"
+        },
+        {
+          "key": "ack",
+          "role": "assistant",
+          "at": "2026-09-07T09:01:00+08:00",
+          "text": "记下了，周四下午去看。"
+        },
+        {
+          "key": "unrelated",
+          "role": "user",
+          "at": "2026-09-08T10:00:00+08:00",
+          "text": "学府那套另外约周日九点，不是江湾。"
+        },
+        {
+          "key": "change1",
+          "role": "user",
+          "at": "2026-09-09T18:00:00+08:00",
+          "text": "江湾看房改到11号下午四点了，房东10号临时出差。"
+        },
+        {
+          "key": "chatter",
+          "role": "assistant",
+          "at": "2026-09-10T20:00:00+08:00",
+          "text": "今晚雨有点大，记得带伞。"
+        },
+        {
+          "key": "change2",
+          "role": "user",
+          "at": "2026-09-11T08:00:00+08:00",
+          "text": "昨天说的江湾那个看房时间又调整了，最后定明天上午十点半。学府的周日安排不变。"
+        }
+      ]
+    }
+  ]
+}

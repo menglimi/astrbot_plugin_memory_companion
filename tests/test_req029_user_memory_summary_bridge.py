@@ -114,6 +114,44 @@ class Req029UserMemorySummaryBridgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(forbidden, rendered)
         self.assertTrue(all(item["content_redacted"] and item["truncated"] for item in result["summaries"]))
 
+    async def test_correction_changes_revision_without_changing_record_count(self) -> None:
+        store = self.make_store()
+        await self.add_private_memory(
+            store, record_id="corrected", user_id="u1", memory_type="user_preference",
+            content="喜欢热咖啡",
+        )
+        service = MemoryCompanionService.__new__(MemoryCompanionService)
+        service.config = _Config(True)
+        service.store = store
+        before = await service.read_user_memory_summary("u1", session_id="qq:FriendMessage:u1")
+        corrected = await store.get_memory("corrected")
+        corrected.content = "用户已纠正：现在更喜欢温水"
+        await store.insert_memory(corrected)
+        after = await service.read_user_memory_summary("u1", session_id="qq:FriendMessage:u1")
+        self.assertEqual(before["counts"], after["counts"])
+        self.assertGreater(after["memory_revision"], before["memory_revision"])
+        rows = await store.read_user_memory_summary_records("u1", session_id="qq:FriendMessage:u1")
+        self.assertEqual("用户已纠正：现在更喜欢温水", rows["records"][0].content)
+
+    async def test_summary_excludes_superseded_archived_and_expired_memories(self) -> None:
+        store = self.make_store()
+        for record_id in ("active", "superseded", "archived", "expired"):
+            await self.add_private_memory(
+                store, record_id=record_id, user_id="u1", memory_type="user_fact",
+                content=f"不同的事实 {record_id}",
+            )
+            record = await store.get_memory(record_id)
+            if record_id == "superseded":
+                record.validity_status = "superseded"
+            elif record_id == "archived":
+                record.lifecycle = "archived"
+            elif record_id == "expired":
+                record.valid_to = "2020-01-01T00:00:00+00:00"
+            await store.insert_memory(record)
+        rows = await store.read_user_memory_summary_records("u1", session_id="qq:FriendMessage:u1")
+        self.assertEqual(["active"], [record.id for record in rows["records"]])
+        self.assertEqual(1, rows["total"])
+
     async def test_session_mismatch_fails_closed_without_cross_user_fallback(self) -> None:
         store = self.make_store()
         await self.add_private_memory(

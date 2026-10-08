@@ -80,6 +80,22 @@ class RerankInputValidationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([], provider.calls)
 
+    async def test_empty_timeout_error_keeps_fallback_and_reports_exception_type(self) -> None:
+        class TimeoutProvider:
+            async def rerank(self, *, query: str, documents: list[str], top_n: int | None = None):
+                raise TimeoutError()
+
+        engine = RetrievalEngine(None, None, retrieval_mode="rerank", rerank_provider=TimeoutProvider(), rerank_timeout_ms=1200)
+        ranked = [_result("first", "一条候选记忆", 1.0)]
+
+        results = await engine._maybe_rerank_results("一个问题", ranked, 1)
+
+        self.assertEqual(ranked, results)
+        self.assertEqual("fallback_basic", engine.last_path_info["path"])
+        self.assertIn("TimeoutError", engine.last_path_info["reason"])
+        self.assertEqual("TimeoutError", engine.last_path_info["rerank_error_type"])
+        self.assertEqual(1200, engine.last_path_info["rerank_timeout_ms"])
+
 
 if __name__ == "__main__":
     unittest.main()

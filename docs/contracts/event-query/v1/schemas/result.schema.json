@@ -1,0 +1,1147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:memory:local-event-query:result:v1",
+  "title": "Temporary event calculations",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "profile",
+    "ok",
+    "status",
+    "error",
+    "events",
+    "excluded",
+    "unresolved",
+    "aggregate",
+    "coverage",
+    "usage"
+  ],
+  "properties": {
+    "profile": {
+      "const": "memory.local-event-query.v1"
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "computed",
+        "rejected"
+      ]
+    },
+    "error": {
+      "type": "string"
+    },
+    "operation": {
+      "type": "string",
+      "enum": [
+        "list",
+        "count",
+        "latest",
+        "earliest",
+        "by_day"
+      ]
+    },
+    "goal": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240
+    },
+    "select": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "subject",
+        "world",
+        "occurrences"
+      ],
+      "properties": {
+        "subject": {
+          "type": "string",
+          "enum": [
+            "current_user",
+            "assistant",
+            "other",
+            "any"
+          ]
+        },
+        "world": {
+          "type": "string",
+          "enum": [
+            "real",
+            "fictional",
+            "any"
+          ]
+        },
+        "occurrences": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": {
+            "type": "string",
+            "enum": [
+              "occurred",
+              "not_occurred",
+              "planned",
+              "cancelled"
+            ]
+          }
+        }
+      }
+    },
+    "events": {
+      "type": "array",
+      "maxItems": 48,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "event_key",
+          "kind",
+          "interpretation_by",
+          "row_ids",
+          "superseded_row_ids",
+          "descriptions",
+          "time",
+          "evidence",
+          "reasons",
+          "subject",
+          "world",
+          "occurrence",
+          "relevance",
+          "identity",
+          "resolution"
+        ],
+        "properties": {
+          "event_key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
+          "kind": {
+            "const": "temporary_event"
+          },
+          "interpretation_by": {
+            "const": "current_model"
+          },
+          "row_ids": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 48,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 80
+            }
+          },
+          "superseded_row_ids": {
+            "type": "array",
+            "maxItems": 48,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 80
+            }
+          },
+          "descriptions": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 48,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 240
+            }
+          },
+          "time": {
+            "anyOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "start_at",
+                  "end_at",
+                  "precision",
+                  "basis"
+                ],
+                "properties": {
+                  "start_at": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80,
+                    "description": "带时区 ISO 8601，运行时校验真实日期与顺序。",
+                    "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+                  },
+                  "end_at": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80,
+                    "description": "带时区 ISO 8601，运行时校验真实日期与顺序。",
+                    "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+                  },
+                  "precision": {
+                    "type": "string",
+                    "enum": [
+                      "instant",
+                      "day",
+                      "interval"
+                    ]
+                  },
+                  "basis": {
+                    "const": "model_interpretation_of_cited_source"
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "evidence": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 288,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "source_ref",
+                "source_version",
+                "quote"
+              ],
+              "properties": {
+                "source_ref": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 180,
+                  "pattern": "^timeline:tl_.+$"
+                },
+                "source_version": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "quote": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 800,
+                  "description": "逐字引用本轮已读 sources 的脱敏片段。"
+                }
+              }
+            }
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
+            }
+          },
+          "subject": {
+            "type": "string",
+            "enum": [
+              "current_user",
+              "assistant",
+              "other",
+              "unknown",
+              "conflict"
+            ]
+          },
+          "world": {
+            "type": "string",
+            "enum": [
+              "real",
+              "fictional",
+              "unknown",
+              "conflict"
+            ]
+          },
+          "occurrence": {
+            "type": "string",
+            "enum": [
+              "occurred",
+              "not_occurred",
+              "planned",
+              "cancelled",
+              "unknown",
+              "conflict"
+            ]
+          },
+          "relevance": {
+            "type": "string",
+            "enum": [
+              "match",
+              "not_match",
+              "uncertain",
+              "conflict"
+            ]
+          },
+          "identity": {
+            "type": "string",
+            "enum": [
+              "clear",
+              "uncertain",
+              "conflict"
+            ]
+          },
+          "resolution": {
+            "type": "string",
+            "enum": [
+              "resolved",
+              "uncertain",
+              "conflicting",
+              "conflict"
+            ]
+          }
+        }
+      }
+    },
+    "excluded": {
+      "type": "array",
+      "maxItems": 48,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "event_key",
+          "kind",
+          "interpretation_by",
+          "row_ids",
+          "superseded_row_ids",
+          "descriptions",
+          "time",
+          "evidence",
+          "reasons",
+          "subject",
+          "world",
+          "occurrence",
+          "relevance",
+          "identity",
+          "resolution"
+        ],
+        "properties": {
+          "event_key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
+          "kind": {
+            "const": "temporary_event"
+          },
+          "interpretation_by": {
+            "const": "current_model"
+          },
+          "row_ids": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 48,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 80
+            }
+          },
+          "superseded_row_ids": {
+            "type": "array",
+            "maxItems": 48,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 80
+            }
+          },
+          "descriptions": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 48,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 240
+            }
+          },
+          "time": {
+            "anyOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "start_at",
+                  "end_at",
+                  "precision",
+                  "basis"
+                ],
+                "properties": {
+                  "start_at": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80,
+                    "description": "带时区 ISO 8601，运行时校验真实日期与顺序。",
+                    "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+                  },
+                  "end_at": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80,
+                    "description": "带时区 ISO 8601，运行时校验真实日期与顺序。",
+                    "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+                  },
+                  "precision": {
+                    "type": "string",
+                    "enum": [
+                      "instant",
+                      "day",
+                      "interval"
+                    ]
+                  },
+                  "basis": {
+                    "const": "model_interpretation_of_cited_source"
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "evidence": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 288,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "source_ref",
+                "source_version",
+                "quote"
+              ],
+              "properties": {
+                "source_ref": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 180,
+                  "pattern": "^timeline:tl_.+$"
+                },
+                "source_version": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "quote": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 800,
+                  "description": "逐字引用本轮已读 sources 的脱敏片段。"
+                }
+              }
+            }
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
+            }
+          },
+          "subject": {
+            "type": "string",
+            "enum": [
+              "current_user",
+              "assistant",
+              "other",
+              "unknown",
+              "conflict"
+            ]
+          },
+          "world": {
+            "type": "string",
+            "enum": [
+              "real",
+              "fictional",
+              "unknown",
+              "conflict"
+            ]
+          },
+          "occurrence": {
+            "type": "string",
+            "enum": [
+              "occurred",
+              "not_occurred",
+              "planned",
+              "cancelled",
+              "unknown",
+              "conflict"
+            ]
+          },
+          "relevance": {
+            "type": "string",
+            "enum": [
+              "match",
+              "not_match",
+              "uncertain",
+              "conflict"
+            ]
+          },
+          "identity": {
+            "type": "string",
+            "enum": [
+              "clear",
+              "uncertain",
+              "conflict"
+            ]
+          },
+          "resolution": {
+            "type": "string",
+            "enum": [
+              "resolved",
+              "uncertain",
+              "conflicting",
+              "conflict"
+            ]
+          }
+        }
+      }
+    },
+    "unresolved": {
+      "type": "array",
+      "maxItems": 48,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "event_key",
+          "kind",
+          "interpretation_by",
+          "row_ids",
+          "superseded_row_ids",
+          "descriptions",
+          "time",
+          "evidence",
+          "reasons",
+          "subject",
+          "world",
+          "occurrence",
+          "relevance",
+          "identity",
+          "resolution"
+        ],
+        "properties": {
+          "event_key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
+          "kind": {
+            "const": "temporary_event"
+          },
+          "interpretation_by": {
+            "const": "current_model"
+          },
+          "row_ids": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 48,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 80
+            }
+          },
+          "superseded_row_ids": {
+            "type": "array",
+            "maxItems": 48,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 80
+            }
+          },
+          "descriptions": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 48,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 240
+            }
+          },
+          "time": {
+            "anyOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "start_at",
+                  "end_at",
+                  "precision",
+                  "basis"
+                ],
+                "properties": {
+                  "start_at": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80,
+                    "description": "带时区 ISO 8601，运行时校验真实日期与顺序。",
+                    "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+                  },
+                  "end_at": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80,
+                    "description": "带时区 ISO 8601，运行时校验真实日期与顺序。",
+                    "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+                  },
+                  "precision": {
+                    "type": "string",
+                    "enum": [
+                      "instant",
+                      "day",
+                      "interval"
+                    ]
+                  },
+                  "basis": {
+                    "const": "model_interpretation_of_cited_source"
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "evidence": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 288,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "source_ref",
+                "source_version",
+                "quote"
+              ],
+              "properties": {
+                "source_ref": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 180,
+                  "pattern": "^timeline:tl_.+$"
+                },
+                "source_version": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "quote": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 800,
+                  "description": "逐字引用本轮已读 sources 的脱敏片段。"
+                }
+              }
+            }
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
+            }
+          },
+          "subject": {
+            "type": "string",
+            "enum": [
+              "current_user",
+              "assistant",
+              "other",
+              "unknown",
+              "conflict"
+            ]
+          },
+          "world": {
+            "type": "string",
+            "enum": [
+              "real",
+              "fictional",
+              "unknown",
+              "conflict"
+            ]
+          },
+          "occurrence": {
+            "type": "string",
+            "enum": [
+              "occurred",
+              "not_occurred",
+              "planned",
+              "cancelled",
+              "unknown",
+              "conflict"
+            ]
+          },
+          "relevance": {
+            "type": "string",
+            "enum": [
+              "match",
+              "not_match",
+              "uncertain",
+              "conflict"
+            ]
+          },
+          "identity": {
+            "type": "string",
+            "enum": [
+              "clear",
+              "uncertain",
+              "conflict"
+            ]
+          },
+          "resolution": {
+            "type": "string",
+            "enum": [
+              "resolved",
+              "uncertain",
+              "conflicting",
+              "conflict"
+            ]
+          }
+        }
+      }
+    },
+    "aggregate": {
+      "type": "object"
+    },
+    "coverage": {
+      "type": "object"
+    },
+    "usage": {
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "ok": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "operation",
+          "goal",
+          "select"
+        ],
+        "properties": {
+          "status": {
+            "const": "computed"
+          },
+          "error": {
+            "const": ""
+          },
+          "aggregate": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "unit",
+              "count_basis",
+              "count",
+              "by_occurrence",
+              "latest_candidates",
+              "earliest_candidates",
+              "ordering",
+              "by_day",
+              "unplaced_event_keys",
+              "days_without_resolved_events",
+              "day_grid",
+              "absence_meaning"
+            ],
+            "properties": {
+              "unit": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120
+              },
+              "count_basis": {
+                "const": "model_resolved_event_groups_in_supplied_rows"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "by_occurrence": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "occurred": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "not_occurred": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "planned": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "cancelled": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                }
+              },
+              "latest_candidates": {
+                "type": "array",
+                "maxItems": 48,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 80
+                }
+              },
+              "earliest_candidates": {
+                "type": "array",
+                "maxItems": 48,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 80
+                }
+              },
+              "ordering": {
+                "type": "string",
+                "enum": [
+                  "unresolved",
+                  "interval_partial_order"
+                ]
+              },
+              "by_day": {
+                "type": "array",
+                "maxItems": 48,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "date",
+                    "event_keys",
+                    "count",
+                    "by_occurrence"
+                  ],
+                  "properties": {
+                    "date": {
+                      "type": "string"
+                    },
+                    "event_keys": {
+                      "type": "array",
+                      "maxItems": 48,
+                      "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 80
+                      }
+                    },
+                    "count": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "by_occurrence": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "occurred": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "not_occurred": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "planned": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "cancelled": {
+                          "type": "integer",
+                          "minimum": 0
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "unplaced_event_keys": {
+                "type": "array",
+                "maxItems": 48,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 80
+                }
+              },
+              "days_without_resolved_events": {
+                "type": "array",
+                "maxItems": 31,
+                "items": {
+                  "type": "string"
+                }
+              },
+              "day_grid": {
+                "type": "string",
+                "enum": [
+                  "not_requested",
+                  "enumerated",
+                  "omitted_over_31_days"
+                ]
+              },
+              "absence_meaning": {
+                "const": "no_resolved_event_in_supplied_rows_not_proof_of_no_event"
+              }
+            }
+          },
+          "coverage": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "scope",
+              "event_window",
+              "source_revision",
+              "event_coverage",
+              "semantics",
+              "citations",
+              "input_rows",
+              "cited_source_count",
+              "observed_uncited_source_count",
+              "source_reads",
+              "not_checked"
+            ],
+            "properties": {
+              "scope": {
+                "const": "current_session_only"
+              },
+              "event_window": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "start_at",
+                      "end_at"
+                    ],
+                    "properties": {
+                      "start_at": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 80,
+                        "description": "带时区 ISO 8601，运行时校验真实日期与顺序。",
+                        "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+                      },
+                      "end_at": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 80,
+                        "description": "带时区 ISO 8601，运行时校验真实日期与顺序。",
+                        "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+                      }
+                    }
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "source_revision": {
+                "type": "string",
+                "pattern": "^[0-9]+$"
+              },
+              "event_coverage": {
+                "const": "not_established"
+              },
+              "semantics": {
+                "const": "model_interpretation_not_verified_by_program"
+              },
+              "citations": {
+                "const": "observed_fragments_revalidated"
+              },
+              "input_rows": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "cited_source_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "observed_uncited_source_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "source_reads": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "selection",
+                    "source_revision",
+                    "start_at",
+                    "end_at",
+                    "more_available",
+                    "returned_count",
+                    "excerpt_truncated_count"
+                  ],
+                  "properties": {
+                    "selection": {
+                      "type": "string",
+                      "enum": [
+                        "literal_terms_any",
+                        "range",
+                        "context",
+                        "read",
+                        "navigation_references"
+                      ]
+                    },
+                    "source_revision": {
+                      "type": "string"
+                    },
+                    "start_at": {
+                      "type": "string"
+                    },
+                    "end_at": {
+                      "type": "string"
+                    },
+                    "more_available": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "returned_count": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "excerpt_truncated_count": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "minimum": 0
+                    }
+                  }
+                }
+              },
+              "not_checked": {
+                "const": [
+                  "semantic_exhaustiveness",
+                  "capture_completeness",
+                  "cross_session_sources"
+                ]
+              }
+            }
+          },
+          "usage": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "step",
+              "remaining_steps",
+              "model_calls",
+              "source_reads",
+              "memory_writes",
+              "elapsed_ms"
+            ],
+            "properties": {
+              "step": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 8
+              },
+              "remaining_steps": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 7
+              },
+              "model_calls": {
+                "const": 0
+              },
+              "source_reads": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "memory_writes": {
+                "const": 0
+              },
+              "elapsed_ms": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "ok": {
+            "const": false
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "const": "rejected"
+          },
+          "error": {
+            "minLength": 1
+          },
+          "events": {
+            "maxItems": 0
+          },
+          "excluded": {
+            "maxItems": 0
+          },
+          "unresolved": {
+            "maxItems": 0
+          },
+          "aggregate": {
+            "maxProperties": 0
+          },
+          "coverage": {
+            "maxProperties": 0
+          },
+          "usage": {
+            "maxProperties": 0
+          }
+        },
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "operation"
+              ]
+            },
+            {
+              "required": [
+                "goal"
+              ]
+            },
+            {
+              "required": [
+                "select"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

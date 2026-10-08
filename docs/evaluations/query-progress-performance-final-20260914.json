@@ -1,0 +1,281 @@
+{
+  "schema_version": "query-progress-performance.v1",
+  "observed_at": "2026-09-14T00:28:33.100599+08:00",
+  "evidence_level": "R",
+  "source_kind": "synthetic_temporary_sqlite",
+  "live_model_calls": 0,
+  "production_writes": 0,
+  "host_reloads": 0,
+  "platform_sends": 0,
+  "boundary": "Local source search and JSON serialization only; no provider, injection, TTS or delivery latency.",
+  "local_ms": {
+    "legacy": {
+      "samples": 40,
+      "median": 2.53,
+      "p95": 3.339,
+      "max": 4.667
+    },
+    "progress": {
+      "samples": 40,
+      "median": 3.713,
+      "p95": 4.879,
+      "max": 5.118
+    },
+    "status": {
+      "samples": 40,
+      "median": 0.812,
+      "p95": 1.387,
+      "max": 1.503
+    }
+  },
+  "output_chars": {
+    "legacy": {
+      "samples": 40,
+      "median": 6538.0,
+      "p95": 6539,
+      "max": 6539
+    },
+    "progress": {
+      "samples": 40,
+      "median": 7059.0,
+      "p95": 7060,
+      "max": 7060
+    },
+    "compact_progress": {
+      "samples": 40,
+      "median": 396.0,
+      "p95": 396,
+      "max": 396
+    }
+  },
+  "paired_extra_ms": {
+    "samples": 40,
+    "median": 1.058,
+    "p95": 2.169,
+    "max": 2.501
+  },
+  "source_rows": 240,
+  "result_rows": 6,
+  "observations": [
+    {
+      "sample": 1,
+      "legacy_ms": 2.9633,
+      "progress_ms": 4.7242
+    },
+    {
+      "sample": 2,
+      "legacy_ms": 3.0789,
+      "progress_ms": 4.695
+    },
+    {
+      "sample": 3,
+      "legacy_ms": 2.4413,
+      "progress_ms": 2.8142
+    },
+    {
+      "sample": 4,
+      "legacy_ms": 3.3393,
+      "progress_ms": 3.811
+    },
+    {
+      "sample": 5,
+      "legacy_ms": 2.2118,
+      "progress_ms": 3.1314
+    },
+    {
+      "sample": 6,
+      "legacy_ms": 3.2953,
+      "progress_ms": 4.1515
+    },
+    {
+      "sample": 7,
+      "legacy_ms": 2.4181,
+      "progress_ms": 3.4997
+    },
+    {
+      "sample": 8,
+      "legacy_ms": 2.8304,
+      "progress_ms": 3.9968
+    },
+    {
+      "sample": 9,
+      "legacy_ms": 2.2655,
+      "progress_ms": 3.9011
+    },
+    {
+      "sample": 10,
+      "legacy_ms": 2.0191,
+      "progress_ms": 2.9092
+    },
+    {
+      "sample": 11,
+      "legacy_ms": 2.5711,
+      "progress_ms": 2.8372
+    },
+    {
+      "sample": 12,
+      "legacy_ms": 2.5231,
+      "progress_ms": 3.3959
+    },
+    {
+      "sample": 13,
+      "legacy_ms": 2.2867,
+      "progress_ms": 4.2678
+    },
+    {
+      "sample": 14,
+      "legacy_ms": 2.3165,
+      "progress_ms": 3.9302
+    },
+    {
+      "sample": 15,
+      "legacy_ms": 2.5464,
+      "progress_ms": 3.5812
+    },
+    {
+      "sample": 16,
+      "legacy_ms": 2.6159,
+      "progress_ms": 3.9705
+    },
+    {
+      "sample": 17,
+      "legacy_ms": 3.0541,
+      "progress_ms": 4.0226
+    },
+    {
+      "sample": 18,
+      "legacy_ms": 1.9725,
+      "progress_ms": 3.6667
+    },
+    {
+      "sample": 19,
+      "legacy_ms": 1.9115,
+      "progress_ms": 4.4123
+    },
+    {
+      "sample": 20,
+      "legacy_ms": 2.3792,
+      "progress_ms": 4.5263
+    },
+    {
+      "sample": 21,
+      "legacy_ms": 2.1484,
+      "progress_ms": 3.8319
+    },
+    {
+      "sample": 22,
+      "legacy_ms": 2.6546,
+      "progress_ms": 4.1829
+    },
+    {
+      "sample": 23,
+      "legacy_ms": 2.9484,
+      "progress_ms": 3.4936
+    },
+    {
+      "sample": 24,
+      "legacy_ms": 2.0902,
+      "progress_ms": 3.6898
+    },
+    {
+      "sample": 25,
+      "legacy_ms": 2.2678,
+      "progress_ms": 2.8782
+    },
+    {
+      "sample": 26,
+      "legacy_ms": 2.9077,
+      "progress_ms": 3.7359
+    },
+    {
+      "sample": 27,
+      "legacy_ms": 2.2093,
+      "progress_ms": 3.7467
+    },
+    {
+      "sample": 28,
+      "legacy_ms": 2.6512,
+      "progress_ms": 4.047
+    },
+    {
+      "sample": 29,
+      "legacy_ms": 1.9825,
+      "progress_ms": 3.3909
+    },
+    {
+      "sample": 30,
+      "legacy_ms": 2.6571,
+      "progress_ms": 2.6344
+    },
+    {
+      "sample": 31,
+      "legacy_ms": 4.6674,
+      "progress_ms": 4.8789
+    },
+    {
+      "sample": 32,
+      "legacy_ms": 3.1937,
+      "progress_ms": 5.1181
+    },
+    {
+      "sample": 33,
+      "legacy_ms": 2.5466,
+      "progress_ms": 3.4993
+    },
+    {
+      "sample": 34,
+      "legacy_ms": 2.703,
+      "progress_ms": 3.1652
+    },
+    {
+      "sample": 35,
+      "legacy_ms": 2.8028,
+      "progress_ms": 2.613
+    },
+    {
+      "sample": 36,
+      "legacy_ms": 2.1111,
+      "progress_ms": 2.8167
+    },
+    {
+      "sample": 37,
+      "legacy_ms": 2.09,
+      "progress_ms": 2.6632
+    },
+    {
+      "sample": 38,
+      "legacy_ms": 2.5368,
+      "progress_ms": 2.8185
+    },
+    {
+      "sample": 39,
+      "legacy_ms": 1.6758,
+      "progress_ms": 3.8447
+    },
+    {
+      "sample": 40,
+      "legacy_ms": 1.9265,
+      "progress_ms": 3.3402
+    }
+  ],
+  "database_changes_during_queries": 0,
+  "p5_gate_calls": 0,
+  "tool_definitions": {
+    "legacy_tools": [
+      "memory_companion_recall",
+      "memory_companion_sources",
+      "memory_companion_navigate",
+      "memory_companion_events"
+    ],
+    "progress_tools": [
+      "memory_companion_recall",
+      "memory_companion_sources",
+      "memory_companion_navigate",
+      "memory_companion_events",
+      "memory_companion_query"
+    ],
+    "legacy_chars": 9929,
+    "progress_chars": 10286,
+    "tokenizer": "unavailable_characters_only"
+  }
+}

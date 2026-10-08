@@ -1,0 +1,332 @@
+{
+  "type": "design_sql_probe_not_runtime_acceptance",
+  "sqlite": "3.50.4",
+  "rows": 50000,
+  "repetitions": 5,
+  "dataset": "synthetic_in_memory_one_authorized_partition",
+  "query_owner_clause": "actual source_partition; valid identity values; imports stubbed",
+  "source_query_sha256": "a31fd4452d4eb2ef5f7273be3af5949a8231086eb2e6a12c336d051351d19b37",
+  "measure_scope": "SQLite execute/fetch only; no service, locks, source receipts, model or network",
+  "observations": [
+    {
+      "anchor_index": 500,
+      "direction": "before",
+      "variant": "existing_tuple",
+      "median_ms": 94.448,
+      "vm_instruction_estimate": 3266200,
+      "vm_resolution": 100,
+      "returned": 7,
+      "plan": [
+        [
+          5,
+          0,
+          61,
+          "SEARCH t USING INDEX idx_timeline_source_page (scope=? AND session_id=?)"
+        ]
+      ]
+    },
+    {
+      "anchor_index": 500,
+      "direction": "before",
+      "variant": "scalar_plus_tuple",
+      "median_ms": 0.133,
+      "vm_instruction_estimate": 700,
+      "vm_resolution": 100,
+      "returned": 7,
+      "plan": [
+        [
+          5,
+          0,
+          50,
+          "SEARCH t USING INDEX idx_timeline_source_page (scope=? AND session_id=? AND <expr><?)"
+        ]
+      ]
+    },
+    {
+      "anchor_index": 500,
+      "direction": "after",
+      "variant": "existing_tuple",
+      "median_ms": 1.094,
+      "vm_instruction_estimate": 34900,
+      "vm_resolution": 100,
+      "returned": 7,
+      "plan": [
+        [
+          5,
+          0,
+          61,
+          "SEARCH t USING INDEX idx_timeline_source_page (scope=? AND session_id=?)"
+        ]
+      ]
+    },
+    {
+      "anchor_index": 500,
+      "direction": "after",
+      "variant": "scalar_plus_tuple",
+      "median_ms": 0.157,
+      "vm_instruction_estimate": 600,
+      "vm_resolution": 100,
+      "returned": 7,
+      "plan": [
+        [
+          5,
+          0,
+          50,
+          "SEARCH t USING INDEX idx_timeline_source_page (scope=? AND session_id=? AND <expr>>?)"
+        ]
+      ]
+    },
+    {
+      "anchor_index": 25000,
+      "direction": "before",
+      "variant": "existing_tuple",
+      "median_ms": 45.942,
+      "vm_instruction_estimate": 1646600,
+      "vm_resolution": 100,
+      "returned": 7,
+      "plan": [
+        [
+          5,
+          0,
+          61,
+          "SEARCH t USING INDEX idx_timeline_source_page (scope=? AND session_id=?)"
+        ]
+      ]
+    },
+    {
+      "anchor_index": 25000,
+      "direction": "before",
+      "variant": "scalar_plus_tuple",
+      "median_ms": 0.136,
+      "vm_instruction_estimate": 700,
+      "vm_resolution": 100,
+      "returned": 7,
+      "plan": [
+        [
+          5,
+          0,
+          50,
+          "SEARCH t USING INDEX idx_timeline_source_page (scope=? AND session_id=? AND <expr><?)"
+        ]
+      ]
+    },
+    {
+      "anchor_index": 25000,
+      "direction": "after",
+      "variant": "existing_tuple",
+      "median_ms": 48.215,
+      "vm_instruction_estimate": 1654600,
+      "vm_resolution": 100,
+      "returned": 7,
+      "plan": [
+        [
+          5,
+          0,
+          61,
+          "SEARCH t USING INDEX idx_timeline_source_page (scope=? AND session_id=?)"
+        ]
+      ]
+    },
+    {
+      "anchor_index": 25000,
+      "direction": "after",
+      "variant": "scalar_plus_tuple",
+      "median_ms": 0.142,
+      "vm_instruction_estimate": 600,
+      "vm_resolution": 100,
+      "returned": 7,
+      "plan": [
+        [
+          5,
+          0,
+          50,
+          "SEARCH t USING INDEX idx_timeline_source_page (scope=? AND session_id=? AND <expr>>?)"
+        ]
+      ]
+    },
+    {
+      "anchor_index": 49000,
+      "direction": "before",
+      "variant": "existing_tuple",
+      "median_ms": 1.907,
+      "vm_instruction_estimate": 62600,
+      "vm_resolution": 100,
+      "returned": 7,
+      "plan": [
+        [
+          5,
+          0,
+          61,
+          "SEARCH t USING INDEX idx_timeline_source_page (scope=? AND session_id=?)"
+        ]
+      ]
+    },
+    {
+      "anchor_index": 49000,
+      "direction": "before",
+      "variant": "scalar_plus_tuple",
+      "median_ms": 0.137,
+      "vm_instruction_estimate": 700,
+      "vm_resolution": 100,
+      "returned": 7,
+      "plan": [
+        [
+          5,
+          0,
+          50,
+          "SEARCH t USING INDEX idx_timeline_source_page (scope=? AND session_id=? AND <expr><?)"
+        ]
+      ]
+    },
+    {
+      "anchor_index": 49000,
+      "direction": "after",
+      "variant": "existing_tuple",
+      "median_ms": 101.041,
+      "vm_instruction_estimate": 3238600,
+      "vm_resolution": 100,
+      "returned": 7,
+      "plan": [
+        [
+          5,
+          0,
+          61,
+          "SEARCH t USING INDEX idx_timeline_source_page (scope=? AND session_id=?)"
+        ]
+      ]
+    },
+    {
+      "anchor_index": 49000,
+      "direction": "after",
+      "variant": "scalar_plus_tuple",
+      "median_ms": 0.145,
+      "vm_instruction_estimate": 600,
+      "vm_resolution": 100,
+      "returned": 7,
+      "plan": [
+        [
+          5,
+          0,
+          50,
+          "SEARCH t USING INDEX idx_timeline_source_page (scope=? AND session_id=? AND <expr>>?)"
+        ]
+      ]
+    }
+  ],
+  "normalization": [
+    {
+      "text": "AbC",
+      "term": "abc",
+      "sqlite_literal_hit": true,
+      "python_casefold_hit": true
+    },
+    {
+      "text": "Äpfel",
+      "term": "ä",
+      "sqlite_literal_hit": false,
+      "python_casefold_hit": true
+    },
+    {
+      "text": "Straße",
+      "term": "STRASSE",
+      "sqlite_literal_hit": false,
+      "python_casefold_hit": true
+    },
+    {
+      "text": "胖次",
+      "term": "胖次",
+      "sqlite_literal_hit": true,
+      "python_casefold_hit": true
+    },
+    {
+      "text": "ＡB",
+      "term": "aB",
+      "sqlite_literal_hit": false,
+      "python_casefold_hit": false
+    }
+  ],
+  "encoded_bigram_probe": {
+    "capability": "FTS5 unicode61 + contentless_delete; default columnsize=1",
+    "sources": 8,
+    "cases": [
+      {
+        "term": "胖次",
+        "expected": [
+          1
+        ],
+        "candidate_ids": [
+          1
+        ]
+      },
+      {
+        "term": "陶杯",
+        "expected": [
+          2
+        ],
+        "candidate_ids": [
+          2
+        ]
+      },
+      {
+        "term": "ab",
+        "expected": [
+          3
+        ],
+        "candidate_ids": [
+          3
+        ]
+      },
+      {
+        "term": "Äp",
+        "expected": [
+          4
+        ],
+        "candidate_ids": [
+          4
+        ]
+      },
+      {
+        "term": "äP",
+        "expected": [],
+        "candidate_ids": []
+      },
+      {
+        "term": "ßE",
+        "expected": [
+          5
+        ],
+        "candidate_ids": [
+          5
+        ]
+      },
+      {
+        "term": "👗紫",
+        "expected": [
+          7
+        ],
+        "candidate_ids": [
+          7
+        ]
+      },
+      {
+        "term": "*?",
+        "expected": [
+          8
+        ],
+        "candidate_ids": [
+          8
+        ]
+      }
+    ],
+    "rejected_parameter_combination": "contentless_delete=1 is incompatible with columnsize=0",
+    "delete_and_reinsert": "passed",
+    "limitation": "small SQL codec/capability probe; no rebuild, concurrency, service or performance acceptance"
+  },
+  "production_writes": 0,
+  "host_reloads": 0,
+  "llm_calls": 0,
+  "embedding_calls": 0,
+  "reproduce": "python -X utf8 scripts/probe_source_query_plans.py --output <new-report.json>",
+  "script": "scripts/probe_source_query_plans.py",
+  "status": "design_probe_completed; C2b runtime implementation and acceptance not_run"
+}

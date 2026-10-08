@@ -1,0 +1,248 @@
+{
+  "case_id": "MRQ-01-local-event-reducer",
+  "semantic_run_status": "not_run",
+  "interpretation_origin": "authored_fixture",
+  "sources": [
+    {
+      "id": "E01",
+      "message_at": "2026-09-07T12:10:00+08:00",
+      "text": "昨天早上吃了包子。"
+    },
+    {
+      "id": "E02",
+      "message_at": "2026-09-07T12:12:00+08:00",
+      "text": "就是刚说的昨天那顿包子，挺顶饱。"
+    },
+    {
+      "id": "E03",
+      "message_at": "2026-09-08T20:00:00+08:00",
+      "text": "明天早上打算吃吐司。"
+    },
+    {
+      "id": "E04",
+      "message_at": "2026-09-09T08:10:00+08:00",
+      "text": "今早出门前只喝了牛奶。"
+    },
+    {
+      "id": "E05",
+      "message_at": "2026-09-10T10:00:00+08:00",
+      "text": "小陈昨天早上也喝了牛奶。"
+    },
+    {
+      "id": "E06",
+      "message_at": "2026-09-10T12:00:00+08:00",
+      "text": "昨天早上那杯，我说牛奶是记错了，其实是豆浆。"
+    },
+    {
+      "id": "E07",
+      "message_at": "2026-09-12T08:00:00+08:00",
+      "text": "今天没吃早饭，只喝了水。"
+    }
+  ],
+  "request": {
+    "plan": {
+      "goal": "过去七个完整自然日，本人早上吃了什么；同一顿只列一次",
+      "unit": "一顿早餐或一次明确没吃早餐的自述",
+      "operation": "by_day",
+      "timezone": "Asia/Shanghai",
+      "window": {
+        "start_at": "2026-09-06T00:00:00+08:00",
+        "end_at": "2026-09-13T00:00:00+08:00"
+      },
+      "select": {
+        "subject": "current_user",
+        "world": "real",
+        "occurrences": [
+          "occurred",
+          "not_occurred"
+        ]
+      },
+      "rows": [
+        {
+          "row_id": "E01",
+          "event_key": "meal-06",
+          "description": "昨天早上吃了包子。",
+          "subject": "current_user",
+          "world": "real",
+          "occurrence": "occurred",
+          "relevance": "match",
+          "identity": "clear",
+          "resolution": "resolved",
+          "time": {
+            "kind": "relative_day",
+            "source_ref": "timeline:tl_E01",
+            "days": -1,
+            "timezone": "Asia/Shanghai"
+          },
+          "evidence": [
+            {
+              "source_ref": "timeline:tl_E01",
+              "source_version": "fixture-version-E01",
+              "quote": "昨天早上吃了包子。"
+            }
+          ]
+        },
+        {
+          "row_id": "E02",
+          "event_key": "meal-06",
+          "description": "就是刚说的昨天那顿包子，挺顶饱。",
+          "subject": "current_user",
+          "world": "real",
+          "occurrence": "occurred",
+          "relevance": "match",
+          "identity": "clear",
+          "resolution": "resolved",
+          "time": {
+            "kind": "relative_day",
+            "source_ref": "timeline:tl_E02",
+            "days": -1,
+            "timezone": "Asia/Shanghai"
+          },
+          "evidence": [
+            {
+              "source_ref": "timeline:tl_E02",
+              "source_version": "fixture-version-E02",
+              "quote": "就是刚说的昨天那顿包子，挺顶饱。"
+            }
+          ]
+        },
+        {
+          "row_id": "E03",
+          "event_key": "plan-09",
+          "description": "明天早上打算吃吐司。",
+          "subject": "current_user",
+          "world": "real",
+          "occurrence": "planned",
+          "relevance": "match",
+          "identity": "clear",
+          "resolution": "resolved",
+          "time": {
+            "kind": "relative_day",
+            "source_ref": "timeline:tl_E03",
+            "days": 1,
+            "timezone": "Asia/Shanghai"
+          },
+          "evidence": [
+            {
+              "source_ref": "timeline:tl_E03",
+              "source_version": "fixture-version-E03",
+              "quote": "明天早上打算吃吐司。"
+            }
+          ]
+        },
+        {
+          "row_id": "E04",
+          "event_key": "meal-09",
+          "description": "今早出门前只喝了牛奶。",
+          "subject": "current_user",
+          "world": "real",
+          "occurrence": "occurred",
+          "relevance": "match",
+          "identity": "clear",
+          "resolution": "resolved",
+          "time": {
+            "kind": "relative_day",
+            "source_ref": "timeline:tl_E04",
+            "days": 0,
+            "timezone": "Asia/Shanghai"
+          },
+          "evidence": [
+            {
+              "source_ref": "timeline:tl_E04",
+              "source_version": "fixture-version-E04",
+              "quote": "今早出门前只喝了牛奶。"
+            }
+          ]
+        },
+        {
+          "row_id": "E05",
+          "event_key": "other-09",
+          "description": "小陈昨天早上也喝了牛奶。",
+          "subject": "other",
+          "world": "real",
+          "occurrence": "occurred",
+          "relevance": "match",
+          "identity": "clear",
+          "resolution": "resolved",
+          "time": {
+            "kind": "relative_day",
+            "source_ref": "timeline:tl_E05",
+            "days": -1,
+            "timezone": "Asia/Shanghai"
+          },
+          "evidence": [
+            {
+              "source_ref": "timeline:tl_E05",
+              "source_version": "fixture-version-E05",
+              "quote": "小陈昨天早上也喝了牛奶。"
+            }
+          ]
+        },
+        {
+          "row_id": "E06",
+          "event_key": "meal-09",
+          "description": "早上那杯是豆浆",
+          "subject": "current_user",
+          "world": "real",
+          "occurrence": "occurred",
+          "relevance": "match",
+          "identity": "clear",
+          "resolution": "resolved",
+          "time": {
+            "kind": "relative_day",
+            "source_ref": "timeline:tl_E06",
+            "days": -1,
+            "timezone": "Asia/Shanghai"
+          },
+          "evidence": [
+            {
+              "source_ref": "timeline:tl_E06",
+              "source_version": "fixture-version-E06",
+              "quote": "昨天早上那杯，我说牛奶是记错了，其实是豆浆。"
+            }
+          ],
+          "supersedes": [
+            "E04"
+          ]
+        },
+        {
+          "row_id": "E07",
+          "event_key": "no-meal-12",
+          "description": "今天没吃早饭，只喝了水。",
+          "subject": "current_user",
+          "world": "real",
+          "occurrence": "not_occurred",
+          "relevance": "match",
+          "identity": "clear",
+          "resolution": "resolved",
+          "time": {
+            "kind": "relative_day",
+            "source_ref": "timeline:tl_E07",
+            "days": 0,
+            "timezone": "Asia/Shanghai"
+          },
+          "evidence": [
+            {
+              "source_ref": "timeline:tl_E07",
+              "source_version": "fixture-version-E07",
+              "quote": "今天没吃早饭，只喝了水。"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "expected": {
+    "resolved_groups": 3,
+    "occurred_groups": 2,
+    "not_occurred_groups": 1,
+    "excluded_groups": 2,
+    "days_without_resolved_events": [
+      "2026-09-07",
+      "2026-09-08",
+      "2026-09-10",
+      "2026-09-11"
+    ],
+    "event_coverage": "not_established"
+  }
+}

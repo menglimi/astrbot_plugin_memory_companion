@@ -1,6 +1,6 @@
 # 记忆精度专项审查与设计
 
-> 导航：[设计总纲](../../astrbot_plugin_private_companion/docs/FRAMEWORK_DESIGN.md) / [主题目录](../../astrbot_plugin_private_companion/docs/FRAMEWORK_DESIGN_INDEX.md)。定位：精度审查与设计来源；历史复现不表示新接口已验收。
+> 定位：2026-09-06 的精度审查与设计来源，保留当时的实验和问题；历史复现不表示问题仍未修或新接口已经验收。现行设计看[Memory 设计目录](./README.md)、[记忆主稿](../../astrbot_plugin_private_companion/docs/MEMORY_CONTRACT_V0.md)及[查询专题](../../astrbot_plugin_private_companion/docs/MEMORY_QUERY_SESSION_DESIGN_V0.md)，当前证据看[路线](../../astrbot_plugin_private_companion/docs/FRAMEWORK_ROADMAP_AND_STATUS_V1.md)。
 
 日期：2026-09-06。源码基线：`a12c386`（2.0.0）。
 

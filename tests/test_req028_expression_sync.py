@@ -17,6 +17,12 @@ from core.service import MemoryCompanionService, MemoryRouteDecision
 from core.time_intent import TimeIntent
 
 
+def make_service_shell() -> MemoryCompanionService:
+    service = MemoryCompanionService.__new__(MemoryCompanionService)
+    service.config = ConfigView({})
+    return service
+
+
 def valid_expression_decision(**updates) -> dict:
     decision = {
         "contract": "companion_interaction_expression.v1",
@@ -200,7 +206,7 @@ class Req028ExpressionSyncTests(unittest.TestCase):
         )
 
     def test_paired_mode_does_not_inject_second_tone_or_write_legacy_state(self) -> None:
-        service = MemoryCompanionService.__new__(MemoryCompanionService)
+        service = make_service_shell()
         ctx = SessionContext(
             scope="private",
             session_id="qq:FriendMessage:u1",
@@ -225,7 +231,7 @@ class Req028ExpressionSyncTests(unittest.TestCase):
         self.assertEqual({"get": 0, "save": 0}, calls)
 
     def test_standalone_fallback_remains_available(self) -> None:
-        service = MemoryCompanionService.__new__(MemoryCompanionService)
+        service = make_service_shell()
         service._BOT_ADDRESS_SUGGESTIONS = {"acquaintance": {"hint": "standalone address hint"}}
         service._get_relationship_phase = MethodType(
             lambda _self, _ctx: {"phase": "acquaintance", "current_address_phase": ""}, service
@@ -254,6 +260,9 @@ class Req028ExpressionSyncTests(unittest.TestCase):
             "persona.memory_touch_events",  # 「记忆触动事件」的当前标题是「近期情绪事件」
             "legacy_context_labels",
             "item.legacy_context",  # 「当时关系情境」在趋势行上的投影
+            'defineView("synergy"',
+            'apiGet("/coordination/status")',
+            "表达权威归属、记忆触动趋势与情绪连续性",
         ):
             self.assertIn(required, source)
         # 互动协同视图必须保持只读：出现写请求就等于记忆侧建立了第二套表达/关系权威；

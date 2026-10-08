@@ -1,0 +1,75 @@
+{
+  "schema_version": "query-scale-cases.v1",
+  "source_kind": "synthetic_not_user_history",
+  "now": "2026-09-14T12:00:00+08:00",
+  "seed": 91403,
+  "sources": [
+    {"key": "cup", "at": "2026-06-08T09:00:00+08:00", "role": "user", "text": "那只赤陶杯是在旧书店旁边买的。"},
+    {"key": "question", "at": "2026-09-08T03:40:00+08:00", "role": "user", "text": "今天的胖次是什么颜色和款式？"},
+    {"key": "answer", "at": "2026-09-08T03:41:00+08:00", "role": "assistant", "text": "浅紫色带细蕾丝边的。"},
+    {"key": "correction", "at": "2026-09-14T08:00:00+08:00", "role": "assistant", "text": "补一句，8号凌晨那个回答说错了，实际是白色纯棉的，没有蕾丝。"},
+    {"key": "travel", "at": "2026-08-19T18:00:00+08:00", "role": "user", "text": "风浪太大，渡船停航了，我临时换乘高铁，到了已经天黑。"},
+    {"key": "scope-visible", "at": "2026-07-01T12:00:00+08:00", "role": "user", "text": "回形针收在书桌第二层抽屉。"},
+    {"key": "scope-hidden", "at": "2026-09-13T23:50:00+08:00", "role": "user", "text": "回形针另一个窗口的私密记录。", "other_owner": true}
+  ],
+  "cases": [
+    {
+      "id": "rare_old_literal",
+      "question": "那只赤陶杯是在哪里买的？",
+      "required_sources": ["cup"],
+      "routes": [
+        {"id": "literal_index", "fts": true, "steps": [{"parameters": {"terms": ["赤陶杯"]}}]},
+        {"id": "same_literal_scan", "fts": false, "steps": [{"parameters": {"terms": ["赤陶杯"]}}]}
+      ]
+    },
+    {
+      "id": "question_answer",
+      "question": "9月8日凌晨我问过哪次胖次，当时的回答原话是什么？",
+      "required_sources": ["question", "answer"],
+      "routes": [
+        {"id": "keyword_only", "steps": [{"parameters": {"terms": ["胖次"]}}]},
+        {"id": "follow_context", "steps": [{"parameters": {"terms": ["胖次"]}}, {"source_from": 0, "parameters": {"action": "context", "direction": "after"}}]}
+      ]
+    },
+    {
+      "id": "late_correction",
+      "question": "9月8日那次回答后来有没有改口，最后怎样说？",
+      "required_sources": ["question", "answer", "correction"],
+      "routes": [
+        {"id": "original_window", "steps": [{"parameters": {"action": "range", "start_at": "2026-09-08T03:40:00+08:00", "end_at": "2026-09-08T03:42:00+08:00"}}]},
+        {"id": "follow_later_wording", "steps": [{"parameters": {"terms": ["胖次"]}}, {"source_from": 0, "parameters": {"action": "context", "direction": "after"}}, {"parameters": {"terms": ["那个回答", "改口", "说错了"]}}]}
+      ]
+    },
+    {
+      "id": "dense_week",
+      "question": "9月7日至13日的相关原始问答有哪些？",
+      "required_sources": ["question", "answer"],
+      "routes": [
+        {"id": "week_three_pages", "steps": [{"parameters": {"action": "range", "start_at": "2026-09-07T00:00:00+08:00", "end_at": "2026-09-14T00:00:00+08:00"}}, {"cursor_from": 0}, {"cursor_from": 1}]},
+        {"id": "known_minute_control", "oracle_window": true, "steps": [{"parameters": {"action": "range", "start_at": "2026-09-08T03:40:00+08:00", "end_at": "2026-09-08T03:42:00+08:00"}}]}
+      ]
+    },
+    {
+      "id": "semantic_wording",
+      "question": "那次临时改变交通方式，最后为什么晚到了？",
+      "required_sources": ["travel"],
+      "routes": [
+        {"id": "question_words", "steps": [{"parameters": {"terms": ["交通方式", "晚到"]}}]},
+        {"id": "known_paraphrase_control", "oracle_terms": true, "steps": [{"parameters": {"terms": ["停航", "高铁"]}}]}
+      ]
+    },
+    {
+      "id": "scope_filter",
+      "question": "回形针放在哪里？",
+      "required_sources": ["scope-visible"],
+      "forbidden_sources": ["scope-hidden"],
+      "routes": [{"id": "authorized_literal", "steps": [{"parameters": {"terms": ["回形针"], "limit": 1}}]}]
+    },
+    {
+      "id": "exact_retry",
+      "question": "重复相同查询会复用已经读到的资料吗？",
+      "required_sources": ["cup"],
+      "routes": [{"id": "same_query_twice", "steps": [{"parameters": {"terms": ["赤陶杯"]}}, {"parameters": {"terms": ["赤陶杯"]}}]}]
+    }
+  ]
+}

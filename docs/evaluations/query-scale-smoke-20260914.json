@@ -1,0 +1,2490 @@
+{
+  "schema_version": "query-scale-baseline.v1",
+  "observed_at": "2026-09-14T02:39:06.854819+08:00",
+  "evidence_level": "R",
+  "source_kind": "temporary_synthetic_sqlite",
+  "production_writes": 0,
+  "host_reloads": 0,
+  "platform_sends": 0,
+  "real_model_calls": 0,
+  "mrq_formal_runs": 0,
+  "fixture": "docs\\evaluations\\query-scale-cases.v1.json",
+  "budget": {
+    "max_steps": 3,
+    "per_step_limit": 6
+  },
+  "boundaries": [
+    "scripted routes are not autonomous model decisions",
+    "gold source IDs used only for scoring",
+    "known-minute and paraphrase routes are oracle controls",
+    "two-dimensional vectors diagnose admission only",
+    "exhaustive vector reference has a larger resource budget",
+    "not production latency, first token or full MRQ",
+    "one disclosed warmup per raw corpus; alternating route order; local threaded store methods unchanged"
+  ],
+  "source_scales": [
+    {
+      "corpus": {
+        "total_rows": 1000,
+        "authorized_rows": 800,
+        "authorized_week_rows": 399,
+        "fixture_sha256": "a7d701f9f958c752b5f628c501cb87c9849fd3e377736ad9c4e7f00f3b919156",
+        "build_ms": 252.448,
+        "fts5_trigram_available": true
+      },
+      "repetitions": 1,
+      "routes": [
+        {
+          "case": "rare_old_literal",
+          "route": "literal_index",
+          "oracle_control": false,
+          "local_ms": {
+            "samples": 1,
+            "median": 6.688,
+            "p95_nearest_rank": 6.688,
+            "max": 6.688
+          },
+          "required_source_recall": [
+            1.0
+          ],
+          "unique_source_count": [
+            1
+          ],
+          "query_calls": 1,
+          "output_chars_median": 1940,
+          "errors": [],
+          "forbidden_returned": [],
+          "first_observation": {
+            "case": "rare_old_literal",
+            "route": "literal_index",
+            "repetition": 1,
+            "scripted": true,
+            "oracle_control": false,
+            "elapsed_ms": 6.688,
+            "required_sources": [
+              "cup"
+            ],
+            "required_returned": [
+              "cup"
+            ],
+            "required_missing": [],
+            "required_source_recall": 1.0,
+            "forbidden_returned": [],
+            "unique_source_count": 1,
+            "query_calls": 1,
+            "errors": [],
+            "more_available_at_end": false,
+            "event_coverage": "not_established",
+            "calls": [
+              {
+                "parameters": {
+                  "terms": [
+                    "赤陶杯"
+                  ]
+                },
+                "elapsed_ms": 6.669,
+                "output_chars": 1940,
+                "ok": true,
+                "error": "",
+                "coverage": {
+                  "scope": "current_session_only",
+                  "time_basis": "message_observation",
+                  "start_at": "",
+                  "end_at": "",
+                  "interval": "[start,end)",
+                  "order": "message_time_desc",
+                  "selection": "literal_terms_any",
+                  "more_available": false,
+                  "source_revision": "1000",
+                  "read_count": 1,
+                  "returned_count": 1,
+                  "suppressed_count": 0,
+                  "excerpt_truncated_count": 0,
+                  "event_coverage": "not_established",
+                  "path": "fts5_trigram",
+                  "unknown_message_time": "excluded_from_time_order"
+                },
+                "usage": {
+                  "step": 1,
+                  "remaining_steps": 2,
+                  "model_calls": 0,
+                  "returned_chars": 15,
+                  "elapsed_ms": 0
+                },
+                "steps": {
+                  "used": 1,
+                  "limit": 3,
+                  "remaining": 2
+                },
+                "sources": [
+                  {
+                    "source_ref": "timeline:tl_scale_cup",
+                    "source_version": "4e9bcd3e5bd277cc2a3a0216f079e3f18a5f5d0912b1836ea7901265d0edf30e",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-06-08T09:00:00+08:00",
+                    "message_at_local": "2026-06-08 09:00:00",
+                    "recorded_at": "2026-06-08T09:00:00+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "那只赤陶杯是在旧书店旁边买的。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 15,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "case": "rare_old_literal",
+          "route": "same_literal_scan",
+          "oracle_control": false,
+          "local_ms": {
+            "samples": 1,
+            "median": 9.153,
+            "p95_nearest_rank": 9.153,
+            "max": 9.153
+          },
+          "required_source_recall": [
+            1.0
+          ],
+          "unique_source_count": [
+            1
+          ],
+          "query_calls": 1,
+          "output_chars_median": 1948,
+          "errors": [],
+          "forbidden_returned": [],
+          "first_observation": {
+            "case": "rare_old_literal",
+            "route": "same_literal_scan",
+            "repetition": 1,
+            "scripted": true,
+            "oracle_control": false,
+            "elapsed_ms": 9.153,
+            "required_sources": [
+              "cup"
+            ],
+            "required_returned": [
+              "cup"
+            ],
+            "required_missing": [],
+            "required_source_recall": 1.0,
+            "forbidden_returned": [],
+            "unique_source_count": 1,
+            "query_calls": 1,
+            "errors": [],
+            "more_available_at_end": false,
+            "event_coverage": "not_established",
+            "calls": [
+              {
+                "parameters": {
+                  "terms": [
+                    "赤陶杯"
+                  ]
+                },
+                "elapsed_ms": 9.133,
+                "output_chars": 1948,
+                "ok": true,
+                "error": "",
+                "coverage": {
+                  "scope": "current_session_only",
+                  "time_basis": "message_observation",
+                  "start_at": "",
+                  "end_at": "",
+                  "interval": "[start,end)",
+                  "order": "message_time_desc",
+                  "selection": "literal_terms_any",
+                  "more_available": false,
+                  "source_revision": "1000",
+                  "read_count": 1,
+                  "returned_count": 1,
+                  "suppressed_count": 0,
+                  "excerpt_truncated_count": 0,
+                  "event_coverage": "not_established",
+                  "path": "partition_substring",
+                  "unknown_message_time": "excluded_from_time_order"
+                },
+                "usage": {
+                  "step": 1,
+                  "remaining_steps": 2,
+                  "model_calls": 0,
+                  "returned_chars": 15,
+                  "elapsed_ms": 15
+                },
+                "steps": {
+                  "used": 1,
+                  "limit": 3,
+                  "remaining": 2
+                },
+                "sources": [
+                  {
+                    "source_ref": "timeline:tl_scale_cup",
+                    "source_version": "4e9bcd3e5bd277cc2a3a0216f079e3f18a5f5d0912b1836ea7901265d0edf30e",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-06-08T09:00:00+08:00",
+                    "message_at_local": "2026-06-08 09:00:00",
+                    "recorded_at": "2026-06-08T09:00:00+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "那只赤陶杯是在旧书店旁边买的。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 15,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "case": "question_answer",
+          "route": "keyword_only",
+          "oracle_control": false,
+          "local_ms": {
+            "samples": 1,
+            "median": 7.536,
+            "p95_nearest_rank": 7.536,
+            "max": 7.536
+          },
+          "required_source_recall": [
+            0.5
+          ],
+          "unique_source_count": [
+            1
+          ],
+          "query_calls": 1,
+          "output_chars_median": 1949,
+          "errors": [],
+          "forbidden_returned": [],
+          "first_observation": {
+            "case": "question_answer",
+            "route": "keyword_only",
+            "repetition": 1,
+            "scripted": true,
+            "oracle_control": false,
+            "elapsed_ms": 7.536,
+            "required_sources": [
+              "answer",
+              "question"
+            ],
+            "required_returned": [
+              "question"
+            ],
+            "required_missing": [
+              "answer"
+            ],
+            "required_source_recall": 0.5,
+            "forbidden_returned": [],
+            "unique_source_count": 1,
+            "query_calls": 1,
+            "errors": [],
+            "more_available_at_end": false,
+            "event_coverage": "not_established",
+            "calls": [
+              {
+                "parameters": {
+                  "terms": [
+                    "胖次"
+                  ]
+                },
+                "elapsed_ms": 7.522,
+                "output_chars": 1949,
+                "ok": true,
+                "error": "",
+                "coverage": {
+                  "scope": "current_session_only",
+                  "time_basis": "message_observation",
+                  "start_at": "",
+                  "end_at": "",
+                  "interval": "[start,end)",
+                  "order": "message_time_desc",
+                  "selection": "literal_terms_any",
+                  "more_available": false,
+                  "source_revision": "1000",
+                  "read_count": 1,
+                  "returned_count": 1,
+                  "suppressed_count": 0,
+                  "excerpt_truncated_count": 0,
+                  "event_coverage": "not_established",
+                  "path": "partition_substring",
+                  "unknown_message_time": "excluded_from_time_order"
+                },
+                "usage": {
+                  "step": 1,
+                  "remaining_steps": 2,
+                  "model_calls": 0,
+                  "returned_chars": 14,
+                  "elapsed_ms": 0
+                },
+                "steps": {
+                  "used": 1,
+                  "limit": 3,
+                  "remaining": 2
+                },
+                "sources": [
+                  {
+                    "source_ref": "timeline:tl_scale_question",
+                    "source_version": "80fef8e31be5a0dac9073fba9944baa9b520842174c6ff17564300c728dfc1cb",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-08T03:40:00+08:00",
+                    "message_at_local": "2026-09-08 03:40:00",
+                    "recorded_at": "2026-09-08T03:40:00+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "今天的胖次是什么颜色和款式？",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 14,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "case": "question_answer",
+          "route": "follow_context",
+          "oracle_control": false,
+          "local_ms": {
+            "samples": 1,
+            "median": 15.903,
+            "p95_nearest_rank": 15.903,
+            "max": 15.903
+          },
+          "required_source_recall": [
+            1.0
+          ],
+          "unique_source_count": [
+            7
+          ],
+          "query_calls": 2,
+          "output_chars_median": 6727,
+          "errors": [],
+          "forbidden_returned": [],
+          "first_observation": {
+            "case": "question_answer",
+            "route": "follow_context",
+            "repetition": 1,
+            "scripted": true,
+            "oracle_control": false,
+            "elapsed_ms": 15.903,
+            "required_sources": [
+              "answer",
+              "question"
+            ],
+            "required_returned": [
+              "answer",
+              "question"
+            ],
+            "required_missing": [],
+            "required_source_recall": 1.0,
+            "forbidden_returned": [],
+            "unique_source_count": 7,
+            "query_calls": 2,
+            "errors": [],
+            "more_available_at_end": true,
+            "event_coverage": "not_established",
+            "calls": [
+              {
+                "parameters": {
+                  "terms": [
+                    "胖次"
+                  ]
+                },
+                "elapsed_ms": 7.869,
+                "output_chars": 1949,
+                "ok": true,
+                "error": "",
+                "coverage": {
+                  "scope": "current_session_only",
+                  "time_basis": "message_observation",
+                  "start_at": "",
+                  "end_at": "",
+                  "interval": "[start,end)",
+                  "order": "message_time_desc",
+                  "selection": "literal_terms_any",
+                  "more_available": false,
+                  "source_revision": "1000",
+                  "read_count": 1,
+                  "returned_count": 1,
+                  "suppressed_count": 0,
+                  "excerpt_truncated_count": 0,
+                  "event_coverage": "not_established",
+                  "path": "partition_substring",
+                  "unknown_message_time": "excluded_from_time_order"
+                },
+                "usage": {
+                  "step": 1,
+                  "remaining_steps": 2,
+                  "model_calls": 0,
+                  "returned_chars": 14,
+                  "elapsed_ms": 0
+                },
+                "steps": {
+                  "used": 1,
+                  "limit": 3,
+                  "remaining": 2
+                },
+                "sources": [
+                  {
+                    "source_ref": "timeline:tl_scale_question",
+                    "source_version": "80fef8e31be5a0dac9073fba9944baa9b520842174c6ff17564300c728dfc1cb",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-08T03:40:00+08:00",
+                    "message_at_local": "2026-09-08 03:40:00",
+                    "recorded_at": "2026-09-08T03:40:00+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "今天的胖次是什么颜色和款式？",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 14,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  }
+                ]
+              },
+              {
+                "parameters": {
+                  "action": "context",
+                  "direction": "after",
+                  "source_ref": "timeline:tl_scale_question"
+                },
+                "elapsed_ms": 8.001,
+                "output_chars": 4778,
+                "ok": true,
+                "error": "",
+                "coverage": {
+                  "scope": "current_session_only",
+                  "time_basis": "message_observation",
+                  "start_at": "",
+                  "end_at": "",
+                  "interval": "[start,end)",
+                  "order": "message_time_asc",
+                  "selection": "context",
+                  "more_available": true,
+                  "source_revision": "1000",
+                  "read_count": 8,
+                  "returned_count": 6,
+                  "suppressed_count": 0,
+                  "excerpt_truncated_count": 0,
+                  "event_coverage": "not_established",
+                  "path": "source_context",
+                  "unknown_message_time": "excluded_from_time_order"
+                },
+                "usage": {
+                  "step": 2,
+                  "remaining_steps": 1,
+                  "model_calls": 0,
+                  "returned_chars": 117,
+                  "elapsed_ms": 0
+                },
+                "steps": {
+                  "used": 2,
+                  "limit": 3,
+                  "remaining": 1
+                },
+                "sources": [
+                  {
+                    "source_ref": "timeline:tl_scale_answer",
+                    "source_version": "0f585d2e454b080b2b5d9dd8d0331e63504ab9775f64274581a0ad49232bd428",
+                    "source_kind": "stored_message",
+                    "speaker_role": "assistant",
+                    "speaker_id": "scale-bot",
+                    "message_at": "2026-09-08T03:41:00+08:00",
+                    "message_at_local": "2026-09-08 03:41:00",
+                    "recorded_at": "2026-09-08T03:41:00+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "浅紫色带细蕾丝边的。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 10,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-222",
+                    "source_version": "8c69744a17abad865edd0d1101fa8b78699aedb1bc5f9723f10766d2c01b941b",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-08T04:42:34+08:00",
+                    "message_at_local": "2026-09-08 04:42:34",
+                    "recorded_at": "2026-09-08T04:42:34+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "楼下的树叶开始发黄了。 随手记录 222。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 21,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-298",
+                    "source_version": "d6cc829fa1ba439ddeadaae4d1b7a5b1b72a14f2ec402ec02539cbd109e778b9",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-08T04:51:25+08:00",
+                    "message_at_local": "2026-09-08 04:51:25",
+                    "recorded_at": "2026-09-08T04:51:25+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "风有点大，晚上早点休息。 随手记录 298。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 22,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-462",
+                    "source_version": "3b3b0d70d5f2f90b63ad31dc9c20e15dbe2c0c96a57aab49529b4ccac22f954d",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-08T05:13:24+08:00",
+                    "message_at_local": "2026-09-08 05:13:24",
+                    "recorded_at": "2026-09-08T05:13:24+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "楼下的树叶开始发黄了。 随手记录 462。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 21,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-532",
+                    "source_version": "ef8354289186130ef2aa6ed73436899507bea39e80fd31083cc57a82e5622bc1",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-08T05:40:46+08:00",
+                    "message_at_local": "2026-09-08 05:40:46",
+                    "recorded_at": "2026-09-08T05:40:46+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "风有点大，晚上早点休息。 随手记录 532。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 22,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-966",
+                    "source_version": "6c10ab0f2c3267d973ccac4f2fa6afd4afc7e0a3d20950babfb4896d5c336f7f",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-08T06:00:21+08:00",
+                    "message_at_local": "2026-09-08 06:00:21",
+                    "recorded_at": "2026-09-08T06:00:21+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "楼下的树叶开始发黄了。 随手记录 966。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 21,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "case": "late_correction",
+          "route": "original_window",
+          "oracle_control": false,
+          "local_ms": {
+            "samples": 1,
+            "median": 6.699,
+            "p95_nearest_rank": 6.699,
+            "max": 6.699
+          },
+          "required_source_recall": [
+            0.6666666666666666
+          ],
+          "unique_source_count": [
+            2
+          ],
+          "query_calls": 1,
+          "output_chars_median": 2549,
+          "errors": [],
+          "forbidden_returned": [],
+          "first_observation": {
+            "case": "late_correction",
+            "route": "original_window",
+            "repetition": 1,
+            "scripted": true,
+            "oracle_control": false,
+            "elapsed_ms": 6.699,
+            "required_sources": [
+              "answer",
+              "correction",
+              "question"
+            ],
+            "required_returned": [
+              "answer",
+              "question"
+            ],
+            "required_missing": [
+              "correction"
+            ],
+            "required_source_recall": 0.6666666666666666,
+            "forbidden_returned": [],
+            "unique_source_count": 2,
+            "query_calls": 1,
+            "errors": [],
+            "more_available_at_end": false,
+            "event_coverage": "not_established",
+            "calls": [
+              {
+                "parameters": {
+                  "action": "range",
+                  "start_at": "2026-09-08T03:40:00+08:00",
+                  "end_at": "2026-09-08T03:42:00+08:00"
+                },
+                "elapsed_ms": 6.683,
+                "output_chars": 2549,
+                "ok": true,
+                "error": "",
+                "coverage": {
+                  "scope": "current_session_only",
+                  "time_basis": "message_observation",
+                  "start_at": "2026-09-07T19:40:00+00:00",
+                  "end_at": "2026-09-07T19:42:00+00:00",
+                  "interval": "[start,end)",
+                  "order": "message_time_desc",
+                  "selection": "range",
+                  "more_available": false,
+                  "source_revision": "1000",
+                  "read_count": 2,
+                  "returned_count": 2,
+                  "suppressed_count": 0,
+                  "excerpt_truncated_count": 0,
+                  "event_coverage": "not_established",
+                  "path": "time_range",
+                  "unknown_message_time": "excluded_from_time_order"
+                },
+                "usage": {
+                  "step": 1,
+                  "remaining_steps": 2,
+                  "model_calls": 0,
+                  "returned_chars": 24,
+                  "elapsed_ms": 0
+                },
+                "steps": {
+                  "used": 1,
+                  "limit": 3,
+                  "remaining": 2
+                },
+                "sources": [
+                  {
+                    "source_ref": "timeline:tl_scale_answer",
+                    "source_version": "0f585d2e454b080b2b5d9dd8d0331e63504ab9775f64274581a0ad49232bd428",
+                    "source_kind": "stored_message",
+                    "speaker_role": "assistant",
+                    "speaker_id": "scale-bot",
+                    "message_at": "2026-09-08T03:41:00+08:00",
+                    "message_at_local": "2026-09-08 03:41:00",
+                    "recorded_at": "2026-09-08T03:41:00+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "浅紫色带细蕾丝边的。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 10,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_question",
+                    "source_version": "80fef8e31be5a0dac9073fba9944baa9b520842174c6ff17564300c728dfc1cb",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-08T03:40:00+08:00",
+                    "message_at_local": "2026-09-08 03:40:00",
+                    "recorded_at": "2026-09-08T03:40:00+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "今天的胖次是什么颜色和款式？",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 14,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "case": "late_correction",
+          "route": "follow_later_wording",
+          "oracle_control": false,
+          "local_ms": {
+            "samples": 1,
+            "median": 24.091,
+            "p95_nearest_rank": 24.091,
+            "max": 24.091
+          },
+          "required_source_recall": [
+            1.0
+          ],
+          "unique_source_count": [
+            8
+          ],
+          "query_calls": 3,
+          "output_chars_median": 8813,
+          "errors": [],
+          "forbidden_returned": [],
+          "first_observation": {
+            "case": "late_correction",
+            "route": "follow_later_wording",
+            "repetition": 1,
+            "scripted": true,
+            "oracle_control": false,
+            "elapsed_ms": 24.091,
+            "required_sources": [
+              "answer",
+              "correction",
+              "question"
+            ],
+            "required_returned": [
+              "answer",
+              "correction",
+              "question"
+            ],
+            "required_missing": [],
+            "required_source_recall": 1.0,
+            "forbidden_returned": [],
+            "unique_source_count": 8,
+            "query_calls": 3,
+            "errors": [],
+            "more_available_at_end": false,
+            "event_coverage": "not_established",
+            "calls": [
+              {
+                "parameters": {
+                  "terms": [
+                    "胖次"
+                  ]
+                },
+                "elapsed_ms": 7.773,
+                "output_chars": 1949,
+                "ok": true,
+                "error": "",
+                "coverage": {
+                  "scope": "current_session_only",
+                  "time_basis": "message_observation",
+                  "start_at": "",
+                  "end_at": "",
+                  "interval": "[start,end)",
+                  "order": "message_time_desc",
+                  "selection": "literal_terms_any",
+                  "more_available": false,
+                  "source_revision": "1000",
+                  "read_count": 1,
+                  "returned_count": 1,
+                  "suppressed_count": 0,
+                  "excerpt_truncated_count": 0,
+                  "event_coverage": "not_established",
+                  "path": "partition_substring",
+                  "unknown_message_time": "excluded_from_time_order"
+                },
+                "usage": {
+                  "step": 1,
+                  "remaining_steps": 2,
+                  "model_calls": 0,
+                  "returned_chars": 14,
+                  "elapsed_ms": 0
+                },
+                "steps": {
+                  "used": 1,
+                  "limit": 3,
+                  "remaining": 2
+                },
+                "sources": [
+                  {
+                    "source_ref": "timeline:tl_scale_question",
+                    "source_version": "80fef8e31be5a0dac9073fba9944baa9b520842174c6ff17564300c728dfc1cb",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-08T03:40:00+08:00",
+                    "message_at_local": "2026-09-08 03:40:00",
+                    "recorded_at": "2026-09-08T03:40:00+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "今天的胖次是什么颜色和款式？",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 14,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  }
+                ]
+              },
+              {
+                "parameters": {
+                  "action": "context",
+                  "direction": "after",
+                  "source_ref": "timeline:tl_scale_question"
+                },
+                "elapsed_ms": 7.254,
+                "output_chars": 4778,
+                "ok": true,
+                "error": "",
+                "coverage": {
+                  "scope": "current_session_only",
+                  "time_basis": "message_observation",
+                  "start_at": "",
+                  "end_at": "",
+                  "interval": "[start,end)",
+                  "order": "message_time_asc",
+                  "selection": "context",
+                  "more_available": true,
+                  "source_revision": "1000",
+                  "read_count": 8,
+                  "returned_count": 6,
+                  "suppressed_count": 0,
+                  "excerpt_truncated_count": 0,
+                  "event_coverage": "not_established",
+                  "path": "source_context",
+                  "unknown_message_time": "excluded_from_time_order"
+                },
+                "usage": {
+                  "step": 2,
+                  "remaining_steps": 1,
+                  "model_calls": 0,
+                  "returned_chars": 117,
+                  "elapsed_ms": 0
+                },
+                "steps": {
+                  "used": 2,
+                  "limit": 3,
+                  "remaining": 1
+                },
+                "sources": [
+                  {
+                    "source_ref": "timeline:tl_scale_answer",
+                    "source_version": "0f585d2e454b080b2b5d9dd8d0331e63504ab9775f64274581a0ad49232bd428",
+                    "source_kind": "stored_message",
+                    "speaker_role": "assistant",
+                    "speaker_id": "scale-bot",
+                    "message_at": "2026-09-08T03:41:00+08:00",
+                    "message_at_local": "2026-09-08 03:41:00",
+                    "recorded_at": "2026-09-08T03:41:00+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "浅紫色带细蕾丝边的。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 10,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-222",
+                    "source_version": "8c69744a17abad865edd0d1101fa8b78699aedb1bc5f9723f10766d2c01b941b",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-08T04:42:34+08:00",
+                    "message_at_local": "2026-09-08 04:42:34",
+                    "recorded_at": "2026-09-08T04:42:34+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "楼下的树叶开始发黄了。 随手记录 222。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 21,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-298",
+                    "source_version": "d6cc829fa1ba439ddeadaae4d1b7a5b1b72a14f2ec402ec02539cbd109e778b9",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-08T04:51:25+08:00",
+                    "message_at_local": "2026-09-08 04:51:25",
+                    "recorded_at": "2026-09-08T04:51:25+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "风有点大，晚上早点休息。 随手记录 298。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 22,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-462",
+                    "source_version": "3b3b0d70d5f2f90b63ad31dc9c20e15dbe2c0c96a57aab49529b4ccac22f954d",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-08T05:13:24+08:00",
+                    "message_at_local": "2026-09-08 05:13:24",
+                    "recorded_at": "2026-09-08T05:13:24+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "楼下的树叶开始发黄了。 随手记录 462。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 21,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-532",
+                    "source_version": "ef8354289186130ef2aa6ed73436899507bea39e80fd31083cc57a82e5622bc1",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-08T05:40:46+08:00",
+                    "message_at_local": "2026-09-08 05:40:46",
+                    "recorded_at": "2026-09-08T05:40:46+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "风有点大，晚上早点休息。 随手记录 532。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 22,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-966",
+                    "source_version": "6c10ab0f2c3267d973ccac4f2fa6afd4afc7e0a3d20950babfb4896d5c336f7f",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-08T06:00:21+08:00",
+                    "message_at_local": "2026-09-08 06:00:21",
+                    "recorded_at": "2026-09-08T06:00:21+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "楼下的树叶开始发黄了。 随手记录 966。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 21,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  }
+                ]
+              },
+              {
+                "parameters": {
+                  "terms": [
+                    "那个回答",
+                    "改口",
+                    "说错了"
+                  ]
+                },
+                "elapsed_ms": 9.007,
+                "output_chars": 2086,
+                "ok": true,
+                "error": "",
+                "coverage": {
+                  "scope": "current_session_only",
+                  "time_basis": "message_observation",
+                  "start_at": "",
+                  "end_at": "",
+                  "interval": "[start,end)",
+                  "order": "message_time_desc",
+                  "selection": "literal_terms_any",
+                  "more_available": false,
+                  "source_revision": "1000",
+                  "read_count": 1,
+                  "returned_count": 1,
+                  "suppressed_count": 0,
+                  "excerpt_truncated_count": 0,
+                  "event_coverage": "not_established",
+                  "path": "partition_substring",
+                  "unknown_message_time": "excluded_from_time_order"
+                },
+                "usage": {
+                  "step": 3,
+                  "remaining_steps": 0,
+                  "model_calls": 0,
+                  "returned_chars": 30,
+                  "elapsed_ms": 0
+                },
+                "steps": {
+                  "used": 3,
+                  "limit": 3,
+                  "remaining": 0
+                },
+                "sources": [
+                  {
+                    "source_ref": "timeline:tl_scale_correction",
+                    "source_version": "4b7dbf7e320b96e33586adc61d32344aab7e0a552b2acd987382980ef9b5dc1c",
+                    "source_kind": "stored_message",
+                    "speaker_role": "assistant",
+                    "speaker_id": "scale-bot",
+                    "message_at": "2026-09-14T08:00:00+08:00",
+                    "message_at_local": "2026-09-14 08:00:00",
+                    "recorded_at": "2026-09-14T08:00:00+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "补一句，8号凌晨那个回答说错了，实际是白色纯棉的，没有蕾丝。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 30,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "case": "dense_week",
+          "route": "week_three_pages",
+          "oracle_control": false,
+          "local_ms": {
+            "samples": 1,
+            "median": 20.709,
+            "p95_nearest_rank": 20.709,
+            "max": 20.709
+          },
+          "required_source_recall": [
+            0.0
+          ],
+          "unique_source_count": [
+            18
+          ],
+          "query_calls": 3,
+          "output_chars_median": 14408,
+          "errors": [],
+          "forbidden_returned": [],
+          "first_observation": {
+            "case": "dense_week",
+            "route": "week_three_pages",
+            "repetition": 1,
+            "scripted": true,
+            "oracle_control": false,
+            "elapsed_ms": 20.709,
+            "required_sources": [
+              "answer",
+              "question"
+            ],
+            "required_returned": [],
+            "required_missing": [
+              "answer",
+              "question"
+            ],
+            "required_source_recall": 0.0,
+            "forbidden_returned": [],
+            "unique_source_count": 18,
+            "query_calls": 3,
+            "errors": [],
+            "more_available_at_end": true,
+            "event_coverage": "not_established",
+            "calls": [
+              {
+                "parameters": {
+                  "action": "range",
+                  "start_at": "2026-09-07T00:00:00+08:00",
+                  "end_at": "2026-09-14T00:00:00+08:00"
+                },
+                "elapsed_ms": 5.92,
+                "output_chars": 4760,
+                "ok": true,
+                "error": "",
+                "coverage": {
+                  "scope": "current_session_only",
+                  "time_basis": "message_observation",
+                  "start_at": "2026-09-06T16:00:00+00:00",
+                  "end_at": "2026-09-13T16:00:00+00:00",
+                  "interval": "[start,end)",
+                  "order": "message_time_desc",
+                  "selection": "range",
+                  "more_available": true,
+                  "source_revision": "1000",
+                  "read_count": 7,
+                  "returned_count": 6,
+                  "suppressed_count": 0,
+                  "excerpt_truncated_count": 0,
+                  "event_coverage": "not_established",
+                  "path": "time_range",
+                  "unknown_message_time": "excluded_from_time_order"
+                },
+                "usage": {
+                  "step": 1,
+                  "remaining_steps": 2,
+                  "model_calls": 0,
+                  "returned_chars": 132,
+                  "elapsed_ms": 0
+                },
+                "steps": {
+                  "used": 1,
+                  "limit": 3,
+                  "remaining": 2
+                },
+                "sources": [
+                  {
+                    "source_ref": "timeline:tl_scale_noise-744",
+                    "source_version": "b896d93da304774d70524b72d50cd9934da4afcf52e325192e269f3061ee5418",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-13T23:26:05+08:00",
+                    "message_at_local": "2026-09-13 23:26:05",
+                    "recorded_at": "2026-09-13T23:26:05+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "楼下的树叶开始发黄了。 随手记录 744。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 21,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-734",
+                    "source_version": "3e2160740eb7389b612120791e12aefe39a501787612b239fefcb0ca7dadd938",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-13T23:06:41+08:00",
+                    "message_at_local": "2026-09-13 23:06:41",
+                    "recorded_at": "2026-09-13T23:06:41+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "午后出门散步，路上车很多。 随手记录 734。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 23,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-296",
+                    "source_version": "b05c0b63854986f76f61ef4671ce42fec190d09097a67a09f60558efcc183c4b",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-13T22:48:51+08:00",
+                    "message_at_local": "2026-09-13 22:48:51",
+                    "recorded_at": "2026-09-13T22:48:51+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "午后出门散步，路上车很多。 随手记录 296。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 23,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-572",
+                    "source_version": "d3b969cb59d2fc8c50fb473535f7d2a9d166d457f44a0dddc0a34cdcd3e745da",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-13T22:35:26+08:00",
+                    "message_at_local": "2026-09-13 22:35:26",
+                    "recorded_at": "2026-09-13T22:35:26+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "午后出门散步，路上车很多。 随手记录 572。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 23,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-348",
+                    "source_version": "2a12b2857770ec013d27e0cba49beb1a4ac704f282a8765c0b03ea9bfd8882a4",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-13T21:57:37+08:00",
+                    "message_at_local": "2026-09-13 21:57:37",
+                    "recorded_at": "2026-09-13T21:57:37+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "楼下的树叶开始发黄了。 随手记录 348。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 21,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-762",
+                    "source_version": "a7ef121c15eca22e153c40eea92f3ca037b70204497258cf6f74363d965ddf74",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-13T21:52:23+08:00",
+                    "message_at_local": "2026-09-13 21:52:23",
+                    "recorded_at": "2026-09-13T21:52:23+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "楼下的树叶开始发黄了。 随手记录 762。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 21,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  }
+                ]
+              },
+              {
+                "parameters": {
+                  "cursor": "src_Gz0W8s41Sx6lxviL5K39IzfFmcuDsMgU"
+                },
+                "elapsed_ms": 6.869,
+                "output_chars": 4834,
+                "ok": true,
+                "error": "",
+                "coverage": {
+                  "scope": "current_session_only",
+                  "time_basis": "message_observation",
+                  "start_at": "2026-09-06T16:00:00+00:00",
+                  "end_at": "2026-09-13T16:00:00+00:00",
+                  "interval": "[start,end)",
+                  "order": "message_time_desc",
+                  "selection": "range",
+                  "more_available": true,
+                  "source_revision": "1000",
+                  "read_count": 7,
+                  "returned_count": 6,
+                  "suppressed_count": 0,
+                  "excerpt_truncated_count": 0,
+                  "event_coverage": "not_established",
+                  "path": "time_range",
+                  "unknown_message_time": "excluded_from_time_order"
+                },
+                "usage": {
+                  "step": 2,
+                  "remaining_steps": 1,
+                  "model_calls": 0,
+                  "returned_chars": 135,
+                  "elapsed_ms": 0
+                },
+                "steps": {
+                  "used": 2,
+                  "limit": 3,
+                  "remaining": 1
+                },
+                "sources": [
+                  {
+                    "source_ref": "timeline:tl_scale_noise-446",
+                    "source_version": "1f69d0bce1af375eaa6e49beee3ae2858b4869258c8abf3f3d831809d329de77",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-13T21:25:02+08:00",
+                    "message_at_local": "2026-09-13 21:25:02",
+                    "recorded_at": "2026-09-13T21:25:02+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "午后出门散步，路上车很多。 随手记录 446。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 23,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-494",
+                    "source_version": "871652442db0a82e89d50d97591556fc0d960a6e3d779911ecc4d5220b7bb3d1",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-13T21:05:37+08:00",
+                    "message_at_local": "2026-09-13 21:05:37",
+                    "recorded_at": "2026-09-13T21:05:37+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "午后出门散步，路上车很多。 随手记录 494。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 23,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-536",
+                    "source_version": "9a2a306247e98239bcd6a5d4d8629eb4509f17a663667285ccfe771a44310e8e",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-13T20:57:46+08:00",
+                    "message_at_local": "2026-09-13 20:57:46",
+                    "recorded_at": "2026-09-13T20:57:46+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "午后出门散步，路上车很多。 随手记录 536。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 23,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-644",
+                    "source_version": "f952a25a75b0e9f4090b0adf3201e2b0f22c1e2e8a9af391f071058d6974a188",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-13T20:50:06+08:00",
+                    "message_at_local": "2026-09-13 20:50:06",
+                    "recorded_at": "2026-09-13T20:50:06+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "午后出门散步，路上车很多。 随手记录 644。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 23,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-68",
+                    "source_version": "4c7bb36029161c8ac63cb08f34c0e87f8964a76380a8283652d68b723052ca74",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-13T19:57:30+08:00",
+                    "message_at_local": "2026-09-13 19:57:30",
+                    "recorded_at": "2026-09-13T19:57:30+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "午后出门散步，路上车很多。 随手记录 68。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 22,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-492",
+                    "source_version": "957958f35d10eda64e4547869e2ca3b49240600c45e176684b2a46753e2c510b",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-13T19:57:08+08:00",
+                    "message_at_local": "2026-09-13 19:57:08",
+                    "recorded_at": "2026-09-13T19:57:08+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "楼下的树叶开始发黄了。 随手记录 492。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 21,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  }
+                ]
+              },
+              {
+                "parameters": {
+                  "cursor": "src_Q4lx9_eE5mgWKOTiWKPC6Id3exL8SQyr"
+                },
+                "elapsed_ms": 7.819,
+                "output_chars": 4814,
+                "ok": true,
+                "error": "",
+                "coverage": {
+                  "scope": "current_session_only",
+                  "time_basis": "message_observation",
+                  "start_at": "2026-09-06T16:00:00+00:00",
+                  "end_at": "2026-09-13T16:00:00+00:00",
+                  "interval": "[start,end)",
+                  "order": "message_time_desc",
+                  "selection": "range",
+                  "more_available": true,
+                  "source_revision": "1000",
+                  "read_count": 7,
+                  "returned_count": 6,
+                  "suppressed_count": 0,
+                  "excerpt_truncated_count": 0,
+                  "event_coverage": "not_established",
+                  "path": "time_range",
+                  "unknown_message_time": "excluded_from_time_order"
+                },
+                "usage": {
+                  "step": 3,
+                  "remaining_steps": 0,
+                  "model_calls": 0,
+                  "returned_chars": 132,
+                  "elapsed_ms": 0
+                },
+                "steps": {
+                  "used": 3,
+                  "limit": 3,
+                  "remaining": 0
+                },
+                "sources": [
+                  {
+                    "source_ref": "timeline:tl_scale_noise-22",
+                    "source_version": "884d5971bec7f764859544c33190bc6b3d6d034c245db65ae4189852214e9691",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-13T19:56:06+08:00",
+                    "message_at_local": "2026-09-13 19:56:06",
+                    "recorded_at": "2026-09-13T19:56:06+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "风有点大，晚上早点休息。 随手记录 22。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 21,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-194",
+                    "source_version": "1ef181dfbe524722048f712032c863d6a69f19a4f2e97df271dd0b59f92fd47d",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-13T19:41:33+08:00",
+                    "message_at_local": "2026-09-13 19:41:33",
+                    "recorded_at": "2026-09-13T19:41:33+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "午后出门散步，路上车很多。 随手记录 194。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 23,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-188",
+                    "source_version": "5e8871beb37093b30dcb944030fc648bfff5c93879955618f59670db3fa8a062",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-13T19:17:11+08:00",
+                    "message_at_local": "2026-09-13 19:17:11",
+                    "recorded_at": "2026-09-13T19:17:11+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "午后出门散步，路上车很多。 随手记录 188。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 23,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-46",
+                    "source_version": "dcb0dbecad9573bd87393f7053a96bed4fca649f81510b0dba4b5b9ed3e3a99f",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-13T18:13:58+08:00",
+                    "message_at_local": "2026-09-13 18:13:58",
+                    "recorded_at": "2026-09-13T18:13:58+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "风有点大，晚上早点休息。 随手记录 46。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 21,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-402",
+                    "source_version": "82f10c8048c5b35d40800fe91775fa6eac6838e1908063e68546ae2ff6d54ebc",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-13T17:22:35+08:00",
+                    "message_at_local": "2026-09-13 17:22:35",
+                    "recorded_at": "2026-09-13T17:22:35+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "楼下的树叶开始发黄了。 随手记录 402。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 21,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_noise-986",
+                    "source_version": "dc63e52cfb73eb84a1f735be432599e1e444991406fbf04eed672799377ddf8c",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-13T16:36:06+08:00",
+                    "message_at_local": "2026-09-13 16:36:06",
+                    "recorded_at": "2026-09-13T16:36:06+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "午后出门散步，路上车很多。 随手记录 986。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 23,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "case": "dense_week",
+          "route": "known_minute_control",
+          "oracle_control": true,
+          "local_ms": {
+            "samples": 1,
+            "median": 6.847,
+            "p95_nearest_rank": 6.847,
+            "max": 6.847
+          },
+          "required_source_recall": [
+            1.0
+          ],
+          "unique_source_count": [
+            2
+          ],
+          "query_calls": 1,
+          "output_chars_median": 2549,
+          "errors": [],
+          "forbidden_returned": [],
+          "first_observation": {
+            "case": "dense_week",
+            "route": "known_minute_control",
+            "repetition": 1,
+            "scripted": true,
+            "oracle_control": true,
+            "elapsed_ms": 6.847,
+            "required_sources": [
+              "answer",
+              "question"
+            ],
+            "required_returned": [
+              "answer",
+              "question"
+            ],
+            "required_missing": [],
+            "required_source_recall": 1.0,
+            "forbidden_returned": [],
+            "unique_source_count": 2,
+            "query_calls": 1,
+            "errors": [],
+            "more_available_at_end": false,
+            "event_coverage": "not_established",
+            "calls": [
+              {
+                "parameters": {
+                  "action": "range",
+                  "start_at": "2026-09-08T03:40:00+08:00",
+                  "end_at": "2026-09-08T03:42:00+08:00"
+                },
+                "elapsed_ms": 6.83,
+                "output_chars": 2549,
+                "ok": true,
+                "error": "",
+                "coverage": {
+                  "scope": "current_session_only",
+                  "time_basis": "message_observation",
+                  "start_at": "2026-09-07T19:40:00+00:00",
+                  "end_at": "2026-09-07T19:42:00+00:00",
+                  "interval": "[start,end)",
+                  "order": "message_time_desc",
+                  "selection": "range",
+                  "more_available": false,
+                  "source_revision": "1000",
+                  "read_count": 2,
+                  "returned_count": 2,
+                  "suppressed_count": 0,
+                  "excerpt_truncated_count": 0,
+                  "event_coverage": "not_established",
+                  "path": "time_range",
+                  "unknown_message_time": "excluded_from_time_order"
+                },
+                "usage": {
+                  "step": 1,
+                  "remaining_steps": 2,
+                  "model_calls": 0,
+                  "returned_chars": 24,
+                  "elapsed_ms": 0
+                },
+                "steps": {
+                  "used": 1,
+                  "limit": 3,
+                  "remaining": 2
+                },
+                "sources": [
+                  {
+                    "source_ref": "timeline:tl_scale_answer",
+                    "source_version": "0f585d2e454b080b2b5d9dd8d0331e63504ab9775f64274581a0ad49232bd428",
+                    "source_kind": "stored_message",
+                    "speaker_role": "assistant",
+                    "speaker_id": "scale-bot",
+                    "message_at": "2026-09-08T03:41:00+08:00",
+                    "message_at_local": "2026-09-08 03:41:00",
+                    "recorded_at": "2026-09-08T03:41:00+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "浅紫色带细蕾丝边的。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 10,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  },
+                  {
+                    "source_ref": "timeline:tl_scale_question",
+                    "source_version": "80fef8e31be5a0dac9073fba9944baa9b520842174c6ff17564300c728dfc1cb",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-09-08T03:40:00+08:00",
+                    "message_at_local": "2026-09-08 03:40:00",
+                    "recorded_at": "2026-09-08T03:40:00+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "今天的胖次是什么颜色和款式？",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 14,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "case": "semantic_wording",
+          "route": "question_words",
+          "oracle_control": false,
+          "local_ms": {
+            "samples": 1,
+            "median": 8.416,
+            "p95_nearest_rank": 8.416,
+            "max": 8.416
+          },
+          "required_source_recall": [
+            0.0
+          ],
+          "unique_source_count": [
+            0
+          ],
+          "query_calls": 1,
+          "output_chars_median": 1435,
+          "errors": [],
+          "forbidden_returned": [],
+          "first_observation": {
+            "case": "semantic_wording",
+            "route": "question_words",
+            "repetition": 1,
+            "scripted": true,
+            "oracle_control": false,
+            "elapsed_ms": 8.416,
+            "required_sources": [
+              "travel"
+            ],
+            "required_returned": [],
+            "required_missing": [
+              "travel"
+            ],
+            "required_source_recall": 0.0,
+            "forbidden_returned": [],
+            "unique_source_count": 0,
+            "query_calls": 1,
+            "errors": [],
+            "more_available_at_end": false,
+            "event_coverage": "not_established",
+            "calls": [
+              {
+                "parameters": {
+                  "terms": [
+                    "交通方式",
+                    "晚到"
+                  ]
+                },
+                "elapsed_ms": 8.4,
+                "output_chars": 1435,
+                "ok": true,
+                "error": "",
+                "coverage": {
+                  "scope": "current_session_only",
+                  "time_basis": "message_observation",
+                  "start_at": "",
+                  "end_at": "",
+                  "interval": "[start,end)",
+                  "order": "message_time_desc",
+                  "selection": "literal_terms_any",
+                  "more_available": false,
+                  "source_revision": "1000",
+                  "read_count": 0,
+                  "returned_count": 0,
+                  "suppressed_count": 0,
+                  "excerpt_truncated_count": 0,
+                  "event_coverage": "not_established",
+                  "path": "partition_substring",
+                  "unknown_message_time": "excluded_from_time_order"
+                },
+                "usage": {
+                  "step": 1,
+                  "remaining_steps": 2,
+                  "model_calls": 0,
+                  "returned_chars": 0,
+                  "elapsed_ms": 0
+                },
+                "steps": {
+                  "used": 1,
+                  "limit": 3,
+                  "remaining": 2
+                },
+                "sources": []
+              }
+            ]
+          }
+        },
+        {
+          "case": "semantic_wording",
+          "route": "known_paraphrase_control",
+          "oracle_control": true,
+          "local_ms": {
+            "samples": 1,
+            "median": 8.06,
+            "p95_nearest_rank": 8.06,
+            "max": 8.06
+          },
+          "required_source_recall": [
+            1.0
+          ],
+          "unique_source_count": [
+            1
+          ],
+          "query_calls": 1,
+          "output_chars_median": 1971,
+          "errors": [],
+          "forbidden_returned": [],
+          "first_observation": {
+            "case": "semantic_wording",
+            "route": "known_paraphrase_control",
+            "repetition": 1,
+            "scripted": true,
+            "oracle_control": true,
+            "elapsed_ms": 8.06,
+            "required_sources": [
+              "travel"
+            ],
+            "required_returned": [
+              "travel"
+            ],
+            "required_missing": [],
+            "required_source_recall": 1.0,
+            "forbidden_returned": [],
+            "unique_source_count": 1,
+            "query_calls": 1,
+            "errors": [],
+            "more_available_at_end": false,
+            "event_coverage": "not_established",
+            "calls": [
+              {
+                "parameters": {
+                  "terms": [
+                    "停航",
+                    "高铁"
+                  ]
+                },
+                "elapsed_ms": 8.044,
+                "output_chars": 1971,
+                "ok": true,
+                "error": "",
+                "coverage": {
+                  "scope": "current_session_only",
+                  "time_basis": "message_observation",
+                  "start_at": "",
+                  "end_at": "",
+                  "interval": "[start,end)",
+                  "order": "message_time_desc",
+                  "selection": "literal_terms_any",
+                  "more_available": false,
+                  "source_revision": "1000",
+                  "read_count": 1,
+                  "returned_count": 1,
+                  "suppressed_count": 0,
+                  "excerpt_truncated_count": 0,
+                  "event_coverage": "not_established",
+                  "path": "partition_substring",
+                  "unknown_message_time": "excluded_from_time_order"
+                },
+                "usage": {
+                  "step": 1,
+                  "remaining_steps": 2,
+                  "model_calls": 0,
+                  "returned_chars": 26,
+                  "elapsed_ms": 15
+                },
+                "steps": {
+                  "used": 1,
+                  "limit": 3,
+                  "remaining": 2
+                },
+                "sources": [
+                  {
+                    "source_ref": "timeline:tl_scale_travel",
+                    "source_version": "fcb4f92d88da8f40133754f48a1f1e8ae5dc3fc4f1035d15c80276918a762706",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-08-19T18:00:00+08:00",
+                    "message_at_local": "2026-08-19 18:00:00",
+                    "recorded_at": "2026-08-19T18:00:00+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "风浪太大，渡船停航了，我临时换乘高铁，到了已经天黑。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 26,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "case": "scope_filter",
+          "route": "authorized_literal",
+          "oracle_control": false,
+          "local_ms": {
+            "samples": 1,
+            "median": 6.601,
+            "p95_nearest_rank": 6.601,
+            "max": 6.601
+          },
+          "required_source_recall": [
+            1.0
+          ],
+          "unique_source_count": [
+            1
+          ],
+          "query_calls": 1,
+          "output_chars_median": 1948,
+          "errors": [],
+          "forbidden_returned": [],
+          "first_observation": {
+            "case": "scope_filter",
+            "route": "authorized_literal",
+            "repetition": 1,
+            "scripted": true,
+            "oracle_control": false,
+            "elapsed_ms": 6.601,
+            "required_sources": [
+              "scope-visible"
+            ],
+            "required_returned": [
+              "scope-visible"
+            ],
+            "required_missing": [],
+            "required_source_recall": 1.0,
+            "forbidden_returned": [],
+            "unique_source_count": 1,
+            "query_calls": 1,
+            "errors": [],
+            "more_available_at_end": false,
+            "event_coverage": "not_established",
+            "calls": [
+              {
+                "parameters": {
+                  "terms": [
+                    "回形针"
+                  ],
+                  "limit": 1
+                },
+                "elapsed_ms": 6.574,
+                "output_chars": 1948,
+                "ok": true,
+                "error": "",
+                "coverage": {
+                  "scope": "current_session_only",
+                  "time_basis": "message_observation",
+                  "start_at": "",
+                  "end_at": "",
+                  "interval": "[start,end)",
+                  "order": "message_time_desc",
+                  "selection": "literal_terms_any",
+                  "more_available": false,
+                  "source_revision": "1000",
+                  "read_count": 1,
+                  "returned_count": 1,
+                  "suppressed_count": 0,
+                  "excerpt_truncated_count": 0,
+                  "event_coverage": "not_established",
+                  "path": "fts5_trigram",
+                  "unknown_message_time": "excluded_from_time_order"
+                },
+                "usage": {
+                  "step": 1,
+                  "remaining_steps": 2,
+                  "model_calls": 0,
+                  "returned_chars": 13,
+                  "elapsed_ms": 0
+                },
+                "steps": {
+                  "used": 1,
+                  "limit": 3,
+                  "remaining": 2
+                },
+                "sources": [
+                  {
+                    "source_ref": "timeline:tl_scale_scope-visible",
+                    "source_version": "614e9f4a13bec40ff79ae0d24b58967a63d0ee5824ebaa67c04b6ed211301a4b",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-07-01T12:00:00+08:00",
+                    "message_at_local": "2026-07-01 12:00:00",
+                    "recorded_at": "2026-07-01T12:00:00+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "回形针收在书桌第二层抽屉。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 13,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "case": "exact_retry",
+          "route": "same_query_twice",
+          "oracle_control": false,
+          "local_ms": {
+            "samples": 1,
+            "median": 9.497,
+            "p95_nearest_rank": 9.497,
+            "max": 9.497
+          },
+          "required_source_recall": [
+            1.0
+          ],
+          "unique_source_count": [
+            1
+          ],
+          "query_calls": 2,
+          "output_chars_median": 2891,
+          "errors": [
+            "duplicate navigation call"
+          ],
+          "forbidden_returned": [],
+          "first_observation": {
+            "case": "exact_retry",
+            "route": "same_query_twice",
+            "repetition": 1,
+            "scripted": true,
+            "oracle_control": false,
+            "elapsed_ms": 9.497,
+            "required_sources": [
+              "cup"
+            ],
+            "required_returned": [
+              "cup"
+            ],
+            "required_missing": [],
+            "required_source_recall": 1.0,
+            "forbidden_returned": [],
+            "unique_source_count": 1,
+            "query_calls": 2,
+            "errors": [
+              "duplicate navigation call"
+            ],
+            "more_available_at_end": null,
+            "event_coverage": null,
+            "calls": [
+              {
+                "parameters": {
+                  "terms": [
+                    "赤陶杯"
+                  ]
+                },
+                "elapsed_ms": 6.204,
+                "output_chars": 1941,
+                "ok": true,
+                "error": "",
+                "coverage": {
+                  "scope": "current_session_only",
+                  "time_basis": "message_observation",
+                  "start_at": "",
+                  "end_at": "",
+                  "interval": "[start,end)",
+                  "order": "message_time_desc",
+                  "selection": "literal_terms_any",
+                  "more_available": false,
+                  "source_revision": "1000",
+                  "read_count": 1,
+                  "returned_count": 1,
+                  "suppressed_count": 0,
+                  "excerpt_truncated_count": 0,
+                  "event_coverage": "not_established",
+                  "path": "fts5_trigram",
+                  "unknown_message_time": "excluded_from_time_order"
+                },
+                "usage": {
+                  "step": 1,
+                  "remaining_steps": 2,
+                  "model_calls": 0,
+                  "returned_chars": 15,
+                  "elapsed_ms": 16
+                },
+                "steps": {
+                  "used": 1,
+                  "limit": 3,
+                  "remaining": 2
+                },
+                "sources": [
+                  {
+                    "source_ref": "timeline:tl_scale_cup",
+                    "source_version": "4e9bcd3e5bd277cc2a3a0216f079e3f18a5f5d0912b1836ea7901265d0edf30e",
+                    "source_kind": "stored_message",
+                    "speaker_role": "user",
+                    "speaker_id": "scale-owner",
+                    "message_at": "2026-06-08T09:00:00+08:00",
+                    "message_at_local": "2026-06-08 09:00:00",
+                    "recorded_at": "2026-06-08T09:00:00+08:00",
+                    "time_basis": "timeline_observation_not_event_occurrence",
+                    "excerpt": "那只赤陶杯是在旧书店旁边买的。",
+                    "excerpt_offset": 0,
+                    "excerpt_end": 15,
+                    "next_excerpt_offset": null,
+                    "excerpt_truncated": false,
+                    "capture_truncated": null
+                  }
+                ]
+              },
+              {
+                "parameters": {
+                  "terms": [
+                    "赤陶杯"
+                  ]
+                },
+                "elapsed_ms": 3.257,
+                "output_chars": 950,
+                "ok": false,
+                "error": "duplicate navigation call",
+                "coverage": {},
+                "usage": {},
+                "steps": {
+                  "used": 1,
+                  "limit": 3,
+                  "remaining": 2
+                },
+                "sources": []
+              }
+            ]
+          }
+        }
+      ],
+      "route_runs": 12,
+      "query_calls": 18,
+      "static_query_database_changes": 0,
+      "warmup_query_calls": 1,
+      "mutation_probe": {
+        "isolated_synthetic_mutation": "one timeline row in another owner session",
+        "sqlite_total_changes_including_triggers": 8,
+        "note_before": {
+          "status": "accepted",
+          "id": "qn_a036325b481fc3f5",
+          "revision": 1
+        },
+        "cursor_error_after": "cursor_invalid",
+        "progress_after": {
+          "state": "ready",
+          "session": "mq_593963df6689b2c0",
+          "revision": 6,
+          "completed": 3,
+          "in_flight": 0,
+          "steps": {
+            "used": 3,
+            "limit": 3,
+            "remaining": 0
+          },
+          "recall_calls": 0,
+          "recall_item_limit": 10,
+          "read_sources": 7,
+          "valid_sources": 0,
+          "partial_sources": 0,
+          "continuations": 0,
+          "current_context": "unknown",
+          "recent": [
+            {
+              "id": 5,
+              "operation": "sources",
+              "state": "rejected",
+              "reserved_steps": 1,
+              "error": "cursor_invalid",
+              "elapsed_ms": 0.0,
+              "usage": {},
+              "usage_known": false,
+              "parameters": {
+                "cursor": "src_5yeGm0eWuZgs6figlXbESj_IKgzxCG-I"
+              },
+              "parameters_omitted": false,
+              "source_refs": []
+            }
+          ],
+          "sources": [],
+          "cursors": [],
+          "omitted_operations": 2
+        },
+        "notes_after": {
+          "state": "ready",
+          "available": 0,
+          "withheld": 1,
+          "omitted": 0,
+          "items": []
+        },
+        "policy": "current_global_revision; no production mutation"
+      },
+      "timings": [
+        {
+          "case": "rare_old_literal",
+          "route": "literal_index",
+          "repetition": 1,
+          "scripted": true,
+          "oracle_control": false,
+          "elapsed_ms": 6.688,
+          "required_sources": [
+            "cup"
+          ],
+          "required_returned": [
+            "cup"
+          ],
+          "required_missing": [],
+          "required_source_recall": 1.0,
+          "forbidden_returned": [],
+          "unique_source_count": 1,
+          "query_calls": 1,
+          "errors": [],
+          "more_available_at_end": false,
+          "event_coverage": "not_established"
+        },
+        {
+          "case": "rare_old_literal",
+          "route": "same_literal_scan",
+          "repetition": 1,
+          "scripted": true,
+          "oracle_control": false,
+          "elapsed_ms": 9.153,
+          "required_sources": [
+            "cup"
+          ],
+          "required_returned": [
+            "cup"
+          ],
+          "required_missing": [],
+          "required_source_recall": 1.0,
+          "forbidden_returned": [],
+          "unique_source_count": 1,
+          "query_calls": 1,
+          "errors": [],
+          "more_available_at_end": false,
+          "event_coverage": "not_established"
+        },
+        {
+          "case": "question_answer",
+          "route": "keyword_only",
+          "repetition": 1,
+          "scripted": true,
+          "oracle_control": false,
+          "elapsed_ms": 7.536,
+          "required_sources": [
+            "answer",
+            "question"
+          ],
+          "required_returned": [
+            "question"
+          ],
+          "required_missing": [
+            "answer"
+          ],
+          "required_source_recall": 0.5,
+          "forbidden_returned": [],
+          "unique_source_count": 1,
+          "query_calls": 1,
+          "errors": [],
+          "more_available_at_end": false,
+          "event_coverage": "not_established"
+        },
+        {
+          "case": "question_answer",
+          "route": "follow_context",
+          "repetition": 1,
+          "scripted": true,
+          "oracle_control": false,
+          "elapsed_ms": 15.903,
+          "required_sources": [
+            "answer",
+            "question"
+          ],
+          "required_returned": [
+            "answer",
+            "question"
+          ],
+          "required_missing": [],
+          "required_source_recall": 1.0,
+          "forbidden_returned": [],
+          "unique_source_count": 7,
+          "query_calls": 2,
+          "errors": [],
+          "more_available_at_end": true,
+          "event_coverage": "not_established"
+        },
+        {
+          "case": "late_correction",
+          "route": "original_window",
+          "repetition": 1,
+          "scripted": true,
+          "oracle_control": false,
+          "elapsed_ms": 6.699,
+          "required_sources": [
+            "answer",
+            "correction",
+            "question"
+          ],
+          "required_returned": [
+            "answer",
+            "question"
+          ],
+          "required_missing": [
+            "correction"
+          ],
+          "required_source_recall": 0.6666666666666666,
+          "forbidden_returned": [],
+          "unique_source_count": 2,
+          "query_calls": 1,
+          "errors": [],
+          "more_available_at_end": false,
+          "event_coverage": "not_established"
+        },
+        {
+          "case": "late_correction",
+          "route": "follow_later_wording",
+          "repetition": 1,
+          "scripted": true,
+          "oracle_control": false,
+          "elapsed_ms": 24.091,
+          "required_sources": [
+            "answer",
+            "correction",
+            "question"
+          ],
+          "required_returned": [
+            "answer",
+            "correction",
+            "question"
+          ],
+          "required_missing": [],
+          "required_source_recall": 1.0,
+          "forbidden_returned": [],
+          "unique_source_count": 8,
+          "query_calls": 3,
+          "errors": [],
+          "more_available_at_end": false,
+          "event_coverage": "not_established"
+        },
+        {
+          "case": "dense_week",
+          "route": "week_three_pages",
+          "repetition": 1,
+          "scripted": true,
+          "oracle_control": false,
+          "elapsed_ms": 20.709,
+          "required_sources": [
+            "answer",
+            "question"
+          ],
+          "required_returned": [],
+          "required_missing": [
+            "answer",
+            "question"
+          ],
+          "required_source_recall": 0.0,
+          "forbidden_returned": [],
+          "unique_source_count": 18,
+          "query_calls": 3,
+          "errors": [],
+          "more_available_at_end": true,
+          "event_coverage": "not_established"
+        },
+        {
+          "case": "dense_week",
+          "route": "known_minute_control",
+          "repetition": 1,
+          "scripted": true,
+          "oracle_control": true,
+          "elapsed_ms": 6.847,
+          "required_sources": [
+            "answer",
+            "question"
+          ],
+          "required_returned": [
+            "answer",
+            "question"
+          ],
+          "required_missing": [],
+          "required_source_recall": 1.0,
+          "forbidden_returned": [],
+          "unique_source_count": 2,
+          "query_calls": 1,
+          "errors": [],
+          "more_available_at_end": false,
+          "event_coverage": "not_established"
+        },
+        {
+          "case": "semantic_wording",
+          "route": "question_words",
+          "repetition": 1,
+          "scripted": true,
+          "oracle_control": false,
+          "elapsed_ms": 8.416,
+          "required_sources": [
+            "travel"
+          ],
+          "required_returned": [],
+          "required_missing": [
+            "travel"
+          ],
+          "required_source_recall": 0.0,
+          "forbidden_returned": [],
+          "unique_source_count": 0,
+          "query_calls": 1,
+          "errors": [],
+          "more_available_at_end": false,
+          "event_coverage": "not_established"
+        },
+        {
+          "case": "semantic_wording",
+          "route": "known_paraphrase_control",
+          "repetition": 1,
+          "scripted": true,
+          "oracle_control": true,
+          "elapsed_ms": 8.06,
+          "required_sources": [
+            "travel"
+          ],
+          "required_returned": [
+            "travel"
+          ],
+          "required_missing": [],
+          "required_source_recall": 1.0,
+          "forbidden_returned": [],
+          "unique_source_count": 1,
+          "query_calls": 1,
+          "errors": [],
+          "more_available_at_end": false,
+          "event_coverage": "not_established"
+        },
+        {
+          "case": "scope_filter",
+          "route": "authorized_literal",
+          "repetition": 1,
+          "scripted": true,
+          "oracle_control": false,
+          "elapsed_ms": 6.601,
+          "required_sources": [
+            "scope-visible"
+          ],
+          "required_returned": [
+            "scope-visible"
+          ],
+          "required_missing": [],
+          "required_source_recall": 1.0,
+          "forbidden_returned": [],
+          "unique_source_count": 1,
+          "query_calls": 1,
+          "errors": [],
+          "more_available_at_end": false,
+          "event_coverage": "not_established"
+        },
+        {
+          "case": "exact_retry",
+          "route": "same_query_twice",
+          "repetition": 1,
+          "scripted": true,
+          "oracle_control": false,
+          "elapsed_ms": 9.497,
+          "required_sources": [
+            "cup"
+          ],
+          "required_returned": [
+            "cup"
+          ],
+          "required_missing": [],
+          "required_source_recall": 1.0,
+          "forbidden_returned": [],
+          "unique_source_count": 1,
+          "query_calls": 2,
+          "errors": [
+            "duplicate navigation call"
+          ],
+          "more_available_at_end": null,
+          "event_coverage": null
+        }
+      ]
+    }
+  ],
+  "vector_probes": [
+    {
+      "memory_rows": 300,
+      "noise_scope": "same_private_session",
+      "vector_type": "synthetic_orthogonal_2d_not_real_embeddings",
+      "provider_stub_calls": 1,
+      "real_model_calls": 0,
+      "stock_limit": 1200,
+      "stock_info": {
+        "embedding_enabled": true,
+        "embedding_provider_id": "scale-synthetic-2d",
+        "embedding_reason": "applied",
+        "embedding_candidates": 300,
+        "embedding_hits": 1,
+        "embedding_stale": 0,
+        "embedding_dim_mismatch": 0,
+        "embedding_threshold": 0.34
+      },
+      "stock_local_ms": 111.771,
+      "stock_visible_target_hit": true,
+      "exhaustive_reference": {
+        "rows_read": 300,
+        "visible_rows": 300,
+        "target_top1": true,
+        "local_ms": 126.084,
+        "equal_resource_budget": false
+      },
+      "memory_literal_pre_rerank_top6_target_hit": true,
+      "static_query_database_changes": 0
+    },
+    {
+      "memory_rows": 300,
+      "noise_scope": "other_private_session",
+      "vector_type": "synthetic_orthogonal_2d_not_real_embeddings",
+      "provider_stub_calls": 1,
+      "real_model_calls": 0,
+      "stock_limit": 1200,
+      "stock_info": {
+        "embedding_enabled": true,
+        "embedding_provider_id": "scale-synthetic-2d",
+        "embedding_reason": "applied",
+        "embedding_candidates": 300,
+        "embedding_hits": 1,
+        "embedding_stale": 0,
+        "embedding_dim_mismatch": 0,
+        "embedding_threshold": 0.34
+      },
+      "stock_local_ms": 121.482,
+      "stock_visible_target_hit": true,
+      "exhaustive_reference": {
+        "rows_read": 300,
+        "visible_rows": 1,
+        "target_top1": true,
+        "local_ms": 125.799,
+        "equal_resource_budget": false
+      },
+      "memory_literal_pre_rerank_top6_target_hit": true,
+      "static_query_database_changes": 0
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 # 记忆提议通道第一轮升级
 
-> 导航：[设计总纲](../../astrbot_plugin_private_companion/docs/FRAMEWORK_DESIGN.md) / [主题目录](../../astrbot_plugin_private_companion/docs/FRAMEWORK_DESIGN_INDEX.md)。定位：旧实现演进提案；供参考适配器映射，标准接口以主题目录所列记忆契约为准。
+> 定位：2026-09-07 旧通道演进记录，保留当时升级范围；它是参考适配器的实现来源，不是现行公共规范。当前入口见[Memory 设计目录](./README.md)，公共提议语义见[Memory 外部接口](../../astrbot_plugin_private_companion/docs/MEMORY_PROPOSAL_QUERY_CONTRACT_V0.md)，本地接线见[适配器](./MEMORY_ADAPTER_DESIGN_V0.md)。
 
 本轮把主动记忆写入从“固定字段直接落库”改为一个轻量的 `MemoryProposal` 通道。模型可以表达事实置信度、长期价值、保留倾向、有效时间和证据引用，运行时仍负责作用域、隐私、长度和状态安全。
 

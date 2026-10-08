@@ -1008,7 +1008,12 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "summary": "第二批会话内容已被整理。",
                     "canonical_summary": "群聊记录了第二批会话内容。",
-                    "key_facts": [{"fact": "第二批会话内容已被整理", "refs": [second_id]}],
+                    "summary_refs": [second_id],
+                    "key_facts": [{
+                        "fact": "第二批会话内容",
+                        "refs": [second_id],
+                        "evidence": [{"ref": second_id, "quote": "第二批会话内容"}],
+                    }],
                     "importance": 0.6,
                 },
                 ensure_ascii=False,
@@ -1177,6 +1182,7 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
                     "summary": "网络恢复后完成了阶段总结。",
                     "canonical_summary": "用户确认网络恢复后可以继续总结。",
                     "persona_summary": "我在网络恢复后完成了阶段总结。",
+                    "summary_refs": [timeline_id],
                     "key_facts": [{"fact": "网络恢复后可以自动完成总结", "refs": [timeline_id]}],
                     "topics": ["阶段总结"],
                     "importance": 0.6,

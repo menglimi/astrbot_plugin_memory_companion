@@ -71,6 +71,8 @@ class SummaryAssociationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"associations"', provider.prompt)
         self.assertIn("联想路由提示", provider.prompt)
         self.assertIn("episodic|semantic|abstraction", provider.prompt)
+        self.assertIn("重复独立证据", provider.prompt)
+        self.assertIn("不按新旧自动覆盖", provider.prompt)
         self.assertEqual(
             [
                 {
@@ -84,7 +86,7 @@ class SummaryAssociationTests(unittest.IsolatedAsyncioTestCase):
             result["associations"],
         )
 
-    def test_unreferenced_facts_and_associations_are_rejected(self) -> None:
+    def test_unreferenced_fact_is_attributed_and_unsupported_body_is_rejected(self) -> None:
         summarizer = MemorySummarizer()
         normalized = summarizer._normalize_payload(
             {
@@ -103,11 +105,103 @@ class SummaryAssociationTests(unittest.IsolatedAsyncioTestCase):
             self.rows(),
         )
 
-        self.assertEqual([], normalized["key_facts"])
+        # A fact without refs of its own is attributed to the message that
+        # actually supports it, so it keeps a real source instead of failing the
+        # batch. An association cannot be attributed that way and stays out.
+        self.assertEqual(
+            [{
+                "fact": "小王喜欢无糖拿铁",
+                "refs": ["event-1"],
+                "evidence": [{"ref": "event-1", "quote": self.rows()[0]["content"]}],
+            }],
+            normalized["key_facts_with_refs"],
+        )
         self.assertEqual([], normalized["associations"])
+        self.assertEqual([], normalized["_validation_errors"])
+        self.assertEqual("normal", summarizer.summary_quality(normalized))
+
+    def test_body_without_any_grounding_in_the_window_is_rejected(self) -> None:
+        """A body nothing in the batch supports stays a contract failure."""
+        summarizer = MemorySummarizer()
+        normalized = summarizer._normalize_payload(
+            {
+                "summary": "我记得小王养了三只仓鼠，每天早上都要喂食。",
+                "summary_refs": ["event-1"],
+                "key_facts": [],
+            },
+            self.rows(),
+        )
+        self.assertTrue(normalized["_validation_errors"])
         self.assertEqual("low", summarizer.summary_quality(normalized))
 
+    def test_key_facts_require_source_quotes_and_consistent_subject_values(self) -> None:
+        summarizer = MemorySummarizer()
+        rows = [
+            {
+                **self.rows()[0],
+                "metadata": {"sender_name": "小王"},
+                "content": "小王说他不喜欢香菜，预约了周三下午三点看牙医。",
+            }
+        ]
+        normalized = summarizer._normalize_payload(
+            {
+                "summary": "小王说了饮食偏好，也提到牙医预约。",
+                "summary_refs": ["event-1"],
+                "key_facts": [
+                    {
+                        "fact": "小王不喜欢香菜",
+                        "refs": ["event-1"],
+                        "evidence": [{"ref": "event-1", "quote": "小王说他不喜欢香菜"}],
+                    },
+                    {
+                        "fact": "小李不喜欢香菜",
+                        "refs": ["event-1"],
+                        "evidence": [{"ref": "event-1", "quote": "小王说他不喜欢香菜"}],
+                    },
+                    {
+                        "fact": "小王预约了周五下午五点看牙医",
+                        "refs": ["event-1"],
+                        "evidence": [{"ref": "event-1", "quote": "预约了周三下午三点看牙医"}],
+                    },
+                    {
+                        "fact": "小王喜欢香菜",
+                        "refs": ["event-1"],
+                        "evidence": [{"ref": "event-1", "quote": "小王说他不喜欢香菜"}],
+                    },
+                    {
+                        "fact": "小王住在上海",
+                        "refs": ["event-1"],
+                        "evidence": [{"ref": "event-1", "quote": "小王住在上海"}],
+                    },
+                ],
+            },
+            rows,
+        )
+
+        self.assertEqual(["小王不喜欢香菜"], normalized["key_facts"])
+        self.assertEqual(
+            [{"fact": "小王不喜欢香菜", "refs": ["event-1"], "evidence": [{"ref": "event-1", "quote": "小王说他不喜欢香菜"}]}],
+            normalized["key_facts_with_refs"],
+        )
+
+    def test_quote_must_be_an_excerpt_of_its_referenced_event(self) -> None:
+        normalized = MemorySummarizer()._normalize_payload(
+            {
+                "key_facts": [
+                    {
+                        "fact": "小王喜欢无糖拿铁",
+                        "refs": ["event-1"],
+                        "evidence": [{"ref": "event-1", "quote": "小王喜欢红茶"}],
+                    }
+                ]
+            },
+            self.rows(),
+        )
+        self.assertEqual([], normalized["key_facts_with_refs"])
+
     async def test_complete_association_rich_json_is_not_truncated_before_parse(self) -> None:
+        rows = self.rows()
+        rows[0]["content"] = "小王喜欢无糖拿铁。"
         payload = {
             "summary": "我记得小王在这段对话里反复提到无糖拿铁。" * 20,
             "canonical_summary": "小王偏好无糖拿铁。" * 20,
@@ -115,7 +209,7 @@ class SummaryAssociationTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "cue": f"线索 {index} " + "甲" * 70,
                     "tag": "饮食偏好 " + "乙" * 70,
-                    "content": f"小王在对话中提到无糖拿铁 {index}。" + "丙" * 220,
+                    "content": "小王喜欢无糖拿铁。" + "丙" * 220,
                     "refs": ["event-1"],
                     "layer": "semantic",
                 }
@@ -127,7 +221,7 @@ class SummaryAssociationTests(unittest.IsolatedAsyncioTestCase):
 
         result = await summarizer.summarize_with_provider(
             provider,
-            rows=self.rows(),
+            rows=rows,
             session_label="私聊 小王",
         )
 
@@ -204,13 +298,15 @@ class SummaryAssociationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], normalized["associations"])
 
     def test_association_count_and_field_lengths_are_bounded(self) -> None:
+        rows = self.rows()
+        rows[0]["content"] = "小王喜欢无糖拿铁。"
         summarizer = MemorySummarizer()
         payload = {
             "associations": [
                 {
                     "cue": f"线索{index}" + "甲" * 100,
                     "tag": "关联" + "乙" * 100,
-                    "content": f"小王在对话中提到无糖拿铁 {index}" + "丙" * 300,
+                    "content": "小王喜欢无糖拿铁。" + "丙" * 300,
                     "refs": ["event-1"],
                     "layer": "abstraction",
                 }
@@ -218,7 +314,7 @@ class SummaryAssociationTests(unittest.IsolatedAsyncioTestCase):
             ]
         }
 
-        associations = summarizer._normalize_payload(payload, self.rows())["associations"]
+        associations = summarizer._normalize_payload(payload, rows)["associations"]
 
         self.assertEqual(MemorySummarizer.MAX_ASSOCIATIONS, len(associations))
         for association in associations:

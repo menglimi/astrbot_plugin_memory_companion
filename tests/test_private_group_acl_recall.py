@@ -5,7 +5,8 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 
 try:
@@ -112,6 +113,25 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("权限只表示该记忆可作为候选", injection)
         self.assertIn("普通陈述或意图不清时忽略", injection)
         self.assertIn("当前发言者的核心意图", injection)
+
+    async def test_scar_scene_gate_runs_in_the_actual_injection_path(self) -> None:
+        service = self.make_service()
+        memory = self.private_memory()
+        memory.metadata["scar_weight"] = 0.8
+        memory_id = await service.store.insert_memory(memory)
+        await self.allow_private_to_group(service)
+        with patch.object(service, "_compute_time_of_day", return_value="late_night"), patch.object(
+            service, "_apply_scar_scene_gate", wraps=service._apply_scar_scene_gate,
+        ) as gate:
+            await service._compose_memory_injection(self.group_context(), max_chars=3200, write_log=False)
+        gate.assert_called_once()
+        self.assertEqual("late_night", gate.call_args.kwargs["time_of_day"])
+        selected = [item.memory for items in gate.call_args.args[1].values() for item in items]
+        scar = next(item for item in selected if item.id == memory_id)
+        self.assertEqual("tone_only", scar.metadata["mention_policy"])
+        self.assertTrue(scar.metadata["_scene_gated"])
+        # The scene projection belongs to this turn, not the stored fact.
+        self.assertNotIn("_scene_gated", (await service.store.get_memory(memory_id)).metadata)
 
     async def test_acl_shared_tool_memory_is_kept_by_recent_state_guard(self) -> None:
         service = self.make_service()
@@ -369,14 +389,14 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
         await self.allow_private_to_group(service)
 
         service.identity.resolve_event_context = AsyncMock(return_value=self.group_context())
-        owner_result = await service.tool_recall(object(), "我中午吃了什么？")
+        owner_result = await service.tool_recall(SimpleNamespace(), "我中午吃了什么？")
         self.assertEqual(["小王明确说过：中午吃了番茄鸡蛋面。"], [item["content"] for item in owner_result["memories"]])
         self.assertIn("条件候选", owner_result["usage"])
 
         service.identity.resolve_event_context = AsyncMock(
             return_value=self.group_context(user_id="u2", message_text="小王中午吃了什么？")
         )
-        other_result = await service.tool_recall(object(), "小王中午吃了什么？")
+        other_result = await service.tool_recall(SimpleNamespace(), "小王中午吃了什么？")
         self.assertEqual([], other_result["memories"])
 
     async def test_recall_tool_keeps_other_memory_slots_when_schedules_rank_first(self) -> None:
@@ -445,7 +465,7 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
         )
         service.identity.resolve_event_context = AsyncMock(return_value=ctx)
 
-        result = await service.tool_recall(object(), "共同召回锚点", top_k=5)
+        result = await service.tool_recall(SimpleNamespace(), "共同召回锚点", top_k=5)
         memory_types = [item["memory_type"] for item in result["memories"]]
 
         self.assertIn("user_preference", memory_types)

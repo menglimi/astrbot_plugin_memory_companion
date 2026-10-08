@@ -14,6 +14,7 @@ class SummaryBatchStore:
     """Batch queue state; the store owns the transaction and the clock."""
 
     BUDGET_RETRY_REASON = "budget"
+    REPAIR_RETRY_REASON = "repair_used"
 
     @classmethod
     def _due_clause(cls, alias: str = "") -> str:
@@ -190,15 +191,19 @@ class SummaryBatchStore:
                 failure = self._conn.execute('SELECT * FROM summary_failures WHERE session_id=?', (session_id,)).fetchone()
                 if not failure:
                     return
-                bounds = [self._conn.execute('SELECT occurred_at,created_at,id FROM timeline WHERE id=? AND session_id=?',
+                bounds = [self._conn.execute('''SELECT occurred_at,created_at,id,
+                          COALESCE(julianday(NULLIF(occurred_at,'')),julianday(NULLIF(created_at,'')),0) AS event_time
+                          FROM timeline WHERE id=? AND session_id=?''',
                           (failure[key], session_id)).fetchone() for key in ('start_timeline_id', 'end_timeline_id')]
                 if all(bounds):
-                    bounds = sorted(tuple(bound) for bound in bounds)
+                    bounds.sort(key=lambda bound: (float(bound['event_time']), bound['created_at'], bound['id']))
                     rows = self._conn.execute('''SELECT * FROM timeline t WHERE session_id=? AND scope=? AND summarized_at=''
-                        AND (occurred_at,created_at,id) >= (?,?,?) AND (occurred_at,created_at,id) <= (?,?,?)
+                        AND (COALESCE(julianday(NULLIF(t.occurred_at,'')),julianday(NULLIF(t.created_at,'')),0),t.created_at,t.id) >= (?,?,?)
+                        AND (COALESCE(julianday(NULLIF(t.occurred_at,'')),julianday(NULLIF(t.created_at,'')),0),t.created_at,t.id) <= (?,?,?)
                         AND NOT EXISTS(SELECT 1 FROM summary_batch_events e WHERE e.event_id=t.id)
-                        ORDER BY occurred_at,created_at,id''',
-                        (session_id, failure['scope'], *tuple(bounds[0]), *tuple(bounds[1]))).fetchall()
+                        ORDER BY COALESCE(julianday(NULLIF(t.occurred_at,'')),julianday(NULLIF(t.created_at,'')),0),t.created_at,t.id''',
+                        (session_id, failure['scope'], bounds[0]['event_time'], bounds[0]['created_at'], bounds[0]['id'],
+                         bounds[1]['event_time'], bounds[1]['created_at'], bounds[1]['id'])).fetchall()
                 else:
                     # Never guess a range when a legacy boundary was deleted.
                     rows = []
@@ -243,7 +248,8 @@ class SummaryBatchStore:
             with self._lock:
                 return [dict(r) for r in self._conn.execute('''SELECT t.* FROM timeline t
                     JOIN summary_batch_events e ON t.id=e.event_id WHERE e.batch_id=? AND t.summarized_at=''
-                    ORDER BY t.occurred_at,t.created_at,t.id''', (batch_id,)).fetchall()]
+                    ORDER BY COALESCE(julianday(NULLIF(t.occurred_at,'')),julianday(NULLIF(t.created_at,'')),0),
+                             t.created_at,t.id''', (batch_id,)).fetchall()]
         return await asyncio.to_thread(read)
 
     @staticmethod
@@ -286,7 +292,7 @@ class SummaryBatchStore:
                 if not force:
                     if row['state'] == 'quarantined':
                         return False
-                    if row['automatic_calls'] >= max_calls or (repair and row['repair_used']):
+                    if row['automatic_calls'] >= max_calls:
                         self._conn.execute("UPDATE summary_batches SET state='quarantined',updated_at=? WHERE id=?", (utc_now(), batch_id))
                         return False
                     window = self._conn.execute('''SELECT COUNT(*),MIN(attempted_at) FROM summary_batch_calls
@@ -389,7 +395,17 @@ class SummaryBatchStore:
 
         return await asyncio.to_thread(release)
 
-    async def finish_summary_batch(self, batch_id, event_ids, *, memory_id='', no_memory=False, reason='', record=None):
+    async def finish_summary_batch(
+        self,
+        batch_id,
+        event_ids,
+        *,
+        memory_id='',
+        no_memory=False,
+        reason='',
+        record=None,
+        mark_timeline=True,
+    ):
         def finish():
             result_memory_id = memory_id
             with self._lock, self._transaction_sync():
@@ -402,7 +418,7 @@ class SummaryBatchStore:
                     self._conn.execute('DELETE FROM summary_batch_events WHERE event_id=?', (event_id,))
                 if record is not None:
                     result_memory_id = self._insert_memory_sync(record, _commit=False)
-                if not no_memory:
+                if not no_memory and mark_timeline:
                     self._mark_timeline_summarized_sync(list(consumed), _commit=False)
                 self._conn.execute('UPDATE summary_batches SET state=?,memory_id=?,last_error=?,updated_at=? WHERE id=?',
                     ('no_memory' if no_memory else 'completed', result_memory_id, clean_text(redact_sensitive_text(reason), 500), utc_now(), batch_id))

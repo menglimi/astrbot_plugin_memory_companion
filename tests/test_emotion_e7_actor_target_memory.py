@@ -75,6 +75,62 @@ class EmotionE7ActorTargetMemoryTests(unittest.TestCase):
         self.assertEqual("u1", refs["actor_ref"]["id"])
         self.assertEqual("b1", refs["target_ref"]["id"])
 
+    def test_self_owner_is_a_shared_bot_sentinel(self) -> None:
+        memory = MemoryRecord(
+            id="m-self",
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            platform="qq",
+            subject=EntityRef(kind="user", id="u1", role="speaker"),
+            object=EntityRef(kind="bot", id="b1", role="bot_self"),
+            metadata={"owner_bot_id": "self"},
+        )
+        ctx = SessionContext(
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            platform="qq",
+            user_id="u1",
+            bot_id="b1",
+        )
+
+        refs = memory_emotion_refs(memory, ctx)
+
+        self.assertIsNotNone(refs)
+        self.assertEqual("b1", refs["target_ref"]["id"])
+
+    def test_missing_bot_id_allows_only_a_matching_self_sentinel(self) -> None:
+        base = {
+            "session_id": "qq:FriendMessage:u1",
+            "scope": "private",
+            "platform": "qq",
+            "subject": EntityRef(kind="user", id="u1", role="speaker"),
+        }
+        ctx = SessionContext(
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            platform="qq",
+            user_id="u1",
+            bot_id="",
+        )
+        sentinel = MemoryRecord(
+            id="m-self-missing-bot",
+            **base,
+            object=EntityRef(kind="bot", id="self", role="bot_self"),
+            metadata={"owner_bot_id": "self"},
+        )
+        explicit_owner = MemoryRecord(
+            id="m-explicit-missing-bot",
+            **base,
+            object=EntityRef(kind="bot", id="b1", role="bot_self"),
+            metadata={"owner_bot_id": "b1"},
+        )
+
+        refs = memory_emotion_refs(sentinel, ctx)
+
+        self.assertIsNotNone(refs)
+        self.assertEqual("self", refs["target_ref"]["id"])
+        self.assertIsNone(memory_emotion_refs(explicit_owner, ctx))
+
     def test_nickname_text_is_not_used_as_identity(self) -> None:
         memory = SimpleNamespace(
             session_id="session-a",
@@ -108,6 +164,62 @@ class EmotionE7ActorTargetMemoryTests(unittest.TestCase):
             with self.subTest(domain=suffix):
                 memory = MemoryRecord(id=f"m-{suffix}", **(base | overrides))
                 self.assertIsNone(memory_emotion_refs(memory, ctx))
+
+    def test_self_owner_is_a_shared_bot_sentinel(self) -> None:
+        memory = MemoryRecord(
+            id="m-self",
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            platform="qq",
+            subject=EntityRef(kind="user", id="u1", role="speaker"),
+            object=EntityRef(kind="bot", id="b1", role="bot_self"),
+            metadata={"owner_bot_id": "self"},
+        )
+        ctx = SessionContext(
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            platform="qq",
+            user_id="u1",
+            bot_id="b1",
+        )
+
+        refs = memory_emotion_refs(memory, ctx)
+
+        self.assertIsNotNone(refs)
+        self.assertEqual("b1", refs["target_ref"]["id"])
+
+    def test_missing_bot_id_allows_only_a_matching_self_sentinel(self) -> None:
+        base = {
+            "session_id": "qq:FriendMessage:u1",
+            "scope": "private",
+            "platform": "qq",
+            "subject": EntityRef(kind="user", id="u1", role="speaker"),
+        }
+        ctx = SessionContext(
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            platform="qq",
+            user_id="u1",
+            bot_id="",
+        )
+        sentinel = MemoryRecord(
+            id="m-self-missing-bot",
+            **base,
+            object=EntityRef(kind="bot", id="self", role="bot_self"),
+            metadata={"owner_bot_id": "self"},
+        )
+        explicit_owner = MemoryRecord(
+            id="m-explicit-missing-bot",
+            **base,
+            object=EntityRef(kind="bot", id="b1", role="bot_self"),
+            metadata={"owner_bot_id": "b1"},
+        )
+
+        refs = memory_emotion_refs(sentinel, ctx)
+
+        self.assertIsNotNone(refs)
+        self.assertEqual("self", refs["target_ref"]["id"])
+        self.assertIsNone(memory_emotion_refs(explicit_owner, ctx))
 
 
 if __name__ == "__main__":

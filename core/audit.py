@@ -259,8 +259,15 @@ class MemoryAuditManager:
                     continue
                 clean_refs = [clean_text(ref, 160) for ref in refs[:6] if clean_text(ref, 160)]
                 fact = clean_text(trace.get("fact"), 240)
+                trace_evidence = trace.get("evidence")
                 if fact and clean_refs:
-                    clean_traces.append({"fact": fact, "refs": clean_refs})
+                    clean_traces.append(
+                        {
+                            "fact": fact,
+                            "refs": clean_refs,
+                            "evidence": trace_evidence if isinstance(trace_evidence, list) else [],
+                        }
+                    )
                     event_ids.extend(clean_refs)
             if clean_traces:
                 trace_map[record.id] = clean_traces
@@ -273,8 +280,15 @@ class MemoryAuditManager:
             for trace in traces:
                 refs = [ref for ref in trace["refs"] if ref in events]
                 evidence_rows = [events[ref] for ref in refs]
-                if refs and MemorySummarizer.fact_supported_by_rows(trace["fact"], evidence_rows):
-                    valid_traces.append({"fact": trace["fact"], "refs": refs})
+                trace_rows = [events[ref] for ref in trace["refs"] if ref in events]
+                if refs and MemorySummarizer.trace_supported_by_rows(trace, trace_rows):
+                    valid_traces.append(
+                        {
+                            "fact": trace["fact"],
+                            "refs": refs,
+                            "evidence": trace.get("evidence", []),
+                        }
+                    )
                     allowed_refs.extend(refs)
             allowed_refs = list(dict.fromkeys(allowed_refs))
             if not valid_traces:

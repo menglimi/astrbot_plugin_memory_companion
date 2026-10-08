@@ -5,7 +5,10 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from contextlib import contextmanager
+from unittest.mock import patch
 
 
 try:
@@ -88,6 +91,202 @@ class StoreConsistencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, store._conn.execute("PRAGMA foreign_keys").fetchone()[0])
         self.assertEqual(3000, store._conn.execute("PRAGMA busy_timeout").fetchone()[0])
         self.assertEqual(500, store._conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0])
+
+    async def test_memory_ordering_uses_absolute_time_for_mixed_offsets(self) -> None:
+        store = self.make_store()
+        records = [
+            MemoryRecord(
+                id="mixed-offset-older",
+                memory_type="conversation_summary",
+                subject=EntityRef(kind="user", id="u1"),
+                scope="private",
+                session_id="qq:FriendMessage:u1",
+                platform="qq",
+                visibility="private_pair",
+                lifecycle="stable_memory",
+                content="older event",
+                importance=0.5,
+                owner_bot_id="b1",
+                metadata={"owner_bot_id": "b1"},
+                occurred_at="2026-08-01T22:00:00+08:00",
+            ),
+            MemoryRecord(
+                id="mixed-offset-newer",
+                memory_type="conversation_summary",
+                subject=EntityRef(kind="user", id="u1"),
+                scope="private",
+                session_id="qq:FriendMessage:u1",
+                platform="qq",
+                visibility="private_pair",
+                lifecycle="stable_memory",
+                content="newer event",
+                importance=0.5,
+                owner_bot_id="b1",
+                metadata={"owner_bot_id": "b1"},
+                occurred_at="2026-08-01T20:00:00+00:00",
+            ),
+        ]
+        for record in records:
+            await store.insert_memory(record)
+
+        listed = await store.list_memories(
+            limit=10,
+            include_pending=False,
+            scope="private",
+            lifecycle="stable_memory",
+            session_id="qq:FriendMessage:u1",
+        )
+        candidates = await store.list_candidate_memories(limit=10)
+        buckets = await store.list_memory_buckets(limit=10)
+
+        self.assertEqual(
+            ["mixed-offset-newer", "mixed-offset-older"],
+            [record.id for record in listed],
+        )
+        self.assertEqual(
+            ["mixed-offset-newer", "mixed-offset-older"],
+            [record.id for record in candidates],
+        )
+        self.assertEqual("2026-08-01T20:00:00+00:00", buckets[0]["latest_at"])
+
+    async def test_maintenance_repair_commits_fingerprint_work_in_batches(self) -> None:
+        store = self.make_store()
+        store.MAINTENANCE_REPAIR_BATCH_SIZE = 2
+        for index in range(5):
+            await store.insert_memory(
+                MemoryRecord(
+                    id=f"repair-batch-{index}",
+                    memory_type="observation",
+                    subject=EntityRef(kind="user", id="u1"),
+                    scope="private",
+                    session_id="qq:FriendMessage:u1",
+                    visibility="private_pair",
+                    lifecycle="stable_memory",
+                    content=f"repair batch row {index}",
+                )
+            )
+        with store._lock:
+            store._conn.execute(
+                "UPDATE memories SET content_fingerprint='', merged_count=0 WHERE id LIKE 'repair-batch-%'"
+            )
+            store._conn.commit()
+
+        original_transaction = store._transaction_sync
+        transaction_entries = 0
+
+        @contextmanager
+        def counted_transaction():
+            nonlocal transaction_entries
+            transaction_entries += 1
+            with original_transaction():
+                yield
+
+        with patch.object(store, "_transaction_sync", counted_transaction):
+            result = await store.maintenance_repair()
+
+        self.assertEqual(5, result["fingerprint_fixed"])
+        self.assertGreaterEqual(transaction_entries, 5)
+        rows = store._conn.execute(
+            "SELECT content_fingerprint, merged_count FROM memories WHERE id LIKE 'repair-batch-%'"
+        ).fetchall()
+        self.assertTrue(all(row["content_fingerprint"] and row["merged_count"] >= 1 for row in rows))
+
+    async def test_maintenance_repair_does_not_rebuild_fts_for_archived_rows(self) -> None:
+        store = self.make_store()
+        if not store._fts_enabled:
+            self.skipTest("SQLite FTS5 is unavailable")
+        await store.insert_memory(
+            MemoryRecord(
+                id="fts-visible",
+                memory_type="observation",
+                subject=EntityRef(kind="user", id="u1"),
+                scope="private",
+                session_id="qq:FriendMessage:u1",
+                visibility="private_pair",
+                lifecycle="stable_memory",
+                content="visible row",
+            )
+        )
+        await store.insert_memory(
+            MemoryRecord(
+                id="fts-archived",
+                memory_type="observation",
+                subject=EntityRef(kind="user", id="u1"),
+                scope="private",
+                session_id="qq:FriendMessage:u1",
+                visibility="private_pair",
+                lifecycle="archived",
+                content="archived row",
+            )
+        )
+
+        result = await store.maintenance_repair()
+
+        self.assertEqual(0, result["fts_rebuilt"])
+
+    async def test_timeline_filters_order_and_cursor_normalize_timezone_offsets(self) -> None:
+        store = self.make_store()
+        earlier = await store.add_timeline_event(
+            event_type="user_message",
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            subject_id="u1",
+            object_id="b1",
+            content="较早消息",
+            metadata={"message_id": "timezone-earlier"},
+            occurred_at="2026-08-01T00:30:00+08:00",
+        )
+        later = await store.add_timeline_event(
+            event_type="user_message",
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            subject_id="u1",
+            object_id="b1",
+            content="较晚消息",
+            metadata={"message_id": "timezone-later"},
+            occurred_at="2026-07-31T16:45:00+00:00",
+        )
+
+        window = await store.timeline_window(
+            start_at="2026-07-31T16:00:00+00:00",
+            end_at="2026-07-31T17:00:00+00:00",
+            scope="private",
+            session_id="qq:FriendMessage:u1",
+        )
+        recent = await store.recent_timeline(
+            limit=2,
+            scope="private",
+            session_id="qq:FriendMessage:u1",
+            entity_id="u1",
+        )
+        cross_window = await store.recent_cross_window_timeline(
+            source_scope="private",
+            current_session_id="qq:FriendMessage:u2",
+            since_at="2026-07-31T16:00:00+00:00",
+            limit=2,
+        )
+        first_page = await store.unsummarized_timeline_window(
+            session_id="qq:FriendMessage:u1", scope="private", limit=1
+        )
+        second_page = await store.unsummarized_timeline_window(
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            limit=1,
+            after_timeline_id=first_page["rows"][0]["id"],
+        )
+        batch_id = await store.create_summary_batch(
+            "qq:FriendMessage:u1",
+            "private",
+            [{"id": later}, {"id": earlier}],
+        )
+        batch_rows = await store.summary_batch_rows(batch_id)
+
+        self.assertEqual([later, earlier], [row["id"] for row in window])
+        self.assertEqual([later, earlier], [row["id"] for row in recent])
+        self.assertEqual([later, earlier], [row["id"] for row in cross_window])
+        self.assertEqual(earlier, first_page["rows"][0]["id"])
+        self.assertEqual(later, second_page["rows"][0]["id"])
+        self.assertEqual([earlier, later], [row["id"] for row in batch_rows])
 
     async def test_wal_checkpoint_truncate_skips_below_threshold(self) -> None:
         store = self.make_store()
@@ -440,6 +639,24 @@ class StoreConsistencyTests(unittest.IsolatedAsyncioTestCase):
             content="未总结",
             occurred_at=old,
         )
+        summary_id = await store.insert_memory(
+            MemoryRecord(
+                id="summary-source-retention",
+                memory_type="conversation_summary",
+                content="小王提到一个已总结的事实。",
+                metadata={
+                    "summary_refs": [summarized_id],
+                    "source_event_ids": [summarized_id],
+                    "key_facts_with_refs": [
+                        {
+                            "fact": "已总结",
+                            "refs": [summarized_id],
+                            "evidence": [{"ref": summarized_id, "quote": "已总结"}],
+                        }
+                    ],
+                },
+            )
+        )
         store._conn.execute(
             "UPDATE timeline SET summarized_at=? WHERE id=?",
             ("2020-01-02T00:00:00+00:00", summarized_id),
@@ -462,6 +679,8 @@ class StoreConsistencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({"timeline": 1, "injection_logs": 1}, deleted)
         self.assertIsNone(store._conn.execute("SELECT id FROM timeline WHERE id=?", (summarized_id,)).fetchone())
         self.assertIsNotNone(store._conn.execute("SELECT id FROM timeline WHERE id=?", (pending_id,)).fetchone())
+        summary = await store.get_memory(summary_id)
+        self.assertEqual([summarized_id], summary.metadata["source_expired_event_ids"])
 
     async def test_memory_management_update_is_atomic(self) -> None:
         store = self.make_store()
@@ -645,6 +864,138 @@ class StoreConsistencyTests(unittest.IsolatedAsyncioTestCase):
         finally:
             store._closed = True
         self.assertFalse(store.db_path.exists())
+
+    async def test_memory_ordering_uses_absolute_time_for_mixed_offsets(self) -> None:
+        store = self.make_store()
+        records = [
+            MemoryRecord(
+                id="mixed-offset-older",
+                memory_type="conversation_summary",
+                subject=EntityRef(kind="user", id="u1"),
+                scope="private",
+                session_id="qq:FriendMessage:u1",
+                platform="qq",
+                visibility="private_pair",
+                lifecycle="stable_memory",
+                content="older event",
+                importance=0.5,
+                owner_bot_id="b1",
+                metadata={"owner_bot_id": "b1"},
+                occurred_at="2026-08-01T22:00:00+08:00",
+            ),
+            MemoryRecord(
+                id="mixed-offset-newer",
+                memory_type="conversation_summary",
+                subject=EntityRef(kind="user", id="u1"),
+                scope="private",
+                session_id="qq:FriendMessage:u1",
+                platform="qq",
+                visibility="private_pair",
+                lifecycle="stable_memory",
+                content="newer event",
+                importance=0.5,
+                owner_bot_id="b1",
+                metadata={"owner_bot_id": "b1"},
+                occurred_at="2026-08-01T20:00:00+00:00",
+            ),
+        ]
+        for record in records:
+            await store.insert_memory(record)
+
+        listed = await store.list_memories(
+            limit=10,
+            include_pending=False,
+            scope="private",
+            lifecycle="stable_memory",
+            session_id="qq:FriendMessage:u1",
+        )
+        candidates = await store.list_candidate_memories(limit=10)
+        buckets = await store.list_memory_buckets(limit=10)
+
+        self.assertEqual(
+            ["mixed-offset-newer", "mixed-offset-older"],
+            [record.id for record in listed],
+        )
+        self.assertEqual(
+            ["mixed-offset-newer", "mixed-offset-older"],
+            [record.id for record in candidates],
+        )
+        self.assertEqual("2026-08-01T20:00:00+00:00", buckets[0]["latest_at"])
+
+    async def test_maintenance_repair_commits_fingerprint_work_in_batches(self) -> None:
+        store = self.make_store()
+        store.MAINTENANCE_REPAIR_BATCH_SIZE = 2
+        for index in range(5):
+            await store.insert_memory(
+                MemoryRecord(
+                    id=f"repair-batch-{index}",
+                    memory_type="observation",
+                    subject=EntityRef(kind="user", id="u1"),
+                    scope="private",
+                    session_id="qq:FriendMessage:u1",
+                    visibility="private_pair",
+                    lifecycle="stable_memory",
+                    content=f"repair batch row {index}",
+                )
+            )
+        with store._lock:
+            store._conn.execute(
+                "UPDATE memories SET content_fingerprint='', merged_count=0 WHERE id LIKE 'repair-batch-%'"
+            )
+            store._conn.commit()
+
+        original_transaction = store._transaction_sync
+        transaction_entries = 0
+
+        @contextmanager
+        def counted_transaction():
+            nonlocal transaction_entries
+            transaction_entries += 1
+            with original_transaction():
+                yield
+
+        with patch.object(store, "_transaction_sync", counted_transaction):
+            result = await store.maintenance_repair()
+
+        self.assertEqual(5, result["fingerprint_fixed"])
+        self.assertGreaterEqual(transaction_entries, 5)
+        rows = store._conn.execute(
+            "SELECT content_fingerprint, merged_count FROM memories WHERE id LIKE 'repair-batch-%'"
+        ).fetchall()
+        self.assertTrue(all(row["content_fingerprint"] and row["merged_count"] >= 1 for row in rows))
+
+    async def test_maintenance_repair_does_not_rebuild_fts_for_archived_rows(self) -> None:
+        store = self.make_store()
+        if not store._fts_enabled:
+            self.skipTest("SQLite FTS5 is unavailable")
+        await store.insert_memory(
+            MemoryRecord(
+                id="fts-visible",
+                memory_type="observation",
+                subject=EntityRef(kind="user", id="u1"),
+                scope="private",
+                session_id="qq:FriendMessage:u1",
+                visibility="private_pair",
+                lifecycle="stable_memory",
+                content="visible row",
+            )
+        )
+        await store.insert_memory(
+            MemoryRecord(
+                id="fts-archived",
+                memory_type="observation",
+                subject=EntityRef(kind="user", id="u1"),
+                scope="private",
+                session_id="qq:FriendMessage:u1",
+                visibility="private_pair",
+                lifecycle="archived",
+                content="archived row",
+            )
+        )
+
+        result = await store.maintenance_repair()
+
+        self.assertEqual(0, result["fts_rebuilt"])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,304 @@
+{
+  "profile": "memory.local-event-query.v1",
+  "ok": true,
+  "status": "computed",
+  "error": "",
+  "operation": "by_day",
+  "goal": "过去七个完整自然日，本人早上吃了什么；同一顿只列一次",
+  "select": {
+    "subject": "current_user",
+    "world": "real",
+    "occurrences": [
+      "occurred",
+      "not_occurred"
+    ]
+  },
+  "events": [
+    {
+      "event_key": "meal-06",
+      "kind": "temporary_event",
+      "interpretation_by": "current_model",
+      "row_ids": [
+        "E01",
+        "E02"
+      ],
+      "superseded_row_ids": [],
+      "descriptions": [
+        "昨天早上吃了包子。",
+        "就是刚说的昨天那顿包子，挺顶饱。"
+      ],
+      "time": {
+        "start_at": "2026-09-05T16:00:00+00:00",
+        "end_at": "2026-09-06T16:00:00+00:00",
+        "precision": "day",
+        "basis": "model_interpretation_of_cited_source"
+      },
+      "evidence": [
+        {
+          "source_ref": "timeline:tl_E01",
+          "source_version": "fixture-version-E01",
+          "quote": "昨天早上吃了包子。"
+        },
+        {
+          "source_ref": "timeline:tl_E02",
+          "source_version": "fixture-version-E02",
+          "quote": "就是刚说的昨天那顿包子，挺顶饱。"
+        }
+      ],
+      "reasons": [],
+      "subject": "current_user",
+      "world": "real",
+      "occurrence": "occurred",
+      "relevance": "match",
+      "identity": "clear",
+      "resolution": "resolved"
+    },
+    {
+      "event_key": "meal-09",
+      "kind": "temporary_event",
+      "interpretation_by": "current_model",
+      "row_ids": [
+        "E04",
+        "E06"
+      ],
+      "superseded_row_ids": [
+        "E04"
+      ],
+      "descriptions": [
+        "早上那杯是豆浆"
+      ],
+      "time": {
+        "start_at": "2026-09-08T16:00:00+00:00",
+        "end_at": "2026-09-09T16:00:00+00:00",
+        "precision": "day",
+        "basis": "model_interpretation_of_cited_source"
+      },
+      "evidence": [
+        {
+          "source_ref": "timeline:tl_E04",
+          "source_version": "fixture-version-E04",
+          "quote": "今早出门前只喝了牛奶。"
+        },
+        {
+          "source_ref": "timeline:tl_E06",
+          "source_version": "fixture-version-E06",
+          "quote": "昨天早上那杯，我说牛奶是记错了，其实是豆浆。"
+        }
+      ],
+      "reasons": [],
+      "subject": "current_user",
+      "world": "real",
+      "occurrence": "occurred",
+      "relevance": "match",
+      "identity": "clear",
+      "resolution": "resolved"
+    },
+    {
+      "event_key": "no-meal-12",
+      "kind": "temporary_event",
+      "interpretation_by": "current_model",
+      "row_ids": [
+        "E07"
+      ],
+      "superseded_row_ids": [],
+      "descriptions": [
+        "今天没吃早饭，只喝了水。"
+      ],
+      "time": {
+        "start_at": "2026-09-11T16:00:00+00:00",
+        "end_at": "2026-09-12T16:00:00+00:00",
+        "precision": "day",
+        "basis": "model_interpretation_of_cited_source"
+      },
+      "evidence": [
+        {
+          "source_ref": "timeline:tl_E07",
+          "source_version": "fixture-version-E07",
+          "quote": "今天没吃早饭，只喝了水。"
+        }
+      ],
+      "reasons": [],
+      "subject": "current_user",
+      "world": "real",
+      "occurrence": "not_occurred",
+      "relevance": "match",
+      "identity": "clear",
+      "resolution": "resolved"
+    }
+  ],
+  "excluded": [
+    {
+      "event_key": "plan-09",
+      "kind": "temporary_event",
+      "interpretation_by": "current_model",
+      "row_ids": [
+        "E03"
+      ],
+      "superseded_row_ids": [],
+      "descriptions": [
+        "明天早上打算吃吐司。"
+      ],
+      "time": {
+        "start_at": "2026-09-08T16:00:00+00:00",
+        "end_at": "2026-09-09T16:00:00+00:00",
+        "precision": "day",
+        "basis": "model_interpretation_of_cited_source"
+      },
+      "evidence": [
+        {
+          "source_ref": "timeline:tl_E03",
+          "source_version": "fixture-version-E03",
+          "quote": "明天早上打算吃吐司。"
+        }
+      ],
+      "reasons": [
+        "occurrence_outside_selection"
+      ],
+      "subject": "current_user",
+      "world": "real",
+      "occurrence": "planned",
+      "relevance": "match",
+      "identity": "clear",
+      "resolution": "resolved"
+    },
+    {
+      "event_key": "other-09",
+      "kind": "temporary_event",
+      "interpretation_by": "current_model",
+      "row_ids": [
+        "E05"
+      ],
+      "superseded_row_ids": [],
+      "descriptions": [
+        "小陈昨天早上也喝了牛奶。"
+      ],
+      "time": {
+        "start_at": "2026-09-08T16:00:00+00:00",
+        "end_at": "2026-09-09T16:00:00+00:00",
+        "precision": "day",
+        "basis": "model_interpretation_of_cited_source"
+      },
+      "evidence": [
+        {
+          "source_ref": "timeline:tl_E05",
+          "source_version": "fixture-version-E05",
+          "quote": "小陈昨天早上也喝了牛奶。"
+        }
+      ],
+      "reasons": [
+        "subject_outside_selection"
+      ],
+      "subject": "other",
+      "world": "real",
+      "occurrence": "occurred",
+      "relevance": "match",
+      "identity": "clear",
+      "resolution": "resolved"
+    }
+  ],
+  "unresolved": [],
+  "aggregate": {
+    "unit": "一顿早餐或一次明确没吃早餐的自述",
+    "count_basis": "model_resolved_event_groups_in_supplied_rows",
+    "count": 3,
+    "by_occurrence": {
+      "occurred": 2,
+      "not_occurred": 1
+    },
+    "latest_candidates": [
+      "no-meal-12"
+    ],
+    "earliest_candidates": [
+      "meal-06"
+    ],
+    "ordering": "interval_partial_order",
+    "by_day": [
+      {
+        "date": "2026-09-06",
+        "event_keys": [
+          "meal-06"
+        ],
+        "count": 1,
+        "by_occurrence": {
+          "occurred": 1
+        }
+      },
+      {
+        "date": "2026-09-09",
+        "event_keys": [
+          "meal-09"
+        ],
+        "count": 1,
+        "by_occurrence": {
+          "occurred": 1
+        }
+      },
+      {
+        "date": "2026-09-12",
+        "event_keys": [
+          "no-meal-12"
+        ],
+        "count": 1,
+        "by_occurrence": {
+          "not_occurred": 1
+        }
+      }
+    ],
+    "unplaced_event_keys": [],
+    "days_without_resolved_events": [
+      "2026-09-07",
+      "2026-09-08",
+      "2026-09-10",
+      "2026-09-11"
+    ],
+    "day_grid": "enumerated",
+    "absence_meaning": "no_resolved_event_in_supplied_rows_not_proof_of_no_event"
+  },
+  "coverage": {
+    "scope": "current_session_only",
+    "event_window": {
+      "start_at": "2026-09-05T16:00:00+00:00",
+      "end_at": "2026-09-12T16:00:00+00:00"
+    },
+    "source_revision": "7",
+    "event_coverage": "not_established",
+    "semantics": "model_interpretation_not_verified_by_program",
+    "citations": "observed_fragments_revalidated",
+    "input_rows": 7,
+    "cited_source_count": 7,
+    "observed_uncited_source_count": 0,
+    "source_reads": [
+      {
+        "selection": "range",
+        "source_revision": "7",
+        "start_at": "2026-09-05T16:00:00+00:00",
+        "end_at": "2026-09-12T16:00:00+00:00",
+        "more_available": true,
+        "returned_count": 6,
+        "excerpt_truncated_count": 0
+      },
+      {
+        "selection": "range",
+        "source_revision": "7",
+        "start_at": "2026-09-05T16:00:00+00:00",
+        "end_at": "2026-09-12T16:00:00+00:00",
+        "more_available": false,
+        "returned_count": 1,
+        "excerpt_truncated_count": 0
+      }
+    ],
+    "not_checked": [
+      "semantic_exhaustiveness",
+      "capture_completeness",
+      "cross_session_sources"
+    ]
+  },
+  "usage": {
+    "step": 3,
+    "remaining_steps": 0,
+    "model_calls": 0,
+    "source_reads": 7,
+    "memory_writes": 0,
+    "elapsed_ms": 0
+  }
+}

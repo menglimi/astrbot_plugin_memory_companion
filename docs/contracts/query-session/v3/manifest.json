@@ -1,0 +1,18 @@
+{
+  "profile": "memory.local-query-session.v3",
+  "owner_profiles": {
+    "discover": "memory.local-source-discovery.v1"
+  },
+  "operations": [
+    "status",
+    "recall",
+    "sources",
+    "navigate",
+    "events",
+    "discover"
+  ],
+  "legacy_profiles_preserved": [
+    "memory.local-query-session.v1",
+    "memory.local-query-session.v2"
+  ]
+}

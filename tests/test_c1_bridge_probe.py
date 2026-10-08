@@ -8,17 +8,17 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-if "astrabot_plugin_remember_you" not in sys.modules:
-    package = types.ModuleType("astrabot_plugin_remember_you")
+if "astrbot_plugin_remember_you" not in sys.modules:
+    package = types.ModuleType("astrbot_plugin_remember_you")
     package.__path__ = [str(ROOT)]
-    sys.modules["astrabot_plugin_remember_you"] = package
+    sys.modules["astrbot_plugin_remember_you"] = package
 if str(ROOT.parent) not in sys.path:
     sys.path.insert(0, str(ROOT.parent))
 
-from astrabot_plugin_remember_you.core import bot_personal_contract
-from astrabot_plugin_remember_you.core.bridge import MemoryCompanionBridge
-from astrabot_plugin_remember_you.core.config import ConfigView
-from astrabot_plugin_remember_you.core.service import MemoryCompanionService
+from astrbot_plugin_remember_you.core import bot_personal_contract
+from astrbot_plugin_remember_you.core.bridge import MemoryCompanionBridge
+from astrbot_plugin_remember_you.core.config import ConfigView
+from astrbot_plugin_remember_you.core.service import MemoryCompanionService
 
 
 class _PluginMustNotBeTouched:

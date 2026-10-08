@@ -1,0 +1,257 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:memory:local-source-query:request:v1",
+  "title": "Current-turn source query arguments",
+  "description": "Canonical local tool arguments. Host resolves identity. Runtime validates dates, ranges, cursors and budgets.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": [
+        "search",
+        "range",
+        "context",
+        "read"
+      ],
+      "default": "search"
+    },
+    "terms": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "maxItems": 6,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 80,
+        "pattern": "\\S"
+      }
+    },
+    "start_at": {
+      "type": "string",
+      "maxLength": 80,
+      "pattern": "^(?:|[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2}))$"
+    },
+    "end_at": {
+      "type": "string",
+      "maxLength": 80,
+      "pattern": "^(?:|[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2}))$"
+    },
+    "source_ref": {
+      "type": "string",
+      "maxLength": 180,
+      "pattern": "^(?:|timeline:tl_.+)$"
+    },
+    "direction": {
+      "type": "string",
+      "enum": [
+        "around",
+        "before",
+        "after"
+      ],
+      "default": "around"
+    },
+    "excerpt_offset": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0
+    },
+    "cursor": {
+      "type": "string",
+      "maxLength": 160,
+      "default": ""
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "0 uses the configured default; positive values are clamped to at most 12."
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "cursor": {
+          "const": ""
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "terms"
+          ],
+          "properties": {
+            "action": {
+              "const": "search"
+            },
+            "terms": {
+              "type": "array",
+              "minItems": 1
+            },
+            "source_ref": {
+              "const": ""
+            },
+            "direction": {
+              "const": "around"
+            },
+            "excerpt_offset": {
+              "const": 0
+            }
+          }
+        },
+        {
+          "required": [
+            "action",
+            "start_at",
+            "end_at"
+          ],
+          "properties": {
+            "action": {
+              "const": "range"
+            },
+            "terms": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "array",
+                  "maxItems": 0
+                }
+              ]
+            },
+            "start_at": {
+              "minLength": 1
+            },
+            "end_at": {
+              "minLength": 1
+            },
+            "source_ref": {
+              "const": ""
+            },
+            "direction": {
+              "const": "around"
+            },
+            "excerpt_offset": {
+              "const": 0
+            }
+          }
+        },
+        {
+          "required": [
+            "action",
+            "source_ref"
+          ],
+          "properties": {
+            "action": {
+              "const": "context"
+            },
+            "terms": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "array",
+                  "maxItems": 0
+                }
+              ]
+            },
+            "start_at": {
+              "const": ""
+            },
+            "end_at": {
+              "const": ""
+            },
+            "source_ref": {
+              "minLength": 13
+            },
+            "excerpt_offset": {
+              "const": 0
+            }
+          }
+        },
+        {
+          "required": [
+            "action",
+            "source_ref"
+          ],
+          "properties": {
+            "action": {
+              "const": "read"
+            },
+            "terms": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "array",
+                  "maxItems": 0
+                }
+              ]
+            },
+            "start_at": {
+              "const": ""
+            },
+            "end_at": {
+              "const": ""
+            },
+            "source_ref": {
+              "minLength": 13
+            },
+            "direction": {
+              "const": "around"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "required": [
+        "cursor"
+      ],
+      "properties": {
+        "cursor": {
+          "type": "string",
+          "pattern": "^src_[A-Za-z0-9_-]+$",
+          "maxLength": 160
+        },
+        "action": {
+          "const": "search"
+        },
+        "terms": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "array",
+              "maxItems": 0
+            }
+          ]
+        },
+        "start_at": {
+          "const": ""
+        },
+        "end_at": {
+          "const": ""
+        },
+        "source_ref": {
+          "const": ""
+        },
+        "direction": {
+          "const": "around"
+        },
+        "excerpt_offset": {
+          "const": 0
+        },
+        "limit": {
+          "const": 0
+        }
+      }
+    }
+  ]
+}

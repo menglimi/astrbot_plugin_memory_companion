@@ -1,0 +1,441 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:memory:local-event-query:request:v1",
+  "title": "Temporary source-backed event query",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "plan"
+  ],
+  "properties": {
+    "plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "goal",
+        "unit",
+        "operation",
+        "timezone",
+        "select",
+        "rows"
+      ],
+      "properties": {
+        "goal": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "unit": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "list",
+            "count",
+            "latest",
+            "earliest",
+            "by_day"
+          ]
+        },
+        "timezone": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "IANA 时区，例如 Asia/Shanghai，运行时校验。"
+        },
+        "window": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "start_at",
+                "end_at"
+              ],
+              "properties": {
+                "start_at": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 80,
+                  "description": "带时区 ISO 8601，运行时校验真实日期与顺序。",
+                  "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+                },
+                "end_at": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 80,
+                  "description": "带时区 ISO 8601，运行时校验真实日期与顺序。",
+                  "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "select": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "subject",
+            "world",
+            "occurrences"
+          ],
+          "properties": {
+            "subject": {
+              "type": "string",
+              "enum": [
+                "current_user",
+                "assistant",
+                "other",
+                "any"
+              ]
+            },
+            "world": {
+              "type": "string",
+              "enum": [
+                "real",
+                "fictional",
+                "any"
+              ]
+            },
+            "occurrences": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 4,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "occurred",
+                  "not_occurred",
+                  "planned",
+                  "cancelled"
+                ]
+              }
+            }
+          }
+        },
+        "rows": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 48,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "row_id",
+              "event_key",
+              "description",
+              "subject",
+              "world",
+              "occurrence",
+              "relevance",
+              "identity",
+              "resolution",
+              "time",
+              "evidence"
+            ],
+            "properties": {
+              "row_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80
+              },
+              "event_key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80,
+                "description": "当前计划内的事件身份；仅确定同一事件才复用。"
+              },
+              "description": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 240
+              },
+              "subject": {
+                "type": "string",
+                "enum": [
+                  "current_user",
+                  "assistant",
+                  "other",
+                  "unknown"
+                ]
+              },
+              "world": {
+                "type": "string",
+                "enum": [
+                  "real",
+                  "fictional",
+                  "unknown"
+                ]
+              },
+              "occurrence": {
+                "type": "string",
+                "enum": [
+                  "occurred",
+                  "not_occurred",
+                  "planned",
+                  "cancelled",
+                  "unknown"
+                ]
+              },
+              "relevance": {
+                "type": "string",
+                "enum": [
+                  "match",
+                  "not_match",
+                  "uncertain"
+                ]
+              },
+              "identity": {
+                "type": "string",
+                "enum": [
+                  "clear",
+                  "uncertain"
+                ]
+              },
+              "resolution": {
+                "type": "string",
+                "enum": [
+                  "resolved",
+                  "uncertain",
+                  "conflicting"
+                ]
+              },
+              "time": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "kind"
+                    ],
+                    "properties": {
+                      "kind": {
+                        "const": "unknown"
+                      }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "kind",
+                      "date",
+                      "timezone",
+                      "source_ref"
+                    ],
+                    "properties": {
+                      "kind": {
+                        "const": "date"
+                      },
+                      "date": {
+                        "type": "string",
+                        "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+                      },
+                      "timezone": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 80,
+                        "description": "IANA 时区，例如 Asia/Shanghai，运行时校验。"
+                      },
+                      "source_ref": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 180,
+                        "pattern": "^timeline:tl_.+$"
+                      }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "kind",
+                      "source_ref",
+                      "days",
+                      "timezone"
+                    ],
+                    "properties": {
+                      "kind": {
+                        "const": "relative_day"
+                      },
+                      "source_ref": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 180,
+                        "pattern": "^timeline:tl_.+$"
+                      },
+                      "days": {
+                        "type": "integer",
+                        "minimum": -36600,
+                        "maximum": 36600
+                      },
+                      "timezone": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 80,
+                        "description": "IANA 时区，例如 Asia/Shanghai，运行时校验。"
+                      }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "kind",
+                      "at",
+                      "source_ref"
+                    ],
+                    "properties": {
+                      "kind": {
+                        "const": "instant"
+                      },
+                      "at": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 80,
+                        "description": "带时区 ISO 8601，运行时校验真实日期与顺序。",
+                        "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+                      },
+                      "source_ref": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 180,
+                        "pattern": "^timeline:tl_.+$"
+                      }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "kind",
+                      "start_at",
+                      "end_at",
+                      "source_ref"
+                    ],
+                    "properties": {
+                      "kind": {
+                        "const": "interval"
+                      },
+                      "start_at": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 80,
+                        "description": "带时区 ISO 8601，运行时校验真实日期与顺序。",
+                        "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+                      },
+                      "end_at": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 80,
+                        "description": "带时区 ISO 8601，运行时校验真实日期与顺序。",
+                        "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+                      },
+                      "source_ref": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 180,
+                        "pattern": "^timeline:tl_.+$"
+                      }
+                    }
+                  }
+                ]
+              },
+              "evidence": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 6,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "source_ref",
+                    "source_version",
+                    "quote"
+                  ],
+                  "properties": {
+                    "source_ref": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 180,
+                      "pattern": "^timeline:tl_.+$"
+                    },
+                    "source_version": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "quote": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 800,
+                      "description": "逐字引用本轮已读 sources 的脱敏片段。"
+                    }
+                  }
+                }
+              },
+              "supersedes": {
+                "type": "array",
+                "maxItems": 48,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 80
+                },
+                "description": "本计划内同一事件被明确纠正的 row_id，不修改事实库。"
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "operation": {
+                "const": "by_day"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "window"
+            ],
+            "properties": {
+              "window": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "start_at",
+                  "end_at"
+                ],
+                "properties": {
+                  "start_at": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80,
+                    "description": "带时区 ISO 8601，运行时校验真实日期与顺序。",
+                    "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+                  },
+                  "end_at": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80,
+                    "description": "带时区 ISO 8601，运行时校验真实日期与顺序。",
+                    "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

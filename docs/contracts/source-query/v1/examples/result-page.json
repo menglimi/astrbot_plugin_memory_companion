@@ -1,0 +1,63 @@
+{
+  "profile": "memory.local-source-query.v1",
+  "ok": true,
+  "status": "page",
+  "error": "",
+  "sources": [
+    {
+      "source_ref": "timeline:tl_example",
+      "source_version": "example-version",
+      "source_kind": "stored_message",
+      "speaker_role": "user",
+      "speaker_id": "example-user",
+      "message_at": "2026-09-07T19:41:21+00:00",
+      "message_at_local": "2026-09-08 03:41:21",
+      "recorded_at": "2026-09-07T19:41:22+00:00",
+      "time_basis": "timeline_observation_not_event_occurrence",
+      "excerpt": "早餐喝了无糖拿铁。",
+      "excerpt_offset": 0,
+      "excerpt_end": 9,
+      "next_excerpt_offset": null,
+      "excerpt_truncated": false,
+      "capture_truncated": null
+    }
+  ],
+  "next_cursor": null,
+  "context_cursors": {},
+  "query": {
+    "action": "search",
+    "terms": [
+      "无糖拿铁"
+    ],
+    "start_at": "",
+    "end_at": "",
+    "source_ref": "",
+    "direction": "around",
+    "excerpt_offset": 0
+  },
+  "coverage": {
+    "scope": "current_session_only",
+    "time_basis": "message_observation",
+    "start_at": "",
+    "end_at": "",
+    "interval": "[start,end)",
+    "order": "message_time_desc",
+    "selection": "literal_terms_any",
+    "more_available": false,
+    "source_revision": "1",
+    "read_count": 1,
+    "returned_count": 1,
+    "suppressed_count": 0,
+    "excerpt_truncated_count": 0,
+    "event_coverage": "not_established",
+    "path": "fts5_trigram",
+    "unknown_message_time": "excluded_from_time_order"
+  },
+  "usage": {
+    "step": 1,
+    "remaining_steps": 2,
+    "model_calls": 0,
+    "returned_chars": 9,
+    "elapsed_ms": 5
+  }
+}

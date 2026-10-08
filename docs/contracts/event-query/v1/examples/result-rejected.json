@@ -1,0 +1,12 @@
+{
+  "profile": "memory.local-event-query.v1",
+  "ok": false,
+  "status": "rejected",
+  "error": "source_changed_retry",
+  "events": [],
+  "excluded": [],
+  "unresolved": [],
+  "aggregate": {},
+  "coverage": {},
+  "usage": {}
+}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from html.parser import HTMLParser
 from typing import Any
 
 try:
@@ -256,6 +257,73 @@ def _plain_request_text(value: Any, *, depth: int = 0) -> str:
                 parts.append(_plain_request_text(value.get(key), depth=depth + 1))
         return "\n".join(part for part in parts if part)
     return ""
+
+
+class _RetrievalHistoryParser(HTMLParser):
+    """Exclude host reminder blocks without treating their metadata as chat."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.reminder_depth = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "system_reminder":
+            self.reminder_depth += 1
+        elif not self.reminder_depth:
+            self.parts.append(self.get_starttag_text())
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "system_reminder":
+            self.reminder_depth = max(0, self.reminder_depth - 1)
+            if not self.reminder_depth:
+                self.parts.append("\n")
+        elif not self.reminder_depth:
+            self.parts.append(f"</{tag}>")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "system_reminder" and not self.reminder_depth:
+            self.parts.append(self.get_starttag_text())
+
+    def handle_data(self, data: str) -> None:
+        if not self.reminder_depth:
+            self.parts.append(data)
+
+    def handle_entityref(self, name: str) -> None:
+        self.handle_data(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        self.handle_data(f"&#{name};")
+
+    def handle_comment(self, data: str) -> None:
+        self.handle_data(f"<!--{data}-->")
+
+    def handle_decl(self, decl: str) -> None:
+        self.handle_data(f"<!{decl}>")
+
+
+def retrieval_history_text(value: Any, *, depth: int = 0) -> str:
+    """Project visible dialogue text; leave the actual provider history intact."""
+    if value is None or depth > 4:
+        return ""
+    if isinstance(value, (list, tuple)):
+        text = "\n".join(retrieval_history_text(item, depth=depth + 1) for item in value)
+    elif isinstance(value, dict):
+        text = retrieval_history_text(value.get("text", value.get("content")), depth=depth + 1)
+    elif isinstance(value, str):
+        text = value
+    else:
+        content = getattr(value, "text", None)
+        if content is None:
+            content = getattr(value, "content", None)
+        return retrieval_history_text(content, depth=depth + 1)
+    if "<system_reminder" in text.lower():
+        parser = _RetrievalHistoryParser()
+        parser.feed(text)
+        parser.close()
+        text = "".join(parser.parts)
+    cleaned, _changed, drop = clean_private_companion_history_text(text)
+    return "" if drop else cleaned
 
 
 def _is_temp_or_plugin_context(item: Any) -> bool:

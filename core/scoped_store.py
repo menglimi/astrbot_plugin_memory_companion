@@ -75,7 +75,13 @@ def _payload(value: Any) -> tuple[str, str]:
 
 
 class ScopedStore:
-    def __init__(self, path: str | Path, *, clock: Any = None) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        clock: Any = None,
+        initialize: bool = True,
+    ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock if callable(clock) else time.time
@@ -83,7 +89,9 @@ class ScopedStore:
         self._active_epoch = ""
         self._active_policy_version = ""
         self._epoch_revision = 0
-        self._initialize()
+        self._initialized = False
+        if initialize:
+            self.initialize()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.path), timeout=15.0, isolation_level=None)
@@ -120,6 +128,13 @@ class ScopedStore:
                 raise
             finally:
                 conn.close()
+
+    def initialize(self) -> None:
+        with self._lock:
+            if self._initialized:
+                return
+            self._initialize()
+            self._initialized = True
 
     def _initialize(self) -> None:
         with self._connection() as conn:
@@ -811,6 +826,13 @@ class ScopedStore:
             )
         self._truncate_wal()
         return result
+
+    def initialize(self) -> None:
+        with self._lock:
+            if self._initialized:
+                return
+            self._initialize()
+            self._initialized = True
 
 
 __all__ = [

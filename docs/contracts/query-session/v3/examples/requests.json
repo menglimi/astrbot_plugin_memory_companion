@@ -1,0 +1,47 @@
+[
+  {
+    "operation": "status"
+  },
+  {
+    "operation": "status",
+    "parameters": {
+      "note_ids": [
+        "qn_0123456789abcdef"
+      ]
+    }
+  },
+  {
+    "operation": "sources",
+    "parameters": {
+      "terms": [
+        "后来改口"
+      ]
+    },
+    "query_note": {
+      "text": "这两条暂按同一次问答理解，后续变化尚待查看。",
+      "evidence": [
+        {
+          "source_ref": "timeline:tl_example",
+          "source_version": "example-version"
+        }
+      ]
+    }
+  },
+  {
+    "operation": "sources",
+    "parameters": {
+      "cursor": "src_example"
+    },
+    "query_note": null
+  },
+  {
+    "operation": "discover",
+    "parameters": {
+      "query": "我上次提到的苹果",
+      "terms": [
+        "苹果"
+      ],
+      "limit": 4
+    }
+  }
+]

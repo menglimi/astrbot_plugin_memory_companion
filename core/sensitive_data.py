@@ -64,6 +64,8 @@ def redact_sensitive_text(value: Any) -> str:
     text = str(value or "")
     if not text:
         return ""
+    text = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{30,}|sk-[A-Za-z0-9_-]{16,})\b", REDACTED, text)
+    text = re.sub(r"(?i)((?:密码|口令|暗号|验证码|令牌|pin|passcode|token|密钥|秘钥)\s*(?:是|为|[:：=]|is)\s*)([^；，。！？!?\r\n]{1,80})", lambda m:m[1]+REDACTED,text)
     text = _PRIVATE_KEY.sub(REDACTED, text)
     text = _BEARER.sub(f"Bearer {REDACTED}", text)
     text = _URL_CREDENTIAL.sub(rf"\1{REDACTED}\3", text)

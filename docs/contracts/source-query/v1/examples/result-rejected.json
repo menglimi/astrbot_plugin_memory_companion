@@ -1,0 +1,11 @@
+{
+  "profile": "memory.local-source-query.v1",
+  "ok": false,
+  "status": "rejected",
+  "error": "cursor_invalid",
+  "sources": [],
+  "next_cursor": null,
+  "context_cursors": {},
+  "coverage": {},
+  "usage": {}
+}

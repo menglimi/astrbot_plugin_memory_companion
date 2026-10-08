@@ -1,0 +1,681 @@
+{
+  "schema_version": "query-relation-review.v1",
+  "observed_at": "2026-09-14",
+  "evidence_level": "R",
+  "review_method": "Codex 逐项核对原始报告中的自然问题、模型答案、实际返回 excerpt、coverage 和错误；非独立评审模型、非生产验收。未修改原始运行报告。",
+  "source_report": "query-relation-model-comparison-20260914.json",
+  "source_report_sha256": "88ea011b21a72a860ff12012f2fb0f061592cffd5803d5f3e9f18c4fed2a4281",
+  "summary": {
+    "samples": 24,
+    "provider_requests": 64,
+    "tool_calls": 56,
+    "sources_calls": 47,
+    "recall_calls": 9,
+    "events_calls": 0,
+    "note_submissions": 0,
+    "status_calls": 0,
+    "budget_rejections": 1,
+    "partial_failure_samples": 4,
+    "incomplete_answer_samples": 1,
+    "other_samples": "supported_with_limits，仍需阅读各项补充与覆盖边界，非完整语义通过",
+    "note_benefit": "not_observed",
+    "mrq_formal_runs": 0,
+    "host_reloads": 0,
+    "production_writes": 0,
+    "platform_sends": 0
+  },
+  "performance": {
+    "A": {
+      "samples": 12,
+      "provider_requests": 32,
+      "tool_calls": 27,
+      "answer_seconds_median": 6.023,
+      "answer_seconds_p95_nearest_rank": 11.187,
+      "answer_seconds_max": 11.187,
+      "answer_chars_median": 153,
+      "tool_definition_chars": [
+        10911
+      ],
+      "provider_tokens": {
+        "input_other": 36860,
+        "input_cached": 189824,
+        "output": 10791
+      },
+      "input_tokens_total": 226684
+    },
+    "B": {
+      "samples": 12,
+      "provider_requests": 32,
+      "tool_calls": 29,
+      "answer_seconds_median": 6.2105,
+      "answer_seconds_p95_nearest_rank": 9.891,
+      "answer_seconds_max": 9.891,
+      "answer_chars_median": 115.5,
+      "tool_definition_chars": [
+        11909
+      ],
+      "provider_tokens": {
+        "input_other": 44463,
+        "input_cached": 199680,
+        "output": 11347
+      },
+      "input_tokens_total": 244143
+    }
+  },
+  "limitations": [
+    "每种问题每侧仅两次，缓存、网络和运行顺序有波动；P95 按 nearest-rank，12 样本时等于最大值，不能作稳定尾延迟结论。",
+    "模型未主动提交或回看便笺；只验证启用开销和既有自主查询，便笺功能由另列程序测试验证。",
+    "24 份执行状态均 answered，但部分答案包含无依据补充、归属口误或漏答，不能以脚本退出码宣称语义全通过。",
+    "报告在已保存 17 个样本后遇到 Windows 写入异常，增加原子检查点与 resume 后只继续缺失的 7 个样本。之前所有记录保留。",
+    "提示的固定当前时刻为 9 月 13 日晚，辅助注入仍使用系统的 9 月 14 日；两侧相同。相对『今天/上周』的时钟一致性留待改进；本次关键历史问题有明确来源锚点。",
+    "真实模型使用临时身份与 SQLite、模拟 P5，无生产 embedding/rerank、其它插件完整提示、TTS、平台投递或流式首字计时。",
+    "程序收尾只改关闭开关时的 status 降级和补 Host partial 绑定检查；本报告启用路径未变，未重复模型采样。",
+    "A 的 9 样本/21 请求及 9 月 13 日的 26 样本/74 请求均独立保留。"
+  ],
+  "cases": [
+    {
+      "id": "ordinary_chat",
+      "mode": "A",
+      "repetition": 1,
+      "execution_status": "answered",
+      "requests": 1,
+      "tool_calls": 0,
+      "seconds": 2.547,
+      "answer_chars": 22,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [],
+      "database_changes": 0,
+      "primary_answer": "自然回应寒暄，4 个样本均未调用记忆工具。",
+      "verdict": "supported_with_limits",
+      "limits": [
+        "上下文只有大风预报，不能据此认定已经测得实际风力；A1 的『风还挺大的』属于额外推断。"
+      ]
+    },
+    {
+      "id": "ordinary_chat",
+      "mode": "B",
+      "repetition": 1,
+      "execution_status": "answered",
+      "requests": 1,
+      "tool_calls": 0,
+      "seconds": 1.329,
+      "answer_chars": 26,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [],
+      "database_changes": 0,
+      "primary_answer": "自然回应寒暄，4 个样本均未调用记忆工具。",
+      "verdict": "supported_with_limits",
+      "limits": [
+        "上下文只有大风预报，不能据此认定已经测得实际风力；A1 的『风还挺大的』属于额外推断。"
+      ]
+    },
+    {
+      "id": "date_and_answer",
+      "mode": "A",
+      "repetition": 1,
+      "execution_status": "answered",
+      "requests": 3,
+      "tool_calls": 3,
+      "seconds": 11.187,
+      "answer_chars": 141,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [
+        "timeline:tl_1a655f5734f24b89",
+        "timeline:tl_1fde71b8b3024c6f",
+        "timeline:tl_3684e8c4b58d4c86",
+        "timeline:tl_58e009419cc8455c",
+        "timeline:tl_8e03e5c19b304645",
+        "timeline:tl_dcee145692784ab3"
+      ],
+      "database_changes": 0,
+      "primary_answer": "本轮可读合成资料支持 9 月 8 日及浅紫色带细蕾丝边原话；8 月 25 日同句未取代目标。",
+      "verdict": "supported_with_limits",
+      "limits": [
+        "『最近一次』仅限本轮可读资料，未建立完整事件覆盖。",
+        "A2 关于用户自身经历的补充无助于问题，不能推广为其它用户历史不存在；本组未重现 A 历史报告中的 6 月 13 日错误，旧失败仍保留。"
+      ]
+    },
+    {
+      "id": "date_and_answer",
+      "mode": "B",
+      "repetition": 1,
+      "execution_status": "answered",
+      "requests": 3,
+      "tool_calls": 4,
+      "seconds": 7.578,
+      "answer_chars": 160,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [
+        "timeline:tl_52341643c79649d5",
+        "timeline:tl_5c055c6f978543d4",
+        "timeline:tl_6c9c78098cf243f5",
+        "timeline:tl_6f4d60fab18640fe",
+        "timeline:tl_a2348ba3667940f9",
+        "timeline:tl_ac9d1ce7fe1a4864"
+      ],
+      "database_changes": 0,
+      "primary_answer": "本轮可读合成资料支持 9 月 8 日及浅紫色带细蕾丝边原话；8 月 25 日同句未取代目标。",
+      "verdict": "supported_with_limits",
+      "limits": [
+        "『最近一次』仅限本轮可读资料，未建立完整事件覆盖。",
+        "A2 关于用户自身经历的补充无助于问题，不能推广为其它用户历史不存在；本组未重现 A 历史报告中的 6 月 13 日错误，旧失败仍保留。"
+      ]
+    },
+    {
+      "id": "missing_answer",
+      "mode": "A",
+      "repetition": 1,
+      "execution_status": "answered",
+      "requests": 4,
+      "tool_calls": 4,
+      "seconds": 5.578,
+      "answer_chars": 165,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [
+        "timeline:tl_2db35f59b31845d2",
+        "timeline:tl_794d8600953d4f18",
+        "timeline:tl_9bc1a0b90a7d44b5",
+        "timeline:tl_e0f8d5dbae344d14"
+      ],
+      "database_changes": 0,
+      "primary_answer": "找到 9 月 8 日的询问，保留该次回答缺口，没有借用其它日期的同句作为答案。",
+      "verdict": "supported_with_limits",
+      "limits": [
+        "读不到回答不区分未记录、无权或遗漏，不证明当时没有回复。",
+        "A1 引用后来的『上上个月』只是历史说法，不能作为正确日期；补充与目标问题无关。"
+      ]
+    },
+    {
+      "id": "missing_answer",
+      "mode": "B",
+      "repetition": 1,
+      "execution_status": "answered",
+      "requests": 3,
+      "tool_calls": 3,
+      "seconds": 4.61,
+      "answer_chars": 123,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [
+        "timeline:tl_00556d1cc98e4f00",
+        "timeline:tl_0b573b030dda4ab0",
+        "timeline:tl_4098942863f34420",
+        "timeline:tl_745d7de454c44853"
+      ],
+      "database_changes": 0,
+      "primary_answer": "找到 9 月 8 日的询问，保留该次回答缺口，没有借用其它日期的同句作为答案。",
+      "verdict": "supported_with_limits",
+      "limits": [
+        "读不到回答不区分未记录、无权或遗漏，不证明当时没有回复。",
+        "A1 引用后来的『上上个月』只是历史说法，不能作为正确日期；补充与目标问题无关。"
+      ]
+    },
+    {
+      "id": "cross_midnight",
+      "mode": "A",
+      "repetition": 1,
+      "execution_status": "answered",
+      "requests": 3,
+      "tool_calls": 3,
+      "seconds": 3.531,
+      "answer_chars": 76,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [
+        "timeline:tl_a31682d2df1746b3",
+        "timeline:tl_b255350bde764eef"
+      ],
+      "database_changes": 0,
+      "primary_answer": "9 月 8 日 23:59 提问，9 月 9 日 00:02 回复；原话中的『昨天』指 9 月 8 日。",
+      "verdict": "incomplete_answer",
+      "limits": [
+        "时间锚点和原话可核对，不证明实际穿着或历史查全。"
+      ],
+      "issue": "提问/回答日期与原话正确，但用户同时问描述哪一天，只引用『昨天』而未明确换算为 9 月 8 日。"
+    },
+    {
+      "id": "cross_midnight",
+      "mode": "B",
+      "repetition": 1,
+      "execution_status": "answered",
+      "requests": 3,
+      "tool_calls": 2,
+      "seconds": 4.032,
+      "answer_chars": 65,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [
+        "timeline:tl_afcc9c24eedf4362",
+        "timeline:tl_f5b429ea408a4f7f"
+      ],
+      "database_changes": 0,
+      "primary_answer": "9 月 8 日 23:59 提问，9 月 9 日 00:02 回复；原话中的『昨天』指 9 月 8 日。",
+      "verdict": "supported_with_limits",
+      "limits": [
+        "时间锚点和原话可核对，不证明实际穿着或历史查全。"
+      ]
+    },
+    {
+      "id": "week_pairs",
+      "mode": "A",
+      "repetition": 1,
+      "execution_status": "answered",
+      "requests": 3,
+      "tool_calls": 3,
+      "seconds": 7.375,
+      "answer_chars": 217,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [
+        "timeline:tl_471827e10e154310",
+        "timeline:tl_4f291520862f4515",
+        "timeline:tl_55d4f01bbfab407a",
+        "timeline:tl_80ecc3b4811b465c",
+        "timeline:tl_baf620101cf14f73",
+        "timeline:tl_ea8b6f68bdef4cbe"
+      ],
+      "database_changes": 0,
+      "primary_answer": "7/10/12 日三次询问有来源；10 日更正为白色纯棉、无蕾丝；12 日回答缺口被保留。",
+      "verdict": "partial_failure",
+      "limits": [
+        "event_coverage=not_established；完整的消息范围页也不证明所有经历都有记录。"
+      ],
+      "issue": "说『5 条记录，没有别的』，实际范围查询返回 6 条；计数错误，且从可读资料推断历史完整。"
+    },
+    {
+      "id": "week_pairs",
+      "mode": "B",
+      "repetition": 1,
+      "execution_status": "answered",
+      "requests": 4,
+      "tool_calls": 4,
+      "seconds": 7.922,
+      "answer_chars": 244,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [
+        "timeline:tl_24cf0e670eb54949",
+        "timeline:tl_26ef5a434a8b4768",
+        "timeline:tl_5d101c6f5589409e",
+        "timeline:tl_71821c818d4a40df",
+        "timeline:tl_b876f2a6135e4449",
+        "timeline:tl_dbfc5ff471544edd"
+      ],
+      "database_changes": 0,
+      "primary_answer": "7/10/12 日三次询问有来源；10 日更正为白色纯棉、无蕾丝；12 日回答缺口被保留。",
+      "verdict": "partial_failure",
+      "limits": [
+        "event_coverage=not_established；完整的消息范围页也不证明所有经历都有记录。"
+      ],
+      "issue": "『13 日那次没有问过』把未找到记录写成没有发生，超出来源可证明的范围。"
+    },
+    {
+      "id": "appointment_changes",
+      "mode": "A",
+      "repetition": 1,
+      "execution_status": "answered",
+      "requests": 2,
+      "tool_calls": 1,
+      "seconds": 7.188,
+      "answer_chars": 184,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [
+        "timeline:tl_1278f9a734fe4545",
+        "timeline:tl_18476a081c3c4a59",
+        "timeline:tl_8a386fa9e700433e",
+        "timeline:tl_e0dfd06b214744a2"
+      ],
+      "database_changes": 0,
+      "primary_answer": "江湾初约 9 月 10 日 15:00，记录有两次调整，最终 9 月 12 日 10:30；学府预约单独处理。",
+      "verdict": "supported_with_limits",
+      "limits": [
+        "9 月 11 日『昨天说的』指向 10 日，但前一条可读调整在 9 日；只能核对已记录的两次调整，完整因果链及未记录次数没有证明。",
+        "B1 主动指出 10 日对话缺口，但『具体对话没留下记录』『完整版本』仍应限定为本次可读资料；不能据此认证完整历史。"
+      ]
+    },
+    {
+      "id": "appointment_changes",
+      "mode": "B",
+      "repetition": 1,
+      "execution_status": "answered",
+      "requests": 3,
+      "tool_calls": 2,
+      "seconds": 9.891,
+      "answer_chars": 286,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [
+        "timeline:tl_04f01fc382c44be8",
+        "timeline:tl_0588b165bff240ec",
+        "timeline:tl_7517240ed3a146fb",
+        "timeline:tl_ad27a9f015ec46cd",
+        "timeline:tl_ded14841aac74c73"
+      ],
+      "database_changes": 0,
+      "primary_answer": "江湾初约 9 月 10 日 15:00，记录有两次调整，最终 9 月 12 日 10:30；学府预约单独处理。",
+      "verdict": "supported_with_limits",
+      "limits": [
+        "9 月 11 日『昨天说的』指向 10 日，但前一条可读调整在 9 日；只能核对已记录的两次调整，完整因果链及未记录次数没有证明。",
+        "B1 主动指出 10 日对话缺口，但『具体对话没留下记录』『完整版本』仍应限定为本次可读资料；不能据此认证完整历史。"
+      ]
+    },
+    {
+      "id": "ordinary_chat",
+      "mode": "B",
+      "repetition": 2,
+      "execution_status": "answered",
+      "requests": 1,
+      "tool_calls": 0,
+      "seconds": 1.187,
+      "answer_chars": 26,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [],
+      "database_changes": 0,
+      "primary_answer": "自然回应寒暄，4 个样本均未调用记忆工具。",
+      "verdict": "supported_with_limits",
+      "limits": [
+        "上下文只有大风预报，不能据此认定已经测得实际风力；A1 的『风还挺大的』属于额外推断。"
+      ]
+    },
+    {
+      "id": "ordinary_chat",
+      "mode": "A",
+      "repetition": 2,
+      "execution_status": "answered",
+      "requests": 1,
+      "tool_calls": 0,
+      "seconds": 1.579,
+      "answer_chars": 30,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [],
+      "database_changes": 0,
+      "primary_answer": "自然回应寒暄，4 个样本均未调用记忆工具。",
+      "verdict": "supported_with_limits",
+      "limits": [
+        "上下文只有大风预报，不能据此认定已经测得实际风力；A1 的『风还挺大的』属于额外推断。"
+      ]
+    },
+    {
+      "id": "date_and_answer",
+      "mode": "B",
+      "repetition": 2,
+      "execution_status": "answered",
+      "requests": 2,
+      "tool_calls": 2,
+      "seconds": 5.047,
+      "answer_chars": 87,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [
+        "timeline:tl_30883b10929e4e12",
+        "timeline:tl_31db1770c1c34784",
+        "timeline:tl_888254b7cefc4197",
+        "timeline:tl_9ab0ae02cc0f4e38",
+        "timeline:tl_bbf079e993c34f6f"
+      ],
+      "database_changes": 0,
+      "primary_answer": "本轮可读合成资料支持 9 月 8 日及浅紫色带细蕾丝边原话；8 月 25 日同句未取代目标。",
+      "verdict": "supported_with_limits",
+      "limits": [
+        "『最近一次』仅限本轮可读资料，未建立完整事件覆盖。",
+        "A2 关于用户自身经历的补充无助于问题，不能推广为其它用户历史不存在；本组未重现 A 历史报告中的 6 月 13 日错误，旧失败仍保留。"
+      ]
+    },
+    {
+      "id": "date_and_answer",
+      "mode": "A",
+      "repetition": 2,
+      "execution_status": "answered",
+      "requests": 3,
+      "tool_calls": 2,
+      "seconds": 7.578,
+      "answer_chars": 185,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [
+        "timeline:tl_1e2d462975d94c27",
+        "timeline:tl_1e4ead3eae224071",
+        "timeline:tl_60a042d45d054f27",
+        "timeline:tl_acd01a3370f74f78",
+        "timeline:tl_cffdd2c93b6c4d56",
+        "timeline:tl_fc6b5f8c2a764544"
+      ],
+      "database_changes": 0,
+      "primary_answer": "本轮可读合成资料支持 9 月 8 日及浅紫色带细蕾丝边原话；8 月 25 日同句未取代目标。",
+      "verdict": "supported_with_limits",
+      "limits": [
+        "『最近一次』仅限本轮可读资料，未建立完整事件覆盖。",
+        "A2 关于用户自身经历的补充无助于问题，不能推广为其它用户历史不存在；本组未重现 A 历史报告中的 6 月 13 日错误，旧失败仍保留。"
+      ]
+    },
+    {
+      "id": "missing_answer",
+      "mode": "B",
+      "repetition": 2,
+      "execution_status": "answered",
+      "requests": 4,
+      "tool_calls": 4,
+      "seconds": 7.969,
+      "answer_chars": 108,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [
+        "timeline:tl_72605cb087db4fee",
+        "timeline:tl_74fc53a4f0284d81",
+        "timeline:tl_e0202ac9014b4ae7"
+      ],
+      "database_changes": 0,
+      "primary_answer": "找到 9 月 8 日的询问，保留该次回答缺口，没有借用其它日期的同句作为答案。",
+      "verdict": "supported_with_limits",
+      "limits": [
+        "读不到回答不区分未记录、无权或遗漏，不证明当时没有回复。",
+        "A1 引用后来的『上上个月』只是历史说法，不能作为正确日期；补充与目标问题无关。"
+      ]
+    },
+    {
+      "id": "missing_answer",
+      "mode": "A",
+      "repetition": 2,
+      "execution_status": "answered",
+      "requests": 4,
+      "tool_calls": 3,
+      "seconds": 5.937,
+      "answer_chars": 120,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [
+        "timeline:tl_178c231d2d5d4718",
+        "timeline:tl_3b7cc915b6a7489f",
+        "timeline:tl_5a4057e25ef04900",
+        "timeline:tl_b62a4d50df9d4c8f"
+      ],
+      "database_changes": 0,
+      "primary_answer": "找到 9 月 8 日的询问，保留该次回答缺口，没有借用其它日期的同句作为答案。",
+      "verdict": "supported_with_limits",
+      "limits": [
+        "读不到回答不区分未记录、无权或遗漏，不证明当时没有回复。",
+        "A1 引用后来的『上上个月』只是历史说法，不能作为正确日期；补充与目标问题无关。"
+      ]
+    },
+    {
+      "id": "cross_midnight",
+      "mode": "B",
+      "repetition": 2,
+      "execution_status": "answered",
+      "requests": 3,
+      "tool_calls": 3,
+      "seconds": 6.171,
+      "answer_chars": 147,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [
+        "timeline:tl_25b581425c5740f7",
+        "timeline:tl_f13b6c13ac7d4adc"
+      ],
+      "database_changes": 0,
+      "primary_answer": "9 月 8 日 23:59 提问，9 月 9 日 00:02 回复；原话中的『昨天』指 9 月 8 日。",
+      "verdict": "partial_failure",
+      "limits": [
+        "时间锚点和原话可核对，不证明实际穿着或历史查全。"
+      ],
+      "issue": "日期和原话正确，补充却写成『我问的昨天』，把历史回答中的词归给提问；说话者归属口误。"
+    },
+    {
+      "id": "cross_midnight",
+      "mode": "A",
+      "repetition": 2,
+      "execution_status": "answered",
+      "requests": 3,
+      "tool_calls": 2,
+      "seconds": 4.078,
+      "answer_chars": 71,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [
+        "timeline:tl_42c77d8b27b14c34",
+        "timeline:tl_62be6ccc82684ad8"
+      ],
+      "database_changes": 0,
+      "primary_answer": "9 月 8 日 23:59 提问，9 月 9 日 00:02 回复；原话中的『昨天』指 9 月 8 日。",
+      "verdict": "supported_with_limits",
+      "limits": [
+        "时间锚点和原话可核对，不证明实际穿着或历史查全。"
+      ]
+    },
+    {
+      "id": "week_pairs",
+      "mode": "B",
+      "repetition": 2,
+      "execution_status": "answered",
+      "requests": 3,
+      "tool_calls": 3,
+      "seconds": 7.438,
+      "answer_chars": 256,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [
+        "timeline:tl_367a1622599c4e1b",
+        "timeline:tl_4ed0a65dba064c7f",
+        "timeline:tl_548aa7425b8845ac",
+        "timeline:tl_7462171e871743d5",
+        "timeline:tl_b4dedcb032694e71",
+        "timeline:tl_e8c9c90cf32b4636"
+      ],
+      "database_changes": 0,
+      "primary_answer": "7/10/12 日三次询问有来源；10 日更正为白色纯棉、无蕾丝；12 日回答缺口被保留。",
+      "verdict": "supported_with_limits",
+      "limits": [
+        "event_coverage=not_established；完整的消息范围页也不证明所有经历都有记录。"
+      ]
+    },
+    {
+      "id": "week_pairs",
+      "mode": "A",
+      "repetition": 2,
+      "execution_status": "answered",
+      "requests": 3,
+      "tool_calls": 5,
+      "seconds": 7.766,
+      "answer_chars": 242,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 1,
+      "source_refs": [
+        "timeline:tl_5048330508a4484b",
+        "timeline:tl_5a1b9e27b262465b",
+        "timeline:tl_660d175d6e30452f",
+        "timeline:tl_7438324276e74b5a",
+        "timeline:tl_c7639c14aead41a8",
+        "timeline:tl_e3dbae002e4b4a7d"
+      ],
+      "database_changes": 0,
+      "primary_answer": "7/10/12 日三次询问有来源；10 日更正为白色纯棉、无蕾丝；12 日回答缺口被保留。",
+      "verdict": "partial_failure",
+      "limits": [
+        "event_coverage=not_established；完整的消息范围页也不证明所有经历都有记录。"
+      ],
+      "issue": "末次 context 因预算拒绝，未完成范围覆盖，却断言 8/9/11/13 日都没有相关记录；主干列表正确不能消除这一无依据补充。"
+    },
+    {
+      "id": "appointment_changes",
+      "mode": "B",
+      "repetition": 2,
+      "execution_status": "answered",
+      "requests": 2,
+      "tool_calls": 2,
+      "seconds": 6.25,
+      "answer_chars": 107,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [
+        "timeline:tl_03375ff622b94f71",
+        "timeline:tl_2c1a1d3da043492b",
+        "timeline:tl_51aa03a524114c7a",
+        "timeline:tl_ca696aac052d44cb"
+      ],
+      "database_changes": 0,
+      "primary_answer": "江湾初约 9 月 10 日 15:00，记录有两次调整，最终 9 月 12 日 10:30；学府预约单独处理。",
+      "verdict": "supported_with_limits",
+      "limits": [
+        "9 月 11 日『昨天说的』指向 10 日，但前一条可读调整在 9 日；只能核对已记录的两次调整，完整因果链及未记录次数没有证明。",
+        "B1 主动指出 10 日对话缺口，但『具体对话没留下记录』『完整版本』仍应限定为本次可读资料；不能据此认证完整历史。"
+      ]
+    },
+    {
+      "id": "appointment_changes",
+      "mode": "A",
+      "repetition": 2,
+      "execution_status": "answered",
+      "requests": 2,
+      "tool_calls": 1,
+      "seconds": 6.109,
+      "answer_chars": 168,
+      "note_submissions": 0,
+      "status_calls": 0,
+      "budget_rejections": 0,
+      "source_refs": [
+        "timeline:tl_34776cc6e5334cd6",
+        "timeline:tl_44270554e8244435",
+        "timeline:tl_ca7389cade644525",
+        "timeline:tl_ed86bad984484fbb"
+      ],
+      "database_changes": 0,
+      "primary_answer": "江湾初约 9 月 10 日 15:00，记录有两次调整，最终 9 月 12 日 10:30；学府预约单独处理。",
+      "verdict": "supported_with_limits",
+      "limits": [
+        "9 月 11 日『昨天说的』指向 10 日，但前一条可读调整在 9 日；只能核对已记录的两次调整，完整因果链及未记录次数没有证明。",
+        "B1 主动指出 10 日对话缺口，但『具体对话没留下记录』『完整版本』仍应限定为本次可读资料；不能据此认证完整历史。"
+      ]
+    }
+  ]
+}

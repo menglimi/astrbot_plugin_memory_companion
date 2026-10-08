@@ -12,6 +12,7 @@ ROOT = bootstrap_package()
 
 from astrbot_plugin_memory_companion.core.models import MemoryRecord, SearchResult, SessionContext
 from astrbot_plugin_memory_companion.core.retrieval import RetrievalEngine
+from astrbot_plugin_memory_companion.core.time_intent import TimeIntent
 from astrbot_plugin_memory_companion.core.visibility import VisibilityPolicy
 
 
@@ -105,6 +106,71 @@ class RouteAgreementTests(unittest.TestCase):
     def test_fts_and_keyword_collapse_into_one_lexical_family(self) -> None:
         families = RetrievalEngine._route_families({"fts", "keyword"})
         self.assertEqual(frozenset({"lexical"}), families)
+
+
+class MutableFactHistoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = RetrievalEngine(None, None)
+        self.ctx = SessionContext(
+            scope="private",
+            session_id="qq:FriendMessage:u1",
+            user_id="u1",
+        )
+        self.older = SearchResult(
+            memory=MemoryRecord(
+                id="older-email",
+                content="小王的邮箱是 old@example.com",
+                scope="private",
+                visibility="private_pair",
+                occurred_at="2025-01-01T00:00:00+00:00",
+            ),
+            score=0.7,
+        )
+        self.newer = SearchResult(
+            memory=MemoryRecord(
+                id="newer-email",
+                content="小王的邮箱是 new@example.com",
+                scope="private",
+                visibility="private_pair",
+                occurred_at="2026-01-01T00:00:00+00:00",
+            ),
+            score=0.8,
+        )
+
+    def test_historical_recall_keeps_older_mutable_fact(self) -> None:
+        results, blocked = self.engine._collapse_mutable_fact_results(
+            "小王以前的邮箱是什么？", self.ctx, [self.older, self.newer]
+        )
+
+        self.assertEqual(["older-email", "newer-email"], [item.memory.id for item in results])
+        self.assertEqual([], blocked)
+
+    def test_explicit_year_recall_keeps_older_mutable_fact(self) -> None:
+        results, blocked = self.engine._collapse_mutable_fact_results(
+            "小王在 2025 年的邮箱是什么？", self.ctx, [self.older, self.newer]
+        )
+
+        self.assertEqual(["older-email", "newer-email"], [item.memory.id for item in results])
+        self.assertEqual([], blocked)
+
+    def test_time_bounded_recall_keeps_all_versions_in_the_window(self) -> None:
+        results, blocked = self.engine._collapse_mutable_fact_results(
+            "邮箱",
+            self.ctx,
+            [self.older, self.newer],
+            time_intent=TimeIntent(active=True, start_at="2025-01-01T00:00:00+00:00", end_at="2026-02-01T00:00:00+00:00"),
+        )
+
+        self.assertEqual(["older-email", "newer-email"], [item.memory.id for item in results])
+        self.assertEqual([], blocked)
+
+    def test_unqualified_current_query_still_prefers_latest_mutable_fact(self) -> None:
+        results, blocked = self.engine._collapse_mutable_fact_results(
+            "小王的邮箱", self.ctx, [self.older, self.newer]
+        )
+
+        self.assertEqual(["newer-email"], [item.memory.id for item in results])
+        self.assertEqual("older-email", blocked[0]["id"])
 
 
 class ImportanceGatingTests(unittest.TestCase):

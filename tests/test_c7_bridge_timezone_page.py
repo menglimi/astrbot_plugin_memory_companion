@@ -57,7 +57,7 @@ class C7StaticBoundaryTests(unittest.TestCase):
             self.assertIn(f'self._err("{endpoint}_unavailable", 500)', source)
         self.assertNotIn('return self._ok({"items": []})', source)
 
-    def test_frontend_http_and_partial_context_errors_are_visible(self):
+    def test_frontend_transport_surfaces_http_and_page_api_errors(self):
         source = (ROOT / "pages" / "记忆面板" / "app.js").read_text(encoding="utf-8")
         # 2.0.0 重写时知识图谱视图连同 renderContextPanelErrors 一起被移除，旧断言锚定
         # 的元素已不存在。等价契约仍是「HTTP 层失败必须抛出可见错误」「视图或子请求

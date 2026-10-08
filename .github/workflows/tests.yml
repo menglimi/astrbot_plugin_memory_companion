@@ -24,10 +24,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      # 本插件只使用标准库，AstrBot 本体由宿主环境提供，
-      # tests/ 不导入 astrbot，因此 CI 只安装测试运行器。
+      # 原生工具绑定与页面路由回归需要真实宿主 API；核心算法测试不调用外部模型。
       - name: Install test runner
-        run: python -m pip install --upgrade pip pytest
+        run: python -m pip install --upgrade pip pytest pytest-asyncio pytest-subtests jsonschema "astrbot==4.27.3"
 
       - name: Run test suite
         run: python -m pytest tests/ -q -p no:cacheprovider

@@ -1,0 +1,9 @@
+{
+  "schema_version": "query-scale-audit.v1",
+  "observed_at": "2026-09-14",
+  "result": "passed",
+  "baseline_sha256": "0cfd4203adfef616c77797d2aa6ba0802d49758d7657b27a26d8dfd58ef8d751",
+  "smoke_sha256": "86cace314eaf5122611a7af694f70a9587088c22307ea8bccc9a66cad28a750e",
+  "checks": ["strict UTF-8 and duplicate-free JSON", "fixture semantic hash matches each source corpus", "baseline 180 route runs / 270 sources / 6 vectors", "smoke 12 route runs / 18 sources / 2 vectors", "no forbidden returned sources in recorded timings", "literal index and scan gold equivalence", "question-only half coverage and context full pair", "three pages read 18 unique sources without target", "old vector target fails above 1200 and exhaustive reference passes", "static query database changes zero", "live calls and production side effects zero", "benchmark script AST parses"],
+  "limitations": ["original_window uses a manually precise time although oracle_control is false; treated as oracle control", "historical raw reports left unchanged", "C1 vector script now explicitly reproduces pre-C2a admission for future reruns", "not a semantic or autonomous model evaluation"]
+}

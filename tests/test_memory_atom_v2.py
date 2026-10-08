@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 try:
     from .package_bootstrap import bootstrap_package
@@ -123,6 +124,15 @@ class MemoryAtomV2Tests(unittest.TestCase):
             }.issubset(indexes)
         )
         self.assertEqual(1, store._conn.execute("SELECT COUNT(*) FROM memories WHERE id='kept'").fetchone()[0])
+
+    def test_atom_backfill_is_not_repeated_after_schema_migration(self) -> None:
+        store = self.make_store()
+        store._insert_memory_sync(self.record("kept"))
+
+        with patch.object(store, "_backfill_memory_atom_v2_sync") as backfill:
+            store.initialize()
+
+        backfill.assert_not_called()
 
     def test_clear_all_covers_bridge_portrait_emotion_and_namespace_tables(self) -> None:
         store = self.make_store()
@@ -430,6 +440,14 @@ class MemoryAtomV2Tests(unittest.TestCase):
         ).fetchone()
         self.assertNotIn("historical-raw-key", historical["content"])
         self.assertNotIn("historical-metadata-key", historical["metadata"])
+        marker = store._conn.execute(
+            "SELECT value FROM schema_metadata WHERE key='sensitive_redaction_version'"
+        ).fetchone()[0]
+        redaction_triggers = store._conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'trg_redaction_%'"
+        ).fetchone()[0]
+        self.assertEqual(store.SENSITIVE_REDACTION_VERSION, marker)
+        self.assertEqual(0, redaction_triggers)
 
     def test_startup_scrub_rekeys_legacy_secret_and_drops_stale_vector(self) -> None:
         store = self.make_store()
@@ -439,6 +457,9 @@ class MemoryAtomV2Tests(unittest.TestCase):
                SET content='api_key=legacy-plain-secret',
                    metadata='{"weather_api_key":"legacy-meta-secret"}'
                WHERE id='legacy-secret'"""
+        )
+        store._conn.execute(
+            "UPDATE schema_metadata SET value='' WHERE key='sensitive_redaction_version'"
         )
         raw = store._conn.execute(
             "SELECT * FROM memories WHERE id='legacy-secret'"
@@ -454,6 +475,10 @@ class MemoryAtomV2Tests(unittest.TestCase):
             "SELECT canonical_key,content_fingerprint FROM memories WHERE id='legacy-secret'"
         ).fetchone()
 
+        # Raw legacy SQL represents a database that has not completed the
+        # redaction migration. Normal sanitized writes retain this marker.
+        store._conn.execute("DELETE FROM schema_metadata WHERE key='sensitive_redaction_version'")
+        store._conn.commit()
         store.initialize()
 
         row = store._conn.execute(
@@ -599,6 +624,15 @@ class MemoryAtomV2Tests(unittest.TestCase):
         self.assertAlmostEqual(0.025, store._get_memory_sync("current").reinforcement_score)
         self.assertEqual("2026-08-16T01:02:03+00:00", store._get_memory_sync("current").last_injected_at)
         self.assertEqual(0, store._get_memory_sync("future").injection_count)
+
+    def test_atom_backfill_is_not_repeated_after_schema_migration(self) -> None:
+        store = self.make_store()
+        store._insert_memory_sync(self.record("kept"))
+
+        with patch.object(store, "_backfill_memory_atom_v2_sync") as backfill:
+            store.initialize()
+
+        backfill.assert_not_called()
 
 
 if __name__ == "__main__":

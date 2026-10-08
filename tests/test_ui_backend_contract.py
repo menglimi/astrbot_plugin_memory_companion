@@ -111,7 +111,6 @@ class UiBackendContractTests(unittest.TestCase):
         self.assertIn("./legacy.html", self.page_source)
         self.assertIn("./app.js?v=", self.shell_source)
 
-
     def test_every_frontend_api_call_has_a_registered_backend_route(self) -> None:
         missing = self.frontend_paths() - self.route_paths()
         self.assertEqual(set(), missing, f"frontend endpoints without backend routes: {sorted(missing)}")
@@ -179,6 +178,8 @@ class UiBackendContractTests(unittest.TestCase):
     def test_every_backend_only_route_has_an_explicit_exposure_reason(self) -> None:
         routes = self.route_paths()
         frontend = self.frontend_paths()
+        views = literal(assignment(self.tree, "UI_VIEW_ENDPOINTS"))
+        frontend.update(path for endpoints in views.values() for path in endpoints)
         exposure = literal(assignment(self.tree, "UI_ENDPOINT_EXPOSURE"))
         self.assertTrue(set(exposure).issubset(routes))
         backend_only = routes - frontend

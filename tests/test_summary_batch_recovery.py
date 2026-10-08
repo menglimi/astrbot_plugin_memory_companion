@@ -4,13 +4,14 @@ import asyncio
 import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 from .package_bootstrap import bootstrap_package
 
 ROOT = bootstrap_package()
-from astrbot_plugin_memory_companion.core.models import SessionContext
+from astrbot_plugin_memory_companion.core.models import EntityRef, MemoryRecord, SessionContext
 from astrbot_plugin_memory_companion.core.service import MemoryCompanionService
 from astrbot_plugin_memory_companion.core.store import MemoryStore
 
@@ -63,16 +64,16 @@ class SummaryBatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_one_bad_batch_does_not_block_new_messages_or_get_retried(self):
         old = await self.event()
-        bad = Provider(['bad json', 'bad json'])
+        bad = Provider(['bad json', 'bad json', 'bad json'])
         self.use(bad)
         self.assertEqual('', await self.service.maybe_summarize_session(self.ctx))
-        self.assertEqual(2, len(bad.calls))
+        self.assertEqual(3, len(bad.calls))
         self.assertIn('invalid JSON', bad.calls[1]['prompt'])
         self.assertIn('bad json', bad.calls[1]['prompt'])
         self.assertEqual('quarantined', self.batches()[0]['state'])
         for _ in range(3):
             await self.service.maybe_summarize_session(self.ctx)
-        self.assertEqual(2, len(bad.calls))
+        self.assertEqual(3, len(bad.calls))
         new = await self.event()
         good = Provider([self.payload(new)])
         self.use(good)
@@ -105,6 +106,38 @@ class SummaryBatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
         row = self.service.store._conn.execute('SELECT content FROM memories WHERE id=?', (memory_id,)).fetchone()
         self.assertNotIn('三杯', row[0])
         self.assertEqual(1, self.batches()[0]['repair_used'])
+
+    async def test_weak_summary_body_is_saved_for_review_and_keeps_source(self):
+        event_id = await self.event()
+        weak = self.payload(event_id)
+        weak['summary'] = '这次讨论了一项完全不同的旅行计划，安排十分具体。'
+        provider = Provider([weak])
+        self.use(provider)
+
+        memory_id = await self.service.maybe_summarize_session(self.ctx)
+
+        self.assertTrue(memory_id)
+        record = await self.service.store.get_memory(memory_id)
+        self.assertEqual('short_term_candidate', record.lifecycle)
+        self.assertEqual('pending', record.review_status)
+        self.assertIn('词面对应较弱', record.metadata['quality_warnings'][0])
+        timeline = (await self.service.store.get_timeline_by_ids([event_id]))[event_id]
+        self.assertFalse(timeline['summarized_at'])
+
+    async def test_multiple_repair_attempts_use_the_configured_batch_budget(self):
+        event_id = await self.event()
+        invalid = self.payload(event_id)
+        invalid['summary_refs'] = ['missing-event']
+        provider = Provider([invalid, invalid, self.payload(event_id)])
+        self.use(provider)
+
+        memory_id = await self.service.maybe_summarize_session(self.ctx)
+
+        self.assertTrue(memory_id)
+        self.assertEqual(3, len(provider.calls))
+        self.assertIn('summary_refs 含本批次不存在的 event_id', provider.calls[1]['prompt'])
+        self.assertIn('summary_refs 含本批次不存在的 event_id', provider.calls[2]['prompt'])
+        self.assertEqual('completed', self.batches()[0]['state'])
 
     async def test_no_memory_is_completed_without_fabricating_summary_or_deleting_raw(self):
         event_id = await self.event('嗯嗯')
@@ -170,15 +203,35 @@ class SummaryBatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.service.maybe_summarize_session(self.ctx)
         self.assertEqual(2, len(p.calls))
 
-    async def test_reserved_call_and_repair_survive_cancellation(self):
+    async def test_repair_reservations_share_the_persisted_call_budget(self):
         event_id = await self.event()
         rows = list((await self.service.store.get_timeline_by_ids([event_id])).values())
         batch_id = await self.service.store.create_summary_batch(self.ctx.session_id, self.ctx.scope, rows)
         self.assertTrue(await self.service.store.reserve_summary_call(batch_id, max_calls=3, hourly_limit=6, repair=True))
+        self.assertTrue(await self.service.store.reserve_summary_call(batch_id, max_calls=3, hourly_limit=6, repair=True))
+        self.assertTrue(await self.service.store.reserve_summary_call(batch_id, max_calls=3, hourly_limit=6, repair=True))
         self.assertFalse(await self.service.store.reserve_summary_call(batch_id, max_calls=3, hourly_limit=6, repair=True))
         batch = await self.service.store.get_summary_batch(batch_id)
-        self.assertEqual(1, batch['automatic_calls'])
+        self.assertEqual(3, batch['automatic_calls'])
         self.assertEqual('quarantined', batch['state'])
+
+    async def test_unverifiable_citations_keep_the_batch_as_a_reviewable_candidate(self):
+        """A summary the gate distrusts must not be thrown away, nor freeze the window."""
+        event_id = await self.event()
+        # Unsupported every round: the body never matches the cited messages.
+        bad = self.payload(event_id)
+        bad.update(summary='小王养了三只仓鼠，每天早上都要喂。')
+        provider = Provider([bad, bad, bad])
+        self.use(provider)
+        memory_id = await self.service.maybe_summarize_session(self.ctx)
+        self.assertTrue(memory_id)
+        row = self.service.store._conn.execute(
+            'SELECT lifecycle,review_status FROM memories WHERE id=?', (memory_id,)
+        ).fetchone()
+        self.assertEqual(('short_term_candidate', 'pending'), tuple(row))
+        self.assertEqual('completed', self.batches()[0]['state'])
+        # The events were represented, so the window is not stuck behind them.
+        self.assertTrue((await self.service.store.get_timeline_by_ids([event_id]))[event_id]['summarized_at'])
 
     async def test_completion_releases_unconsumed_events(self):
         ids = [await self.event(), await self.event()]
@@ -188,14 +241,45 @@ class SummaryBatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
         window = await self.service.store.unsummarized_timeline_window(session_id=self.ctx.session_id, exclude_assigned=True)
         self.assertEqual([ids[1]], [r['id'] for r in window['rows']])
 
+    async def test_expired_pending_candidates_are_archived_but_pinned_items_remain(self):
+        now = datetime.now(timezone.utc)
+        old_at = (now - timedelta(days=60)).isoformat(timespec='seconds')
+        cutoff = (now - timedelta(days=30)).isoformat(timespec='seconds')
+        for memory_id, durability in (('candidate-old', 'short'), ('candidate-pinned', 'pinned')):
+            await self.service.store.insert_memory(MemoryRecord(
+                id=memory_id,
+                memory_type='conversation_summary',
+                subject=EntityRef(kind='user', id='u1', name='小王'),
+                object=EntityRef.bot_self('b1'),
+                scope='private',
+                session_id=self.ctx.session_id,
+                platform='qq',
+                visibility='private_pair',
+                lifecycle='short_term_candidate',
+                review_status='pending',
+                durability=durability,
+                content=f'待人工确认的摘要内容 {memory_id}。',
+                created_at=old_at,
+                metadata={'owner_bot_id': 'b1'},
+            ))
+
+        archived = await self.service.store.archive_expired_pending_candidates(cutoff)
+
+        self.assertEqual(1, archived)
+        expired = await self.service.store.get_memory('candidate-old')
+        pinned = await self.service.store.get_memory('candidate-pinned')
+        self.assertEqual(('archived', 'expired'), (expired.lifecycle, expired.review_status))
+        self.assertEqual(('short_term_candidate', 'pending'), (pinned.lifecycle, pinned.review_status))
+        self.assertEqual(['candidate-pinned'], [row['memory_id'] for row in await self.service.store.list_review_queue()])
+
     async def test_manual_repair_does_not_reset_automatic_budget(self):
         event_id = await self.event()
-        p = Provider(['bad json', 'bad json', self.payload(event_id)])
+        p = Provider(['bad json', 'bad json', 'bad json', self.payload(event_id)])
         self.use(p)
-        await self.service.maybe_summarize_session(self.ctx)
+        self.assertEqual('', await self.service.maybe_summarize_session(self.ctx))
         self.assertTrue(await self.service.maybe_summarize_session(self.ctx, force=True))
-        self.assertEqual(2, self.batches()[0]['automatic_calls'])
-        self.assertEqual(3, len(p.calls))
+        self.assertEqual(3, self.batches()[0]['automatic_calls'])
+        self.assertEqual(4, len(p.calls))
 
     async def test_invalid_no_memory_cannot_consume_unchecked_events(self):
         event_id = await self.event()

@@ -1,0 +1,23 @@
+{
+  "schema_version": "vector-search-c2a-audit.v1",
+  "observed_at": "2026-09-14",
+  "result": "passed",
+  "first_report_sha256": "4993f3c72d9f5200f522bd5c4d6bbc12d69bf7fe51be0bd835689966342df452",
+  "final_report_sha256": "db9e76cc28994ab7d20bca51a6f99f2be4322ffb2c5c2b60838d7ad4fb70801b",
+  "targeted_unique_test_nodes": 92,
+  "new_test_nodes": 16,
+  "targeted_test_files": ["tests/test_retrieval_performance.py", "tests/test_candidate_bundle.py", "tests/test_pr29_optimized.py", "tests/test_private_group_acl_recall.py", "tests/test_strict_session_visibility.py", "tests/test_owner_bot_mismatch.py", "tests/test_memory_atom_v2.py", "tests/test_vector_search.py"],
+  "final_vector_test_run_passed": 16,
+  "existing_subtests_passed_separately": 32,
+  "initial_fixture_failures_resolved": 2,
+  "final_numeric_probes": 10,
+  "final_numeric_route_observations": 120,
+  "final_authorized_route_observations": 60,
+  "final_stub_embedding_calls": 60,
+  "first_report_probes_separate": 10,
+  "first_report_stub_embedding_calls_separate": 60,
+  "profile_calls_separate": 1,
+  "legacy_C1_recheck_stub_calls_separate": 2,
+  "checks": ["strict UTF-8 and duplicate-free finite JSON", "current implementation hashes match final report", "all authorized top-32 lists match independent exact numeric reference", "score error below 1e-12", "authorized candidate counts match scope", "cached scans zero and final records re-read", "all static query database writes zero", "provider calls are local stubs", "11 documents and 317 local file/anchor references valid", "Python AST and changed-file whitespace valid", "status renders with unique IDs; pre-existing historical counters preserved; S2/S3 and MRQ zero retained"],
+  "limitations": ["no real model or embedding quality evaluation", "no host reload or production writes", "first complete search and frequent global invalidation remain costs", "32 subtests and repeated nodes not added to 92", "initial ACL fixture object() failures fixed using mutable SimpleNamespace events", "same provider ID with same-dimensional model change still needs versioned embedding migration"]
+}

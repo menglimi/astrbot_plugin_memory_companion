@@ -1,0 +1,470 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:memory:local-source-query:result:v1",
+  "title": "Current-turn source query result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "profile",
+    "ok",
+    "status",
+    "error",
+    "sources",
+    "next_cursor",
+    "context_cursors",
+    "coverage",
+    "usage"
+  ],
+  "properties": {
+    "profile": {
+      "const": "memory.local-source-query.v1"
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "status": {
+      "enum": [
+        "page",
+        "empty",
+        "rejected"
+      ]
+    },
+    "error": {
+      "type": "string"
+    },
+    "sources": {
+      "type": "array",
+      "maxItems": 12,
+      "items": {
+        "$ref": "#/$defs/source"
+      }
+    },
+    "next_cursor": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^src_[A-Za-z0-9_-]+$",
+      "maxLength": 160
+    },
+    "context_cursors": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "before": {
+          "type": "string",
+          "pattern": "^src_[A-Za-z0-9_-]+$",
+          "maxLength": 160
+        },
+        "after": {
+          "type": "string",
+          "pattern": "^src_[A-Za-z0-9_-]+$",
+          "maxLength": 160
+        }
+      }
+    },
+    "query": {
+      "$ref": "#/$defs/query"
+    },
+    "coverage": {
+      "type": "object"
+    },
+    "usage": {
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "ok": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "page",
+              "empty"
+            ]
+          },
+          "error": {
+            "const": ""
+          },
+          "coverage": {
+            "$ref": "#/$defs/coverage"
+          },
+          "usage": {
+            "$ref": "#/$defs/usage"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "page"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "sources": {
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "empty"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "sources": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "ok": {
+            "const": false
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "status": {
+            "const": "rejected"
+          },
+          "error": {
+            "minLength": 1
+          },
+          "sources": {
+            "maxItems": 0
+          },
+          "next_cursor": {
+            "const": null
+          },
+          "context_cursors": {
+            "maxProperties": 0
+          },
+          "coverage": {
+            "maxProperties": 0
+          },
+          "usage": {
+            "maxProperties": 0
+          }
+        },
+        "not": {
+          "required": [
+            "query"
+          ]
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_ref",
+        "source_version",
+        "source_kind",
+        "speaker_role",
+        "speaker_id",
+        "message_at",
+        "message_at_local",
+        "recorded_at",
+        "time_basis",
+        "excerpt",
+        "excerpt_offset",
+        "excerpt_end",
+        "next_excerpt_offset",
+        "excerpt_truncated",
+        "capture_truncated"
+      ],
+      "properties": {
+        "source_ref": {
+          "type": "string",
+          "pattern": "^timeline:tl_.+$",
+          "maxLength": 180
+        },
+        "source_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_kind": {
+          "const": "stored_message"
+        },
+        "speaker_role": {
+          "enum": [
+            "user",
+            "assistant"
+          ]
+        },
+        "speaker_id": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "message_at": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "message_at_local": {
+          "type": "string"
+        },
+        "recorded_at": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "time_basis": {
+          "const": "timeline_observation_not_event_occurrence"
+        },
+        "excerpt": {
+          "type": "string",
+          "maxLength": 800
+        },
+        "excerpt_offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "excerpt_end": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "next_excerpt_offset": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "excerpt_truncated": {
+          "type": "boolean"
+        },
+        "capture_truncated": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "time_basis",
+        "start_at",
+        "end_at",
+        "interval",
+        "order",
+        "selection",
+        "more_available",
+        "source_revision",
+        "read_count",
+        "returned_count",
+        "suppressed_count",
+        "excerpt_truncated_count",
+        "event_coverage",
+        "path",
+        "unknown_message_time"
+      ],
+      "properties": {
+        "scope": {
+          "const": "current_session_only"
+        },
+        "time_basis": {
+          "const": "message_observation"
+        },
+        "start_at": {
+          "type": "string",
+          "maxLength": 80,
+          "pattern": "^(?:|[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2}))$"
+        },
+        "end_at": {
+          "type": "string",
+          "maxLength": 80,
+          "pattern": "^(?:|[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2}))$"
+        },
+        "interval": {
+          "const": "[start,end)"
+        },
+        "order": {
+          "enum": [
+            "message_time_asc",
+            "message_time_desc",
+            "single_message"
+          ]
+        },
+        "selection": {
+          "enum": [
+            "literal_terms_any",
+            "range",
+            "context",
+            "read"
+          ]
+        },
+        "more_available": {
+          "type": "boolean"
+        },
+        "source_revision": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "read_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "returned_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "suppressed_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "excerpt_truncated_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "event_coverage": {
+          "const": "not_established"
+        },
+        "path": {
+          "enum": [
+            "fts5_trigram",
+            "partition_substring",
+            "time_range",
+            "source_context",
+            "source_read"
+          ]
+        },
+        "unknown_message_time": {
+          "const": "excluded_from_time_order"
+        }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "step",
+        "remaining_steps",
+        "model_calls",
+        "returned_chars",
+        "elapsed_ms"
+      ],
+      "properties": {
+        "step": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8
+        },
+        "remaining_steps": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 7
+        },
+        "model_calls": {
+          "const": 0
+        },
+        "returned_chars": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "elapsed_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "query": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "terms",
+        "start_at",
+        "end_at",
+        "source_ref",
+        "direction",
+        "excerpt_offset"
+      ],
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "search",
+            "range",
+            "context",
+            "read"
+          ],
+          "default": "search"
+        },
+        "terms": {
+          "type": "array",
+          "maxItems": 6,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80,
+            "pattern": "\\S"
+          }
+        },
+        "start_at": {
+          "type": "string",
+          "maxLength": 80,
+          "pattern": "^(?:|[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2}))$"
+        },
+        "end_at": {
+          "type": "string",
+          "maxLength": 80,
+          "pattern": "^(?:|[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2}))$"
+        },
+        "source_ref": {
+          "type": "string",
+          "maxLength": 180,
+          "pattern": "^(?:|timeline:tl_.+)$"
+        },
+        "direction": {
+          "type": "string",
+          "enum": [
+            "around",
+            "before",
+            "after"
+          ],
+          "default": "around"
+        },
+        "excerpt_offset": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        }
+      }
+    }
+  }
+}

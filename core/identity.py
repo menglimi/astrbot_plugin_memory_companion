@@ -177,6 +177,8 @@ class IdentityResolver:
 
     @staticmethod
     def _original_wake_message_text(event: Any, current: str) -> str:
+        # Companion validates the active wake prefix without rewriting AstrBot's
+        # routing text. Consume only a snapshot that still describes this event.
         snapshot = getattr(event, "_private_companion_wake_message_context", None)
         if not isinstance(snapshot, dict) or bool(getattr(event, "private_companion_proactive_framework", False)):
             return current

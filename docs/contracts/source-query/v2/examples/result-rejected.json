@@ -1,0 +1,4 @@
+{
+  "profile": "memory.local-source-query.v2", "ok": false, "status": "rejected",
+  "error": "source_query_v2_not_offered", "sources": [], "batch": {}, "coverage": {}, "usage": {}
+}

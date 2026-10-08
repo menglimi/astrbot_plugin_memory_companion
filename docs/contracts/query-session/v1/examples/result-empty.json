@@ -1,0 +1,11 @@
+{
+  "profile": "memory.local-query-session.v1",
+  "ok": true,
+  "operation": "status",
+  "operation_id": null,
+  "error": "",
+  "result": null,
+  "progress": {
+    "state": "empty"
+  }
+}

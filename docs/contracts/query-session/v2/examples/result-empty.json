@@ -1,0 +1,21 @@
+{
+  "profile": "memory.local-query-session.v2",
+  "ok": true,
+  "operation": "status",
+  "operation_id": null,
+  "error": "",
+  "result": null,
+  "progress": {
+    "state": "empty"
+  },
+  "note_receipt": {
+    "status": "not_submitted"
+  },
+  "notes": {
+    "state": "empty",
+    "available": 0,
+    "withheld": 0,
+    "omitted": 0,
+    "items": []
+  }
+}
