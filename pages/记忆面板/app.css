@@ -2136,6 +2136,24 @@ html[data-ui-mode="cinema"] .starmap-card[data-theme="light"] { background: rgba
   animation: intro-grid 2s var(--ease) forwards;
 }
 .intro-inner { position: relative; text-align: center; padding: 0 24px; }
+/* 标题分两层：底下 .intro-ghost 自带**静态**高斯模糊、只淡出；上面 .intro-title
+   清晰、淡入。这样「从模糊里显出来」的效果还在，但模糊值从头到尾不重算
+   ——逐帧重算 filter:blur 是合成重灾区，手机上会掉帧（help_dex / orbit 同款做法）。 */
+.intro-title-wrap { display: grid; place-items: center; }
+.intro-title-wrap > * { grid-area: 1 / 1; }
+.intro-ghost {
+  margin: 0;
+  font-size: clamp(30px, 7.4vw, 60px);
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  line-height: 1.24;
+  color: var(--accent-2);
+  filter: blur(14px);
+  opacity: 0;
+  pointer-events: none;
+  will-change: opacity, transform;
+  animation: intro-ghost 2s var(--ease-out) forwards;
+}
 .intro-mark {
   width: 34px;
   height: 2px;
@@ -2214,11 +2232,17 @@ html[data-ui-mode="cinema"] .starmap-card[data-theme="light"] { background: rgba
   100% { opacity: 0; }
 }
 @keyframes intro-title {
-  0%, 8% { opacity: 0; transform: translateY(16px); filter: blur(12px); }
-  34% { opacity: 1; transform: translateY(0); filter: blur(0); }
+  0%, 8% { opacity: 0; transform: translateY(16px); }
+  34% { opacity: 1; transform: translateY(0); }
   46% { background-position: 130% 0; }
   78% { opacity: 1; background-position: -30% 0; }
   100% { opacity: 0; transform: translateY(-6px); }
+}
+@keyframes intro-ghost {
+  0%, 8% { opacity: 0; transform: scale(1.08); }
+  26% { opacity: 0.5; transform: scale(1.03); }
+  52% { opacity: 0.18; }
+  80%, 100% { opacity: 0; transform: scale(1); }
 }
 @keyframes intro-sub {
   0%, 34% { opacity: 0; transform: translateY(8px); }

@@ -2,6 +2,40 @@
 
 本项目遵循面向用户体验的版本记录。日期使用北京时间。
 
+## 2.3.3 - 2026-10-14（本地补丁，非上游）
+
+### 工具注册改由配置开关控制
+
+- `@filter.llm_tool` 在模块导入时就注册了工具，那时拿不到配置，开关只在函数体内部检查；
+  于是关掉的功能仍留在 LLM 的工具列表里，模型先白跑一轮调用（实测 5–10 秒）才拿到
+  disabled 错误再重新决策。新增 `_gate_disabled_tools()`，在 `initialize()` 末尾按开关撤下：
+  重建类（`sources` / `events` / `navigate` / `discover_sources`，受 `memory_reconstruction.enabled`
+  与 `memory_tools.enable_reconstruction_tool`）、`recall`、`remember`、`note_create/read/delete`。
+  开关为默认值时行为不变。
+
+### 摘要请求重试次数 0 → 1
+
+- `core/summarizer.py` 调 `provider.text_chat(request_max_retries=0)`；AstrBot 的最小值为 1，
+  于是每次总结都记一条 `request_max_retries=0 is below minimum 1` 告警（实测 29 条）。改为 1。
+
+### 开场幕布首帧不闪、去掉逐帧模糊
+
+- `legacy.html` 的幕布底色原本依赖 `app.css` 里的 CSS 变量，样式到达前 WebView 会先画一帧
+  未上样式的页面/面板（「一开头闪一下、边角漏出后面的面板」）。在 `<head>` 内联一段首帧兜底
+  （页面底色 + 幕布位置/底色），app.css 到达后由它的完整规则接管。
+- 标题原本逐帧重算 `filter: blur(12px→0)`，是合成重灾区（手机上掉帧）。改为两层：
+  底下 `.intro-ghost` 用**静态**模糊只做淡出，上面 `.intro-title` 清晰淡入；
+  「从模糊里显出来」的效果不变，但模糊值从头到尾不重算（help_dex / orbit 同款做法）。
+
+## 2.3.2 - 2026-10-08
+
+### 注入记录可见性修复
+
+- 总览恢复最近注入明细，显示查询、时间、选中记忆、注入字数和过滤数量。
+- Memory OS 新版终端增加独立的最近注入状态区和刷新入口，避免新版只显示记忆档案而看不到主链注入状态。
+- `/logs` 纳入总览 UI 契约，继续复用后端已有脱敏数据，不新增原文暴露路径。
+- 更新静态资源版本标识，避免浏览器继续使用 2.3.1 的页面缓存。
+
 ## 2.3.1 - 2026-10-08
 
 ### 数据库初始化与关闭竞态修复

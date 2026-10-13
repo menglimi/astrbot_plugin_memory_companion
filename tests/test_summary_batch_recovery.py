@@ -159,7 +159,7 @@ class SummaryBatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(5):
             await self.service.maybe_summarize_session(self.ctx)
         self.assertEqual(3, len(p1.calls) + len(p2.calls))
-        self.assertTrue(all(c['request_max_retries'] == 0 for c in p1.calls + p2.calls))
+        self.assertTrue(all(c['request_max_retries'] == 1 for c in p1.calls + p2.calls))
         store = self.service.store
         db_path = store.db_path
         store.close()

@@ -153,7 +153,7 @@ class MemorySummarizer:
         kwargs: dict[str, Any] = {
             "prompt": prompt,
             "system_prompt": self._system_prompt(),
-            "request_max_retries": 0,
+            "request_max_retries": 1,
         }
         started = time.monotonic()
         try:
