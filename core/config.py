@@ -64,7 +64,6 @@ class ConfigView:
         "context_orchestration.conversation_summary_limit": ("context_orchestration_advanced.conversation_summary_limit",),
         "context_orchestration.stable_memory_limit": ("context_orchestration_advanced.stable_memory_limit",),
         "maintenance.pending_review_max_age_days": ("maintenance.pending_candidate_retention_days",),
-        "maintenance.pending_review_max_age_days": ("maintenance.pending_candidate_retention_days",),
         # maintenance → maintenance_decay
         "maintenance.memory_decay_after_days": ("maintenance_decay.memory_decay_after_days",),
         "maintenance.memory_decay_idle_days": ("maintenance_decay.memory_decay_idle_days",),

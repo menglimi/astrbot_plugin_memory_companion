@@ -15,7 +15,6 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
-from zoneinfo import ZoneInfo
 
 from quart import jsonify, request, send_file
 
@@ -28,6 +27,7 @@ from .core.bridge import serialize_memory
 from .core.capability_probe import CAPABILITY_SNAPSHOT_FIELDS
 from .core.coordination_status import build_coordination_status, project_p6_status
 from .core.identity import normalize_session_context_fields, parse_scope_from_session
+from .core.local_time import local_tz
 from .core.memory_atom import DURABILITY_LEVELS, SENSITIVITY_LEVELS, VALIDITY_STATUSES
 from .core.models import SessionContext, clean_text
 from .companion_page_bridge import (
@@ -93,7 +93,7 @@ UI_MODES = (
     {"id": "cinema", "label": "放映馆界面"},
 )
 UI_VIEW_ENDPOINTS = {
-    "overview": ("/stats", "/buckets"),
+    "overview": ("/stats", "/buckets", "/logs"),
     "users": (
         "/memories",
         "/memory",
@@ -215,7 +215,7 @@ UI_ENDPOINT_EXPOSURE = {
     "/graph": {"exposure": "compat", "reason": "旧知识图谱数据入口，面板改用 /memories 结果本地构图，保留兼容读取"},
     "/threads": {"exposure": "compat", "reason": "旧开放线程列表入口，面板改用 /stats 与 /memories 聚合，保留兼容读取"},
     "/thread/status": {"exposure": "advanced", "reason": "线程开闭状态写入，面板不提供按钮，保留给管理员直接维护未闭环线程"},
-    "/logs": {"exposure": "compat", "reason": "注入日志明细，面板只显示 /stats 的条数汇总，保留给排障直连读取"},
+    "/logs": {"exposure": "visible", "reason": "总览与 Memory OS 展示最近注入轮次，内容为脱敏后的诊断摘要"},
     "/context/config": {"exposure": "compat", "reason": "上下文编排配置读取，面板统一走 /config/schema 的 context_orchestration 模块"},
     "/retrieval/config/update": {"exposure": "compat", "reason": "检索配置写入，面板统一走 /config/module/update 的 retrieval 模块"},
     "/memory/rebind-owner": {"exposure": "compat", "reason": "记忆归属改绑，面板统一走 /memory/update 表单，保留兼容修复入口"},
@@ -327,6 +327,8 @@ class PluginPageApi:
             ("/maintenance/clear_all", self.clear_all, ["POST"], "MemoryCompanion Page clear all memory data"),
             ("/maintenance/clear_scope", self.clear_scope, ["POST"], "MemoryCompanion Page clear scoped memory data"),
             ("/maintenance/release_summary_batch", self.release_summary_batch, ["POST"], "MemoryCompanion Page release quarantined summary batch"),
+            ("/maintenance/summary_batches", self.summary_batches, ["GET"], "MemoryCompanion Page list quarantined summary batches"),
+            ("/maintenance/release_summary_batches", self.release_summary_batches, ["POST"], "MemoryCompanion Page bulk release quarantined summary batches"),
             ("/import/livingmemory/preview", self.import_preview, ["GET"], "MemoryCompanion Page import preview"),
             ("/import/livingmemory/run", self.import_run, ["POST"], "MemoryCompanion Page import run"),
             ("/persona-state", self.persona_state, ["GET"], "MemoryCompanion Page persona state"),
@@ -1674,7 +1676,7 @@ class PluginPageApi:
                     "trigger_event_count": config.int("memory_summary.trigger_event_count", 20),
                     "trigger_interval_minutes": config.int("memory_summary.trigger_interval_minutes", 60),
                     "max_events_per_summary": config.int("memory_summary.max_events_per_summary", 40),
-                    "max_retries": config.int("memory_summary.max_retries", 3),
+                    "max_retries": config.int("memory_summary.max_retries", 5),
                     "retry_backoff_seconds": config.int("memory_summary.retry_backoff_seconds", 60),
                     "transient_retry_cooldown_minutes": config.int(
                         "memory_summary.transient_retry_cooldown_minutes", 10
@@ -2656,7 +2658,7 @@ class PluginPageApi:
             normalized = text.replace("Z", "+00:00")
             dt = datetime.fromisoformat(normalized)
             if dt.tzinfo is not None:
-                dt = dt.astimezone(ZoneInfo("Asia/Shanghai"))
+                dt = dt.astimezone(local_tz())
             return dt.date().isoformat()
         except Exception:
             return text[:10] if len(text) >= 10 else ""
@@ -2668,7 +2670,7 @@ class PluginPageApi:
             return self._date_key(value)
         if ts <= 0:
             return ""
-        return datetime.fromtimestamp(ts, ZoneInfo("Asia/Shanghai")).date().isoformat()
+        return datetime.fromtimestamp(ts, local_tz()).date().isoformat()
 
     def _timestamp_label(self, value: Any) -> str:
         try:
@@ -2677,7 +2679,7 @@ class PluginPageApi:
             return clean_text(value, 40)
         if ts <= 0:
             return ""
-        return datetime.fromtimestamp(ts, ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
+        return datetime.fromtimestamp(ts, local_tz()).strftime("%Y-%m-%d %H:%M")
 
     def _is_personal_action(self, record: Any) -> bool:
         tags = getattr(record, "tags", []) or []
@@ -3221,6 +3223,45 @@ class PluginPageApi:
             return self._err(clean_text(result.get("error"), 120) or "release failed", 400)
         return self._ok({"data": result})
 
+    async def summary_batches(self):
+        """List the quarantined batches a human is asked to review.
+
+        The overview only showed a count and the release endpoint needs a batch
+        id, so without this read side the freeze was effectively unactionable.
+        """
+        state = clean_text(request.args.get("state", "quarantined"), 40) or "quarantined"
+        if state != "quarantined":
+            return self._err("unsupported_state", 400)
+        result = await self.plugin.service.store.list_quarantined_batches(
+            limit=max(1, min(500, self._int(request.args.get("limit"), 50))),
+            offset=max(0, self._int(request.args.get("offset"), 0)),
+        )
+        return self._ok({"data": result})
+
+    async def release_summary_batches(self):
+        """Release a whole backlog of quarantined batches in one request."""
+        payload = await self._json()
+        mode = clean_text(payload.get("mode"), 20).lower() or "retry"
+        raw_ids = payload.get("batch_ids")
+        batch_ids = [clean_text(item, 160) for item in raw_ids] if isinstance(raw_ids, list) else []
+        batch_ids = [item for item in batch_ids if item]
+        all_quarantined = self._bool(payload.get("all"), False)
+        if not all_quarantined and not batch_ids:
+            return self._err("batch_ids or all is required", 400)
+        raw_limit = payload.get("limit")
+        limit = None
+        if raw_limit not in (None, ""):
+            try:
+                limit = max(1, min(2000, int(raw_limit)))
+            except (TypeError, ValueError):
+                limit = None
+        result = await self.plugin.service.store.release_quarantined_batches(
+            mode=mode, batch_ids=batch_ids, all_quarantined=all_quarantined, limit=limit
+        )
+        if not result.get("ok"):
+            return self._err(clean_text(result.get("error"), 120) or "release failed", 400)
+        return self._ok({"data": result})
+
     async def import_preview(self):
         configured = clean_text(request.args.get("path", ""), 1000)
         report = self.plugin.service.migrator.preview(configured)
@@ -3672,7 +3713,7 @@ class PluginPageApi:
     def _iso_timestamp_number(value: str) -> float:
         parsed = datetime.fromisoformat(clean_text(value, 80).replace("Z", "+00:00"))
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+            parsed = parsed.replace(tzinfo=local_tz())
         return parsed.timestamp()
 
     @staticmethod

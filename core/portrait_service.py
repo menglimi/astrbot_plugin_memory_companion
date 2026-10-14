@@ -1,13 +1,13 @@
 """Memory-owned REQ-036 portrait capture, governance, and read boundary."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
 try:
     from ..unified_profile_contract import build_person_ref, validate_profile_dto
 except ImportError:  # Existing standalone core.* test/import compatibility.
     from unified_profile_contract import build_person_ref, validate_profile_dto  # type: ignore[no-redef]
+from .local_time import local_now
 from .models import SessionContext, clean_text
 from .portrait import (
     build_evidence,
@@ -210,7 +210,7 @@ class PortraitService:
     async def run_daily_batch(self, person_id: str, *, run_day: str = "") -> dict[str, Any]:
         day = clean_text(run_day, 16)
         if not day:
-            day = datetime.now(timezone.utc).astimezone().date().isoformat()
+            day = local_now().date().isoformat()
         return await self.store.run_portrait_daily_batch(
             person_id=person_id,
             run_day=day,

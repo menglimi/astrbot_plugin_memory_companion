@@ -14,7 +14,6 @@ class SummaryBatchStore:
     """Batch queue state; the store owns the transaction and the clock."""
 
     BUDGET_RETRY_REASON = "budget"
-    REPAIR_RETRY_REASON = "repair_used"
 
     @classmethod
     def _due_clause(cls, alias: str = "") -> str:
@@ -97,6 +96,14 @@ class SummaryBatchStore:
             return
         if int(retry_column["notnull"] or 0) == 1:
             self._rebuild_summary_batches_nullable_retry_sync(columns)
+            # The rebuild recreates the table with ``retry_reason`` already in
+            # place, so the snapshot taken before it is stale: re-read the
+            # columns or the follow-up ALTER would fail with "duplicate column
+            # name" on exactly the legacy shape this method exists to fix.
+            columns = [
+                row
+                for row in self._conn.execute("PRAGMA table_info(summary_batches)").fetchall()
+            ]
         if not any(clean_text(row["name"], 40) == "retry_reason" for row in columns):
             self._conn.execute(
                 "ALTER TABLE summary_batches ADD COLUMN retry_reason TEXT NOT NULL DEFAULT ''"
@@ -395,6 +402,135 @@ class SummaryBatchStore:
 
         return await asyncio.to_thread(release)
 
+    async def list_quarantined_batches(self, *, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        """Read the quarantined queue for the panel, most recently touched first.
+
+        A quarantined batch owns its events and is never selected by the
+        automatic pass again, so the only way to end the freeze is this listing
+        plus ``release_quarantined_batches``.  Without it the panel could show a
+        count but never the batch ids a human is asked to review.
+        """
+        def read():
+            with self._lock:
+                total = self._conn.execute(
+                    "SELECT COUNT(*) FROM summary_batches WHERE state='quarantined'"
+                ).fetchone()[0]
+                legacy = self._conn.execute("SELECT COUNT(*) FROM summary_failures").fetchone()[0]
+                rows = self._conn.execute('''
+                    SELECT b.id, b.session_id, b.scope, b.automatic_calls, b.repair_used,
+                           b.last_error, b.created_at, b.updated_at,
+                           (SELECT COUNT(*) FROM summary_batch_events e WHERE e.batch_id=b.id) AS event_count
+                    FROM summary_batches b WHERE b.state='quarantined'
+                    ORDER BY b.updated_at DESC, b.id LIMIT ? OFFSET ?''',
+                    (max(1, int(limit)), max(0, int(offset)))).fetchall()
+                return {
+                    "total": int(total or 0),
+                    "legacy_failures": int(legacy or 0),
+                    "batches": [dict(row) for row in rows],
+                }
+        return await asyncio.to_thread(read)
+
+    async def release_quarantined_batches(
+        self, *, mode: str = "retry", batch_ids=None, all_quarantined: bool = False, limit=None
+    ) -> dict[str, Any]:
+        """Release many quarantined batches in one transaction.
+
+        ``release_summary_batch`` handles a single human-chosen batch; the panel
+        also needs to clear a backlog of hundreds, which would otherwise mean one
+        round-trip per id.  ``mode='retry'`` hands the events back for a later
+        batch, ``mode='discard'`` marks them summarized and accepts the loss.
+        """
+        normalized_mode = clean_text(mode, 20).lower()
+        if normalized_mode not in {"retry", "discard"}:
+            return {"ok": False, "error": "unsupported_release_mode", "mode": normalized_mode}
+
+        def release():
+            with self._lock, self._transaction_sync():
+                if all_quarantined:
+                    selected = self._conn.execute(
+                        "SELECT id FROM summary_batches WHERE state='quarantined' ORDER BY updated_at, id"
+                    ).fetchall()
+                    ids = [clean_text(row[0], 160) for row in selected]
+                else:
+                    ids = [clean_text(item, 160) for item in (batch_ids or [])]
+                ids = [item for item in ids if item]
+                if limit is not None:
+                    ids = ids[: max(0, int(limit))]
+                released = 0
+                skipped = 0
+                for batch_id in ids:
+                    row = self._conn.execute(
+                        "SELECT state FROM summary_batches WHERE id=?", (batch_id,)
+                    ).fetchone()
+                    if not row or row["state"] != "quarantined":
+                        skipped += 1
+                        continue
+                    event_ids = [
+                        clean_text(item[0], 160)
+                        for item in self._conn.execute(
+                            "SELECT event_id FROM summary_batch_events WHERE batch_id=?", (batch_id,)
+                        )
+                    ]
+                    event_ids = [event_id for event_id in event_ids if event_id]
+                    if normalized_mode == "discard" and event_ids:
+                        placeholders = ",".join("?" for _ in event_ids)
+                        self._conn.execute(
+                            f"UPDATE timeline SET summarized_at=? WHERE id IN ({placeholders}) AND summarized_at=''",
+                            [utc_now(), *event_ids],
+                        )
+                    self._conn.execute("DELETE FROM summary_batch_events WHERE batch_id=?", (batch_id,))
+                    if normalized_mode == "retry":
+                        self._conn.execute(
+                            "UPDATE summary_batches SET state='retry_pending',automatic_calls=0,repair_used=0,"
+                            "next_retry_at=NULL,retry_reason='',last_error='',memory_id='',updated_at=? WHERE id=?",
+                            (utc_now(), batch_id),
+                        )
+                    else:
+                        self._conn.execute(
+                            "UPDATE summary_batches SET state='completed',next_retry_at=NULL,retry_reason='',updated_at=? WHERE id=?",
+                            (utc_now(), batch_id),
+                        )
+                    released += 1
+                return {
+                    "ok": True,
+                    "mode": normalized_mode,
+                    "released": released,
+                    "skipped": skipped,
+                    "candidates": len(ids),
+                }
+        return await asyncio.to_thread(release)
+
+    async def reap_stale_quarantined_batches(
+        self, *, older_than_days: int, limit: int = 50, mode: str = "retry"
+    ) -> dict[str, Any]:
+        """Re-queue quarantined batches that have been frozen longer than a window.
+
+        Quarantine is meant to be a review pause, not a permanent sink: without
+        this the queue only ever grows.  Releasing a batch refreshes
+        ``updated_at``, so a batch that fails again is not re-reaped until the
+        window has passed once more.
+        """
+        days = int(older_than_days or 0)
+        if days <= 0:
+            return {"ok": True, "released": 0, "mode": mode, "disabled": True}
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+
+        def select():
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT id FROM summary_batches WHERE state='quarantined' AND updated_at<=? "
+                    "ORDER BY updated_at, id LIMIT ?",
+                    (cutoff, max(1, int(limit))),
+                ).fetchall()
+                return [clean_text(row[0], 160) for row in rows if clean_text(row[0], 160)]
+
+        ids = await asyncio.to_thread(select)
+        if not ids:
+            return {"ok": True, "released": 0, "mode": mode, "cutoff": cutoff}
+        result = await self.release_quarantined_batches(mode=mode, batch_ids=ids)
+        result["cutoff"] = cutoff
+        return result
+
     async def finish_summary_batch(
         self,
         batch_id,
@@ -442,7 +578,8 @@ class SummaryBatchStore:
                 return {'raw_events': timeline[0], 'last_recorded_at': timeline[1] or '',
                         'conversation_memories': memories[0], 'last_summary_at': memories[1] or '',
                         'pending_batches': int(pending or 0),
-                        'quarantined_batches': counts.get('quarantined', 0) + legacy,
+                        'quarantined_batches': int(counts.get('quarantined', 0) or 0),
+                        'legacy_failures': int(legacy or 0),
                         'frozen_events': int(frozen or 0),
                         'no_memory_batches': counts.get('no_memory', 0)}
         return await asyncio.to_thread(read)

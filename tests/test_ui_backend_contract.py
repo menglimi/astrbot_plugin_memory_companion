@@ -203,6 +203,16 @@ class UiBackendContractTests(unittest.TestCase):
             self.assertTrue(endpoints, view)
             self.assertEqual(set(), set(endpoints) - routes, view)
 
+    def test_recent_injection_trace_is_wired_to_both_panel_modes(self) -> None:
+        views = literal(assignment(self.tree, "UI_VIEW_ENDPOINTS"))
+        self.assertIn("/logs", views["overview"])
+        modern = (ROOT / "pages" / "记忆面板" / "modern.html").read_text(encoding="utf-8")
+        injection_script = (ROOT / "pages" / "记忆面板" / "injection-status.js").read_text(encoding="utf-8")
+        self.assertIn("./injection-status.js?v=", modern)
+        self.assertIn('bridge.apiGet("page/logs"', injection_script)
+        self.assertIn("/logs?limit=", injection_script)
+        self.assertIn("最近注入", injection_script)
+
 
 if __name__ == "__main__":
     unittest.main()

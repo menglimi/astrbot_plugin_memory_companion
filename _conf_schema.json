@@ -95,6 +95,12 @@
         "hint": "默认关闭（行为与旧版一致）。开启后，写入新记忆时把「Bot 自我时间线」「情绪较重」两类记忆的 mention_policy 从 tone_only 提为 soft_echo，使注入侧能给出这些记忆的内容而非纯语气提示。只影响之后新写入的记忆；存量记忆需回填或依赖注入侧放宽参数。",
         "type": "bool",
         "default": false
+      },
+      "reliable_sources_enabled": {
+        "description": "启用可靠来源捕获",
+        "hint": "记忆捕获与来源索引的总开关（默认开启）。关闭后不再记录用户消息、Bot 回复和来源片段，用于临时停用整个捕获链路；阶段总结、管理命令和手动写入不受影响。",
+        "type": "bool",
+        "default": true
       }
     }
   },
@@ -363,6 +369,18 @@
         "hint": "后台总结等待全局并发槽位的最长时间；超时则本轮跳过，等新消息再次触发。0 表示无限等待。",
         "type": "int",
         "default": 20
+      },
+      "quarantine_auto_retry_days": {
+        "description": "隔离批次自动重排天数",
+        "hint": "被隔离（待修复）的总结批次闲置超过该天数后，维护任务会自动把它们重新排队，把事件交还给后续会话重新总结，避免隔离区只增不减。0 表示关闭自动重排，只由面板手动释放。",
+        "type": "int",
+        "default": 7
+      },
+      "quarantine_auto_retry_limit": {
+        "description": "每次自动重排上限",
+        "hint": "每轮维护最多自动重排多少个隔离批次，避免一次性把大量旧批次推回队列。面板手动释放不受此限制。",
+        "type": "int",
+        "default": 50
       }
     }
   },

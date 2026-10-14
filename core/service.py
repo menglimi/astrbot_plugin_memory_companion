@@ -16,7 +16,6 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
-from zoneinfo import ZoneInfo
 
 from .astrbot_compat import (
     _plain_request_text,
@@ -65,6 +64,7 @@ from .injection import (
     MEMORY_COMPANION_INJECTION_HEADER,
     InjectionComposer,
 )
+from .local_time import bind_timezone_provider, local_tz, timezone_name
 from .migration_livingmemory import LivingMemoryMigrator
 from .models import (
     EntityRef,
@@ -141,9 +141,6 @@ from .summarizer import MemorySummarizer
 from .time_intent import TimeIntent, parse_time_intent
 from .turn_signal import analyze_turn_signal, message_terms
 from .visibility import VisibilityPolicy
-
-
-LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 USER_MEMORY_SUMMARY_VERSION = "memory.user_memory_summary.v1"
 _USER_MEMORY_PROFILE_TYPES = frozenset({"user_profile", "user_habit", "manual_memory"})
@@ -314,6 +311,29 @@ class MemoryCompanionService:
     # missed write-path update self-heals within one interval.
     _ACL_RECONCILE_INTERVAL_SECONDS = 60.0
 
+    def _host_timezone_name(self) -> str:
+        """Read AstrBot's global ``timezone`` for the plugin's wall clock.
+
+        AstrBot is the single owner of this setting and other plugins read the
+        same value, so mirroring it keeps memory summaries and time queries
+        aligned with the rest of the deployment.
+        """
+        context = getattr(self, "context", None)
+        getter = getattr(context, "get_config", None)
+        if not callable(getter):
+            return ""
+        try:
+            config = getter()
+        except Exception:
+            return ""
+        if config is None:
+            return ""
+        try:
+            value = config.get("timezone") if hasattr(config, "get") else getattr(config, "timezone", "")
+        except Exception:
+            return ""
+        return clean_text(value, 80)
+
     def __init__(
         self,
         *,
@@ -327,6 +347,9 @@ class MemoryCompanionService:
         self.config = ConfigView(config)
         self.plugin_root = Path(plugin_root)
         self.data_dir = Path(data_dir)
+        # The host owns the wall-clock timezone; bind it before any time-based
+        # work so summaries and queries use the same zone as AstrBot itself.
+        bind_timezone_provider(self._host_timezone_name)
 
         # 启动宽限期：插件加载后的前 N 秒内暂缓创建任何后台任务，
         # 避开 AstrBot 核心加载完插件后执行的 SQLAlchemy 连接池迁移窗口，
@@ -1404,7 +1427,7 @@ class MemoryCompanionService:
         return start, end
 
     def _portrait_seconds_until_window(self, now: datetime | None = None) -> float:
-        local_now = (now or datetime.now(LOCAL_TZ)).astimezone(LOCAL_TZ)
+        local_now = (now or datetime.now(local_tz())).astimezone(local_tz())
         start, end = self._portrait_window_hours()
         if start <= local_now.hour < end:
             return 0.0
@@ -1567,6 +1590,12 @@ class MemoryCompanionService:
             try:
                 self._maintenance_dispatch_status["state"] = "running"
                 result = await self.sleep_maintenance(reason="scheduled_natural_forgetting")
+                quarantine_days = self.config.int("memory_summary.quarantine_auto_retry_days", 7)
+                if quarantine_days > 0:
+                    await self.store.reap_stale_quarantined_batches(
+                        older_than_days=quarantine_days,
+                        limit=max(1, self.config.int("memory_summary.quarantine_auto_retry_limit", 50)),
+                    )
                 self._maintenance_dispatch_status.update(
                     {
                         "state": "scheduled",
@@ -1605,10 +1634,10 @@ class MemoryCompanionService:
                 # Do not repeatedly re-enter the same window after the two
                 # bounded attempts.  The next pass begins on the next local
                 # calendar day.
-                next_start = (datetime.now(LOCAL_TZ) + timedelta(days=1)).replace(
+                next_start = (datetime.now(local_tz()) + timedelta(days=1)).replace(
                     hour=self._portrait_window_hours()[0], minute=0, second=0, microsecond=0
                 )
-                await asyncio.sleep(max(60.0, (next_start - datetime.now(LOCAL_TZ)).total_seconds()))
+                await asyncio.sleep(max(60.0, (next_start - datetime.now(local_tz())).total_seconds()))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1620,7 +1649,7 @@ class MemoryCompanionService:
                 await asyncio.sleep(15 * 60)
 
     async def run_due_portrait_batches(self, *, force_window: bool = False) -> dict[str, Any]:
-        now = datetime.now(LOCAL_TZ)
+        now = datetime.now(local_tz())
         if not force_window and self._portrait_seconds_until_window(now) > 0:
             return {"ok": True, "code": "portrait_window_closed", "processed": 0, "results": []}
         run_day = now.date().isoformat()
@@ -2714,7 +2743,7 @@ class MemoryCompanionService:
                 "warnings": ["store_unavailable"],
             }
         if not clean_text(current_date, 20) or not clean_text(current_window, 40):
-            now = datetime.now(ZoneInfo("Asia/Shanghai"))
+            now = datetime.now(local_tz())
             current_date = current_date or now.strftime("%Y-%m-%d")
             current_window = current_window or self._bot_personal_window_for_datetime(now)
         return build_profile_result(
@@ -4180,7 +4209,7 @@ class MemoryCompanionService:
         error: str = "",
     ) -> None:
         usage = self._extract_token_usage(resp, prompt, completion)
-        now_dt = datetime.now(LOCAL_TZ)
+        now_dt = datetime.now(local_tz())
         now_ts = time.time()
         day = now_dt.strftime("%Y-%m-%d")
         hour = now_dt.strftime("%Y-%m-%dT%H:00")
@@ -5687,8 +5716,7 @@ class MemoryCompanionService:
                         ),
                     )
                 spent = not force and int((current or {}).get("automatic_calls") or 0) >= max_calls
-                no_more_attempts = spent or str((current or {}).get("retry_reason") or "") == self.store.REPAIR_RETRY_REASON
-                if no_more_attempts:
+                if spent:
                     # Nothing usable came back and this batch is out of attempts,
                     # so freeze it instead of consuming events of unproven value.
                     logger.warning(
@@ -5735,8 +5763,9 @@ class MemoryCompanionService:
             )
             summary_quality = self.summarizer.summary_quality(payload or {})
             evidence_gate_passed = summary_quality == "normal"
+            candidate_valid_days = max(1, self.config.int("memory_summary.candidate_valid_days", 30))
             candidate_valid_to = (
-                (datetime.now(timezone.utc) + timedelta(days=14)).isoformat(timespec="seconds")
+                (datetime.now(timezone.utc) + timedelta(days=candidate_valid_days)).isoformat(timespec="seconds")
                 if not evidence_gate_passed
                 else ""
             )
@@ -5776,7 +5805,7 @@ class MemoryCompanionService:
                     "end_at": end_at,
                     "start_at_local": start_at_local,
                     "end_at_local": end_at_local,
-                    "timezone": "Asia/Shanghai",
+                    "timezone": timezone_name(),
                     "summarizer": "companion_memory_schema_v1",
                     "summary_schema_version": "companion_memory_v1",
                     "owner_bot_id": self._bot_subject_id(ctx),
@@ -8127,7 +8156,7 @@ class MemoryCompanionService:
                 "end_at": clean_text(metadata.get("end_at"), 80),
                 "start_at_local": clean_text(metadata.get("start_at_local"), 80),
                 "end_at_local": clean_text(metadata.get("end_at_local"), 80),
-                "timezone": clean_text(metadata.get("timezone") or "Asia/Shanghai", 40),
+                "timezone": clean_text(metadata.get("timezone") or timezone_name(), 40),
             },
             "subject": {
                 "id": clean_text(memory.subject.id, 120),
@@ -8366,6 +8395,9 @@ class MemoryCompanionService:
     async def operational_report(self) -> dict[str, Any]:
         report = await build_operational_report(self)
         report["summary_progress"] = await self.store.summary_progress()
+        # Surface the wall-clock zone the plugin actually uses, so a host
+        # timezone mismatch is visible instead of silently skewing summaries.
+        report["timezone"] = timezone_name()
         return report
 
     async def export_portable_data(self) -> dict[str, Any]:
@@ -10207,7 +10239,7 @@ class MemoryCompanionService:
             return text
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
+        return parsed.astimezone(local_tz()).strftime("%Y-%m-%d %H:%M:%S")
 
     @staticmethod
     def _recent_fact_categories(text: Any) -> set[str]:
@@ -10348,7 +10380,7 @@ class MemoryCompanionService:
             return ""
         lines = [f"方向：{direction}；有效窗口：近 {ttl_minutes} 分钟；仅含当前用户与同一 Bot 的片段。"]
         for item in reversed(selected):
-            local_time = item["occurred_at"].astimezone(ZoneInfo("Asia/Shanghai")).strftime("%H:%M")
+            local_time = item["occurred_at"].astimezone(local_tz()).strftime("%H:%M")
             lines.append(f"{local_time} {item['speaker']}：{item['text']}")
         return clean_text(" | ".join(lines), 1100)
 
@@ -10425,7 +10457,7 @@ class MemoryCompanionService:
             f"以下是同一私聊近 {ttl_hours} 小时的原始事实锚点，不是长期摘要；有更新时以较新的明确说法为准："
         ]
         for fact in selected:
-            local_time = fact["occurred_at"].astimezone(ZoneInfo("Asia/Shanghai")).strftime("%H:%M")
+            local_time = fact["occurred_at"].astimezone(local_tz()).strftime("%H:%M")
             user_text = self.injection._redact_sensitive_text(fact["text"])
             line = f"- {local_time} 用户明确说：{user_text}"
             acknowledgements = [
@@ -12412,7 +12444,7 @@ class MemoryCompanionService:
         if not check_like:
             return False
         try:
-            hour = datetime.now(LOCAL_TZ).hour
+            hour = datetime.now(local_tz()).hour
         except Exception:
             return True
         return hour >= 23 or hour < 7
@@ -12995,7 +13027,7 @@ class MemoryCompanionService:
     def _compute_time_of_day(self) -> str:
         """Compute time-of-day category for atmosphere hints."""
         try:
-            hour = datetime.now(LOCAL_TZ).hour
+            hour = datetime.now(local_tz()).hour
         except Exception:
             return ""
         if 23 <= hour or hour < 4:

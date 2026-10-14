@@ -27,12 +27,22 @@
       } catch (_) {}
     })();
   </script>
-  <link rel="stylesheet" href="./app.css?v=2.3.1" />
+  <style>
+    /* 首帧兜底：在 app.css 到达之前就把页面底色和幕布摆好。
+       否则 WebView 会先画一帧白底（或没上样式的面板），用户看到的就是
+       「一开头闪一下、边角漏出后面的面板」。这里只放第一眼必须正确的三条：
+       页面底色、幕布位置、幕布底色。app.css 到了之后会被它的完整规则接管。 */
+    html { background: #0b0d12; }
+    html[data-theme="light"] { background: #f6f7fa; }
+    .intro { position: fixed; inset: 0; z-index: 200; background: #0b0d12; }
+    html[data-theme="light"] .intro { background: #f6f7fa; }
+  </style>
+  <link rel="stylesheet" href="./app.css?v=2.3.4" />
   <!-- app.js 挂载三维档案阵列与装配查看器时只认 window.MemoryCinema3D，而全仓库
        只有 cinema-3d.bundle.js 会定义它。缺了这个标签，面板会等满 8 秒再显示
        "ARCHIVE SCENE / UNAVAILABLE"，且重试按钮永远无效。放在 head 里让下载提前
        开始；该包是自包含的 ES module，不依赖 assets/ 下的 three.js 与 loader。 -->
-  <script type="module" src="./assets/cinema-3d.bundle.js?v=2.3.1"></script>
+  <script type="module" src="./assets/cinema-3d.bundle.js?v=2.3.4"></script>
 </head>
 <body>
   <!-- 开场遮罩。指针恒不吃（见 app.css 的 .intro），且不依赖 JS 收尾：
@@ -41,7 +51,10 @@
   <div class="intro" id="intro" aria-hidden="true">
     <div class="intro-inner">
       <div class="intro-mark"></div>
-      <h1 class="intro-title">我会牢牢记住你</h1>
+      <div class="intro-title-wrap">
+        <span class="intro-ghost" aria-hidden="true">我会牢牢记住你</span>
+        <h1 class="intro-title">我会牢牢记住你</h1>
+      </div>
       <p class="intro-sub">MEMORY COMPANION · 记忆中枢</p>
       <div class="intro-rule"><i></i></div>
     </div>
@@ -81,6 +94,6 @@
       window.setTimeout(drop, 4000);
     })();
   </script>
-  <script src="/api/plugin/page/bridge-sdk.js"></script><script src="./app.js?v=2.3.1"></script>
+  <script src="/api/plugin/page/bridge-sdk.js"></script><script src="./app.js?v=2.3.4"></script>
 </body>
 </html>

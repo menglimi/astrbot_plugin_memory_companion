@@ -19,7 +19,7 @@ from .core.query_session import bind_query_tool_schema, bind_query_tool_v3_schem
 from .core.service import MemoryCompanionService
 
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
-PLUGIN_VERSION = "2.3.1"
+PLUGIN_VERSION = "2.3.4"
 
 _ACTIVE_BRIDGE: MemoryCompanionBridge | None = None
 
@@ -74,6 +74,38 @@ class MemoryCompanionPlugin(Star):
 
         logger.info("[MemoryCompanion] 我会牢牢记住你 已启动，数据目录=%s", self.service.data_dir)
 
+    def _gate_disabled_tools(self) -> None:
+        """撤下被配置开关关掉的工具。
+
+        `@filter.llm_tool` 在模块导入时就注册了工具，那时还拿不到配置，只能在拿到
+        配置后撤销——否则关掉的功能仍留在 LLM 的工具列表里，模型会先白跑一轮调用
+        才拿到 disabled 错误，再重新决策。
+        """
+        config = self.service.config
+        manager = self.context.get_llm_tool_manager()
+        if (
+            not config.bool("memory_reconstruction.enabled", True)
+            or not config.bool("memory_tools.enable_reconstruction_tool", True)
+        ):
+            for name in (
+                "memory_companion_sources",
+                "memory_companion_events",
+                "memory_companion_navigate",
+                "memory_companion_discover_sources",
+            ):
+                manager.remove_func(name)
+        if not config.bool("memory_tools.enable_recall_tool", True):
+            manager.remove_func("memory_companion_recall")
+        if not config.bool("memory_tools.enable_remember_tool", True):
+            manager.remove_func("memory_companion_remember")
+        if not config.bool("memory_tools.enable_note_tools", True):
+            for name in (
+                "memory_companion_note_create",
+                "memory_companion_note_read",
+                "memory_companion_note_delete",
+            ):
+                manager.remove_func(name)
+
     async def initialize(self):
         """Start retained maintenance workers after AstrBot owns the event loop."""
         if not await self.service.initialize_database():
@@ -86,6 +118,7 @@ class MemoryCompanionPlugin(Star):
             logger.info("[MemoryCompanion] source discovery v3 binding unavailable; keeping legacy query projection")
         if not bind_source_query_v2_schema(self.context.get_llm_tool_manager(), type(self).__module__):
             logger.info("[MemoryCompanion] source range batch binding unavailable; keeping source query v1")
+        self._gate_disabled_tools()
         self.service._ensure_lifecycle_maintenance_dispatcher()
         self.service._ensure_portrait_daily_dispatcher()
         self.service.capture.start()
