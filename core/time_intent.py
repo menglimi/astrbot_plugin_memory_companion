@@ -3,12 +3,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
+from .local_time import local_tz
 from .models import clean_text
-
-
-LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 
 @dataclass(slots=True)
@@ -36,10 +33,10 @@ def parse_time_intent(text: str, *, now: datetime | None = None) -> TimeIntent:
     if not compact:
         return TimeIntent()
 
-    current = now or datetime.now(LOCAL_TZ)
+    current = now or datetime.now(local_tz())
     if current.tzinfo is None:
-        current = current.replace(tzinfo=LOCAL_TZ)
-    current = current.astimezone(LOCAL_TZ)
+        current = current.replace(tzinfo=local_tz())
+    current = current.astimezone(local_tz())
     today = current.replace(hour=0, minute=0, second=0, microsecond=0)
     summary_like = _summary_like(compact)
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import inspect
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -391,3 +392,82 @@ class StoreProjectionTests(unittest.IsolatedAsyncioTestCase):
             "SELECT id FROM recallable_memories ORDER BY id"
         ).fetchall()
         self.assertEqual(["native-private"], [row["id"] for row in rows])
+
+    # 旧库迁移：next_retry_at NOT NULL 且无 retry_reason 的历史表必须在启动时
+    # 安全升级，而不是因重建后重复 ADD COLUMN 崩溃。
+    def test_legacy_retry_state_migration_upgrades_without_duplicate_column(self) -> None:
+        db_path = Path(self.temp.name) / "legacy.db"
+        legacy = sqlite3.connect(str(db_path))
+        legacy.executescript(
+            """
+            CREATE TABLE summary_batches (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, scope TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending', automatic_calls INTEGER NOT NULL DEFAULT 0,
+                repair_used INTEGER NOT NULL DEFAULT 0, next_retry_at TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '', metadata TEXT NOT NULL DEFAULT '{}',
+                memory_id TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            INSERT INTO summary_batches(id,session_id,scope,state,next_retry_at,created_at,updated_at)
+                VALUES('sb_legacy','qq:FriendMessage:u1','private','quarantined','',
+                       '2026-09-17T11:57:56+00:00','2026-09-17T11:59:31+00:00');
+            """
+        )
+        legacy.commit()
+        legacy.close()
+
+        upgraded = MemoryStore(db_path)
+        self.addCleanup(upgraded.close)
+        upgraded.initialize()
+
+        columns = {row["name"] for row in upgraded._conn.execute("PRAGMA table_info(summary_batches)")}
+        self.assertIn("retry_reason", columns)
+        row = upgraded._conn.execute(
+            "SELECT state,next_retry_at,retry_reason FROM summary_batches WHERE id='sb_legacy'"
+        ).fetchone()
+        self.assertEqual("quarantined", row["state"])
+        self.assertIsNone(row["next_retry_at"])
+        self.assertEqual("", row["retry_reason"])
+
+    async def test_list_and_bulk_release_quarantined_batches(self) -> None:
+        first, _ = await self._batch_with_event("第一条被隔离的对话")
+        second, _ = await self._batch_with_event("第二条被隔离的对话")
+        for batch_id in (first, second):
+            self.store._conn.execute(
+                "UPDATE summary_batches SET state='quarantined' WHERE id=?", (batch_id,)
+            )
+        self.store._conn.commit()
+
+        listing = await self.store.list_quarantined_batches(limit=10)
+        self.assertEqual(2, listing["total"])
+        self.assertEqual({first, second}, {item["id"] for item in listing["batches"]})
+        self.assertTrue(all(item["event_count"] == 1 for item in listing["batches"]))
+
+        result = await self.store.release_quarantined_batches(all_quarantined=True, mode="retry")
+        self.assertTrue(result["ok"])
+        self.assertEqual(2, result["released"])
+        self.assertEqual(0, (await self.store.list_quarantined_batches())["total"])
+        window = await self.store.unsummarized_timeline_window(
+            session_id=SESSION_ID, exclude_assigned=True
+        )
+        self.assertEqual(2, len(window["rows"]))
+
+    async def test_reap_stale_quarantined_batches_requeues_only_old_ones(self) -> None:
+        stale, _ = await self._batch_with_event("很久以前被隔离的对话")
+        fresh, _ = await self._batch_with_event("刚刚被隔离的对话")
+        for batch_id in (stale, fresh):
+            self.store._conn.execute(
+                "UPDATE summary_batches SET state='quarantined' WHERE id=?", (batch_id,)
+            )
+        old_at = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat(timespec="seconds")
+        self.store._conn.execute(
+            "UPDATE summary_batches SET updated_at=? WHERE id=?", (old_at, stale)
+        )
+        self.store._conn.commit()
+
+        result = await self.store.reap_stale_quarantined_batches(older_than_days=7, limit=50)
+        self.assertEqual(1, result["released"])
+        self.assertEqual("retry_pending", (await self.store.get_summary_batch(stale))["state"])
+        self.assertEqual("quarantined", (await self.store.get_summary_batch(fresh))["state"])
+
+        disabled = await self.store.reap_stale_quarantined_batches(older_than_days=0)
+        self.assertEqual(0, disabled["released"])

@@ -19,7 +19,7 @@ from .core.query_session import bind_query_tool_schema, bind_query_tool_v3_schem
 from .core.service import MemoryCompanionService
 
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
-PLUGIN_VERSION = "2.3.3"
+PLUGIN_VERSION = "2.3.4"
 
 _ACTIVE_BRIDGE: MemoryCompanionBridge | None = None
 

@@ -2,6 +2,46 @@
 
 本项目遵循面向用户体验的版本记录。日期使用北京时间。
 
+## 2.3.4 - 2026-10-15（本地补丁，非上游）
+
+### 时间计算跟随 AstrBot 全局时区
+
+- 插件原先在 service / summarizer / bridge / chat_import / qq_history / time_intent /
+  page_api / companion_page_legacy 等处一律写死 `Asia/Shanghai`。宿主的 `timezone` 设置
+  （`context.get_config().get("timezone")`）与其它插件共用同一个值，写死会让记忆插件在管理员
+  改了时区后仍按上海时间解释和展示时间线（时间线本身按 UTC 存储），导致摘要把消息归到错误的
+  时段、跨零点时连日期都错。
+- 新增 `core/local_time.py` 作为唯一时区来源：启动时绑定宿主时区，取值带 30 秒缓存，非法或
+  缺失时回退 `Asia/Shanghai`。所有 `datetime.now(LOCAL_TZ)` / `ZoneInfo("Asia/Shanghai")`
+  及提示词里的时区名改为跟随该来源。
+- `portrait_service` 的当日批次日期不再回退系统时区。
+- 运维诊断新增 `timezone` 字段，便于核对当前生效时区。
+
+### 待修复批次可见、可批量释放、可自动重排
+
+- 面板新增「待修复批次」视图：列出被隔离的总结批次（会话、失败原因、冻结事件数、时间），
+  支持逐条与整批「重新排队 / 放弃」；总览的「待修复批次」数字改为可点击进入。
+  过去该数字只是计数，释放接口又只能手填批次 ID，隔离区实际无从处理。
+- 新增 `list_quarantined_batches` / `release_quarantined_batches` 及两个页面端点
+  （`GET /maintenance/summary_batches`、`POST /maintenance/release_summary_batches`）。
+- 维护任务按 `memory_summary.quarantine_auto_retry_days`（默认 7 天）自动把闲置的隔离批次
+  重新排队，避免隔离区只增不减；`quarantine_auto_retry_limit` 限制每轮数量。
+
+### 修复
+
+- 旧库迁移崩溃：`summary_batches` 在「重建为可空 `next_retry_at`」后会按重建前的列快照再执行一次
+  `ALTER TABLE ... ADD COLUMN retry_reason`，对新表而言是重复列，启动即抛
+  `duplicate column name: retry_reason`。改为重建后重新读取列信息。
+- `summary_progress` 的「待修复批次」不再把旧表 `summary_failures` 行数算进批次数；旧失败记录
+  改为独立字段 `legacy_failures`。
+- 证据候选有效期：主总结路径原先写死 14 天，改为读取 `memory_summary.candidate_valid_days`，
+  与降级候选路径一致。
+- 移除死代码：`REPAIR_RETRY_REASON` 常量与恒为假的判断、`MemorySummarizer._row_time_evidence`
+  被后定义覆盖的旧实现、`core/config.py` 中重复的 `maintenance.pending_review_max_age_days` 别名。
+- `memory_capture.reliable_sources_enabled` 补进配置 schema（此前代码读取但面板无开关）。
+- 面板「模块配置」补上 `memory_assertions` / `source_semantic` / `startup` 的中文标签；
+  `/config/schema` 回显的 `memory_summary.max_retries` 默认值与运行时统一为 5。
+
 ## 2.3.3 - 2026-10-14（本地补丁，非上游）
 
 ### 工具注册改由配置开关控制

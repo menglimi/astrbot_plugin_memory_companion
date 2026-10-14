@@ -46,10 +46,14 @@ class BridgeNegativeProbeTests(unittest.TestCase):
 
 class C7StaticBoundaryTests(unittest.TestCase):
     def test_service_uses_configured_local_timezone_for_wall_clock_checks(self):
+        """墙钟时间跟随 AstrBot 全局 timezone，不再写死也不回退系统时区。"""
         source = (ROOT / "core" / "service.py").read_text(encoding="utf-8")
-        self.assertIn('LOCAL_TZ = ZoneInfo("Asia/Shanghai")', source)
-        self.assertIn("datetime.now(LOCAL_TZ)", source)
+        self.assertIn("bind_timezone_provider(self._host_timezone_name)", source)
+        self.assertIn('config.get("timezone")', source)
+        self.assertIn("datetime.now(local_tz())", source)
         self.assertNotIn("datetime.now()", source)
+        resolver = (ROOT / "core" / "local_time.py").read_text(encoding="utf-8")
+        self.assertIn('DEFAULT_TIMEZONE_NAME = "Asia/Shanghai"', resolver)
 
     def test_page_endpoints_return_real_errors_without_exception_text(self):
         source = (ROOT / "page_api.py").read_text(encoding="utf-8")
@@ -79,6 +83,30 @@ class C7StaticBoundaryTests(unittest.TestCase):
         )
         self.assertIn("if (result.available === false) {", source)
         self.assertIn("return { available: false, reason: compact(result.reason)", source)
+
+
+class LocalTimezoneResolverTests(unittest.TestCase):
+    """The shared resolver must follow the host zone and stay import-safe."""
+
+    def setUp(self):
+        from core import local_time
+
+        self.local_time = local_time
+        self.addCleanup(local_time.bind_timezone_provider, lambda: "")
+
+    def test_follows_host_timezone(self):
+        self.local_time.bind_timezone_provider(lambda: "Europe/Kaliningrad")
+        self.assertEqual("Europe/Kaliningrad", self.local_time.timezone_name())
+        self.assertEqual("Europe/Kaliningrad", str(self.local_time.local_tz()))
+
+    def test_blank_host_value_falls_back_to_default(self):
+        self.local_time.bind_timezone_provider(lambda: "")
+        self.assertEqual("Asia/Shanghai", self.local_time.timezone_name())
+
+    def test_invalid_host_value_keeps_last_usable_zone(self):
+        self.local_time.bind_timezone_provider(lambda: "Europe/Kaliningrad")
+        self.local_time.bind_timezone_provider(lambda: "Not/ARealZone")
+        self.assertEqual("Europe/Kaliningrad", self.local_time.timezone_name())
 
 
 if __name__ == "__main__":

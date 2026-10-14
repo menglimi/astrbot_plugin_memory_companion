@@ -7,7 +7,6 @@ import hmac
 import json
 import secrets
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from . import bot_personal_contract
 from .bot_personal_dto import BotPersonalArchiveDTO, build_bot_personal_archive
@@ -18,14 +17,13 @@ from .capability_probe import (
     detect_companion_plugin,
 )
 from .context_consumer import consume_context_projection
+from .local_time import local_tz, timezone_name
 from .models import EntityRef, MemoryRecord, SessionContext, clean_text
 from .namespace_capability import namespace_capability_descriptor
 from .namespace import build_namespace_context, validate_namespace_context
 from .person_projection import consume_person_projection
 from .scoped_store import ScopedStore, ScopedStoreError
 
-
-LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 _PRIVATE_COMPANION_ROOT = "astrbot_plugin_private_companion"
 _PRIVATE_COMPANION_NAMES = {"PrivateCompanion", "private_companion"}
@@ -441,7 +439,7 @@ def _local_time_label(value: Any) -> str:
         dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        return dt.astimezone(local_tz()).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return text
 
@@ -2860,7 +2858,7 @@ def serialize_memory(record: MemoryRecord, score: float | None = None, reason: s
             "end_at": clean_text(metadata.get("end_at"), 80),
             "start_at_local": clean_text(metadata.get("start_at_local"), 80) or _local_time_label(metadata.get("start_at")),
             "end_at_local": clean_text(metadata.get("end_at_local"), 80) or _local_time_label(metadata.get("end_at")),
-            "timezone": "Asia/Shanghai",
+            "timezone": timezone_name(),
         },
         "subject": {
             "kind": record.subject.kind,

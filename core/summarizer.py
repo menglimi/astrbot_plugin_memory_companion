@@ -9,6 +9,7 @@ from difflib import SequenceMatcher
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from .local_time import local_tz, timezone_name
 from .models import clean_text, json_dumps, json_loads
 from .assertions import (
     MAX_ASSERTION_VALUE_CHARS,
@@ -318,7 +319,7 @@ class MemorySummarizer:
                 "speaker": speaker,
                 "speaker_id": sender_id,
                 "time": occurred,
-                "timezone": "Asia/Shanghai",
+                "timezone": timezone_name(),
                 "event_type": event_type or "message",
                 "content": content,
                 "content_is_untrusted_chat_data": True,
@@ -391,7 +392,7 @@ class MemorySummarizer:
             "只保留足以核对该事实的最短片段，不要复制整条聊天。没有直接证据的内容不要输出。\n"
             "若重要事件由一问一答共同说明，保留回答中的具体信息及其来源；问题只能证明问过，不能替代答案。相似话题和后来的复述不是独立证据。\n"
             "6. 必须使用消息前缀里的具体昵称或稳定 ID，禁止用“用户、某用户、某人、有人、群成员、对方”替代。\n"
-            "7. 每条消息的 time 字段都是 Asia/Shanghai 本地绝对时间；总结时必须按各条消息自己的 time 判断上午/中午/晚上，不能只按总结触发时间判断。\n"
+            f"7. 每条消息的 time 字段都是 {timezone_name()} 本地绝对时间；总结时必须按各条消息自己的 time 判断上午/中午/晚上，不能只按总结触发时间判断。\n"
             "time 首先表示消息记录时间；消息可能在追问或回忆更早的事，事情的实际日期须由原文和明确的时间锚点支持，无法确定时保留未知。\n"
             "8. 长期记忆正文、canonical_summary 和 key_facts 禁止使用“今天、昨天、明天、今晚、昨晚、刚才、现在”等相对时间词；必须写成“YYYY-MM-DD 中午/晚上”这类绝对日期表达。\n"
             f"{scene_rules}\n"
@@ -467,7 +468,7 @@ class MemorySummarizer:
             '  "importance": 0.7\n'
             "}\n\n"
             f"会话：{session_label}\n"
-            f"当前本地时间：{self._now_local().strftime('%Y-%m-%d %H:%M')} Asia/Shanghai\n"
+            f"当前本地时间：{self._now_local().strftime('%Y-%m-%d %H:%M')} {timezone_name()}\n"
             f"本次总结窗口：{time_range or '未知'}\n"
             "<untrusted_messages_jsonl>\n"
             f"{transcript}"
@@ -1015,7 +1016,7 @@ class MemorySummarizer:
 
     @staticmethod
     def _local_tz() -> ZoneInfo:
-        return ZoneInfo("Asia/Shanghai")
+        return local_tz()
 
     @classmethod
     def _now_local(cls) -> datetime:
@@ -1092,52 +1093,6 @@ class MemorySummarizer:
         return labels
 
     @classmethod
-    def _row_time_evidence(cls, row: dict[str, Any]) -> str:
-        """Expose a message timestamp as local date, weekday, and time-of-day evidence."""
-        raw_time = clean_text(row.get("occurred_at") or row.get("created_at"), 80)
-        dt = cls._parse_local_datetime(raw_time)
-        if dt is None:
-            return ""
-        weekday = "一二三四五六日"[dt.weekday()]
-        parts = [
-            dt.strftime("%Y-%m-%d"),
-            f"{dt.year}年{dt.month}月{dt.day}日",
-            f"{dt.month}月{dt.day}日",
-            f"周{weekday}",
-            f"星期{weekday}",
-        ]
-        if not re.search(r"(?:T|\s)\d{1,2}:\d{2}", raw_time):
-            return " ".join(parts)
-        hour = dt.hour
-        if hour <= 4:
-            periods = ("凌晨", "深夜")
-        elif hour == 5:
-            periods = ("凌晨", "早上")
-        elif hour <= 7:
-            periods = ("早上",)
-        elif hour <= 9:
-            periods = ("早上", "上午")
-        elif hour <= 10:
-            periods = ("上午",)
-        elif hour == 11:
-            periods = ("上午", "中午")
-        elif hour == 12:
-            periods = ("中午",)
-        elif hour == 13:
-            periods = ("中午", "下午")
-        elif hour <= 16:
-            periods = ("下午",)
-        elif hour == 17:
-            periods = ("下午", "傍晚")
-        elif hour == 18:
-            periods = ("傍晚", "晚上")
-        elif hour <= 21:
-            periods = ("晚上",)
-        else:
-            periods = ("晚上", "深夜")
-        return " ".join((*parts, *periods, f"{hour}点", dt.strftime("%H:%M")))
-
-    @classmethod
     def _rows_local_time_range(cls, rows: list[dict[str, Any]]) -> str:
         values: list[datetime] = []
         for row in rows:
@@ -1148,7 +1103,7 @@ class MemorySummarizer:
             return ""
         start = min(values).strftime("%Y-%m-%d %H:%M")
         end = max(values).strftime("%Y-%m-%d %H:%M")
-        return f"{start} 至 {end} Asia/Shanghai"
+        return f"{start} 至 {end} {timezone_name()}"
 
     @classmethod
     def _relative_time_anchor(cls, rows: list[dict[str, Any]]) -> tuple[str, str, str]:
@@ -1494,7 +1449,7 @@ class MemorySummarizer:
         """断言是否被所引用消息支持："" = 支持，否则返回可读的失败原因。
 
         证据 = 消息正文（词语重合、极性、正文里提到的日期）+ 消息自身的时间戳
-        （日期/周几/时段/钟点，按 Asia/Shanghai）。返回原因而不是布尔值，是为了让
+        （日期/周几/时段/钟点，按 AstrBot 配置的本地时区）。返回原因而不是布尔值，是为了让
         「自动纠正一次」拿到可执行的诊断。
         """
         raw_text = "；".join(clean_text(row.get("content"), 1000) for row in rows)

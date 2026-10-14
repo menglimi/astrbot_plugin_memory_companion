@@ -586,6 +586,9 @@ input, select, textarea { font: inherit; color: inherit; }
   font-variant-numeric: tabular-nums;
 }
 .kpi-foot { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+button.kpi { width: 100%; font: inherit; text-align: left; color: inherit; cursor: pointer; }
+button.kpi.is-link { border-color: var(--accent-line); }
+button.kpi.is-link:hover { border-color: var(--border-strong); }
 
 /* ---------- 徽标 / 药丸 ---------- */
 .badge {
