@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import re
+from datetime import datetime, timezone
 from typing import Any
 
 from .models import MemoryRecord, SearchResult, SessionContext, clean_text
@@ -18,13 +19,174 @@ MEMORY_COMPANION_INJECTION_FOOTER = "</MemoryCompanion-Context>"
 
 
 class InjectionComposer:
-    def __init__(self, instruction_relax: bool = False) -> None:
+    # 拟人化注入包（humanize）新增的可配置项。默认全部保持历史行为：
+    # enabled=False 时本类所有分支与旧版本逐字节一致。
+    HUMANIZE_DEFAULTS: dict[str, Any] = {
+        "enabled": False,
+        "fuzzy_impression_max_items": 2,
+        "fuzzy_item_max_chars": 160,
+        "vivid_full_days": 45.0,
+        "vivid_fuzzy_days": 540.0,
+        "no_recall_hint_enabled": True,
+    }
+    # 配置项短名 → 面板配置路径。运行期取值只认这张表，新增参数必须同时
+    # 出现在 DEFAULTS 与此处，避免配置名拼错时静默回退成默认值。
+    HUMANIZE_CONFIG_PATHS: dict[str, str] = {
+        "enabled": "memory_humanization.enabled",
+        "fuzzy_impression_max_items": "memory_humanization.fuzzy_impression_max_items",
+        "fuzzy_item_max_chars": "memory_humanization.fuzzy_item_max_chars",
+        "vivid_full_days": "memory_humanization.vivid_full_days",
+        "vivid_fuzzy_days": "memory_humanization.vivid_fuzzy_days",
+        "no_recall_hint_enabled": "memory_humanization.no_recall_hint_enabled",
+    }
+
+    def __init__(
+        self,
+        instruction_relax: bool = False,
+        humanize_options: dict[str, Any] | None = None,
+    ) -> None:
         self.last_omission_diagnostics: list[dict[str, str]] = []
         self.last_omission_reasons: list[str] = []
         self.last_included_memory_ids: list[str] = []
         # instruction_relax=False 时 instruction 措辞与历史版本完全一致；
         # 开启后允许模型更主动地自然引用注入的记忆条目（见 compose 的 <instruction> 生成）。
         self.instruction_relax = instruction_relax
+        # humanize_options 里的 enabled 只是静态回退值；真正生效的是运行期
+        # 由宿主注入的 _humanize_config_provider（memory_humanization.* 配置），
+        # 让面板改完配置无需重建注入器。enabled=False 时本类所有分支与
+        # 旧版本逐字节一致：A1 模糊化措辞、A2 uncertain 改道模糊印象槽、
+        # A3 空召回诚实提示全部保持关闭。
+        self.humanize_options = dict(self.HUMANIZE_DEFAULTS)
+        self.humanize_options.update(
+            {
+                key: value
+                for key, value in dict(humanize_options or {}).items()
+                if key in self.HUMANIZE_DEFAULTS
+            }
+        )
+        self._humanize_config_provider = None
+        # 每轮 compose 刷新：A1 的「此刻犹豫」提示依赖 Bot 当前心理能量。
+        self._current_bot_energy: float = 0.0
+        # 每轮 compose 重置：A2 收集被改道的 uncertain 记忆条目。
+        self.humanize_pending: list[dict[str, Any]] = []
+
+    def set_humanize_config_provider(self, provider: Any) -> None:
+        """挂接返回 (dotted_key, default) -> 配置值 的可调用对象（服务层注入）。"""
+        self._humanize_config_provider = provider if callable(provider) else None
+
+    def _humanize_config_value(self, key: str, default: Any) -> Any:
+        static_default = self.humanize_options.get(key, default)
+        provider = self._humanize_config_provider
+        if provider is None:
+            return static_default
+        dotted = self.HUMANIZE_CONFIG_PATHS.get(key)
+        if dotted is None:
+            return static_default
+        try:
+            value = provider(dotted, static_default)
+        except Exception:
+            return static_default
+        return static_default if value is None else value
+
+    def _humanize_enabled(self) -> bool:
+        return bool(self._humanize_config_value("enabled", False))
+
+    def _humanize_int(self, key: str) -> int:
+        try:
+            return int(self._humanize_config_value(key, self.HUMANIZE_DEFAULTS[key]))
+        except (TypeError, ValueError):
+            return int(self.HUMANIZE_DEFAULTS[key])
+
+    def _humanize_float(self, key: str) -> float:
+        try:
+            return float(self._humanize_config_value(key, self.HUMANIZE_DEFAULTS[key]))
+        except (TypeError, ValueError):
+            return float(self.HUMANIZE_DEFAULTS[key])
+
+    def _humanize_keep_uncertain(self) -> bool:
+        """拟人模式下的 uncertain 去向：True=改道模糊印象槽，False=沿用旧行为整条丢弃。"""
+        return self._humanize_enabled() and self._humanize_int("fuzzy_impression_max_items") > 0
+
+    @staticmethod
+    def _parse_timestamp(value: Any) -> datetime | None:
+        text = clean_text(value, 96)
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _memory_age_days(self, memory: MemoryRecord) -> float | None:
+        """记忆年龄（天）。宁缺勿假：时间戳缺失或不可解析时返回 None，调用方保持原样注入。"""
+        for value in (
+            getattr(memory, "occurred_at", ""),
+            getattr(memory, "updated_at", ""),
+            getattr(memory, "created_at", ""),
+        ):
+            parsed = self._parse_timestamp(value)
+            if parsed is not None:
+                return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds() / 86400.0)
+        return None
+
+    def _vividness_level(self, memory: MemoryRecord) -> int:
+        """记忆鲜亮度：0=清晰可明说 1=细节模糊只剩大意 2=轮廓印象。
+
+        取「年龄分级」与「置信分级」中更模糊的一档：低置信记忆即使很新，
+        人也只是模糊地记得，措辞同样要保留不确定感。被明确固定、手动记住
+        或情绪上刻骨铭心的记忆不受年龄分级影响（人也不会忘记自己的誓言），
+        但仍受置信分级约束。
+        """
+        try:
+            confidence = float(getattr(memory, "confidence", 0.5) or 0.5)
+        except (TypeError, ValueError):
+            confidence = 0.5
+        level = 2 if confidence < 0.58 else (1 if confidence < 0.72 else 0)
+        if self._vividness_age_exempt(memory):
+            return level
+        age_days = self._memory_age_days(memory)
+        if age_days is not None:
+            if age_days >= self._humanize_float("vivid_fuzzy_days"):
+                level = max(level, 2)
+            elif age_days >= self._humanize_float("vivid_full_days"):
+                level = max(level, 1)
+        return level
+
+    def _vividness_age_exempt(self, memory: MemoryRecord) -> bool:
+        """年龄不侵蚀的记忆：固定/手动/关系承诺/伤疤/创作里程碑/高重要度。"""
+        try:
+            importance = float(getattr(memory, "importance", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            importance = 0.0
+        if importance >= 0.85:
+            return True
+        metadata = self._metadata_dict(memory)
+        decay_mode = clean_text(metadata.get("decay_mode"), 48).lower()
+        if decay_mode in {"no_decay", "scar_slow_decay", "creative_milestone"}:
+            return True
+        tags = {clean_text(tag, 64).lower() for tag in (getattr(memory, "tags", None) or [])}
+        if tags & {"pinned", "manual_keep", "never_forget", "manual", "protected", "keep"}:
+            return True
+        if clean_text(getattr(memory, "memory_type", ""), 80).lower() in {
+            "manual_memory", "explicit_memory", "relationship_claim", "promise",
+        }:
+            return True
+        try:
+            scar = float(metadata.get("scar_weight") or 0.0)
+        except (TypeError, ValueError):
+            scar = 0.0
+        return scar >= 0.55
+
+    def _vividness_usage(self, level: int) -> str:
+        if level >= 2:
+            return "轮廓印象：只记得大概轮廓；只能说'好像有这么回事'，禁止给出日期、原话或具体细节"
+        return "细节已模糊：可提话题与大致方向；具体数字、日期和原话不确定，不确定时先问别猜"
+
+    def _vividness_tag(self, level: int) -> str:
+        return "印象模糊" if level == 1 else "只剩轮廓"
 
     def compose(
         self,
@@ -52,6 +214,11 @@ class InjectionComposer:
         snapshot_options: dict[str, Any] | None = None,
     ) -> str:
         included_memory_ids = included_memory_ids if included_memory_ids is not None else []
+        self.humanize_pending = []
+        try:
+            self._current_bot_energy = float(companion_bot_energy or 0.0)
+        except (TypeError, ValueError):
+            self._current_bot_energy = 0.0
         results, slot_sections = self._filter_injection_results(results, slot_sections)
         core_memories = list(core_memories or [])
         if (
@@ -60,6 +227,8 @@ class InjectionComposer:
             and not intent_context
             and not recent_fact_context
             and not recent_cross_window_context
+            # A2：整轮只剩模糊印象时不提前返回空包，否则模糊印象永远无法注入。
+            and not self.humanize_pending
         ):
             return ""
 
@@ -104,6 +273,12 @@ class InjectionComposer:
             )
         else:
             lines.append("这是辅助记忆，不是用户新发言或新任务。先回应 current_user_message，旧记忆只在自然相关时融入。")
+        if self._humanize_enabled():
+            lines.append(
+                "你像人一样记忆：越久没提起的事细节越淡。标注了印象模糊或只剩轮廓的条目，"
+                "坦然用‘我记得…不过细节想不起来了’的口吻承认模糊，这不丢分也不算错误；"
+                "真正想不起时直接说想不起，不要用编造的细节填空。"
+            )
         lines.extend(
             [
                 "当前消息优先；冲突时以当前消息和用户纠正为准。明确记录可引用，推测和低置信内容要保留不确定感。",
@@ -210,8 +385,26 @@ class InjectionComposer:
                 if results
                 else "- 没有检索到足够相关的长期记忆；只依据当前用户消息回复。"
             )
+            if (
+                not results
+                # 有模糊印象时不喊「完全想不起来」，两者会互相打脸。
+                and not self.humanize_pending
+                and self._humanize_enabled()
+                and bool(self._humanize_config_value("no_recall_hint_enabled", True))
+            ):
+                fallback = (
+                    "- 关于这件事你确实想不起来了，这不是需要掩饰的失误；"
+                    "可以坦诚说不记得，或请对方提醒，不要脑补细节当真话接。"
+                )
             if len("\n".join([*lines, fallback, *closing_lines])) <= inner_limit:
                 lines.append(fallback)
+        fuzzy_lines = [] if rest_check_hint else self._build_fuzzy_impression_lines(
+            base_lines=lines,
+            closing_lines=closing_lines,
+            inner_limit=inner_limit,
+        )
+        if fuzzy_lines:
+            lines.extend(fuzzy_lines)
         lines.extend(closing_lines)
 
         text = "\n".join(lines)
@@ -473,6 +666,65 @@ class InjectionComposer:
                 memory_lines.extend([*opening, *item_lines, f"</{tag}>"])
         return memory_lines
 
+    def _fuzzy_gist(self, item: SearchResult, *, limit: int) -> str:
+        """模糊印象的正文：只保留大意轮廓，敏感信息照常脱敏。"""
+        memory = getattr(item, "memory", None)
+        metadata = self._metadata_dict(memory)
+        key_facts = metadata.get("key_facts")
+        gist = ""
+        if isinstance(key_facts, list):
+            for value in key_facts:
+                if isinstance(value, str) and clean_text(value, 120):
+                    gist = clean_text(value, 120)
+                    break
+        if not gist:
+            gist = clean_text(getattr(memory, "content", ""), 160)
+        return self._safe_text(self._redact_sensitive_text(gist), max(24, limit))
+
+    def _build_fuzzy_impression_lines(
+        self,
+        *,
+        base_lines: list[str],
+        closing_lines: list[str],
+        inner_limit: int,
+    ) -> list[str]:
+        """A2：把 uncertain 候选渲染成「模糊印象」区块。
+
+        与事实槽的措辞刻意不同：只给大意、明示「不确定」，让模型自然使用
+        「是不是…来着？我可能记岔了」这类口吻，而不是照本宣科或干脆沉默。
+        """
+        entries = list(self.humanize_pending)
+        if not entries or not self._humanize_enabled():
+            return []
+        item_limit = max(24, self._humanize_int("fuzzy_item_max_chars"))
+        opening = [
+            "<fuzzy_impressions>",
+            "内心提示：以下只是模糊印象，不是可靠事实。可以说‘我记得好像…’‘是不是…来着’，"
+            "说错或被纠正都很正常；禁止把它们当事实断言，也禁止为补齐印象编造细节。",
+        ]
+        closing = ["</fuzzy_impressions>", ""]
+
+        def fits(candidate: list[str]) -> bool:
+            return len("\n".join([*base_lines, *candidate, *closing_lines])) <= inner_limit
+
+        lines = list(opening)
+        for entry in entries:
+            age_days = entry.get("age_days")
+            if isinstance(age_days, (int, float)):
+                age_label = f"大约 {int(age_days)} 天前"
+            else:
+                age_label = "具体时间想不起"
+            gist = self._fuzzy_gist(entry.get("item"), limit=item_limit)
+            if not gist:
+                continue
+            candidate_line = f"- {age_label}，隐约记得：{gist}（细节不确定，可向对方求证）"
+            if not fits([*lines, candidate_line, *closing]):
+                break
+            lines.append(candidate_line)
+        if len(lines) <= len(opening):
+            return []
+        return [*lines, *closing]
+
     @staticmethod
     def _build_short_rest_memory_lines(
         results: list[SearchResult],
@@ -570,6 +822,7 @@ class InjectionComposer:
         time_label = self._safe_text(self._time_label(memory), 24)
         source_label = self._safe_text(self._source_label(memory), 100)
         usage = self._expression_usage(item) if not compact else f"表达：{self._expression_label(item)}"
+        vividness = self._vividness_level(memory) if self._humanize_enabled() else 0
         parts = [
             f"内容：{detail}",
             f"时间：{time_label}",
@@ -596,6 +849,27 @@ class InjectionComposer:
                     f"用法：{usage}",
                 ]
             )
+        if vividness >= 1:
+            # A1：越久没提起的记忆，注入措辞越含糊。正文保留（事实层不动），
+            # 但用法指令降级为「只可模糊提及」，让模型自然说出记不清细节。
+            # 刻意压制类策略（别主动提/只做语气）优先于模糊化，不被覆盖。
+            suppression_policy = clean_text(metadata.get("mention_policy"), 60) in {
+                "avoid_unless_asked", "tone_only",
+            }
+            if not suppression_policy:
+                if compact:
+                    parts[-1] = f"表达：{self._vividness_usage(vividness)}"
+                else:
+                    parts[-1] = f"用法：{self._vividness_usage(vividness)}"
+            if not compact:
+                parts.insert(
+                    3,
+                    f"记忆印象：{self._vividness_tag(vividness)}",
+                )
+        if self._humanize_enabled():
+            hesitation = self._hesitation_hint(item, self._current_bot_energy)
+            if hesitation:
+                parts.append(f"此刻心态：{self._safe_text(hesitation, 160)}")
         return "- " + "；".join(part for part in parts if part)
 
     def _select_key_facts_for_query(
@@ -678,6 +952,34 @@ class InjectionComposer:
             self.last_omission_diagnostics.append(diagnostic)
             self.last_omission_reasons.append(reason)
 
+        humanize_uncertain = self._humanize_keep_uncertain()
+        fuzzy_limit = max(0, self._humanize_int("fuzzy_impression_max_items"))
+        fuzzy_seen: set[str] = set()
+
+        def fuzzy_slot(item: SearchResult, *, slot: str = "") -> None:
+            """A2：uncertain 不再静默丢弃，改道收集为「模糊印象」。
+
+            印象条目不计入 included_memory_ids：模糊印象不是「实际注入的
+            事实」，不参与注入强化反馈；但保留诊断记录便于排查。预算用尽
+            时退回旧行为（injection_omitted:uncertain）。
+            """
+            memory_key = item_key(item)
+            if memory_key in fuzzy_seen:
+                return
+            if len(self.humanize_pending) >= fuzzy_limit:
+                record(item, "injection_omitted:uncertain", expression="uncertain", slot=slot)
+                return
+            fuzzy_seen.add(memory_key)
+            memory = getattr(item, "memory", None)
+            self.humanize_pending.append(
+                {
+                    "item": item,
+                    "age_days": self._memory_age_days(memory) if memory is not None else None,
+                    "slot": slot,
+                }
+            )
+            record(item, "injection_fuzzy_impression", expression="uncertain", slot=slot)
+
         def decision(item: SearchResult) -> tuple[bool, str, str]:
             key = item_key(item)
             cached = decision_cache.get(key)
@@ -689,7 +991,10 @@ class InjectionComposer:
             if not allowed:
                 result = (False, f"injection_omitted:{reason}", expression)
             elif expression == "uncertain":
-                result = (False, "injection_omitted:uncertain", expression)
+                if humanize_uncertain:
+                    result = (False, "injection_fuzzy_impression", expression)
+                else:
+                    result = (False, "injection_omitted:uncertain", expression)
             elif expression == "candidate" and self._is_rule_profile(memory):
                 result = (False, "injection_omitted:candidate", expression)
             else:
@@ -700,6 +1005,9 @@ class InjectionComposer:
         def keep(item: SearchResult, *, slot: str = "") -> bool:
             allowed, reason, expression = decision(item)
             if not allowed:
+                if reason == "injection_fuzzy_impression":
+                    fuzzy_slot(item, slot=slot)
+                    return False
                 record(item, reason, expression=expression, slot=slot)
                 return False
             memory_id = clean_text(

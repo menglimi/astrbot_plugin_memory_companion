@@ -359,6 +359,12 @@ class MemoryCompanionService:
             capture_min_chars=self.config.int("memory_capture.capture_min_chars", 2)
         )
         self.injection = InjectionComposer()
+        # 拟人化注入（memory_humanization.*）走运行期配置提供者：
+        # 面板改配置即时生效，无需重建注入器。enabled=false 时注入器
+        # 所有 humanize 分支保持旧行为。
+        self.injection.set_humanize_config_provider(
+            lambda dotted, default: self.config.get(dotted, default)
+        )
         self.summarizer = MemorySummarizer(
             max_input_chars=self.config.int("memory_summary.max_input_chars", 6000),
             max_summary_chars=self.config.int("memory_summary.max_summary_chars", 1200),

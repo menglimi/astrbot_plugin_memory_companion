@@ -784,6 +784,49 @@
       }
     }
   },
+  "memory_humanization": {
+    "description": "拟人化记忆表达",
+    "hint": "让记忆表达更像人：久不提起的事措辞变模糊、没把握的事以模糊印象出现、彻底想不起时坦然承认。只影响注入措辞层，不改写存储的记忆内容，也不改变检索与权限判定；关闭后与旧版本行为完全一致。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用拟人化表达",
+        "hint": "开启后同时启用三项：按记忆年龄与置信度分级模糊化措辞、低置信/陈旧记忆改以「模糊印象」注入（不再整条丢弃）、零命中时注入诚实的「想不起来」提示。存储与检索正确性不受影响。",
+        "type": "bool",
+        "default": false
+      },
+      "vivid_full_days": {
+        "description": "细节清晰期（天）",
+        "hint": "记忆存在不超过该天数时按原文清晰引用；超过后注入措辞降级为「细节已模糊，只可提大意」。手动记住、固定、关系承诺、伤疤和高重要度记忆不受年龄分级影响。",
+        "type": "float",
+        "default": 45.0
+      },
+      "vivid_fuzzy_days": {
+        "description": "轮廓印象期（天）",
+        "hint": "记忆存在超过该天数后只保留轮廓：措辞为「好像有这么回事」，不再给出日期、原话等具体细节。建议 365-730。",
+        "type": "float",
+        "default": 540.0
+      },
+      "fuzzy_impression_max_items": {
+        "description": "模糊印象条数上限",
+        "hint": "每轮最多把多少条低置信/陈旧记忆以「模糊印象」注入（模型可用「是不是…来着」的求证口吻使用）。0 = 恢复旧行为，这类记忆整条不注入。",
+        "type": "int",
+        "default": 2
+      },
+      "fuzzy_item_max_chars": {
+        "description": "模糊印象单条字数",
+        "hint": "模糊印象条目只保留大意轮廓，限制单条最大字数。",
+        "type": "int",
+        "default": 160
+      },
+      "no_recall_hint_enabled": {
+        "description": "想不起来时诚实提示",
+        "hint": "开启后，本轮完全没有召回任何记忆时，注入包附带一条：坦然承认「想不起来」而不是脑补细节。关闭拟人化总开关时本项无效。",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
   "conversation_memory": {
     "description": "连续对话记忆",
     "hint": "记录群聊中连续发生的可见对话，阶段性整理为 conversation_summary，用于之后衔接话题；不会把原始消息窗口直接注入给模型。",
@@ -1503,15 +1546,15 @@
     "items": {
       "memory_decay_after_days": {
         "description": "衰减年龄天数",
-        "hint": "稳定记忆存在超过该天数后才可能进入衰减候选。明确记住、画像、偏好、关系、手动记忆会被保护。",
+        "hint": "稳定记忆存在超过该天数后才可能进入衰减候选。明确记住、画像、偏好、关系、手动记忆会被保护。原版默认 180；拟人向调低到 90，让久不提起的日常记忆更早真正变淡。",
         "type": "int",
-        "default": 180
+        "default": 90
       },
       "memory_decay_idle_days": {
         "description": "未访问天数",
-        "hint": "记忆距离上次被召回超过该天数后才可能衰减；被频繁召回的记忆会自然加固。",
+        "hint": "记忆距离上次被召回超过该天数后才可能衰减；被频繁召回的记忆会自然加固。原版默认 90；拟人向调低到 45，约一个半月没人提起的事就开始变淡。",
         "type": "int",
-        "default": 90
+        "default": 45
       },
       "memory_decay_max_importance_percent": {
         "description": "重要记忆慢忘阈值",
