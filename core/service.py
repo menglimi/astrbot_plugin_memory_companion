@@ -352,7 +352,10 @@ class MemoryCompanionService:
                 raise
         self.portraits = PortraitService(self.store, self.config)
 
-        self.identity = IdentityResolver(self._resolve_default_bot_id)
+        self.identity = IdentityResolver(
+            self._resolve_default_bot_id,
+            self._resolve_default_persona_id,
+        )
         self.reply_chain = ReplyChainResolver()
         self.intent_builder = RetrievalIntentBuilder()
         self.classifier = MemoryClassifier(
@@ -564,6 +567,42 @@ class MemoryCompanionService:
                         add(star_config.get(key))
 
         return next(iter(ids)) if len(ids) == 1 else ""
+
+    async def _resolve_default_persona_id(self, event: Any = None) -> str:
+        """Return the persona ID that AstrBot currently runs for this session.
+
+        The bridge stamps ``persona_id`` on archived memories from the companion
+        plugin's configured persona, but ``IdentityResolver`` can only read it
+        back from the event.  ``AstrMessageEvent`` has no ``persona_id``
+        attribute, and a single-persona companion install leaves
+        ``private_companion_persona_id`` unset, so without this fallback every
+        archived memory is rejected as ``persona_context_missing``.
+
+        The companion's write path uses its static ``plugin_specific_persona_id``
+        when multi-persona mode is off, which mirrors AstrBot's configured
+        default persona.  We resolve exactly that and deliberately ignore
+        per-session overrides: honouring an override here would report a persona
+        the write path never used and turn the failure into ``persona_mismatch``.
+        """
+        persona_manager = getattr(
+            getattr(self, "context", None), "persona_manager", None
+        )
+        getter = getattr(persona_manager, "get_default_persona_v3", None)
+        if not callable(getter):
+            return ""
+        umo = clean_text(getattr(event, "unified_msg_origin", ""), 200)
+        try:
+            persona = await maybe_await(getter(umo=umo) if umo else getter())
+        except Exception:
+            return ""
+        name = (
+            persona.get("name")
+            if isinstance(persona, dict)
+            else getattr(persona, "name", "")
+        )
+        name = clean_text(name, 96)
+        # ``[%None]`` is AstrBot's explicit "no persona" marker.
+        return "" if name == "[%None]" else name
 
     def _p5_gate_enabled(self, sink: str) -> bool:
         key = (
