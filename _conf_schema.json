@@ -27,14 +27,15 @@
         "default": "月白"
       },
       "ui_style": {
-        "description": "拓展页 UI 样式",
-        "hint": "默认使用旧版管理面板；切换为新版后使用 Memory OS 三维终端界面。",
+        "description": "拓展页打开方式",
+        "hint": "默认「人物」：一打开就是她记得的人，点谁就能改称呼、纠正分量、让她忘掉某件事。「控制台」是旧版全部功能页；「三维终端」是彩蛋。",
         "type": "string",
         "options": [
-          "旧版",
-          "新版"
+          "人物",
+          "控制台",
+          "三维终端"
         ],
-        "default": "旧版"
+        "default": "人物"
       }
     }
   },
@@ -95,6 +96,12 @@
         "hint": "默认关闭（行为与旧版一致）。开启后，写入新记忆时把「Bot 自我时间线」「情绪较重」两类记忆的 mention_policy 从 tone_only 提为 soft_echo，使注入侧能给出这些记忆的内容而非纯语气提示。只影响之后新写入的记忆；存量记忆需回填或依赖注入侧放宽参数。",
         "type": "bool",
         "default": false
+      },
+      "reliable_sources_enabled": {
+        "description": "启用可靠来源捕获",
+        "hint": "记忆捕获与来源索引的总开关（默认开启）。关闭后不再记录用户消息、Bot 回复和来源片段，用于临时停用整个捕获链路；阶段总结、管理命令和手动写入不受影响。",
+        "type": "bool",
+        "default": true
       }
     }
   },
@@ -310,6 +317,12 @@
         "type": "int",
         "default": 300
       },
+      "request_max_retries": {
+        "description": "总结调用重试次数",
+        "hint": "单次总结请求内部最多重试几次（默认 2）。以前写死 1 次，一次网络抖动就让这批摘要永久失败、进隔离区。",
+        "type": "int",
+        "default": 2
+      },
       "evidence_events": {
         "description": "证据事件条数",
         "hint": "长期总结记忆中最多保留多少条原始时间线事件作为 evidence，便于排查总结来源。",
@@ -363,6 +376,18 @@
         "hint": "后台总结等待全局并发槽位的最长时间；超时则本轮跳过，等新消息再次触发。0 表示无限等待。",
         "type": "int",
         "default": 20
+      },
+      "quarantine_auto_retry_days": {
+        "description": "隔离批次自动重排天数",
+        "hint": "被隔离（待修复）的总结批次闲置超过该天数后，维护任务会自动把它们重新排队，把事件交还给后续会话重新总结，避免隔离区只增不减。0 表示关闭自动重排，只由面板手动释放。",
+        "type": "int",
+        "default": 7
+      },
+      "quarantine_auto_retry_limit": {
+        "description": "每次自动重排上限",
+        "hint": "每轮维护最多自动重排多少个隔离批次，避免一次性把大量旧批次推回队列。面板手动释放不受此限制。",
+        "type": "int",
+        "default": 50
       }
     }
   },
@@ -458,9 +483,9 @@
     "items": {
       "embedding_enabled": {
         "description": "启用嵌入召回",
-        "hint": "开启后使用 Embedding Provider 为长期记忆建立向量索引，并额外召回语义相近候选；失败时自动回退本地检索。",
+        "hint": "默认开着：有嵌入模型就顺手建向量索引，召回时多找一层语义相近的话；没配嵌入模型也不会报错，自动退回全文检索。没有它，记忆只能靠字面相似找，等于还是消息记录库。",
         "type": "bool",
-        "default": false
+        "default": true
       },
       "embedding_provider_id": {
         "description": "嵌入模型 Provider",
@@ -510,6 +535,24 @@
     "hint": "向量比较批量、相似度阈值、超时和补索引等高级调优参数。日常使用可保持默认。",
     "type": "object",
     "items": {
+      "anchor_floor_enabled": {
+        "description": "人工锚定保底",
+        "hint": "开启后，被显式锚定的记忆会获得一条保底分数下限（旧行为）。2.6.1 起默认关闭：锚定只作为证据之一参与排序，不再强行抬进结果。",
+        "type": "bool",
+        "default": false
+      },
+      "scope_bonus_scale": {
+        "description": "同窗口加分缩放",
+        "hint": "同一个会话/同一个人/同一个群/机器人自身的记忆获得的轻微加分倍率。1.0 恢复 2.6.0 之前的硬偏置（+0.25/+0.15/+0.15/+0.08），默认 0.2 只做平手裁决。",
+        "type": "float",
+        "default": 0.2
+      },
+      "mmr_redundancy_weight": {
+        "description": "多样性去冗余权重",
+        "hint": "MMR 重排里“与已选结果重复”的扣分权重。越大越倾向给不同的事，越小越倾向给最相关的同一件事。默认 0.35。",
+        "type": "float",
+        "default": 0.35
+      },
       "recall_latency_budget_ms": {
         "description": "召回延迟预算（毫秒）",
         "hint": "每轮召回的时间预算。超预算后跳过可选的模型调用（精排），但候选数量不变——变慢的是排序质量，不是召回内容。想提速请用这一项，而不是调低注入条数：调低条数会直接删掉这个插件存在的意义。0 表示不限制。",
@@ -691,6 +734,18 @@
         "type": "int",
         "default": 1800
       },
+      "query_max_chars": {
+        "description": "语义检索查询长度上限",
+        "hint": "把检索问题拼成语义查询时最多保留的字符数，取值会限制在 1-2000。",
+        "type": "int",
+        "default": 1000
+      },
+      "documents_per_query": {
+        "description": "单次语义扫描来源上限",
+        "hint": "一次语义检索最多扫描的来源条数，取值会限制在 64-20000；调大可提高召回但会变慢。",
+        "type": "int",
+        "default": 5000
+      },
       "processing_version": {
         "description": "原文投影修订",
         "hint": "来源脱敏或可读投影策略改变时更新此标识，避免新旧片段偏移共用 generation。",
@@ -770,17 +825,60 @@
         "type": "bool",
         "default": true
       },
-      "injection_cache_ttl_seconds": {
-        "description": "注入结果缓存秒数",
-        "hint": "同一轮内多次请求复用注入结果的时长。0 = 不缓存。",
-        "type": "float",
-        "default": 0.0
-      },
       "hook_request_budget_seconds": {
         "description": "注入钩子超时预算（秒）",
         "hint": "正数时整个注入钩子被 wait_for 包裹，超时即降级放行（本轮不注入），绝不拖死全轮对话。0 = 关闭。",
         "type": "float",
         "default": 0.0
+      },
+      "empty_recall_notice": {
+        "description": "空召回时提示「没检索到记忆」",
+        "hint": "默认关：什么都没想起来的时候不写任何回执，模型不会开口就交代「我查了记忆库」。只有排查检索问题时才需要打开。",
+        "type": "bool",
+        "default": false
+      }
+    }
+  },
+  "memory_humanization": {
+    "description": "拟人化记忆表达",
+    "hint": "让记忆表达更像人：久不提起的事措辞变模糊、没把握的事以模糊印象出现、彻底想不起时坦然承认。只影响注入措辞层，不改写存储的记忆内容，也不改变检索与权限判定；关闭后与旧版本行为完全一致。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用拟人化表达",
+        "hint": "默认开：久不提起的事说得模糊一点、没把握的说成「好像」、真想不起来就承认。关掉会变成一板一眼的确定口吻。存储与检索正确性不受影响。",
+        "type": "bool",
+        "default": true
+      },
+      "vivid_full_days": {
+        "description": "细节清晰期（天）",
+        "hint": "记忆存在不超过该天数时按原文清晰引用；超过后注入措辞降级为「细节已模糊，只可提大意」。手动记住、固定、关系承诺、伤疤和高重要度记忆不受年龄分级影响。",
+        "type": "float",
+        "default": 45.0
+      },
+      "vivid_fuzzy_days": {
+        "description": "轮廓印象期（天）",
+        "hint": "记忆存在超过该天数后只保留轮廓：措辞为「好像有这么回事」，不再给出日期、原话等具体细节。建议 365-730。",
+        "type": "float",
+        "default": 540.0
+      },
+      "fuzzy_impression_max_items": {
+        "description": "模糊印象条数上限",
+        "hint": "每轮最多把多少条低置信/陈旧记忆以「模糊印象」注入（模型可用「是不是…来着」的求证口吻使用）。0 = 恢复旧行为，这类记忆整条不注入。",
+        "type": "int",
+        "default": 2
+      },
+      "fuzzy_item_max_chars": {
+        "description": "模糊印象单条字数",
+        "hint": "模糊印象条目只保留大意轮廓，限制单条最大字数。",
+        "type": "int",
+        "default": 160
+      },
+      "no_recall_hint_enabled": {
+        "description": "想不起来时诚实提示",
+        "hint": "开启后，本轮完全没有召回任何记忆时，注入包附带一条：坦然承认「想不起来」而不是脑补细节。关闭拟人化总开关时本项无效。",
+        "type": "bool",
+        "default": true
       }
     }
   },
@@ -795,11 +893,29 @@
         "type": "bool",
         "default": true
       },
-      "capture_group_messages": {
-        "description": "记录群聊普通发言",
-        "hint": "开启后，即使 Bot 没被唤醒，也会记录群聊中的普通文本发言，用于形成连续对话片段。",
+      "capture_private_messages": {
+        "description": "记录私聊消息",
+        "hint": "开启后记录与 Bot 的私聊消息，用于形成连续对话片段。私聊天然指向 Bot，不需要唤醒词。",
         "type": "bool",
         "default": true
+      },
+      "capture_group_messages": {
+        "description": "记录群聊普通发言",
+        "hint": "默认关闭：群里别人互相聊天不再被记录（否则等于把整群人说的话都存进她的记忆）。开启后仍只记录被 @、回复 Bot、命中唤醒前缀或关键词的发言。",
+        "type": "bool",
+        "default": false
+      },
+      "group_capture_engagement_only": {
+        "description": "群聊只记与 Bot 相关的话",
+        "hint": "开启时，群聊只有 @Bot、回复 Bot、唤醒前缀或关键词命中的发言会被记录；关闭则记录群里所有文本发言（仅在已开启「记录群聊普通发言」时生效）。",
+        "type": "bool",
+        "default": true
+      },
+      "group_capture_keywords": {
+        "description": "群聊采集关键词",
+        "hint": "除 @ 和回复之外，群聊里出现这些词时也视为在叫 Bot，会记录该条发言。多个词用逗号、分号或空格分隔；留空表示不额外匹配。",
+        "type": "string",
+        "default": ""
       },
       "idle_gap_minutes": {
         "description": "连续片段间隔",
@@ -983,6 +1099,12 @@
         ],
         "default": "current_message"
       },
+      "include_intent_diagnostics": {
+        "description": "注入里回显检索诊断",
+        "hint": "开启后在注入内容里回显“检索模式/检索关键词/Bot 心理能量”等遥测行（调试用）。默认关闭，避免把内部字段写进给模型的人话里。",
+        "type": "bool",
+        "default": false
+      },
       "include_intent_context": {
         "description": "注入检索意图",
         "hint": "在上下文包中加入本轮检索意图摘要，帮助模型理解这些记忆为什么被取出。",
@@ -1058,6 +1180,55 @@
       }
     }
   },
+  "persona_memory": {
+    "description": "记得这个人",
+    "hint": "每次开口前，先把「眼前这个人是谁」放回她眼前：名字、称呼、关系、分量，还有几件要紧的事。关掉就退回按相似度找记忆。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用「记得这个人」",
+        "hint": "默认开启。开启后每轮注入一小段人物卡，超字数会自动只留名字和关系。",
+        "type": "bool",
+        "default": true
+      },
+      "max_chars": {
+        "description": "人物卡字数上限",
+        "hint": "太小会只剩名字和关系，太大会挤掉对话本身。默认 420。",
+        "type": "int",
+        "default": 420
+      },
+      "max_items": {
+        "description": "要紧的事条数",
+        "hint": "人物卡里最多列几件她记得的事。默认 4。",
+        "type": "int",
+        "default": 4
+      },
+      "max_item_chars": {
+        "description": "单条字数",
+        "hint": "人物卡里每件事最多写多少字。默认 90。",
+        "type": "int",
+        "default": 90
+      },
+      "imprint_keep_forever": {
+        "description": "刻骨的永不归档",
+        "hint": "亲密、承诺、第一次、吵过又和好的原话，不受「原始事件保留天数」限制。默认开。",
+        "type": "bool",
+        "default": true
+      },
+      "weight_enabled": {
+        "description": "她心里有杆秤",
+        "hint": "按这个人留下多少、留下多深、认识多久、一起经历过什么，掂一个「分量」，决定想起多少、忘得多快。别人（人形化、关系插件）报了自己的好感度，就听别人的。默认开。",
+        "type": "bool",
+        "default": true
+      },
+      "absorb_enabled": {
+        "description": "顺手记住关系插件说的关系",
+        "hint": "关系插件（如 user_tag）会在请求里说明「她在这人面前是谁」。默认开：只把它记进这个人的档案，不写进记忆、不当事实讲出去；用户本人亲口说的关系更硬，不会被覆盖。",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
   "private_companion_bridge": {
     "description": "记忆插件协同",
     "hint": "与主动陪伴插件协调记忆、连续对话和自我时间线，减少重复注入和提示词污染。",
@@ -1124,10 +1295,10 @@
         "default": true
       },
       "clean_proactive_history": {
-        "description": "清理主动消息历史提示与外部残留块",
-        "hint": "注入前清理 AstrBot 原始上下文中残留的主动消息生成提示、send_message_to_user 工具说明、主动承接占位和 TTS/定时控制标签，只保留用户可见的干净聊天内容。同时只保留真正带临时/不保存标记的外部片段，历史里遗留的 private_companion HTML 动态块会被清理，避免状态、引用链或工具提示写入会话历史后反复污染主链。",
+        "description": "清理自家残留的主动消息提示",
+        "hint": "默认关闭。开启后只清理本插件自己塞进请求的临时片段（主动消息生成提示、send_message_to_user 说明、主动承接占位、TTS/定时控制标签），绝不改动用户和宿主写入的历史。以前这项会顺手改写宿主传来的整段上下文，已收窄。",
         "type": "bool",
-        "default": true
+        "default": false
       },
       "suppress_self_timeline_when_companion_seen": {
         "description": "陪伴已注入时隐藏自我时间线槽",
@@ -1203,6 +1374,12 @@
         "type": "bool",
         "default": true
       },
+      "enable_person_weight_tool": {
+        "description": "启用分量工具",
+        "hint": "开启后模型可查看、纠正自己心里对当前这个人的分量（memory_companion_person_weight）；只影响当前发言者，不写聊天记录。",
+        "type": "bool",
+        "default": true
+      },
       "enable_note_tools": {
         "description": "启用陪伴笔记工具",
         "hint": "开启后模型可创建、读取和删除当前 Bot 自己可见的 companion_note，用于日程、状态、创作草稿和陪伴线索整理。",
@@ -1218,6 +1395,12 @@
       "enable_source_query_v2": {
         "description": "启用原文范围批读",
         "hint": "默认关闭。完成工具能力绑定后可按消息时间正序批读，长消息连续分片；仍共用导航步数和全局版本校验，不代表事件查全。",
+        "type": "bool",
+        "default": false
+      },
+      "allow_group_remember": {
+        "description": "允许在群聊里写入记忆",
+        "hint": "默认关闭：群里谁都能说话，一条「记住这个」不该变成对全群可见的永久记忆。需要的话在这里打开；打开后群里写的记忆也不会被钉成永久，随时可以被忘掉。",
         "type": "bool",
         "default": false
       }
@@ -1363,9 +1546,9 @@
       },
       "retention_unsummarized_timeline_days": {
         "description": "未总结时间线保留天数",
-        "hint": "从未成功写入长期总结的原始消息，超过该天数后在睡眠维护时删除；仍被待处理批次占有的行会跳过。这些行多半来自总结失败或被隔离的批次，不设上限的话时间线只会一直增长。默认 0 表示不自动删除——删的是原始对话，不可逆，确认不再需要后再开启。",
+        "hint": "从未成功写入长期总结的原始消息，超过该天数后在睡眠维护时删除；仍被待处理批次占用的行会跳过。默认 365 天：一年的原话还总结不了，基本就是没用了，留着只会让时间线无限长。删的是原始流水，已总结出来的记忆不受影响；改成 0 就是不自动删。",
         "type": "int",
-        "default": 0
+        "default": 365
       },
       "pending_review_max_age_days": {
         "description": "待复核候选最长保留天数",
@@ -1503,15 +1686,15 @@
     "items": {
       "memory_decay_after_days": {
         "description": "衰减年龄天数",
-        "hint": "稳定记忆存在超过该天数后才可能进入衰减候选。明确记住、画像、偏好、关系、手动记忆会被保护。",
+        "hint": "稳定记忆存在超过该天数后才可能进入衰减候选。明确记住、画像、偏好、关系、手动记忆会被保护。原版默认 180；拟人向调低到 90，让久不提起的日常记忆更早真正变淡。",
         "type": "int",
-        "default": 180
+        "default": 90
       },
       "memory_decay_idle_days": {
         "description": "未访问天数",
-        "hint": "记忆距离上次被召回超过该天数后才可能衰减；被频繁召回的记忆会自然加固。",
+        "hint": "记忆距离上次被召回超过该天数后才可能衰减；被频繁召回的记忆会自然加固。原版默认 90；拟人向调低到 45，约一个半月没人提起的事就开始变淡。",
         "type": "int",
-        "default": 90
+        "default": 45
       },
       "memory_decay_max_importance_percent": {
         "description": "重要记忆慢忘阈值",
@@ -1524,6 +1707,30 @@
         "hint": "年龄、未访问时间、重要度和置信度共同计算的衰减分达到该百分比后才进入压缩。",
         "type": "int",
         "default": 75
+      },
+      "memory_decay_gradual_enabled": {
+        "description": "先淡再忘",
+        "hint": "打开后，老记忆先一档一档褪色（召回分数越来越低），褪到很淡才归档；不会某天突然整条消失。关掉就退回「到点直接归档」的老做法。",
+        "type": "bool",
+        "default": true
+      },
+      "memory_decay_fade_floor_percent": {
+        "description": "淡到什么程度才归档",
+        "hint": "记忆的「清晰度」低于该百分比才允许归档。默认 25：只剩两成多印象时，她才真的想不起来了。",
+        "type": "int",
+        "default": 25
+      },
+      "memory_decay_fade_ratio_percent": {
+        "description": "每次褪色比例",
+        "hint": "每褪一次，清晰度变成原来的百分之多少。默认 70，褪两三次就到了「模糊」那档。",
+        "type": "int",
+        "default": 70
+      },
+      "memory_decay_fade_interval_days": {
+        "description": "褪色间隔天数",
+        "hint": "同一条记忆两次褪色之间至少隔多少天，避免维护一跑就一路褪到底。",
+        "type": "int",
+        "default": 1
       },
       "memory_decay_max_candidates": {
         "description": "单次候选上限",

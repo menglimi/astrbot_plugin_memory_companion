@@ -150,6 +150,7 @@ class ScopedStore:
                     policy_version TEXT NOT NULL,
                     migration_epoch TEXT NOT NULL,
                     deleted INTEGER NOT NULL DEFAULT 0,
+                    erased INTEGER NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY(namespace_scope, record_kind, record_id)
                 );
@@ -188,6 +189,14 @@ class ScopedStore:
                 );
                 """
             )
+            columns = {
+                str(row["name"]) for row in conn.execute("PRAGMA table_info(scoped_records)").fetchall()
+            }
+            if "erased" not in columns:
+                # 旧库兼容：擦除标记列用幂等 ALTER 补上，默认 0，历史行全部可读。
+                conn.execute(
+                    "ALTER TABLE scoped_records ADD COLUMN erased INTEGER NOT NULL DEFAULT 0"
+                )
             state = conn.execute(
                 "SELECT migration_epoch,policy_version,revision FROM scoped_epoch_state WHERE singleton=1"
             ).fetchone()
@@ -330,7 +339,7 @@ class ScopedStore:
                     raise ScopedRecordConflict("scoped_event_conflict")
                 return "duplicate"
             row = conn.execute(
-                "SELECT revision,payload_hash,deleted FROM scoped_records WHERE namespace_scope=? AND record_kind=? AND record_id=?",
+                "SELECT revision,payload_hash,deleted,erased FROM scoped_records WHERE namespace_scope=? AND record_kind=? AND record_id=?",
                 (scope, record_kind, identifier),
             ).fetchone()
             if row is None:
@@ -351,12 +360,12 @@ class ScopedStore:
                 conn.execute(
                     """INSERT INTO scoped_records(
                         namespace_scope,record_kind,record_id,revision,payload_json,payload_hash,
-                        policy_version,migration_epoch,deleted,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,0,?)
+                        policy_version,migration_epoch,deleted,erased,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,0,0,?)
                     ON CONFLICT(namespace_scope,record_kind,record_id) DO UPDATE SET
                         revision=excluded.revision,payload_json=excluded.payload_json,payload_hash=excluded.payload_hash,
                         policy_version=excluded.policy_version,migration_epoch=excluded.migration_epoch,
-                        deleted=0,updated_at=excluded.updated_at""",
+                        deleted=0,erased=0,updated_at=excluded.updated_at""",
                     (
                         scope, record_kind, identifier, revision, encoded, digest,
                         context.policy_version, context.migration_epoch, now,
@@ -399,6 +408,7 @@ class ScopedStore:
             rows = conn.execute(
                 """SELECT record_id,revision,payload_json,payload_hash,policy_version,migration_epoch,updated_at
                 FROM scoped_records WHERE namespace_scope=? AND record_kind=? AND deleted=0
+                AND erased=0
                 ORDER BY revision,record_id LIMIT ?""",
                 (self._scope(context), record_kind, safe_limit),
             ).fetchall()
@@ -450,7 +460,7 @@ class ScopedStore:
             if int(row["deleted"]) == 1:
                 raise ScopedRecordConflict("scoped_record_tombstoned")
             conn.execute(
-                """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,deleted=1,updated_at=?
+                """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,deleted=1,erased=1,updated_at=?
                    WHERE namespace_scope=? AND record_kind=? AND record_id=?""",
                 (revision, _ERASED_PAYLOAD_JSON, _ERASED_PAYLOAD_HASH, now, scope, record_kind, identifier),
             )
@@ -504,7 +514,7 @@ class ScopedStore:
             ).fetchall()
             for row in rows:
                 conn.execute(
-                    """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,deleted=1,updated_at=?
+                    """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,deleted=1,erased=1,updated_at=?
                        WHERE namespace_scope=? AND record_kind=? AND record_id=? AND deleted=0""",
                     (
                         int(row["revision"]) + 1, _ERASED_PAYLOAD_JSON, _ERASED_PAYLOAD_HASH,
@@ -574,10 +584,15 @@ class ScopedStore:
                 if prior["request_hash"] != request_hash:
                     raise ScopedRecordConflict("scoped_namespace_operation_conflict")
                 return json.loads(prior["result_json"])
+            # 同一类 bug：真实 record_id 是 uuid，按前缀匹配会假成功；归属字段在
+            # namespace_scope JSON 里，先 instr() 粗筛再按 kind/persona/identity 精判。
+            persona_needle = '"persona_id":' + _canonical(context.persona_id)
+            identity_needle = '"identity_id":' + _canonical(context.identity_id)
             candidates = conn.execute(
                 """SELECT namespace_scope,record_kind,record_id,revision FROM scoped_records
-                   WHERE deleted=0 AND record_id LIKE ? ORDER BY namespace_scope,record_kind,record_id""",
-                (f"{prefix}%",),
+                   WHERE deleted=0 AND instr(namespace_scope, ?) > 0 AND instr(namespace_scope, ?) > 0
+                   ORDER BY namespace_scope,record_kind,record_id""",
+                (persona_needle, identity_needle),
             ).fetchall()
             rows: list[sqlite3.Row] = []
             scopes: set[str] = set()
@@ -597,7 +612,7 @@ class ScopedStore:
                     scopes.add(str(row["namespace_scope"]))
             for row in rows:
                 conn.execute(
-                    """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,deleted=1,updated_at=?
+                    """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,deleted=1,erased=1,updated_at=?
                        WHERE namespace_scope=? AND record_kind=? AND record_id=? AND deleted=0""",
                     (
                         int(row["revision"]) + 1, _ERASED_PAYLOAD_JSON, _ERASED_PAYLOAD_HASH,
@@ -608,6 +623,7 @@ class ScopedStore:
             result = {
                 "code": "identity_scopes_tombstoned" if rows else "identity_scopes_already_empty",
                 "count": len(rows),
+                "deleted": len(rows),
                 "namespace_count": len(scopes),
                 "reason_code": reason,
             }
@@ -660,14 +676,26 @@ class ScopedStore:
                 if prior["request_hash"] != request_hash:
                     raise ScopedRecordConflict("scoped_namespace_operation_conflict")
                 return json.loads(prior["result_json"])
+            # 真实 record_id 是 uuid，旧实现用 record_id LIKE 'req041-%' 只能命中
+            # 测试数据，线上一条都擦不到（返回成功但库里什么都没擦）。归属信息
+            # 在 namespace_scope 的 JSON 里，按 persona_id/group_id 精确匹配；
+            # instr() 只做便宜的前置过滤，真正的判定仍在下面按 JSON 字段做。
+            # record_prefix 仍保留在 request_hash 里，只为旧 operation 幂等兼容。
+            persona_needle = '"persona_id":' + _canonical(context.persona_id)
+            group_needle = '"group_id":' + _canonical(context.group_id)
             candidates = conn.execute(
-                """SELECT namespace_scope,record_kind,record_id,revision,payload_json FROM scoped_records
-                   WHERE deleted=0 AND record_id LIKE ? ORDER BY namespace_scope,record_kind,record_id""",
-                (f"{prefix}%",),
+                """SELECT namespace_scope,record_kind,record_id,revision,payload_json,payload_hash,erased
+                   FROM scoped_records
+                   WHERE deleted=0 AND instr(namespace_scope, ?) > 0 AND instr(namespace_scope, ?) > 0
+                   ORDER BY namespace_scope,record_kind,record_id""",
+                (persona_needle, group_needle),
             ).fetchall()
             rows: list[tuple[sqlite3.Row, str, str]] = []
             scopes: set[str] = set()
             for row in candidates:
+                if int(row["erased"]):
+                    # 已经擦空的行不重复 bump revision；用新 operation_id 再擦是 no-op。
+                    continue
                 try:
                     owner = json.loads(row["namespace_scope"])
                     payload = json.loads(row["payload_json"])
@@ -705,7 +733,7 @@ class ScopedStore:
                 scopes.add(str(row["namespace_scope"]))
             for row, encoded, digest in rows:
                 conn.execute(
-                    """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,updated_at=?
+                    """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,erased=1,updated_at=?
                        WHERE namespace_scope=? AND record_kind=? AND record_id=? AND deleted=0""",
                     (
                         int(row["revision"]) + 1, encoded, digest, now, row["namespace_scope"],
@@ -714,7 +742,8 @@ class ScopedStore:
                 )
             result = {
                 "code": "group_scopes_erased" if rows else "group_scopes_already_empty",
-                "count": len(rows), "namespace_count": len(scopes), "reason_code": reason,
+                "count": len(rows), "deleted": len(rows),
+                "namespace_count": len(scopes), "reason_code": reason,
             }
             conn.execute(
                 """INSERT INTO scoped_namespace_operations(
@@ -763,15 +792,22 @@ class ScopedStore:
                 if prior["request_hash"] != request_hash:
                     raise ScopedRecordConflict("scoped_namespace_operation_conflict")
                 return json.loads(prior["result_json"])
+            # 同 erase_group_scopes：真实 record_id 是 uuid，按 owner 的
+            # namespace_scope 里 persona_id 精确匹配，前缀只用于旧 operation 哈希。
+            persona_needle = '"persona_id":' + _canonical(context.persona_id)
             candidates = conn.execute(
-                """SELECT namespace_scope,record_kind,record_id,revision,payload_json FROM scoped_records
-                   WHERE deleted=0 AND record_id LIKE ? ORDER BY namespace_scope,record_kind,record_id""",
-                (f"{prefix}%",),
+                """SELECT namespace_scope,record_kind,record_id,revision,payload_json,payload_hash,erased
+                   FROM scoped_records
+                   WHERE deleted=0 AND instr(namespace_scope, ?) > 0
+                   ORDER BY namespace_scope,record_kind,record_id""",
+                (persona_needle,),
             ).fetchall()
             rows: list[tuple[sqlite3.Row, str, str]] = []
             scopes: set[str] = set()
             kinds: set[str] = set()
             for row in candidates:
+                if int(row["erased"]):
+                    continue
                 try:
                     owner = json.loads(row["namespace_scope"])
                     payload = json.loads(row["payload_json"])
@@ -806,7 +842,7 @@ class ScopedStore:
                 kinds.add(str(owner.get("kind") or ""))
             for row, encoded, digest in rows:
                 conn.execute(
-                    """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,updated_at=?
+                    """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,erased=1,updated_at=?
                        WHERE namespace_scope=? AND record_kind=? AND record_id=? AND deleted=0""",
                     (
                         int(row["revision"]) + 1, encoded, digest, now, row["namespace_scope"],
@@ -815,7 +851,7 @@ class ScopedStore:
                 )
             result = {
                 "code": "persona_scopes_erased" if rows else "persona_scopes_already_empty",
-                "count": len(rows), "namespace_count": len(scopes),
+                "count": len(rows), "deleted": len(rows), "namespace_count": len(scopes),
                 "namespace_kinds": sorted(kinds), "reason_code": reason,
             }
             conn.execute(

@@ -1,0 +1,24 @@
+[project]
+name = "astrbot_plugin_memory_companion"
+version = "2.6.1"
+description = "AstrBot 记忆伴侣插件：跨会话记忆、画像与页面控制台"
+requires-python = ">=3.10"
+dependencies = ["astrbot>=4.27"]
+
+# 这里只声明 pytest 配置，不声明构建后端：插件以源码目录直接安装进 AstrBot，
+# 不走 pip 分发。
+[tool.pytest.ini_options]
+# 插件根目录本身是 Python 包（__init__.py + tests/__init__.py）。pyproject 放在
+# 仓库根后 pytest 的 confcutdir 默认就变成仓库根，收集单文件时会把插件根当成
+# 名为 __init__ 的包去 import，触发根 __init__.py 里的相对导入失败。把
+# confcutdir 钉在 tests/：与加 pyproject 之前的默认行为一致，conftest 与 sys.path
+# 兜底由 pythonpath 负责。
+addopts = "--confcutdir=tests"
+# 测试里同时有 unittest.IsolatedAsyncioTestCase 与 async def 用例；auto 模式
+# 只接管后者，不改变 IsolatedAsyncioTestCase 的既有行为。
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["."]
+# subtests：pytest 9 原生收集 subTest，pytest-subtests 插件（requirements-dev.txt）
+# 提供旧版兼容，二者都不需要额外开关。

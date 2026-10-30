@@ -1,0 +1,148 @@
+#memory-injection-status {
+  position: absolute;
+  z-index: 7;
+  left: 60px;
+  top: 292px;
+  width: 448px;
+  padding: 17px 18px 15px;
+  border-top: 1px solid rgba(80, 75, 65, 0.55);
+  border-bottom: 1px solid rgba(80, 75, 65, 0.22);
+  color: #3d3b35;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(8px);
+  transition: opacity 0.7s 0.2s, transform 0.7s 0.2s;
+}
+
+#stage[data-mode="archive"] #memory-injection-status {
+  opacity: 1;
+  pointer-events: auto;
+  transform: none;
+}
+
+.mc-injection-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 10px;
+}
+
+.mc-injection-head div {
+  display: grid;
+  gap: 5px;
+}
+
+.mc-injection-head span,
+.mc-injection-status,
+.mc-injection-row-main span,
+.mc-injection-row-meta {
+  color: #77756d;
+  font-size: 10px;
+  letter-spacing: 0.7px;
+}
+
+.mc-injection-head strong {
+  color: #282a24;
+  font-size: 17px;
+  font-weight: 650;
+}
+
+.mc-injection-head button {
+  width: 26px;
+  height: 26px;
+  border: 1px solid rgba(80, 75, 65, 0.35);
+  color: #6c634f;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.mc-injection-head button:hover,
+.mc-injection-head button:focus-visible {
+  border-color: #9b7247;
+  color: #9b7247;
+}
+
+.mc-injection-head button:disabled {
+  cursor: wait;
+  opacity: 0.5;
+}
+
+.mc-injection-status {
+  margin: 0 0 9px;
+  letter-spacing: 0;
+}
+
+.mc-injection-status[data-error="true"] {
+  color: #a04c35;
+}
+
+.mc-injection-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mc-injection-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 42px;
+  padding: 7px 0 7px 10px;
+  border-left: 2px solid rgba(89, 96, 75, 0.28);
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.mc-injection-row-main {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.mc-injection-row-main strong {
+  overflow: hidden;
+  color: #292a25;
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mc-injection-row-main span {
+  letter-spacing: 0;
+}
+
+.mc-injection-row-meta {
+  display: grid;
+  flex: none;
+  justify-items: end;
+  gap: 3px;
+  white-space: nowrap;
+}
+
+.mc-injection-row-meta b {
+  color: #6b7958;
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.mc-injection-row-meta b[data-state="empty"] {
+  color: #9a7651;
+}
+
+.mc-injection-row-meta i {
+  color: #9a9286;
+  font-size: 9px;
+  font-style: normal;
+}
+
+@media (max-width: 800px) {
+  #memory-injection-status {
+    left: 40px;
+    top: 314px;
+    width: min(448px, calc(100% - 80px));
+  }
+}

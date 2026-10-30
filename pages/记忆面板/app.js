@@ -175,6 +175,11 @@ async function apiPost(path, payload) {
 
 async function apiRequest(path, options) {
   const method = (options.method || "GET").toUpperCase();
+  // 2.6.0：危险动作的确认口令与写操作的 CSRF 令牌统一在这里补齐，调用点保持原样。
+  if (method !== "GET") {
+    options.body = await withCsrfToken(options.body);
+    options.body = await withConfirmation(path, options.body);
+  }
   const httpAvailable = canUseHttpFallback();
   const bridge = getBridge() || await waitForBridge();
   let data;
@@ -197,6 +202,111 @@ async function apiRequest(path, options) {
   }
   if (!data || data.success === false) throw new Error(data && data.error ? data.error : "请求失败");
   return guardPayload(data.data !== undefined ? data.data : data, path);
+}
+
+// 与后端 _wrap_route 的确认口径一一对应：
+// 删除类 DELETE:<id>、清空类 CLEAR:<scope>、擦人类 ERASE:<user_id>、
+// 其余危险路由 CONFIRM:<route>。只有危险路由才注入，普通写入不受影响。
+const CONFIRMATION_ROUTES = new Set([
+  "/memory/delete",
+  "/core-memory/delete",
+  "/person/erase",
+  "/person/weight",
+  "/portrait/govern",
+  "/maintenance/audit/apply",
+  "/maintenance/audit/rollback",
+  "/data/import/run",
+  "/conversation-import/rollback",
+  "/maintenance/clear_all",
+  "/maintenance/clear_scope",
+  "/import/livingmemory/run",
+  "/config/module/update",
+]);
+
+function canonicalConfirmation(route, payload) {
+  if (route === "/memory/delete" || route === "/core-memory/delete") {
+    return "DELETE:" + (payload.id || "");
+  }
+  if (route === "/person/erase") {
+    return "ERASE:" + (payload.user_id || "");
+  }
+  if (route === "/maintenance/clear_all") {
+    return "CLEAR:all";
+  }
+  if (route === "/maintenance/clear_scope") {
+    return "CLEAR:" + (payload.target_type || payload.type || payload.scope || "");
+  }
+  return "CONFIRM:" + route;
+}
+
+// P13：写操作要带 CSRF 令牌。令牌由 GET /ui/csrf 下发（15 分钟有效）；
+// 桥接通道无法自定义请求头，所以统一放进 body.csrf_token，服务端两种都收。
+let csrfTokenCache = { token: "", expiresAt: 0 };
+
+function payloadOf(data) {
+  return data && data.data !== undefined ? data.data : data;
+}
+
+// 不经过 apiRequest 的底层请求：取令牌/取 nonce 时不能再次触发注入逻辑。
+async function rawApiRequest(path, method, body) {
+  const bridge = getBridge() || await waitForBridge();
+  if (bridge && typeof bridge.apiGet === "function" && typeof bridge.apiPost === "function") {
+    return bridgeRequest(bridge, path, method, body);
+  }
+  if (canUseHttpFallback()) return httpRequest(path, method, body);
+  return null;
+}
+
+async function ensureCsrfToken(force) {
+  const now = Date.now();
+  if (!force && csrfTokenCache.token && csrfTokenCache.expiresAt > now + 5000) {
+    return csrfTokenCache.token;
+  }
+  let data = null;
+  try {
+    data = await rawApiRequest("/ui/csrf", "GET", null);
+  } catch (error) {
+    return "";
+  }
+  const body = payloadOf(data);
+  const token = body && typeof body.token === "string" ? body.token : "";
+  if (!token) return "";
+  const ttl = Number(body.expires_in) > 0 ? Number(body.expires_in) : 900;
+  csrfTokenCache = { token: token, expiresAt: now + ttl * 1000 };
+  return token;
+}
+
+async function withCsrfToken(body) {
+  const payload = Object.assign({}, body || {});
+  const token = await ensureCsrfToken(false);
+  if (token) payload.csrf_token = token;
+  return payload;
+}
+
+async function requestConfirmationNonce(route, payload) {
+  let data = null;
+  try {
+    const token = await ensureCsrfToken(false);
+    const requestBody = { route: route, payload: payload || {} };
+    if (token) requestBody.csrf_token = token;
+    data = await rawApiRequest("/ui/confirm-nonce", "POST", requestBody);
+  } catch (error) {
+    return "";
+  }
+  const body = payloadOf(data);
+  return body && typeof body.confirm === "string" ? body.confirm : "";
+}
+
+// P9：确认串改为一次性 nonce——先向服务端要 "<canonical>:<nonce>"，取不到时
+// 回退到固定串（非浏览器上下文仍然接受，便于本地脚本与排查）。
+async function withConfirmation(path, body) {
+  const route = String(path || "").split("?")[0];
+  if (!CONFIRMATION_ROUTES.has(route)) return body;
+  const payload = Object.assign({}, body || {});
+  const canonical = canonicalConfirmation(route, payload);
+  const nonce = await requestConfirmationNonce(route, payload);
+  payload.confirm = nonce || canonical;
+  return payload;
 }
 
 async function bridgeRequest(bridge, path, method, body) {
@@ -517,7 +627,7 @@ const NAV = [
     id: "import",
     label: "导入",
     icon: "download",
-    views: ["chatimport", "migrate"],
+    views: ["chatimport", "migrate", "quarantine"],
   },
   {
     id: "settings",
@@ -638,18 +748,23 @@ function refresh() {
 /* ------------------------------------------------------------
    组件片段
    ------------------------------------------------------------ */
-function kpi(label, value, foot, tone) {
-  return (
-    '<article class="kpi"' + (tone ? ' data-tone="' + tone + '"' : "") + ">" +
+function kpi(label, value, foot, tone, goto) {
+  const inner =
     '<span class="kpi-label">' + esc(label) + "</span>" +
     '<span class="kpi-value">' + esc(value) + "</span>" +
-    (foot ? '<span class="kpi-foot">' + esc(foot) + "</span>" : "") +
-    "</article>"
-  );
+    (foot ? '<span class="kpi-foot">' + esc(foot) + "</span>" : "");
+  const toneAttr = tone ? ' data-tone="' + esc(tone) + '"' : "";
+  if (goto) {
+    return (
+      '<button class="kpi is-link" type="button"' + toneAttr +
+      ' data-goto="' + esc(goto) + '">' + inner + "</button>"
+    );
+  }
+  return '<article class="kpi"' + toneAttr + ">" + inner + "</article>";
 }
 
 function badge(text, tone) {
-  return '<span class="badge' + (tone ? '" data-tone="' + tone : "") + '">' + esc(text) + "</span>";
+  return '<span class="badge' + (tone ? '" data-tone="' + esc(tone) : "") + '">' + esc(text) + "</span>";
 }
 
 function emptyState(title, text) {
@@ -1135,19 +1250,30 @@ defineView("overview", {
   eyebrow: "Overview",
   hint: "记忆库规模、范围分布与联动状态的整体快照",
   async load() {
-    const [statsPayload, buckets, core, caps, coord, memories, personal] = await Promise.all([
+    const [statsPayload, buckets, core, caps, coord, memories, personal, injectionLogs] = await Promise.all([
       apiGet("/stats"),
       apiTry(() => apiGet("/buckets?limit=160"), { buckets: [] }),
       apiTry(() => apiGet("/core-memory"), { blocks: [] }),
       apiTry(() => apiGet("/capabilities/bot-personal"), {}),
       apiTry(() => apiGet("/coordination/status"), { status: {} }),
-      apiTry(() => apiGet("/memories?limit=80"), { memories: [] }),
+      // 列表接口必须带范围；总览用显式的 scope=all 表示“所有范围”。
+      apiTry(() => apiGet("/memories?scope=all&limit=80"), { memories: [] }),
       apiTry(() => apiGet("/companion/personal-memory?limit=1"), null),
+      apiTry(() => apiGet("/logs?limit=12"), { items: [] }),
     ]);
     const stats = (statsPayload && statsPayload.stats) || {};
     state.stats = stats;
     state.buckets = Array.isArray(buckets.buckets) ? buckets.buckets : [];
-    return { stats, buckets: state.buckets, core: core.blocks || [], caps, personal, coord: coord.status || {}, memories: memories.memories || [] };
+    return {
+      stats,
+      buckets: state.buckets,
+      core: core.blocks || [],
+      caps,
+      personal,
+      coord: coord.status || {},
+      memories: memories.memories || [],
+      injectionLogs: Array.isArray(injectionLogs.items) ? injectionLogs.items : [],
+    };
   },
   render(data) {
     if (state.mode === "cinema") return renderCinemaOverview(data);
@@ -1168,7 +1294,7 @@ defineView("overview", {
       kpi("原文已记录", fmtInt(progress.raw_events), "原始会话事件", "group"),
       kpi("会话记忆已生成", fmtInt(progress.conversation_memories), "不含待审核候选", "fact"),
       kpi("待处理批次", fmtInt(progress.pending_batches), "排队或延迟重试", "accent"),
-      kpi("待修复批次", fmtInt(progress.quarantined_batches), "本批事件已冻结，需人工复核释放", "gold"),
+      kpi("待修复批次", fmtInt(progress.quarantined_batches), "冻结原文 " + fmtInt(progress.frozen_events) + " 条 · 点击查看并释放", "gold", "quarantine"),
       kpi("已处理，无新增记忆", fmtInt(progress.no_memory_batches), "原文保留，不重复总结", "private"),
     ].join("");
 
@@ -1228,17 +1354,52 @@ defineView("overview", {
           ? (personalStatus.dailyPlanEnabled ? "日程已启用" : "日程未启用") + " · " + (personalStatus.detailEnabled ? "细化已启用" : "细化未启用")
           : personalStatus.reason || "不可用",
     ]);
-    const injectionLogs = Number(stats.injection_logs) || 0;
+    const injectionLogCount = Number(stats.injection_logs) || 0;
     bridges.push([
-      injectionLogs > 0 ? "is-ok" : "is-off",
+      injectionLogCount > 0 ? "is-ok" : "is-off",
       "外部写入接口",
-      injectionLogs > 0 ? injectionLogs + " 条注入日志" : "暂无注入日志",
+      injectionLogCount > 0 ? injectionLogCount + " 条注入日志" : "暂无注入日志",
     ]);
     const linkageNote = personalStatus.installed
       ? ""
       : '<p class="section-note">未检测到 astrbot_plugin_private_companion。<b>记忆功能不受影响</b>，'
         + '装上陪伴插件后这里会显示它的日程、相册与表达权威归属。'
         + '<button class="btn is-sm" type="button" data-goto="companion" style="margin-left:8px">查看联动页</button></p>';
+
+    const injectionLogs = Array.isArray(data.injectionLogs) ? data.injectionLogs : [];
+    const injectionRows = injectionLogs
+      .slice(0, 12)
+      .map((item) => {
+        const selected = Array.isArray(item.selected_memories) ? item.selected_memories : [];
+        const blocked = Array.isArray(item.blocked_reasons) ? item.blocked_reasons : [];
+        const query = compact(item.query) || "无检索词";
+        const selectedText = selected.length
+          ? selected.slice(0, 2).map((memory) => memoryTitle(memory)).join("；")
+          : blocked.length
+            ? "未注入记忆 · 过滤 " + blocked.length + " 项"
+            : "未注入记忆";
+        return (
+          '<div class="row" style="cursor:default;align-items:flex-start">' +
+            '<div class="row-main" style="min-width:0">' +
+              '<div class="row-title" title="' + esc(query) + '">' + esc(clip(query, 72)) + "</div>" +
+              '<div class="row-sub">' + esc(fmtTime(item.created_at)) + " · " +
+                esc(selected.length + " 条记忆 · " + int(item.injection_chars) + " 字") + "</div>" +
+              '<div class="section-note" style="margin-top:5px;white-space:normal">' + esc(clip(selectedText, 180)) + "</div>" +
+            "</div>" +
+            '<div class="row-meta">' +
+              badge(selected.length ? "已注入" : "未注入", selected.length ? "ok" : "warn") +
+              (blocked.length ? badge("过滤 " + blocked.length, "") : "") +
+            "</div>" +
+          "</div>"
+        );
+      })
+      .join("");
+    const injectionCard = card(
+      "最近注入",
+      injectionLogs.length ? "最近 12 轮主链注入记录" : "暂无可展示的注入记录",
+      injectionRows || emptyState("暂无注入记录", "开启记忆注入并产生请求后，这里会显示最近轮次。"),
+      '<button class="btn is-sm is-ghost" type="button" data-refresh-injection>刷新</button>'
+    );
 
     return (
       '<div class="grid" style="gap:16px">' +
@@ -1262,10 +1423,12 @@ defineView("overview", {
         kpi("关系边", fmtInt(stats.relationships), "实体间关系", "relation") +
         kpi("ACL 规则", fmtInt(stats.acl_rules), "跨窗口读写授权", "gold") +
       "</div>" +
+      injectionCard +
       "</div>"
     );
   },
   mount(node) {
+    $("[data-refresh-injection]", node)?.addEventListener("click", () => refresh());
     const sceneRoot = $("#cinemaScene", node);
     if (sceneRoot) {
       const mountScene = () => window.MemoryCinema3D && window.MemoryCinema3D.mountArchiveScene(sceneRoot);
@@ -1346,7 +1509,7 @@ defineView("overview", {
    ============================================================ */
 async function loadPool() {
   if (state.pool) return state.pool;
-  const result = await apiGet("/memories?limit=800");
+  const result = await apiGet("/memories?scope=all&limit=200");
   state.pool = Array.isArray(result.memories) ? result.memories : [];
   return state.pool;
 }
@@ -1499,6 +1662,8 @@ defineView("inspect", {
       if (filters.scope === "group") params.push("group_id=" + encodeURIComponent(filters.target));
       else params.push("entity_id=" + encodeURIComponent(filters.target));
     }
+    // 没有指定范围时用显式 scope=all，而不是让后端默认放开全量。
+    if (!filters.scope && !filters.target) params.push("scope=all");
     const result = await apiGet("/memories?" + params.join("&"));
     let memories = Array.isArray(result.memories) ? result.memories : [];
     if (filters.scope === "profile") {
@@ -3691,6 +3856,131 @@ defineView("migrate", {
 });
 
 /* ============================================================
+   视图：待修复批次
+   ============================================================ */
+const QUARANTINE_PAGE_SIZE = 50;
+let quarantineOffset = 0;
+
+defineView("quarantine", {
+  title: "待修复批次",
+  navLabel: "待修复批次",
+  eyebrow: "Quarantine · Review",
+  hint: "被隔离的总结批次：原文事件已冻结，需人工复核后重新排队或放弃",
+  async load() {
+    return apiTry(
+      () => apiGet("/maintenance/summary_batches?limit=" + QUARANTINE_PAGE_SIZE + "&offset=" + quarantineOffset),
+      { total: 0, legacy_failures: 0, batches: [] }
+    );
+  },
+  render(data) {
+    const total = int(data.total);
+    const legacy = int(data.legacy_failures);
+    const batches = Array.isArray(data.batches) ? data.batches : [];
+    const pageTo = quarantineOffset + batches.length;
+
+    const summary =
+      '<div class="pill-row" style="gap:8px;margin-bottom:12px">' +
+      badge("待修复批次 " + fmtInt(total), "gold") +
+      badge("旧版失败记录 " + fmtInt(legacy), "fact") +
+      "</div>";
+
+    const bulk =
+      '<div class="tool-actions" style="margin-bottom:12px">' +
+      '<button class="btn is-sm" type="button" id="qRetryAllBtn">全部重新排队</button>' +
+      '<button class="btn is-sm is-danger" type="button" id="qDiscardAllBtn">全部放弃</button>' +
+      '<button class="btn is-sm" type="button" id="qRefreshBtn">刷新</button>' +
+      "</div>";
+
+    const pager =
+      '<div class="pill-row" style="justify-content:space-between;align-items:center;margin-top:12px">' +
+      '<button class="btn is-sm" type="button" id="qPrevBtn"' + (quarantineOffset <= 0 ? " disabled" : "") + ">上一页</button>" +
+      '<span class="kpi-foot">' + (batches.length ? quarantineOffset + 1 + "–" + pageTo + " / " + fmtInt(total) : "无记录") + "</span>" +
+      '<button class="btn is-sm" type="button" id="qNextBtn"' + (pageTo >= total ? " disabled" : "") + ">下一页</button>" +
+      "</div>";
+
+    const rows = batches.length
+      ? '<div class="row-list">' +
+        batches
+          .map((item) =>
+            '<div class="row">' +
+            '<div class="row-main">' +
+            '<div class="row-title">' + esc(compact(item.session_id)) + "</div>" +
+            '<div class="row-sub">' + esc(compact(item.last_error) || "（无错误摘要）") + "</div>" +
+            '<div class="row-sub" style="font-family:var(--font-mono)">' + esc(item.id) + "</div>" +
+            '<div class="row-meta">' +
+            badge("事件 " + fmtInt(item.event_count), "group") +
+            badge(compact(item.scope), "fact") +
+            badge(String(item.updated_at || "").slice(0, 16), "private") +
+            "</div></div>" +
+            '<div class="tool-actions" style="margin-top:0">' +
+            '<button class="btn is-sm" type="button" data-q-action="retry" data-q-batch="' + esc(item.id) + '">重新排队</button>' +
+            '<button class="btn is-sm is-danger" type="button" data-q-action="discard" data-q-batch="' + esc(item.id) + '">放弃</button>' +
+            "</div></div>"
+          )
+          .join("") +
+        "</div>"
+      : emptyState("没有待修复批次", "被隔离的总结批次会出现在这里，可逐条或整批重新排队 / 放弃。");
+
+    return (
+      '<div class="grid">' +
+      card(
+        "待修复批次",
+        "隔离批次持有其原文事件，释放后事件才会重新进入总结流程",
+        summary + bulk + rows + pager
+      ) +
+      "</div>"
+    );
+  },
+  mount(node) {
+    const run = async (label, fn) => {
+      await withBusy(label + "…", async () => {
+        try {
+          const result = await fn();
+          const payload = (result && result.data) || {};
+          toast(label + "完成" + (payload.released !== undefined ? "：" + payload.released + " 条" : ""), "ok");
+        } catch (error) {
+          toast(label + "失败：" + error.message, "error");
+        }
+        go("quarantine");
+      });
+    };
+    const bind = (id, fn, label) => {
+      const button = $(id, node);
+      if (button) button.addEventListener("click", () => run(label, fn));
+    };
+    bind("#qRefreshBtn", () => Promise.resolve({}), "刷新");
+    bind("#qRetryAllBtn", async () => {
+      const confirmed = await showInlineConfirmation("全部重新排队", "把全部待修复批次的事件交还，交给后续会话重新总结。确定继续？", "重新排队");
+      if (!confirmed) throw new Error("已取消");
+      return apiPost("/maintenance/release_summary_batches", { all: true, mode: "retry" });
+    }, "全部重新排队");
+    bind("#qDiscardAllBtn", async () => {
+      const confirmed = await showInlineConfirmation("全部放弃", "把全部待修复批次的原文标记为已总结，等于承认它们不再进入长期记忆。确定继续？", "全部放弃");
+      if (!confirmed) throw new Error("已取消");
+      return apiPost("/maintenance/release_summary_batches", { all: true, mode: "discard" });
+    }, "全部放弃");
+    const prev = $("#qPrevBtn", node);
+    if (prev) prev.addEventListener("click", () => { quarantineOffset = Math.max(0, quarantineOffset - QUARANTINE_PAGE_SIZE); go("quarantine"); });
+    const next = $("#qNextBtn", node);
+    if (next) next.addEventListener("click", () => { quarantineOffset += QUARANTINE_PAGE_SIZE; go("quarantine"); });
+    $$("[data-q-action]", node).forEach((button) => {
+      button.addEventListener("click", () => {
+        const batchId = button.dataset.qBatch;
+        if (button.dataset.qAction === "discard") {
+          run("放弃批次", async () => {
+            const confirmed = await showInlineConfirmation("放弃该批次", "该批次的原文将被标记为已总结，不再进入长期记忆。确定继续？", "放弃");
+            if (!confirmed) throw new Error("已取消");
+            return apiPost("/maintenance/release_summary_batches", { batch_ids: [batchId], mode: "discard" });
+          });
+        } else {
+          run("重新排队", () => apiPost("/maintenance/release_summary_batches", { batch_ids: [batchId], mode: "retry" }));
+        }
+      });
+    });
+  },
+});
+
+/* ============================================================
    视图：模块配置
    ============================================================ */
 const MODULE_LABELS = {
@@ -3717,7 +4007,22 @@ const MODULE_LABELS = {
   maintenance: "维护",
   maintenance_audit: "记忆审计",
   maintenance_decay: "记忆衰减",
+  memory_assertions: "记忆断言",
+  source_semantic: "原文语义",
+  startup: "启动",
 };
+
+// P8：后端下发的受保护键（可见性 / 桥接闸门 / 凭据类）在面板里只读，
+// 保存时也不提交——面板不能成为修改安全键的通道。
+function protectedConfigSets(data) {
+  const keys = data && Array.isArray(data.protected_keys) ? data.protected_keys : [];
+  const modules = data && Array.isArray(data.protected_modules) ? data.protected_modules : [];
+  return { keys: new Set(keys), modules: new Set(modules) };
+}
+
+function isProtectedConfigKey(guard, moduleId, key) {
+  return guard.modules.has(moduleId) || guard.keys.has(moduleId + "." + key);
+}
 
 defineView("config", {
   title: "模块配置",
@@ -3738,6 +4043,7 @@ defineView("config", {
     const moduleSchema = schema[moduleId] || { items: {} };
     const moduleValues = values[moduleId] || {};
     const items = moduleSchema.items || {};
+    const guard = protectedConfigSets(data);
 
     const nav = modules
       .map(
@@ -3754,6 +4060,7 @@ defineView("config", {
         const value = moduleValues[key] === undefined ? item.default : moduleValues[key];
         const desc = compact(item.description) || key;
         const hint = compact(item.hint);
+        const locked = isProtectedConfigKey(guard, moduleId, key);
         let input;
         if (Array.isArray(item.options) && item.options.length) {
           input =
@@ -3772,8 +4079,10 @@ defineView("config", {
         } else {
           input = '<input type="text" id="cfg_' + esc(key) + '" value="' + esc(value === undefined || value === null ? "" : value) + '" />';
         }
+        if (locked) input = input.replace(/<(input|select)/, "<$1 disabled");
         return (
-          '<div class="config-field"><div><div class="cf-label">' + esc(desc) + "</div>" +
+          '<div class="config-field"><div><div class="cf-label">' + esc(desc) +
+          (locked ? ' <span class="cf-desc">（安全键 · 只读）</span>' : "") + "</div>" +
           (hint ? '<div class="cf-desc">' + esc(hint) + "</div>" : "") +
           '<div class="cf-desc mono" style="opacity:.7;margin-top:4px">' + esc(key) + "</div></div>" +
           '<div class="cf-input">' + input + "</div></div>"
@@ -3810,8 +4119,10 @@ defineView("config", {
       saveBtn.addEventListener("click", async () => {
         const moduleId = state.configModule;
         const items = (schema[moduleId] || {}).items || {};
+        const guard = protectedConfigSets(data);
         const values = {};
         Object.keys(items).forEach((key) => {
+          if (isProtectedConfigKey(guard, moduleId, key)) return;
           const item = items[key] || {};
           const el = $("#cfg_" + key, node);
           if (!el) return;

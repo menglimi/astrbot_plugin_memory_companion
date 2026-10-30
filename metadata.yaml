@@ -2,9 +2,9 @@ name: astrbot_plugin_memory_companion
 display_name: 我会牢牢记住你
 author: menglimi
 author_url: https://github.com/menglimi
-version: 2.3.1
-description: 我会牢牢记住你是面向 AstrBot 陪伴体系的记忆陪伴中枢。它统一管理长期记忆、历史对话整理、群聊连续对话记忆、主链注入、权限边界、知识图谱、陪伴插件桥接、自然衰减、可移植数据、双界面管理和运行诊断。
-desc: 为 AstrBot 提供主链记忆注入、历史聊天整理导入、连续对话记忆、陪伴插件协同、主动记忆/回忆工具、知识图谱、权限边界、自我时间线、自然衰减、迁移导出和成本诊断。
+version: 2.6.1
+description: 她会记得你这个人：怎么叫你、你们是什么关系、你对她有多重、什么该留原文什么该自然淡掉。装上就能用，不用配置。
+desc: 为 AstrBot 陪伴体系提供按人组织的长期记忆。每轮开口前先想起眼前这个人（人物卡：名字、称呼、关系、分量、几件最牢的事），刻骨的话留原文，在乎的人忘得慢、只聊过几句的淡得快，分量由她自己掂量、也能被你一句话纠正。带「她记得的人」面板：看人、改称呼、把分量往上往下挪、让她忘掉某件事。另有历史聊天导入、权限边界、知识图谱、陪伴插件桥接与运行诊断。
 repo: https://github.com/menglimi/astrbot_plugin_memory_companion
 category: AI 增强
 tags:
@@ -19,4 +19,4 @@ tags:
 icon: logo.png
 support_platforms:
   - aiocqhttp
-astrbot_version: ">=4.22.0"
+astrbot_version: ">=4.27,<5"
