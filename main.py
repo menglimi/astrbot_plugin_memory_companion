@@ -363,9 +363,11 @@ class MemoryCompanionPlugin(Star):
         Args:
             content(string): 要保存的记忆内容。
             note_type(string): memory/preference/relationship/promise 等简短类别。
-            confidence/importance(number): 模型对事实和长期价值的判断，运行时会限制在 0-1。
+            confidence(number): 对事实成立性的把握，运行时会限制在 0-1。
+            importance(number): 对长期价值的判断，运行时会限制在 0-1。
             durability(string): ephemeral/short/normal/durable/pinned；只表达保留倾向。
-            valid_from/valid_to(string): 可选的 ISO 时间边界。
+            valid_from(string): 可选的有效期起点（ISO 时间）。
+            valid_to(string): 可选的有效期终点（ISO 时间）。
             evidence_refs(array[string]): 支持该提议的事件引用或简短线索。
             rationale(string): 可选的写入理由，仅用于审计。
         """
