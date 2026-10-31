@@ -10,15 +10,20 @@ the bridge stamps a persona on write.
 from __future__ import annotations
 
 import asyncio
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from .package_bootstrap import bootstrap_package
 
-bootstrap_package()
+ROOT = bootstrap_package()
 
 from astrbot_plugin_memory_companion.core.identity import IdentityResolver
+from astrbot_plugin_memory_companion.core.memory_lifecycle import evaluate_memory_lifecycle
+from astrbot_plugin_memory_companion.core.models import MemoryRecord
+from astrbot_plugin_memory_companion.core.service import MemoryCompanionService
 
 
 def plain_event():
@@ -102,3 +107,105 @@ def test_fallback_does_not_disturb_other_identity_fields():
     assert ctx.user_id == "1538054427"
     assert ctx.scope == "group"
     assert ctx.platform == "aiocqhttp"
+
+
+def host_persona_manager(default_personality, personas=None):
+    """Return the real AstrBot persona manager the plugin resolves against.
+
+    The service-level fallback talks to the host API, not to a hand-written
+    double, so the test fails when a supported AstrBot release stops exposing
+    ``get_default_persona_v3`` with a ``name`` field.
+
+    Args:
+        default_personality: Persona id configured as the session default.
+        personas: Personas the manager knows about; defaults to one persona.
+
+    Returns:
+        A ``PersonaManager`` backed by an in-memory configuration manager.
+    """
+    import astrbot.api  # noqa: F401  # persona_mgr re-enters astrbot.api; load the host graph first
+    from astrbot.core.persona_mgr import PersonaManager
+
+    class ConfigManager:
+        """One configuration profile for every session origin."""
+
+        def __init__(self):
+            self.default_conf = {
+                "provider_settings": {"default_personality": default_personality}
+            }
+
+        def get_conf(self, umo=None):
+            return self.default_conf
+
+    manager = PersonaManager(db_helper=None, acm=ConfigManager())
+    manager.personas_v3 = list(
+        personas if personas is not None else [{"name": "kazusa", "prompt": "你叫和纱。"}]
+    )
+    return manager
+
+
+def resolve_through_service(persona_manager, event):
+    """Resolve one event through the service wiring and its host persona manager.
+
+    Args:
+        persona_manager: Host persona manager exposed by the AstrBot context, or
+            ``None`` for a host that exposes no persona manager at all.
+        event: The message event to resolve.
+
+    Returns:
+        The ``SessionContext`` the service builds for that event.
+    """
+    temp_dir = tempfile.TemporaryDirectory()
+    service = MemoryCompanionService(
+        context=(
+            SimpleNamespace(persona_manager=persona_manager)
+            if persona_manager is not None
+            else None
+        ),
+        config={},
+        plugin_root=ROOT,
+        data_dir=Path(temp_dir.name),
+        defer_database_initialization=True,
+    )
+    try:
+        return asyncio.run(service.identity.resolve_event_context(event))
+    finally:
+        service.close()
+        temp_dir.cleanup()
+
+
+def test_service_resolves_the_persona_astrbot_runs():
+    manager = host_persona_manager("kazusa")
+
+    ctx = resolve_through_service(manager, plain_event())
+
+    expected = asyncio.run(manager.get_default_persona_v3(umo=ctx.session_id))
+    # The resolver must pick the persona id out of the host payload, not the
+    # whole v3 record, or the gate compares apples to oranges.
+    assert expected["name"] == "kazusa"
+    assert ctx.persona_id == "kazusa"
+
+
+def test_persona_gate_opens_only_when_the_host_reports_a_persona():
+    archive = MemoryRecord(
+        id="companion-archive",
+        content="人格范围的归档记忆",
+        owner_bot_id="3884021973",
+        metadata={"persona_id": "kazusa"},
+    )
+
+    unresolved = resolve_through_service(None, plain_event())
+    assert unresolved.persona_id == ""
+    assert evaluate_memory_lifecycle(archive, unresolved).reason == "persona_context_missing"
+
+    resolved = resolve_through_service(host_persona_manager("kazusa"), plain_event())
+    assert resolved.persona_id == "kazusa"
+    assert evaluate_memory_lifecycle(archive, resolved).eligible
+
+
+def test_service_degrades_to_an_empty_persona_when_the_host_fails():
+    class BrokenManager:
+        async def get_default_persona_v3(self, umo=None):
+            raise RuntimeError("persona manager unavailable")
+
+    assert resolve_through_service(BrokenManager(), plain_event()).persona_id == ""
