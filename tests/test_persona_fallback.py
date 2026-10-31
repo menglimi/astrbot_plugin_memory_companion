@@ -5,7 +5,7 @@ AstrBot's ``AstrMessageEvent`` has no ``persona_id`` attribute and a
 single-persona companion install leaves ``private_companion_persona_id`` unset,
 so the resolver previously produced an empty persona.  ``memory_lifecycle`` then
 rejected every persona-tagged memory as ``persona_context_missing`` even though
-the bridge stamps a persona on write.
+the runtime applied one.
 """
 from __future__ import annotations
 
@@ -22,8 +22,9 @@ ROOT = bootstrap_package()
 
 from astrbot_plugin_memory_companion.core.identity import IdentityResolver
 from astrbot_plugin_memory_companion.core.memory_lifecycle import evaluate_memory_lifecycle
-from astrbot_plugin_memory_companion.core.models import MemoryRecord
+from astrbot_plugin_memory_companion.core.models import MemoryRecord, SessionContext
 from astrbot_plugin_memory_companion.core.service import MemoryCompanionService
+from astrbot_plugin_memory_companion.core.source_query import source_visible
 
 
 def plain_event():
@@ -43,6 +44,20 @@ def plain_event():
 
 def resolve(resolver, event):
     return asyncio.run(resolver.resolve_event_context(event))
+
+
+@pytest.fixture(autouse=True)
+def session_service_config(monkeypatch):
+    """Patch the host preference store AstrBot reads for per-session personas."""
+    import astrbot.api
+
+    state = {"config": {}}
+
+    async def get_async(*, scope, scope_id, key, default=None):
+        return state["config"] if key == "session_service_config" else default
+
+    monkeypatch.setattr(astrbot.api.sp, "get_async", get_async)
+    return state
 
 
 def test_without_fallback_persona_stays_empty():
@@ -112,12 +127,9 @@ def test_fallback_does_not_disturb_other_identity_fields():
 def host_persona_manager(default_personality, personas=None):
     """Return the real AstrBot persona manager the plugin resolves against.
 
-    The service-level fallback talks to the host API, not to a hand-written
-    double, so the test fails when a supported AstrBot release stops exposing
-    ``get_default_persona_v3`` with a ``name`` field.
-
     Args:
-        default_personality: Persona id configured as the session default.
+        default_personality: Persona id configured as the session default;
+            ``None`` leaves ``default_personality`` unset.
         personas: Personas the manager knows about; defaults to one persona.
 
     Returns:
@@ -130,9 +142,12 @@ def host_persona_manager(default_personality, personas=None):
         """One configuration profile for every session origin."""
 
         def __init__(self):
-            self.default_conf = {
-                "provider_settings": {"default_personality": default_personality}
-            }
+            settings = (
+                {}
+                if default_personality is None
+                else {"default_personality": default_personality}
+            )
+            self.default_conf = {"provider_settings": settings}
 
         def get_conf(self, umo=None):
             return self.default_conf
@@ -144,24 +159,39 @@ def host_persona_manager(default_personality, personas=None):
     return manager
 
 
-def resolve_through_service(persona_manager, event):
+def conversation_manager(persona_id):
+    """Return a host conversation manager pinning one persona."""
+
+    class Manager:
+        async def get_curr_conversation_id(self, umo):
+            return "conversation-1"
+
+        async def get_conversation(self, umo, conversation_id):
+            return SimpleNamespace(persona_id=persona_id)
+
+    return Manager()
+
+
+def resolve_through_service(persona_manager, event, *, conversation_persona_id=None):
     """Resolve one event through the service wiring and its host persona manager.
 
     Args:
         persona_manager: Host persona manager exposed by the AstrBot context, or
             ``None`` for a host that exposes no persona manager at all.
         event: The message event to resolve.
+        conversation_persona_id: Persona pinned on the active conversation.
 
     Returns:
         The ``SessionContext`` the service builds for that event.
     """
     temp_dir = tempfile.TemporaryDirectory()
+    context = None
+    if persona_manager is not None:
+        context = SimpleNamespace(persona_manager=persona_manager)
+        if conversation_persona_id is not None:
+            context.conversation_manager = conversation_manager(conversation_persona_id)
     service = MemoryCompanionService(
-        context=(
-            SimpleNamespace(persona_manager=persona_manager)
-            if persona_manager is not None
-            else None
-        ),
+        context=context,
         config={},
         plugin_root=ROOT,
         data_dir=Path(temp_dir.name),
@@ -174,19 +204,39 @@ def resolve_through_service(persona_manager, event):
         temp_dir.cleanup()
 
 
-def test_service_resolves_the_persona_astrbot_runs():
-    manager = host_persona_manager("kazusa")
+@pytest.mark.parametrize("default_personality", ["kazusa", "yuki"])
+def test_service_resolves_the_persona_astrbot_applies(default_personality):
+    ctx = resolve_through_service(host_persona_manager(default_personality), plain_event())
 
-    ctx = resolve_through_service(manager, plain_event())
+    assert ctx.persona_id == default_personality
 
-    expected = asyncio.run(manager.get_default_persona_v3(umo=ctx.session_id))
-    # The resolver must pick the persona id out of the host payload, not the
-    # whole v3 record, or the gate compares apples to oranges.
-    assert expected["name"] == "kazusa"
+
+def test_service_follows_the_session_persona(session_service_config):
+    session_service_config["config"] = {"persona_id": "kazusa"}
+
+    ctx = resolve_through_service(host_persona_manager("default"), plain_event())
+
     assert ctx.persona_id == "kazusa"
 
 
-def test_persona_gate_opens_only_when_the_host_reports_a_persona():
+def test_service_follows_the_conversation_persona():
+    ctx = resolve_through_service(
+        host_persona_manager("default"),
+        plain_event(),
+        conversation_persona_id="kazusa",
+    )
+
+    assert ctx.persona_id == "kazusa"
+
+
+@pytest.mark.parametrize("configured", ["[%None]", None])
+def test_service_keeps_the_persona_empty_when_none_applies(configured):
+    ctx = resolve_through_service(host_persona_manager(configured), plain_event())
+
+    assert ctx.persona_id == ""
+
+
+def test_persona_gate_reports_missing_context_only_without_a_runtime_persona():
     archive = MemoryRecord(
         id="companion-archive",
         content="人格范围的归档记忆",
@@ -198,13 +248,56 @@ def test_persona_gate_opens_only_when_the_host_reports_a_persona():
     assert unresolved.persona_id == ""
     assert evaluate_memory_lifecycle(archive, unresolved).reason == "persona_context_missing"
 
+    disabled = resolve_through_service(host_persona_manager("[%None]"), plain_event())
+    assert disabled.persona_id == ""
+    assert evaluate_memory_lifecycle(archive, disabled).reason == "persona_context_missing"
+
     resolved = resolve_through_service(host_persona_manager("kazusa"), plain_event())
     assert resolved.persona_id == "kazusa"
     assert evaluate_memory_lifecycle(archive, resolved).eligible
 
 
+def test_foreign_persona_memory_is_reported_as_mismatch():
+    archive = MemoryRecord(
+        id="other-persona-archive",
+        content="另一个人格的归档记忆",
+        owner_bot_id="3884021973",
+        metadata={"persona_id": "yuki"},
+    )
+
+    ctx = resolve_through_service(host_persona_manager("kazusa"), plain_event())
+
+    assert evaluate_memory_lifecycle(archive, ctx).reason == "persona_mismatch"
+
+
+def test_legacy_source_rows_without_persona_stay_visible():
+    ctx = SessionContext(
+        session_id="qq:FriendMessage:source-user",
+        scope="private",
+        platform="qq",
+        user_id="source-user",
+        bot_id="source-bot",
+        persona_id="default",
+    )
+    row = {
+        "scope": "private",
+        "session_id": ctx.session_id,
+        "event_type": "user_message",
+        "object_id": ctx.user_id,
+        "subject_id": ctx.user_id,
+    }
+    metadata = {"owner_bot_id": ctx.bot_id, "platform": ctx.platform, "persona_id": ""}
+    assert source_visible(ctx, row, metadata)
+
+    metadata["persona_id"] = "other-persona"
+    assert not source_visible(ctx, row, metadata)
+
+
 def test_service_degrades_to_an_empty_persona_when_the_host_fails():
     class BrokenManager:
+        async def resolve_selected_persona(self, **kwargs):
+            raise RuntimeError("persona manager unavailable")
+
         async def get_default_persona_v3(self, umo=None):
             raise RuntimeError("persona manager unavailable")
 

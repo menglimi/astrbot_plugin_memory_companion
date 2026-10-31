@@ -88,10 +88,10 @@ class IdentityResolver:
         # AstrBot's AstrMessageEvent has no ``persona_id`` attribute, and a
         # single-persona companion install deliberately leaves
         # ``private_companion_persona_id`` unset.  Reading only those two would
-        # leave the context without a persona, so every persona-tagged memory
-        # would be rejected as ``persona_context_missing`` even though the write
-        # path stamps a real persona.  The host service supplies the value from
-        # AstrBot's persona manager.
+        # leave the context without a persona, so persona-tagged memories would
+        # be rejected as ``persona_context_missing`` even though the host runs
+        # one.  The host service supplies the persona AstrBot applies, and keeps
+        # it empty when no persona applies.
         self.persona_id_fallback = persona_id_fallback
 
     async def resolve_event_context(self, event: Any) -> SessionContext:

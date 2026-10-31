@@ -569,28 +569,134 @@ class MemoryCompanionService:
         return next(iter(ids)) if len(ids) == 1 else ""
 
     async def _resolve_default_persona_id(self, event: Any = None) -> str:
-        """Return the persona ID that AstrBot currently runs for this session.
+        """Return the persona AstrBot applies to this session, or ``""`` for none.
 
-        The bridge stamps ``persona_id`` on archived memories from the companion
-        plugin's configured persona, but ``IdentityResolver`` can only read it
-        back from the event.  ``AstrMessageEvent`` has no ``persona_id``
-        attribute, and a single-persona companion install leaves
-        ``private_companion_persona_id`` unset, so without this fallback every
-        archived memory is rejected as ``persona_context_missing``.
-
-        The companion's write path uses its static ``plugin_specific_persona_id``
-        when multi-persona mode is off, which mirrors AstrBot's configured
-        default persona.  We resolve exactly that and deliberately ignore
-        per-session overrides: honouring an override here would report a persona
-        the write path never used and turn the failure into ``persona_mismatch``.
+        ``AstrMessageEvent`` carries no persona and a single-persona companion
+        leaves ``private_companion_persona_id`` unset, so the host persona has
+        to come from AstrBot's persona manager.  ``get_default_persona_v3`` is
+        not enough: it cannot report AstrBot's explicit "no persona" marker
+        (``[%None]``) and ignores session-level persona overrides.  Resolution
+        therefore uses ``resolve_selected_persona``, whose result is the persona
+        the runtime actually applies and the one the write path stamps.  When no
+        persona applies the id stays empty, so ``persona_context_missing``
+        remains an honest diagnostic instead of being replaced by a guess.
         """
-        persona_manager = getattr(
-            getattr(self, "context", None), "persona_manager", None
+        context = getattr(self, "context", None)
+        persona_manager = getattr(context, "persona_manager", None)
+        if persona_manager is None:
+            return ""
+        umo = clean_text(getattr(event, "unified_msg_origin", ""), 200)
+        provider_settings = self._persona_provider_settings(
+            context, persona_manager, umo
         )
+        resolver = getattr(persona_manager, "resolve_selected_persona", None)
+        if callable(resolver) and umo:
+            try:
+                selected = await maybe_await(
+                    resolver(
+                        umo=umo,
+                        conversation_persona_id=await self._conversation_persona_id(
+                            event, umo
+                        ),
+                        platform_name=await self._event_platform_name(event),
+                        provider_settings=provider_settings,
+                    )
+                )
+            except Exception:
+                return ""
+            persona_id = selected[0] if isinstance(selected, tuple) else selected
+            persona_id = clean_text(persona_id, 96)
+            return "" if persona_id == "[%None]" else persona_id
+        return await self._fallback_persona_id(
+            persona_manager, provider_settings, umo
+        )
+
+    @staticmethod
+    def _persona_provider_settings(
+        context: Any, persona_manager: Any, umo: str
+    ) -> dict[str, Any]:
+        """Return AstrBot's ``provider_settings`` for one session, if exposed.
+
+        Args:
+            context: The AstrBot context the service was built with.
+            persona_manager: The host persona manager.
+            umo: Session origin used to select a per-session configuration.
+
+        Returns:
+            The provider settings mapping, or an empty mapping when the host
+            does not expose one.
+        """
+        acm = getattr(persona_manager, "acm", None)
+        for owner, name in ((context, "get_config"), (acm, "get_conf")):
+            getter = getattr(owner, name, None)
+            if not callable(getter):
+                continue
+            try:
+                config = getter(umo=umo) if umo else getter()
+            except TypeError:
+                try:
+                    config = getter(umo)
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            settings = config.get("provider_settings") if hasattr(config, "get") else None
+            if isinstance(settings, dict):
+                return settings
+        return {}
+
+    async def _conversation_persona_id(self, event: Any, umo: str) -> str | None:
+        """Return the persona pinned on the session's active conversation.
+
+        The built provider request already carries it during LLM hooks; other
+        entry points read it from the host conversation manager.
+        """
+        get_extra = getattr(event, "get_extra", None)
+        if callable(get_extra):
+            try:
+                request = get_extra("provider_request")
+            except Exception:
+                request = None
+            value = getattr(getattr(request, "conversation", None), "persona_id", None)
+            if value:
+                return clean_text(value, 96)
+        manager = getattr(getattr(self, "context", None), "conversation_manager", None)
+        get_id = getattr(manager, "get_curr_conversation_id", None)
+        get_conversation = getattr(manager, "get_conversation", None)
+        if not umo or not callable(get_id) or not callable(get_conversation):
+            return None
+        try:
+            conversation_id = await maybe_await(get_id(umo))
+            if not conversation_id:
+                return None
+            conversation = await maybe_await(get_conversation(umo, conversation_id))
+        except Exception:
+            return None
+        return clean_text(getattr(conversation, "persona_id", None), 96) or None
+
+    @staticmethod
+    async def _event_platform_name(event: Any) -> str:
+        getter = getattr(event, "get_platform_name", None)
+        if not callable(getter):
+            return ""
+        try:
+            return clean_text(await maybe_await(getter()), 80)
+        except Exception:
+            return ""
+
+    async def _fallback_persona_id(
+        self,
+        persona_manager: Any,
+        provider_settings: dict[str, Any],
+        umo: str,
+    ) -> str:
+        """Resolve the configured default persona on hosts without the richer API."""
+        configured = clean_text(provider_settings.get("default_personality"), 96)
+        if configured == "[%None]":
+            return ""
         getter = getattr(persona_manager, "get_default_persona_v3", None)
         if not callable(getter):
             return ""
-        umo = clean_text(getattr(event, "unified_msg_origin", ""), 200)
         try:
             persona = await maybe_await(getter(umo=umo) if umo else getter())
         except Exception:
@@ -601,7 +707,6 @@ class MemoryCompanionService:
             else getattr(persona, "name", "")
         )
         name = clean_text(name, 96)
-        # ``[%None]`` is AstrBot's explicit "no persona" marker.
         return "" if name == "[%None]" else name
 
     def _p5_gate_enabled(self, sink: str) -> bool:
