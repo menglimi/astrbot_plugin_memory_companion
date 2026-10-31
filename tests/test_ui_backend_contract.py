@@ -139,6 +139,12 @@ class UiBackendContractTests(unittest.TestCase):
         self.assertIn('const response = await apiGet("/memory?id=" + encodeURIComponent(memoryId));', self.frontend_source)
         self.assertIn('const memory = response && response.memory ? response.memory : response;', self.frontend_source)
 
+    def test_summary_batch_release_hint_uses_the_real_batch_id_prefix(self) -> None:
+        # 真实批次 ID 由 core/summary_batches.py 生成为 `sb_` + sha256(...)，旧提示
+        # 却让管理员输入 `summary_batch_...`，照着填只会得到 `batch_not_found`。
+        self.assertIn('placeholder: "sb_... 批次 ID"', self.frontend_source)
+        self.assertNotIn("summary_batch_...", self.frontend_source)
+
     def test_memory_category_filters_expand_to_persisted_types(self) -> None:
         filters = literal(assignment(self.tree, "MEMORY_TYPE_FILTERS"))
         self.assertIn("user_profile", filters["profile"])

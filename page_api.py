@@ -3219,6 +3219,15 @@ class PluginPageApi:
         result = await self.plugin.service.store.release_summary_batch(batch_id, mode=mode)
         if not result.get("ok"):
             return self._err(clean_text(result.get("error"), 120) or "release failed", 400)
+        # A release changes what the automatic window can see, so the audit trail
+        # records which batch was unfrozen, in which mode, and what it became.
+        logger.info(
+            "[MemoryCompanion] 阶段总结批次已释放: batch=%s mode=%s released_events=%s state=%s",
+            batch_id,
+            clean_text(result.get("mode"), 20) or mode,
+            int(result.get("released_events") or 0),
+            clean_text(result.get("state"), 40),
+        )
         return self._ok({"data": result})
 
     async def import_preview(self):
