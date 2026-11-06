@@ -47,6 +47,10 @@ PAGE_API_PREFIXES = (f"/{PLUGIN_NAME}/page",)
 
 logger = logging.getLogger("MemoryCompanion.PageAPI")
 
+# Windows 绝对路径（盘符或 UNC）：非 Windows 平台上必须显式拒绝，
+# 否则 Path() 会把它当成普通相对路径拼到当前目录下。
+_WINDOWS_ABSOLUTE_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+
 
 def _split_capture_keywords(raw: Any) -> list[str]:
     """把 schema 里的字符串关键词（逗号/分号/空格分隔）拆成列表，兼容历史 list 值。"""
@@ -4300,6 +4304,10 @@ class PluginPageApi:
         text = clean_text(raw, 1000)
         if not text:
             return None, ""
+        if sys.platform != "win32" and _WINDOWS_ABSOLUTE_PATH.match(text):
+            # 非 Windows 平台上 Path("C:\\...") 会被当成相对路径拼到当前目录，
+            # 绕过允许根检查；Windows 绝对路径一律按"逃逸出数据目录"拒绝。
+            return None, "path is outside the plugin data directory"
         normalized = text.replace(chr(92), "/")
         if ".." in Path(normalized).parts:
             return None, "path must not contain .."

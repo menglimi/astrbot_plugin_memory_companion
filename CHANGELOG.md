@@ -16,6 +16,9 @@
 ### 面板：`/bots` 路由补策略声明
 - 新增的 `/bots` 只读端点漏了 `UI_READ_ENDPOINTS` 声明，面板策略自检会判定「没有显式策略」，补齐。
 
+### 面板：跨平台路径守卫
+- 修复非 Windows 平台（CI 的 Linux）上 `C:\Windows\win.ini` 这类 Windows 绝对路径被 `Path()` 当成相对路径、拼到当前目录后绕过数据目录检查的问题：`_resolve_page_path()` 现在显式拒绝盘符与 UNC 路径。
+
 ### 测试
 - 修掉 40 个因行为变更而过时的断言：预设默认值（`top_k` 8 / `max_item_chars` 240）、星图视图已删除、跨群同人可见、摘要校验改为「至少两个实词命中」、`injection-status.js` 已移除、隔离批次改为真删原文、情绪衰减测试改用相对时间。
 - 新增 `ScopedStore` 连接复用、`tool_schema` 契约转换的单元测试。
