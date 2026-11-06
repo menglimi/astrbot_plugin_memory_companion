@@ -156,19 +156,19 @@
       "min_independent_evidence": {
         "description": "智能画像独立证据阈值",
         "type": "int",
-        "default": 3,
+        "default": 2,
         "hint": "同一人物、同一候选至少三条去重后的本人消息证据；不要求与 Bot 互动或跨会话。"
       },
       "daily_success_limit_per_person": {
         "description": "单用户每日成功更新上限",
         "type": "int",
-        "default": 1,
+        "default": 3,
         "hint": "智能画像每天最多成功更新一次。"
       },
       "daily_attempt_limit_per_person": {
         "description": "单用户每日尝试上限",
         "type": "int",
-        "default": 2,
+        "default": 6,
         "hint": "允许一次失败退避重试；达到上限后当天不再生成。"
       },
       "daily_dispatch_enabled": {
@@ -279,19 +279,19 @@
         "description": "最少事件数",
         "hint": "未总结的时间线事件少于该数量时不会总结。",
         "type": "int",
-        "default": 20
+        "default": 8
       },
       "trigger_event_count": {
         "description": "按条数触发",
         "hint": "未总结事件达到该数量时触发总结。建议 12-20。",
         "type": "int",
-        "default": 20
+        "default": 8
       },
       "trigger_interval_minutes": {
         "description": "按时间触发",
         "hint": "最早未总结事件距今超过该分钟数且达到最少事件数时触发总结。0 表示只按条数触发。",
         "type": "int",
-        "default": 60
+        "default": 30
       },
       "max_events_per_summary": {
         "description": "单次最多事件",
@@ -359,6 +359,24 @@
         "type": "int",
         "default": 30
       },
+      "auto_drain_enabled": {
+        "description": "自动消化积压原文",
+        "hint": "后台定时扫描「从未总结过的原始对话」，把它们变成记忆。关闭后只有收到新消息的会话才会总结，老会话的原文会一直积压。",
+        "type": "bool",
+        "default": true
+      },
+      "auto_drain_interval_minutes": {
+        "description": "自动消化间隔分钟",
+        "hint": "两轮自动消化之间等待的分钟数。间隔越短消化越快，模型调用也越频繁。",
+        "type": "int",
+        "default": 2
+      },
+      "auto_drain_sessions_per_round": {
+        "description": "每轮消化会话数",
+        "hint": "每轮最多挑几个积压会话做总结。配合间隔控制后台模型调用速度。",
+        "type": "int",
+        "default": 20
+      },
       "max_calls_per_session_hour": {
         "description": "每会话每小时自动调用上限",
         "hint": "实际调用次数预算，首次、备用模型和纠正共用；达到后暂停到后续触发，原文和待处理批次保留。重启不重置。默认 24，活跃会话可按需调整。",
@@ -388,6 +406,18 @@
         "hint": "每轮维护最多自动重排多少个隔离批次，避免一次性把大量旧批次推回队列。面板手动释放不受此限制。",
         "type": "int",
         "default": 50
+      },
+      "self_experience_enabled": {
+        "type": "bool",
+        "description": "生成 Bot 自己的经历记忆",
+        "hint": "总结时额外产出一条 Bot 视角的脱敏经历（只写自己做了什么、感受到什么，不含对方隐私），跨会话可见。",
+        "default": true
+      },
+      "self_experience_max_chars": {
+        "type": "int",
+        "description": "自身经历字数上限",
+        "hint": "单条 Bot 经历记忆的最大字数。",
+        "default": 200
       }
     }
   },
@@ -644,10 +674,10 @@
         "default": 80
       },
       "relax_keyword_min_hits": {
-        "description": "放宽词法复核门槛",
+        "description": "弱关键词也允许召回：查询词只命中 1 个时仍进入注入候选（默认开；关闭后要求命中 2 个以上，短句更容易注入为空）",
         "hint": "默认关闭（行为与旧版一致）。开启后，语义候选的词法复核 min_hits 统一降到 1——语义相关但关键词不重叠的记忆更容易通过复核（配合调大向量合并数量效果明显），噪声由评分与注入条数兜底。",
         "type": "bool",
-        "default": false
+        "default": true
       },
       "proactive_message_score_penalty": {
         "description": "主动消息记忆降权",
@@ -657,9 +687,9 @@
       },
       "dedupe_content_ratio": {
         "description": "内容级去重阈值",
-        "hint": "检索结果中规范化文本相似度达到该比例（difflib ratio，0-1）的候选只保留评分最高的一条，避免同一事实的多条措辞变体占用注入名额。0=关闭（默认，行为与旧版一致）；建议 0.75-0.85。",
+        "hint": "内容相似度超过该比例的记忆只保留一条，避免同一件事反复注入。0 表示关闭去重，建议 0.85。",
         "type": "float",
-        "default": 0.0
+        "default": 0.85
       },
       "non_conversation_budget": {
         "description": "非对话记忆预算",
@@ -767,9 +797,9 @@
       },
       "top_k": {
         "description": "注入条数",
-        "hint": "每轮最多注入多少条记忆。默认 4 条，优先保留最相关内容；时间聚合问题可按需增加。",
+        "hint": "每轮对话最多注入几条记忆。太小会「记不住」，太大会挤占上下文；单人使用建议 6-10。",
         "type": "int",
-        "default": 4
+        "default": 8
       },
       "max_chars": {
         "description": "最大注入字数",
@@ -781,7 +811,7 @@
         "description": "单条记忆内容上限",
         "hint": "每条注入记忆的内容最多保留多少字符（默认 320）。注入条数较少时可保留更完整的摘要片段，整包仍受「最大注入字数」限制。",
         "type": "int",
-        "default": 320
+        "default": 240
       },
       "temporal_aggregate_max_chars": {
         "description": "时间聚合注入字数",
@@ -854,7 +884,7 @@
         "description": "细节清晰期（天）",
         "hint": "记忆存在不超过该天数时按原文清晰引用；超过后注入措辞降级为「细节已模糊，只可提大意」。手动记住、固定、关系承诺、伤疤和高重要度记忆不受年龄分级影响。",
         "type": "float",
-        "default": 45.0
+        "default": 180.0
       },
       "vivid_fuzzy_days": {
         "description": "轮廓印象期（天）",
@@ -901,9 +931,9 @@
       },
       "capture_group_messages": {
         "description": "记录群聊普通发言",
-        "hint": "默认关闭：群里别人互相聊天不再被记录（否则等于把整群人说的话都存进她的记忆）。开启后仍只记录被 @、回复 Bot、命中唤醒前缀或关键词的发言。",
+        "hint": "开启后群聊里 @ 机器人、回复机器人或命中关键词的发言会写入记忆，私聊时才能想起群里聊过的事；默认开启，群聊普通闲聊仍不记录。",
         "type": "bool",
-        "default": false
+        "default": true
       },
       "group_capture_engagement_only": {
         "description": "群聊只记与 Bot 相关的话",
@@ -979,10 +1009,10 @@
         "default": 20
       },
       "suppress_memory_on_low_information": {
-        "description": "弱语义禁用长期召回",
+        "description": "低信息量消息（嗯/好的/表情）也允许注入少量相关记忆。默认关掉抑制：真实聊天里短句占多数，抑制会让记忆长期不出现。",
         "hint": "开启后，弱语义输入不使用长期记忆和陪伴插件检索线索，只根据当前消息与必要的近期原始上下文回复。",
         "type": "bool",
-        "default": true
+        "default": false
       },
       "topic_shift_guard_enabled": {
         "description": "新话题隔离保护",
@@ -991,10 +1021,10 @@
         "default": true
       },
       "suppress_memory_on_topic_shift": {
-        "description": "新话题禁用长期召回",
+        "description": "话题切换时也允许注入相关记忆。默认关掉抑制：切话题不等于要失忆，检索仍会按相关度过滤。",
         "hint": "开启后，新话题隔离触发时也会跳过长期记忆召回；用户明确说记得、之前、上次、按我喜欢的等需要记忆时不会跳过。",
         "type": "bool",
-        "default": true
+        "default": false
       },
       "topic_shift_guard_recent_events": {
         "description": "新话题比较事件数",
@@ -1018,7 +1048,7 @@
         "description": "跨窗口衔接有效分钟",
         "hint": "只读取该分钟数内相反会话类型的近期消息，过期内容不会进入跨窗口上下文。",
         "type": "int",
-        "default": 30
+        "default": 120
       },
       "cross_window_recent_event_limit": {
         "description": "跨窗口衔接片段数",
@@ -1061,19 +1091,37 @@
         "description": "每轮核心块上限",
         "hint": "按优先级选取当前作用域可见的核心块，建议保持在 4-12 条。",
         "type": "int",
-        "default": 8
+        "default": 12
       },
       "max_chars": {
         "description": "核心记忆字数预算",
         "hint": "核心块在整份记忆注入包内的独立预算，超出时按优先级保留。",
         "type": "int",
-        "default": 800
+        "default": 1200
       },
       "scan_limit": {
         "description": "核心块扫描上限",
         "hint": "单轮最多检查多少个核心块的作用域和可见性。一般无需调整。",
         "type": "int",
         "default": 200
+      },
+      "auto_distill_enabled": {
+        "type": "bool",
+        "description": "自动沉淀核心记忆",
+        "default": true,
+        "hint": "维护任务每轮从高重要度的长期记忆里挑事实，补成核心记忆块；只在块数少于上限时补，不会覆盖你手写的块。"
+      },
+      "auto_distill_max_blocks": {
+        "type": "int",
+        "description": "自动沉淀块数上限",
+        "default": 6,
+        "hint": "自动生成的核心块最多补到这么多块，剩下的额度留给你自己写。"
+      },
+      "auto_distill_min_salience": {
+        "type": "float",
+        "description": "自动沉淀重要度门槛",
+        "default": 0.45,
+        "hint": "只沉淀重要度不低于该值的记忆（0~1），调低会沉淀更多但更杂。"
       }
     }
   },
@@ -1152,7 +1200,7 @@
         "description": "Bot 自我时间线槽",
         "hint": "每轮最多放入多少条 Bot 自己的日程、主动行为和陪伴笔记。",
         "type": "int",
-        "default": 2
+        "default": 4
       },
       "user_profile_limit": {
         "description": "用户画像槽",
@@ -1170,13 +1218,13 @@
         "description": "阶段总结槽",
         "hint": "每轮最多放入多少条阶段性对话总结，用于保持连续性。",
         "type": "int",
-        "default": 2
+        "default": 3
       },
       "stable_memory_limit": {
         "description": "稳定记忆槽",
         "hint": "每轮最多放入多少条其他可见稳定记忆；总数仍受记忆注入 top_k 限制。",
         "type": "int",
-        "default": 3
+        "default": 4
       }
     }
   },
@@ -1201,7 +1249,7 @@
         "description": "要紧的事条数",
         "hint": "人物卡里最多列几件她记得的事。默认 4。",
         "type": "int",
-        "default": 4
+        "default": 6
       },
       "max_item_chars": {
         "description": "单条字数",
@@ -1327,9 +1375,9 @@
       },
       "allow_group_public_in_private": {
         "description": "私聊可见群公共记忆",
-        "hint": "开启后私聊中可看到群公共记忆，便于跨窗口回话。如需严格隔离私聊与群聊可关闭。",
+        "hint": "开启后，私聊里也能想起这个人在群里公开说过的事（跨群、跨会话的「同一个人」记忆）。关掉则群聊记忆只在原群里可见。默认开启；涉及他人隐私时可关闭。",
         "type": "bool",
-        "default": false
+        "default": true
       },
       "enable_acl_rules": {
         "description": "启用卡片权限",
@@ -1706,7 +1754,7 @@
         "description": "衰减分阈值",
         "hint": "年龄、未访问时间、重要度和置信度共同计算的衰减分达到该百分比后才进入压缩。",
         "type": "int",
-        "default": 75
+        "default": 65
       },
       "memory_decay_gradual_enabled": {
         "description": "先淡再忘",

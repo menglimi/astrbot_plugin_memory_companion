@@ -7292,6 +7292,7 @@ class MemoryStore(SummaryBatchStore):
         scope: str,
         group_id: str,
         allow_group_public_in_private: bool = False,
+        person_id: str = "",
     ) -> tuple[str, list[Any]]:
         # The rule lives in core/visibility.py now (visibility_prefilter_sql),
         # so the person card and VisibilityPolicy.is_visible cannot disagree.
@@ -7303,6 +7304,7 @@ class MemoryStore(SummaryBatchStore):
             scope,
             group_id,
             allow_group_public_in_private=allow_group_public_in_private,
+            person_id=person_id,
         )
 
     def _person_snapshot_sync(
@@ -7335,7 +7337,7 @@ class MemoryStore(SummaryBatchStore):
             identity_row = self._conn.execute(identity_sql, identity_params).fetchone()
 
             visibility_sql, visibility_params = self._person_snapshot_visibility_sql(
-                scope, group_id, allow_group_public_in_private
+                scope, group_id, allow_group_public_in_private, user_id
             )
             # 和 VisibilityPolicy 同口径：归档的永远不进来；待复核的看 hide_pending_review；
             # 原始流水看 include_raw_events。否则「每轮无条件注入」的人卡会绕过这两个开关。
@@ -11878,6 +11880,7 @@ class MemoryStore(SummaryBatchStore):
         visibility_values: list[str] | tuple[str, ...] | None = None,
         source_plugin_exclude: str = "",
         owner_bot_id: str = "",
+        owner_bot_strict: bool = False,
     ) -> list[MemoryRecord]:
         return await self._run_recoverable_database_operation(
             self._list_memories_sync,
@@ -11898,6 +11901,7 @@ class MemoryStore(SummaryBatchStore):
             visibility_values,
             source_plugin_exclude,
             owner_bot_id,
+            owner_bot_strict,
         )
 
     def _list_memories_sync(
@@ -11919,11 +11923,17 @@ class MemoryStore(SummaryBatchStore):
         visibility_values: list[str] | tuple[str, ...] | None,
         source_plugin_exclude: str,
         owner_bot_id: str = "",
+        owner_bot_strict: bool = False,
     ) -> list[MemoryRecord]:
         params: list[Any] = []
         where = "1=1"
         owner_bot = clean_text(owner_bot_id, 120)
-        bot_clause, bot_params = self._bot_scope_clause("owner_bot_id", owner_bot)
+        if owner_bot_strict:
+            # 面板按 Bot 分块查看时要精确匹配：空串代表 2.5.0 之前的旧数据，
+            # 不能像召回那样把旧数据混进别的 Bot 的列表里。
+            bot_clause, bot_params = " AND owner_bot_id=?", [owner_bot]
+        else:
+            bot_clause, bot_params = self._bot_scope_clause("owner_bot_id", owner_bot)
         if bot_clause:
             # 有 bot_id 的行只归该 bot；'' 是旧数据，继续按公共兜底可读。
             where += bot_clause
@@ -14564,6 +14574,31 @@ class MemoryStore(SummaryBatchStore):
                 "oldest_unsummarized_at": clean_text(row["oldest"] if row else "", 80),
                 "quarantined_frozen_events": int((frozen[0] if frozen else 0) or 0),
             }
+
+        return await asyncio.to_thread(read)
+
+    async def list_summary_backlog_sessions(self, *, limit: int = 5) -> list[dict[str, Any]]:
+        """Sessions whose raw timeline never became memory, oldest backlog first."""
+
+        def read():
+            with self._lock:
+                rows = self._conn.execute(
+                    """
+                    SELECT session_id,
+                           COALESCE(MAX(scope), '') AS scope,
+                           COALESCE(MAX(bot_id), '') AS bot_id,
+                           COUNT(*) AS pending_events,
+                           MIN(COALESCE(NULLIF(occurred_at, ''), created_at)) AS oldest
+                    FROM timeline
+                    WHERE summarized_at=''
+                      AND NOT EXISTS(SELECT 1 FROM summary_batch_events e WHERE e.event_id=timeline.id)
+                    GROUP BY session_id
+                    ORDER BY oldest
+                    LIMIT ?
+                    """,
+                    (max(1, int(limit or 1)),),
+                ).fetchall()
+                return [dict(row) for row in rows]
 
         return await asyncio.to_thread(read)
 

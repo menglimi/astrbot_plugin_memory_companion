@@ -28,6 +28,7 @@ def visibility_prefilter_sql(
     group_id: str | None,
     *,
     allow_group_public_in_private: bool = False,
+    person_id: str | None = "",
 ) -> tuple[str, list[Any]]:
     # SQL prefilter for the visibility branch of VisibilityPolicy.is_visible.
     # Only the visibility column is covered here: callers keep their own
@@ -46,6 +47,17 @@ def visibility_prefilter_sql(
         marks = ", ".join(f"'{value}'" for value in allowed)
         return f"COALESCE(visibility, '') IN ({marks})", []
     if current_scope == "group" and current_group:
+        person = _clean_id(person_id)
+        if person:
+            # 同一个人：他在别的群公开说过的事，在这个群也能想起来。
+            return (
+                "("
+                "COALESCE(visibility, '') = 'shareable' OR ("
+                "COALESCE(visibility, '') = 'group_public' AND ("
+                "group_id=? OR subject_id=? OR object_id=?"
+                ")))",
+                [current_group, person, person],
+            )
         return (
             "("
             "COALESCE(visibility, '') = 'shareable' OR ("
@@ -127,6 +139,14 @@ class VisibilityPolicy:
                 if not owner_ok:
                     return False, owner_reason
                 return True, "same_group"
+            if ctx.scope == "group" and _clean_id(ctx.user_id):
+                # 一个人的记忆跟着人走：记忆主体就是当前发言人时，跨群也可见。
+                ids = {_clean_id(memory.subject.id), _clean_id(memory.object.id)}
+                if _clean_id(ctx.user_id) in ids:
+                    owner_ok, owner_reason = self._bot_owner_visible(memory, ctx)
+                    if not owner_ok:
+                        return False, owner_reason
+                    return True, "same_person_other_group"
             if ctx.scope == "private" and self.allow_group_public_in_private:
                 owner_ok, owner_reason = self._bot_owner_visible(memory, ctx)
                 if not owner_ok:

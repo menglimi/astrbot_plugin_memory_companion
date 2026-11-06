@@ -14,6 +14,7 @@ const TRANSPARENT_IMAGE = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAA
 const THEME_KEY = "memory_companion_theme";
 const NAV_KEY = "memory_companion_nav";
 const MODE_KEY = "memory_companion_mode";
+const PALETTE_KEY = "memory_companion_palette";
 
 /* ------------------------------------------------------------
    基础工具
@@ -476,9 +477,8 @@ const state = {
   ready: false,
   stats: null,
   buckets: [],
-  filters: { scope: "", q: "", visibility: "", lifecycle: "", memoryType: "" },
+  filters: { scope: "", q: "", visibility: "", lifecycle: "", memoryType: "", ownerBot: "" },
   selected: null,
-  starmap: null,
   configSchema: null,
   configModule: "appearance",
   companion: null,
@@ -512,13 +512,21 @@ function busy(on, text) {
   layer.classList.toggle("is-on", busyCount > 0);
 }
 
-async function withBusy(text, fn) {
+async function withBusy(text, fn, minMs) {
   busy(true, text);
+  const startedAt = Date.now();
   try {
     return await fn();
   } finally {
+    const remaining = (Number(minMs) || 0) - (Date.now() - startedAt);
+    if (remaining > 0) await new Promise((resolve) => window.setTimeout(resolve, remaining));
     busy(false);
   }
+}
+
+function setBusyText(text) {
+  const el = $("#busyText");
+  if (el && text) el.textContent = text;
 }
 
 function openDrawer(title, eyebrow, html) {
@@ -575,16 +583,25 @@ function applyPalette(key) {
   const value = compact(key).toLowerCase();
   if (PALETTE_KEYS.has(value)) {
     document.documentElement.dataset.palette = value;
+    try { window.localStorage.setItem(PALETTE_KEY, value); } catch (error) { /* 忽略存储禁用 */ }
     return value;
   }
   delete document.documentElement.dataset.palette;
+  try { window.localStorage.removeItem(PALETTE_KEY); } catch (error) { /* 忽略存储禁用 */ }
   return "";
 }
 
 async function syncPalette() {
   const payload = await apiTry(() => apiGet("/ui-preferences"), null);
-  if (!payload) return;
-  applyPalette(payload.palette);
+  if (payload) {
+    applyPalette(payload.palette);
+    return;
+  }
+  // 后端暂时不可达时退回上次缓存，避免面板莫名变回默认紫色
+  try {
+    const cached = window.localStorage.getItem(PALETTE_KEY);
+    if (cached) applyPalette(cached);
+  } catch (error) { /* 忽略存储禁用 */ }
 }
 
 function applyTheme(theme) {
@@ -615,7 +632,7 @@ const NAV = [
     id: "insight",
     label: "洞察",
     icon: "spark",
-    views: ["starmap", "microscope", "synergy"],
+    views: ["microscope", "synergy"],
   },
   {
     id: "bridge",
@@ -627,7 +644,7 @@ const NAV = [
     id: "import",
     label: "导入",
     icon: "download",
-    views: ["chatimport", "migrate", "quarantine"],
+    views: ["chatimport", "migrate", "queue", "quarantine", "processed"],
   },
   {
     id: "settings",
@@ -748,8 +765,9 @@ function refresh() {
 /* ------------------------------------------------------------
    组件片段
    ------------------------------------------------------------ */
-function kpi(label, value, foot, tone, goto) {
+function kpi(label, value, foot, tone, goto, iconName, filter) {
   const inner =
+    (iconName ? icon(iconName, "kpi-icon") : "") +
     '<span class="kpi-label">' + esc(label) + "</span>" +
     '<span class="kpi-value">' + esc(value) + "</span>" +
     (foot ? '<span class="kpi-foot">' + esc(foot) + "</span>" : "");
@@ -757,7 +775,10 @@ function kpi(label, value, foot, tone, goto) {
   if (goto) {
     return (
       '<button class="kpi is-link" type="button"' + toneAttr +
-      ' data-goto="' + esc(goto) + '">' + inner + "</button>"
+      ' data-goto="' + esc(goto) + '"' +
+      (filter ? ' data-filter="' + esc(filter) + '"' : "") + ">" +
+      inner +
+      '<span class="kpi-go" aria-hidden="true">›</span></button>'
     );
   }
   return '<article class="kpi"' + toneAttr + ">" + inner + "</article>";
@@ -1250,7 +1271,7 @@ defineView("overview", {
   eyebrow: "Overview",
   hint: "记忆库规模、范围分布与联动状态的整体快照",
   async load() {
-    const [statsPayload, buckets, core, caps, coord, memories, personal, injectionLogs] = await Promise.all([
+    const [statsPayload, buckets, core, caps, coord, memories, personal, injectionLogs, botsPayload] = await Promise.all([
       apiGet("/stats"),
       apiTry(() => apiGet("/buckets?limit=160"), { buckets: [] }),
       apiTry(() => apiGet("/core-memory"), { blocks: [] }),
@@ -1260,6 +1281,7 @@ defineView("overview", {
       apiTry(() => apiGet("/memories?scope=all&limit=80"), { memories: [] }),
       apiTry(() => apiGet("/companion/personal-memory?limit=1"), null),
       apiTry(() => apiGet("/logs?limit=12"), { items: [] }),
+      apiTry(() => apiGet("/bots"), { bots: [] }),
     ]);
     const stats = (statsPayload && statsPayload.stats) || {};
     state.stats = stats;
@@ -1273,6 +1295,7 @@ defineView("overview", {
       coord: coord.status || {},
       memories: memories.memories || [],
       injectionLogs: Array.isArray(injectionLogs.items) ? injectionLogs.items : [],
+      bots: Array.isArray(botsPayload.bots) ? botsPayload.bots : [],
     };
   },
   render(data) {
@@ -1285,23 +1308,22 @@ defineView("overview", {
     const groupCount = int(byScope.group);
 
     const kpis = [
-      kpi("记忆总量", fmtInt(stats.total_memories), storageMb + " MB 存储", "accent"),
-      kpi("私聊记忆", fmtInt(privateCount), "一对一会话", "private"),
-      kpi("群聊记忆", fmtInt(groupCount), "群窗口沉淀", "group"),
-      kpi("用户档案", fmtInt(stats.identities), "已识别身份", "relation"),
-      kpi("核心记忆", fmtInt((data.core || []).length), "强制注入块", "gold"),
-      kpi("开放线程", fmtInt(stats.open_threads), "跨窗口续接", "fact"),
-      kpi("原文已记录", fmtInt(progress.raw_events), "原始会话事件", "group"),
-      kpi("会话记忆已生成", fmtInt(progress.conversation_memories), "不含待审核候选", "fact"),
-      kpi("待处理批次", fmtInt(progress.pending_batches), "排队或延迟重试", "accent"),
-      kpi("待修复批次", fmtInt(progress.quarantined_batches), "冻结原文 " + fmtInt(progress.frozen_events) + " 条 · 点击查看并释放", "gold", "quarantine"),
-      kpi("已处理，无新增记忆", fmtInt(progress.no_memory_batches), "原文保留，不重复总结", "private"),
+      kpi("记忆总量", fmtInt(stats.total_memories), storageMb + " MB 存储", "accent", "inspect", "db"),
+      kpi("私聊记忆", fmtInt(privateCount), "一对一会话", "private", "inspect", "user", "scope:private"),
+      kpi("群聊记忆", fmtInt(groupCount), "群窗口沉淀", "group", "inspect", "users", "scope:group"),
+      kpi("用户档案", fmtInt(stats.identities), "已识别身份", "relation", "inspect", "tag", "profile"),
+      kpi("核心记忆", fmtInt((data.core || []).length), "强制注入块", "gold", "core", "star"),
+      kpi("开放线程", fmtInt(stats.open_threads), "跨窗口续接", "fact", "navigate", "link"),
+      kpi("原文已记录", fmtInt(progress.raw_events), "原始会话事件", "group", "inspect", "library"),
+      kpi("会话记忆已生成", fmtInt(progress.conversation_memories), "不含待审核候选", "fact", "inspect", "chat"),
+      kpi("待处理批次", fmtInt(progress.pending_batches), "正常排队等总结 · 不是错误", "accent", "queue", "clock"),
+      kpi("待修复批次", fmtInt(progress.quarantined_batches), "总结失败被隔离 · 冻结原文 " + fmtInt(progress.frozen_events) + " 条", "gold", "quarantine", "shield"),
+      kpi("已处理，无新增记忆", fmtInt(progress.no_memory_batches), "原文保留，不重复总结", "private", "processed", "box"),
     ].join("");
 
     const entries = [
       ["navigate", "记忆导航", "按私聊 / 群聊 / 个人等范围进入", "scope"],
       ["inspect", "记忆检视", "逐条查看并修正记忆参数", "db"],
-      ["starmap", "知识星图", "以星系模型浏览关联记忆", "star"],
       ["microscope", "记忆显微镜", "模拟一次真实召回", "scope"],
       ["botlife", "Bot 日程与相册", "Bot 自身的生活记录", "camera"],
       ["config", "模块配置", "按模块调整检索与注入策略", "sliders"],
@@ -1373,8 +1395,24 @@ defineView("overview", {
         const selected = Array.isArray(item.selected_memories) ? item.selected_memories : [];
         const blocked = Array.isArray(item.blocked_reasons) ? item.blocked_reasons : [];
         const query = compact(item.query) || "无检索词";
+        const scopeTag = (memory) => {
+          const key = compact(memory.scope);
+          if (key === "group") return "群聊·";
+          if (key === "private") return "私聊·";
+          if (key === "profile") return "档案·";
+          if (key === "personal") return "Bot·";
+          return "";
+        };
         const selectedText = selected.length
-          ? selected.slice(0, 2).map((memory) => memoryTitle(memory)).join("；")
+          ? selected
+              .slice(0, 2)
+              .map((memory) => {
+                const logSession = compact(item.session_id);
+                const memorySession = compact(memory.session_id);
+                const cross = logSession && memorySession && logSession !== memorySession ? "↔跨窗口 " : "";
+                return cross + scopeTag(memory) + memoryTitle(memory);
+              })
+              .join("；")
           : blocked.length
             ? "未注入记忆 · 过滤 " + blocked.length + " 项"
             : "未注入记忆";
@@ -1394,6 +1432,58 @@ defineView("overview", {
         );
       })
       .join("");
+    const fallbackOwners = (stats && stats.by_owner_bot) || {};
+    const botOwners = Array.isArray(data.bots) && data.bots.length
+      ? data.bots
+      : Object.keys(fallbackOwners).map((key) => ({
+          id: key === "<empty>" ? "" : key,
+          name: "",
+          count: int(fallbackOwners[key]),
+        }));
+    const personaName = compact(data.persona);
+    const botTotal = botOwners.reduce((sum, item) => sum + int(item.count), 0) || 1;
+    const botRows = botOwners
+      .map((item) => {
+        const count = int(item.count);
+        const botId = compact(item.id);
+        const ownerKey = botId || "__empty__";
+        const title = compact(item.name) || personaName || (botId ? "Bot " + botId : "未标记归属");
+        const sub = botId && compact(item.name) ? botId : "";
+        return (
+          '<button class="row is-clickable" type="button" data-goto="inspect" data-owner-bot="' + esc(ownerKey) + '">' +
+            '<div class="row-main" style="min-width:0">' +
+              '<div class="row-title">' + esc(title) + (sub ? ' <span class="bot-id">' + esc(sub) + "</span>" : "") + "</div>" +
+              '<div class="bot-bar"><span style="width:' + Math.max(3, Math.round((count / botTotal) * 100)) + '%"></span></div>' +
+            "</div>" +
+            '<div class="row-meta">' + badge(fmtInt(count) + " 条", "fact") + "</div>" +
+          "</button>"
+        );
+      })
+      .join("");
+    const botCard = botOwners.length
+      ? card("Bot 记忆分布", "共 " + botOwners.length + " 个归属 · 点名字看这个 Bot 的记忆", '<div class="row-list">' + botRows + "</div>", '<button class="btn is-sm is-ghost" type="button" data-goto="inspect" data-filter="all">全部记忆</button>')
+      : card("Bot 记忆分布", "还没有归属数据", emptyState("暂无归属", "记忆写入后会按 Bot 归属统计。"));
+
+    const drainInfo = (stats && stats.summary_drain) || {};
+    const drainLabel =
+      drainInfo.state === "running" ? "正在消化积压"
+      : drainInfo.state === "degraded" ? "上一轮出错"
+      : drainInfo.state === "scheduled" ? "等待下一轮"
+      : "未启动";
+    const drainCard = card(
+      "自动消化",
+      "后台定时扫未总结的原文",
+      '<div class="row-list">' +
+        '<div class="row"><div class="row-main"><div class="row-title">' + esc(drainLabel) + "</div>" +
+          '<div class="row-sub">' + esc(compact(drainInfo.last_result) || "还没有跑过") + "</div></div>" +
+          '<div class="row-meta">' + esc(compact(drainInfo.last_completed_at) || "—") + "</div></div>" +
+        (compact(drainInfo.last_error)
+          ? '<div class="row"><div class="row-main"><div class="row-title">最近错误</div><div class="row-sub">' + esc(drainInfo.last_error) + "</div></div></div>"
+          : "") +
+      "</div>",
+      '<button class="btn is-sm is-ghost" type="button" data-goto="queue">看排队中</button>'
+    );
+
     const injectionCard = card(
       "最近注入",
       injectionLogs.length ? "最近 12 轮主链注入记录" : "暂无可展示的注入记录",
@@ -1417,11 +1507,13 @@ defineView("overview", {
           ) +
         "</div>" +
       "</div>" +
+      botCard +
+      drainCard +
       '<div class="grid g4">' +
-        kpi("稳定记忆", fmtInt(stats.stable_memories), "lifecycle=stable_memory", "fact") +
-        kpi("时间线事件", fmtInt(stats.timeline_events), "结构化事件流", "group") +
-        kpi("关系边", fmtInt(stats.relationships), "实体间关系", "relation") +
-        kpi("ACL 规则", fmtInt(stats.acl_rules), "跨窗口读写授权", "gold") +
+        kpi("稳定记忆", fmtInt(stats.stable_memories), "lifecycle=stable_memory", "fact", "inspect", "heart") +
+        kpi("时间线事件", fmtInt(stats.timeline_events), "结构化事件流", "group", "navigate", "clock") +
+        kpi("关系边", fmtInt(stats.relationships), "实体间关系", "relation", "navigate", "link") +
+        kpi("ACL 规则", fmtInt(stats.acl_rules), "跨窗口读写授权", "gold", "acl", "shield") +
       "</div>" +
       injectionCard +
       "</div>"
@@ -1658,12 +1750,14 @@ defineView("inspect", {
     if (filters.lifecycle) params.push("lifecycle=" + encodeURIComponent(filters.lifecycle));
     if (filters.memoryType) params.push("memory_type=" + encodeURIComponent(filters.memoryType));
     if (filters.q) params.push("q=" + encodeURIComponent(filters.q));
+    if (filters.ownerBot) params.push("owner_bot=" + encodeURIComponent(filters.ownerBot));
     if (filters.target) {
       if (filters.scope === "group") params.push("group_id=" + encodeURIComponent(filters.target));
       else params.push("entity_id=" + encodeURIComponent(filters.target));
     }
     // 没有指定范围时用显式 scope=all，而不是让后端默认放开全量。
     if (!filters.scope && !filters.target) params.push("scope=all");
+    const botsPayload = await apiTry(() => apiGet("/bots"), { bots: [], persona: "" });
     const result = await apiGet("/memories?" + params.join("&"));
     let memories = Array.isArray(result.memories) ? result.memories : [];
     if (filters.scope === "profile") {
@@ -1673,7 +1767,7 @@ defineView("inspect", {
         "relationship", "relationship_claim", "relationship_phase_summary",
       ].includes(compact(m.memory_type)));
     }
-    return { memories, filters };
+    return { memories, filters, bots: Array.isArray(botsPayload.bots) ? botsPayload.bots : [], persona: botsPayload.persona || "" };
   },
   render(data) {
     const filters = data.filters || {};
@@ -1707,9 +1801,21 @@ defineView("inspect", {
       })
       .join("");
 
+    const botPills = (data.bots || []).length
+      ? '<div class="pill-row">' +
+        '<button class="pill' + (!filters.ownerBot ? " is-active" : "") + '" type="button" data-filter-key="ownerBot" data-filter-value="">全部 Bot</button>' +
+        (data.bots || []).map((bot) => {
+          const key = compact(bot.id) || "__empty__";
+          const name = compact(bot.name) || compact(data.persona) || (compact(bot.id) ? "Bot " + bot.id : "未标记归属");
+          return '<button class="pill' + (filters.ownerBot === key ? " is-active" : "") + '" type="button" data-filter-key="ownerBot" data-filter-value="' + esc(key) + '">' + esc(name) + " · " + fmtInt(bot.count) + "</button>";
+        }).join("") +
+        "</div>"
+      : "";
+
     const activeChips = [];
     if (filters.q) activeChips.push("关键词：" + filters.q);
     if (filters.target) activeChips.push("目标：" + filters.target);
+    if (filters.ownerBot) activeChips.push("Bot：" + (filters.ownerBot === "__empty__" ? "未标记归属" : filters.ownerBot));
 
     const rows = memories.length
       ? memories.map((memory, index) => memoryRow(memory, index)).join("")
@@ -1718,6 +1824,7 @@ defineView("inspect", {
     return (
       '<div class="grid" style="gap:14px">' +
       '<section class="card is-tight">' +
+        (botPills ? '<div style="display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin-bottom:10px">' + botPills + "</div>" : "") +
         '<div style="display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center">' +
           '<div class="pill-row">' + scopePills + "</div>" +
         "</div>" +
@@ -1825,6 +1932,7 @@ defineView("core", {
         '<label class="field is-inline" style="width:auto"><span>优先级</span><input name="priority" id="corePriority" type="number" min="0" max="100" step="1" value="50" style="width:88px" /></label>' +
         '<label class="switch"><input type="checkbox" id="coreEnabled" checked /><span class="switch-track"></span><span>启用注入</span></label>' +
         '<div class="pill-row" style="margin-left:auto">' +
+          '<button class="btn is-sm is-danger" type="button" id="coreDeleteBtn" disabled>删除此块</button>' +
           '<button class="btn is-sm is-ghost" type="button" id="coreResetBtn">重置</button>' +
           '<button class="btn is-sm is-primary" type="submit">保存核心块</button>' +
         "</div>" +
@@ -1833,7 +1941,15 @@ defineView("core", {
 
     return (
       '<div class="grid split-2">' +
-        card("核心记忆块", (data.blocks || []).length + " 个 · 按优先级排序", '<div class="row-list">' + rows + "</div>") +
+        card(
+          "核心记忆块",
+          (data.blocks || []).length + " 个 · 按优先级排序",
+          '<div class="row-actions" style="margin-bottom:10px">' +
+            '<button class="btn is-sm" type="button" id="coreExtractBtn">从记忆提炼核心块</button>' +
+            '<span class="cf-desc" style="margin-left:8px">按私聊 / 群聊 / 档案 / 全局汇总最稳定的事实</span>' +
+          "</div>" +
+          '<div class="row-list">' + rows + "</div>"
+        ) +
         card("编辑核心块", "留空 ID 表示新建", form) +
       "</div>"
     );
@@ -1856,6 +1972,8 @@ defineView("core", {
       $("#coreContent", node).value = block ? compact(block.content) : "";
       $("#corePriority", node).value = block ? int(block.priority) : 50;
       $("#coreEnabled", node).checked = block ? block.enabled !== false : true;
+      const deleteBtn = $("#coreDeleteBtn", node);
+      if (deleteBtn) deleteBtn.disabled = !block;
     };
 
     $$("[data-core]", node).forEach((row) => {
@@ -1863,6 +1981,26 @@ defineView("core", {
     });
 
     $("#coreResetBtn", node).addEventListener("click", () => fill(null));
+    $("#coreDeleteBtn", node).addEventListener("click", async () => {
+      const id = $("#coreId", node).value.trim();
+      if (!id) {
+        toast("先选中一个核心记忆块", "warn");
+        return;
+      }
+      const confirmed = await showInlineConfirmation("删除核心记忆块", "删除后该块不再参与注入，且不可恢复。确定删除？", "删除");
+      if (!confirmed) return;
+      await withBusy("正在删除…", async () => {
+        const result = await apiPost("/core-memory/delete", { id: id });
+        if (result && result.ok === false) {
+          toast("删除失败：" + (result.code || "未知原因"), "error");
+          return;
+        }
+        invalidatePool();
+        toast("核心记忆块已删除", "ok");
+        fill(null);
+        refresh();
+      }, 3000);
+    });
 
     $("#coreForm", node).addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -1895,6 +2033,82 @@ defineView("core", {
         refresh();
       });
     });
+
+    const extractBtn = $("#coreExtractBtn", node);
+    if (extractBtn) {
+      extractBtn.addEventListener("click", async () => {
+        extractBtn.disabled = true;
+        try {
+          const pool = await apiGet("/memories?scope=all&limit=200");
+          const list = Array.isArray(pool.memories) ? pool.memories : [];
+          if (!list.length) {
+            toast("还没有记忆可提炼，先聊几轮或导入历史", "warn");
+            return;
+          }
+          const buckets = { private: [], group: [], profile: [], global: [] };
+          list.forEach((memory) => {
+            const key = compact(memory.scope) || "global";
+            (buckets[key] || buckets.global).push(memory);
+          });
+          const labels = { private: "私聊稳定事实", group: "群聊稳定事实", profile: "用户档案要点", global: "全局规则与偏好" };
+          const candidates = Object.keys(labels)
+            .map((scope) => {
+              const items = buckets[scope] || [];
+              if (!items.length) return null;
+              const facts = [];
+              items
+                .slice()
+                .sort((a, b) => (Number(b.salience) || 0) - (Number(a.salience) || 0))
+                .forEach((memory) => {
+                  const keyFacts = Array.isArray(memory.key_facts) ? memory.key_facts : [];
+                  if (keyFacts.length) {
+                    keyFacts.forEach((fact) => {
+                      if (compact(fact)) facts.push(compact(fact));
+                    });
+                  } else if (compact(memory.content)) {
+                    facts.push(clip(compact(memory.content), 60));
+                  }
+                });
+              const unique = Array.from(new Set(facts.filter(Boolean))).slice(0, 8);
+              if (!unique.length) return null;
+              return {
+                label: labels[scope],
+                kind: "fact",
+                scope: scope === "profile" ? "global" : scope,
+                priority: 60,
+                content: unique.join("；"),
+                enabled: true,
+              };
+            })
+            .filter(Boolean);
+          if (!candidates.length) {
+            toast("没提炼出可用的事实", "warn");
+            return;
+          }
+          const previewText = candidates.map((item) => item.label + "：" + clip(item.content, 46)).join("；");
+          const confirmed = await showInlineConfirmation(
+            "从记忆提炼核心块",
+            "将生成 " + candidates.length + " 个核心块，可在列表里再改或删。" + previewText,
+            "写入 " + candidates.length + " 个"
+          );
+          if (!confirmed) return;
+          await withBusy("正在写入…", async () => {
+            let done = 0;
+            for (const candidate of candidates) {
+              const result = await apiPost("/core-memory/upsert", candidate);
+              if (result && result.ok !== false) done += 1;
+            }
+            invalidatePool();
+            toast("已写入 " + done + " 个核心块", done ? "ok" : "warn");
+            refresh();
+          }, 900);
+        } catch (error) {
+          toast("提炼失败：" + (error.message || error), "error");
+        } finally {
+          extractBtn.disabled = false;
+        }
+      });
+    }
   },
 });
 
@@ -2184,518 +2398,7 @@ function relationScore(center, other) {
   return clamp(score, 0, 1);
 }
 
-function buildGalaxy(memories, centerId) {
-  const pool = (memories || []).filter((m) => compact(m.id));
-  if (!pool.length) return null;
-  let center = centerId ? pool.find((m) => m.id === centerId) : null;
-  if (!center) {
-    center = pool.slice().sort((a, b) => {
-      const diff = Number(b.importance || 0) - Number(a.importance || 0);
-      if (Math.abs(diff) > 0.0001) return diff;
-      return memoryTimestamp(b) - memoryTimestamp(a);
-    })[0];
-  }
-  const scored = pool
-    .filter((m) => m.id !== center.id)
-    .map((memory) => ({ memory, score: relationScore(center, memory) }))
-    .filter((item) => item.score > 0.08)
-    .sort((a, b) => b.score - a.score || Number(b.memory.importance || 0) - Number(a.memory.importance || 0))
-    .slice(0, 12);
 
-  const nodes = scored.map((item, index) => {
-    const tier = item.score >= 0.62 ? 0 : item.score >= 0.36 ? 1 : 2;
-    const count = scored.filter((s, i) => (s.score >= 0.62 ? 0 : s.score >= 0.36 ? 1 : 2) === tier).length;
-    return {
-      id: item.memory.id,
-      memory: item.memory,
-      score: item.score,
-      tier,
-      color: satelliteColor(item.memory),
-      angle: (index / Math.max(1, scored.length)) * Math.PI * 2 + tier * 0.7,
-      size: 4.4 + Number(item.memory.importance || 0) * 5.2 + item.score * 2.4,
-      slotIndex: index,
-      tierCount: count,
-    };
-  });
-  return { center, nodes, pool };
-}
-
-function easeInOutCubic(t) {
-  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
-}
-
-class GalaxyView {
-  constructor(canvas) {
-    this.canvas = canvas;
-    this.ctx = canvas.getContext("2d");
-    this.dpr = Math.min(2, window.devicePixelRatio || 1);
-    this.w = 0;
-    this.h = 0;
-    this.galaxy = null;
-    this.pending = null;
-    this.transition = null;
-    this.hoverId = "";
-    this.paused = false;
-    this.destroyed = false;
-    this.starfield = [];
-    this.lastFrame = 0;
-    this.tip = null;
-    this.onSelect = null;
-    this.onHover = null;
-    this.resize();
-    this.bindEvents();
-    this.loop = this.loop.bind(this);
-    requestAnimationFrame(this.loop);
-  }
-
-  destroy() {
-    this.destroyed = true;
-    window.removeEventListener("resize", this.resizeHandler);
-    this.canvas.removeEventListener("mousemove", this.moveHandler);
-    this.canvas.removeEventListener("mouseleave", this.leaveHandler);
-    this.canvas.removeEventListener("click", this.clickHandler);
-  }
-
-  resize() {
-    const rect = this.canvas.getBoundingClientRect();
-    this.w = Math.max(320, Math.round(rect.width));
-    this.h = Math.max(320, Math.round(rect.height || 620));
-    this.canvas.width = Math.round(this.w * this.dpr);
-    this.canvas.height = Math.round(this.h * this.dpr);
-    this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    this.buildStarfield();
-  }
-
-  buildStarfield() {
-    const count = Math.round((this.w * this.h) / 5200);
-    const stars = [];
-    let seed = 20260829;
-    const rand = () => {
-      seed = (seed * 1664525 + 1013904223) % 4294967296;
-      return seed / 4294967296;
-    };
-    for (let i = 0; i < count; i += 1) {
-      stars.push({
-        x: rand() * this.w,
-        y: rand() * this.h,
-        r: 0.35 + rand() * 0.95,
-        a: 0.12 + rand() * 0.42,
-        tw: rand() * Math.PI * 2,
-      });
-    }
-    this.starfield = stars;
-  }
-
-  bindEvents() {
-    this.resizeHandler = () => this.resize();
-    window.addEventListener("resize", this.resizeHandler);
-
-    this.moveHandler = (event) => {
-      const rect = this.canvas.getBoundingClientRect();
-      const mx = event.clientX - rect.left;
-      const my = event.clientY - rect.top;
-      const found = this.hitTest(mx, my);
-      const id = found ? found.id : "";
-      if (id !== this.hoverId) {
-        this.hoverId = id;
-        this.canvas.style.cursor = id ? "pointer" : "default";
-        if (this.onHover) this.onHover(found ? found.node : null, mx, my);
-      } else if (id && this.onHover) {
-        this.onHover(found.node, mx, my);
-      }
-    };
-    this.leaveHandler = () => {
-      this.hoverId = "";
-      this.canvas.style.cursor = "default";
-      if (this.onHover) this.onHover(null, 0, 0);
-    };
-    this.clickHandler = (event) => {
-      const rect = this.canvas.getBoundingClientRect();
-      const found = this.hitTest(event.clientX - rect.left, event.clientY - rect.top);
-      if (found && this.onSelect) this.onSelect(found.node);
-    };
-    this.canvas.addEventListener("mousemove", this.moveHandler);
-    this.canvas.addEventListener("mouseleave", this.leaveHandler);
-    this.canvas.addEventListener("click", this.clickHandler);
-  }
-
-  setGalaxy(galaxy) {
-    if (!galaxy) return;
-    if (!this.galaxy || !this.galaxy.center || galaxy.center.id === this.galaxy.center.id) {
-      const keepAngles = {};
-      if (this.galaxy) this.galaxy.nodes.forEach((node) => (keepAngles[node.id] = node.angle));
-      galaxy.nodes.forEach((node) => {
-        if (keepAngles[node.id] !== undefined) node.angle = keepAngles[node.id];
-        node.born = 1;
-      });
-      this.galaxy = galaxy;
-      return;
-    }
-    const outgoing = this.galaxy;
-    const incoming = galaxy;
-    const clicked = outgoing.nodes.find((node) => node.id === galaxy.center.id);
-    incoming.nodes.forEach((node) => {
-      node.born = 0;
-    });
-    this.transition = {
-      t: 0,
-      outgoing,
-      incoming,
-      clicked: clicked || null,
-      startX: clicked ? this.nodeX(clicked) : this.w / 2,
-      startY: clicked ? this.nodeY(clicked) : this.h / 2,
-      startSize: clicked ? clicked.size : 6,
-      startColor: clicked ? clicked.color : "#a99bff",
-    };
-  }
-
-  cx() {
-    return this.w / 2;
-  }
-  cy() {
-    return this.h / 2 - 6;
-  }
-  orbitRadius(tier) {
-    const base = Math.min(this.w, this.h) * 0.5;
-    return base * ORBIT_TIERS[tier].ratio;
-  }
-  nodeX(node) {
-    const r = this.orbitRadius(node.tier);
-    return this.cx() + Math.cos(node.angle) * r;
-  }
-  nodeY(node) {
-    const r = this.orbitRadius(node.tier);
-    return this.cy() + Math.sin(node.angle) * r * 0.7;
-  }
-  depthOf(angle) {
-    return (Math.sin(angle) + 1) / 2;
-  }
-
-  hitTest(mx, my) {
-    if (!this.galaxy) return null;
-    const nodes = this.galaxy.nodes;
-    for (let i = nodes.length - 1; i >= 0; i -= 1) {
-      const node = nodes[i];
-      if (node.born < 0.4) continue;
-      const x = this.nodeX(node);
-      const y = this.nodeY(node);
-      const r = Math.max(11, node.size + 7);
-      if ((mx - x) ** 2 + (my - y) ** 2 <= r * r) return { id: node.id, node };
-    }
-    const cx = this.cx();
-    const cy = this.cy();
-    if ((mx - cx) ** 2 + (my - cy) ** 2 <= 26 * 26) return null;
-    return null;
-  }
-
-  loop(now) {
-    if (this.destroyed) return;
-    const dt = this.lastFrame ? Math.min(64, now - this.lastFrame) : 16;
-    this.lastFrame = now;
-    this.step(dt);
-    this.draw(now);
-    requestAnimationFrame(this.loop);
-  }
-
-  step(dt) {
-    if (this.transition) {
-      this.transition.t = Math.min(1, this.transition.t + dt / 1050);
-      const e = easeInOutCubic(this.transition.t);
-      this.transition.incoming.nodes.forEach((node, index) => {
-        const delay = clamp((index / Math.max(1, this.transition.incoming.nodes.length)) * 0.5, 0, 0.5);
-        node.born = clamp((e - delay) / (1 - delay), 0, 1);
-      });
-      if (this.transition.t >= 1) {
-        this.transition.incoming.nodes.forEach((node) => (node.born = 1));
-        this.galaxy = this.transition.incoming;
-        this.transition = null;
-        this.hoverId = "";
-      }
-      return;
-    }
-    if (this.paused || this.userPaused || !this.galaxy) return;
-    const seconds = dt / 1000;
-    this.galaxy.nodes.forEach((node) => {
-      const dir = node.tier % 2 === 0 ? 1 : -1;
-      node.angle += ((ORBIT_TIERS[node.tier].speed * Math.PI) / 180) * seconds * dir;
-      if (node.angle > Math.PI * 4) node.angle -= Math.PI * 4;
-      if (node.angle < -Math.PI * 4) node.angle += Math.PI * 4;
-    });
-  }
-
-  draw(now) {
-    const ctx = this.ctx;
-    const isDark = document.documentElement.dataset.theme !== "light";
-    ctx.clearRect(0, 0, this.w, this.h);
-
-    const bg = ctx.createLinearGradient(0, 0, 0, this.h);
-    if (isDark) {
-      bg.addColorStop(0, "#05070d");
-      bg.addColorStop(0.55, "#080b14");
-      bg.addColorStop(1, "#05070d");
-    } else {
-      bg.addColorStop(0, "#eef2f9");
-      bg.addColorStop(0.55, "#e6ecf7");
-      bg.addColorStop(1, "#eef2f9");
-    }
-    ctx.fillStyle = bg;
-    ctx.fillRect(0, 0, this.w, this.h);
-
-    this.drawStarfield(now, isDark);
-    this.drawDisk(isDark);
-    this.drawOrbits(isDark);
-    this.drawTransition(now, isDark);
-    if (!this.transition) this.drawSystem(this.galaxy, now, isDark);
-  }
-
-  drawStarfield(now, isDark) {
-    const ctx = this.ctx;
-    const time = now / 1000;
-    this.starfield.forEach((star) => {
-      const tw = 0.65 + 0.35 * Math.sin(time * 0.7 + star.tw);
-      ctx.globalAlpha = star.a * tw;
-      ctx.fillStyle = isDark ? "#dfe6f5" : "#7d8aa5";
-      ctx.beginPath();
-      ctx.arc(star.x, star.y, star.r, 0, Math.PI * 2);
-      ctx.fill();
-    });
-    ctx.globalAlpha = 1;
-  }
-
-  drawDisk(isDark) {
-    const ctx = this.ctx;
-    const r = this.orbitRadius(2) * 1.16;
-    const gradient = ctx.createRadialGradient(this.cx(), this.cy(), r * 0.06, this.cx(), this.cy(), r);
-    if (isDark) {
-      gradient.addColorStop(0, "rgba(124,108,240,0.16)");
-      gradient.addColorStop(0.42, "rgba(90,110,200,0.07)");
-      gradient.addColorStop(1, "rgba(10,14,26,0)");
-    } else {
-      gradient.addColorStop(0, "rgba(124,108,240,0.14)");
-      gradient.addColorStop(0.45, "rgba(120,140,210,0.07)");
-      gradient.addColorStop(1, "rgba(230,236,247,0)");
-    }
-    ctx.save();
-    ctx.translate(this.cx(), this.cy());
-    ctx.scale(1, 0.7);
-    ctx.beginPath();
-    ctx.arc(0, 0, r, 0, Math.PI * 2);
-    ctx.fillStyle = gradient;
-    ctx.fill();
-    ctx.restore();
-  }
-
-  drawOrbits(isDark) {
-    const ctx = this.ctx;
-    ORBIT_TIERS.forEach((tier, index) => {
-      const rx = this.orbitRadius(index);
-      const ry = rx * 0.7;
-      ctx.save();
-      ctx.translate(this.cx(), this.cy());
-      ctx.beginPath();
-      ctx.ellipse(0, 0, rx, ry, 0, 0, Math.PI * 2);
-      ctx.strokeStyle = isDark ? "rgba(255,255,255,0.055)" : "rgba(16,24,40,0.07)";
-      ctx.lineWidth = 1;
-      ctx.stroke();
-
-      ctx.beginPath();
-      ctx.ellipse(0, 0, rx, ry, 0, 0, Math.PI);
-      ctx.strokeStyle = isDark ? "rgba(255,255,255,0.13)" : "rgba(16,24,40,0.14)";
-      ctx.lineWidth = 1.1;
-      ctx.stroke();
-      ctx.restore();
-    });
-  }
-
-  drawSystem(galaxy, now, isDark) {
-    if (!galaxy) return;
-    this.drawCenter(galaxy.center, this.cx(), this.cy(), 1, 1, isDark, now);
-    const sorted = galaxy.nodes.slice().sort((a, b) => Math.sin(a.angle) - Math.sin(b.angle));
-    sorted.forEach((node) => {
-      const born = node.born === undefined ? 1 : node.born;
-      if (born <= 0.01) return;
-      this.drawSatellite(node, born, isDark, now);
-    });
-  }
-
-  drawTransition(now, isDark) {
-    const tr = this.transition;
-    if (!tr) return;
-    const e = easeInOutCubic(tr.t);
-
-    tr.outgoing.nodes.forEach((node) => {
-      if (tr.clicked && node.id === tr.clicked.id) return;
-      const fade = 1 - clamp(tr.t / 0.55, 0, 1);
-      const born = clamp(1 - fade * 0.92, 0.08, 1);
-      this.drawSatellite(node, born, isDark, now, 1 - fade * 0.9);
-    });
-
-    const oldCenterFade = 1 - clamp(tr.t / 0.5, 0, 1);
-    if (oldCenterFade > 0.01) {
-      this.drawCenter(tr.outgoing.center, this.cx(), this.cy(), 1 - e * 0.45, oldCenterFade, isDark, now);
-    }
-
-    if (tr.clicked) {
-      const x = tr.startX + (this.cx() - tr.startX) * e;
-      const y = tr.startY + (this.cy() - tr.startY) * e;
-      const scale = 1 + e * 1.5;
-      ctx_save(this.ctx);
-      this.drawMoving(x, y, tr.startSize * scale, tr.startColor, isDark);
-      ctx_restore(this.ctx);
-    }
-
-    if (e > 0.45) {
-      const appear = clamp((e - 0.45) / 0.55, 0, 1);
-      this.drawCenter(tr.incoming.center, this.cx(), this.cy(), 0.6 + appear * 0.4, appear, isDark, now);
-    }
-
-    tr.incoming.nodes.forEach((node) => {
-      if (node.born <= 0.01) return;
-      this.drawSatellite(node, node.born, isDark, now);
-    });
-  }
-
-  drawMoving(x, y, size, color, isDark) {
-    const ctx = this.ctx;
-    const glow = ctx.createRadialGradient(x, y, 0, x, y, size * 4.2);
-    glow.addColorStop(0, hexAlpha(color, 0.5));
-    glow.addColorStop(0.45, hexAlpha(color, 0.16));
-    glow.addColorStop(1, hexAlpha(color, 0));
-    ctx.fillStyle = glow;
-    ctx.beginPath();
-    ctx.arc(x, y, size * 4.2, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.fillStyle = color;
-    ctx.beginPath();
-    ctx.arc(x, y, size, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.fillStyle = isDark ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.85)";
-    ctx.beginPath();
-    ctx.arc(x - size * 0.26, y - size * 0.3, size * 0.3, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  drawCenter(memory, x, y, scale, alpha, isDark, now) {
-    const ctx = this.ctx;
-    if (!memory) return;
-    const pulse = 1 + Math.sin(now / 1400) * 0.045;
-    const base = 13 * scale * pulse;
-    const color = satelliteColor(memory);
-
-    const halo = ctx.createRadialGradient(x, y, 0, x, y, base * 6);
-    halo.addColorStop(0, hexAlpha(color, 0.34 * alpha));
-    halo.addColorStop(0.3, hexAlpha(color, 0.13 * alpha));
-    halo.addColorStop(1, hexAlpha(color, 0));
-    ctx.fillStyle = halo;
-    ctx.beginPath();
-    ctx.arc(x, y, base * 6, 0, Math.PI * 2);
-    ctx.fill();
-
-    const core = ctx.createRadialGradient(x - base * 0.3, y - base * 0.34, base * 0.1, x, y, base);
-    core.addColorStop(0, hexAlpha("#ffffff", 0.98 * alpha));
-    core.addColorStop(0.42, hexAlpha(color, 0.95 * alpha));
-    core.addColorStop(1, hexAlpha(color, 0.6 * alpha));
-    ctx.fillStyle = core;
-    ctx.beginPath();
-    ctx.arc(x, y, base, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.strokeStyle = hexAlpha(color, 0.5 * alpha);
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.arc(x, y, base * 1.72, 0, Math.PI * 2);
-    ctx.stroke();
-
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    ctx.fillStyle = isDark ? "rgba(242,245,250,0.9)" : "rgba(16,19,25,0.86)";
-    ctx.font = '600 11px "Sarasa Gothic SC", "PingFang SC", system-ui, sans-serif';
-    ctx.textAlign = "center";
-    ctx.fillText(clip(memoryTitle(memory), 20), x, y + base * 1.72 + 16);
-    ctx.font = '400 10px "JetBrains Mono", monospace';
-    ctx.fillStyle = isDark ? "rgba(152,163,184,0.72)" : "rgba(85,96,122,0.78)";
-    ctx.fillText(
-      (TYPE_LABEL[compact(memory.memory_type)] || compact(memory.memory_type) || "记忆") +
-        " · 重要 " + num(memory.importance),
-      x,
-      y + base * 1.72 + 30
-    );
-    ctx.restore();
-  }
-
-  drawSatellite(node, born, isDark, now, alphaOverride) {
-    const ctx = this.ctx;
-    const rx = this.orbitRadius(node.tier);
-    const ry = rx * 0.7;
-    const x = this.cx() + Math.cos(node.angle) * rx * (0.35 + 0.65 * born);
-    const y = this.cy() + Math.sin(node.angle) * ry * (0.35 + 0.65 * born);
-    const depth = this.depthOf(node.angle);
-    const isHover = this.hoverId === node.id;
-    const sizeScale = (0.74 + depth * 0.4) * (0.5 + 0.5 * born) * (isHover ? 1.42 : 1);
-    const size = Math.max(2, node.size * sizeScale);
-    const alpha = clamp((alphaOverride === undefined ? 0.48 + depth * 0.52 : alphaOverride) * born, 0, 1);
-
-    const dir = node.tier % 2 === 0 ? 1 : -1;
-    const rEff = (rx + ry) / 2;
-    const step = (24 / Math.max(60, rEff)) * dir;
-    const trailScale = [0.5, 0.37, 0.26, 0.17];
-    const trailAlpha = [0.44, 0.3, 0.18, 0.09];
-    for (let i = 0; i < 4; i += 1) {
-      const ta = node.angle - step * (i + 1);
-      const tx = this.cx() + Math.cos(ta) * rx * (0.35 + 0.65 * born);
-      const ty = this.cy() + Math.sin(ta) * ry * (0.35 + 0.65 * born);
-      const tDepth = this.depthOf(ta);
-      ctx.globalAlpha = trailAlpha[i] * born * (0.55 + tDepth * 0.45);
-      ctx.fillStyle = node.color;
-      ctx.beginPath();
-      ctx.arc(tx, ty, Math.max(0.8, size * trailScale[i]), 0, Math.PI * 2);
-      ctx.fill();
-    }
-    ctx.globalAlpha = 1;
-
-    const glowR = size * (isHover ? 5.4 : 3.6);
-    const glow = ctx.createRadialGradient(x, y, 0, x, y, glowR);
-    glow.addColorStop(0, hexAlpha(node.color, (isHover ? 0.55 : 0.34) * alpha));
-    glow.addColorStop(1, hexAlpha(node.color, 0));
-    ctx.fillStyle = glow;
-    ctx.beginPath();
-    ctx.arc(x, y, glowR, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.globalAlpha = alpha;
-    ctx.fillStyle = node.color;
-    ctx.beginPath();
-    ctx.arc(x, y, size, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = hexAlpha("#ffffff", 0.55 * alpha);
-    ctx.beginPath();
-    ctx.arc(x - size * 0.28, y - size * 0.32, size * 0.32, 0, Math.PI * 2);
-    ctx.fill();
-
-    if (isHover || born > 0.85) {
-      ctx.globalAlpha = alpha * (isHover ? 1 : 0.62);
-      ctx.strokeStyle = hexAlpha(node.color, isHover ? 0.9 : 0.4);
-      ctx.lineWidth = isHover ? 1.4 : 1;
-      ctx.beginPath();
-      ctx.arc(x, y, size + (isHover ? 7 : 3.4), 0, Math.PI * 2);
-      ctx.stroke();
-    }
-
-    if (isHover || born > 0.9) {
-      ctx.globalAlpha = alpha;
-      ctx.fillStyle = isDark ? "rgba(242,245,250,0.94)" : "rgba(16,19,25,0.9)";
-      ctx.font = '500 10.5px "Sarasa Gothic SC", "PingFang SC", system-ui, sans-serif';
-      ctx.textAlign = "center";
-      ctx.fillText(clip(memoryTitle(node.memory), 16), x, y + size + 15);
-    }
-    ctx.globalAlpha = 1;
-  }
-}
-
-function ctx_save(ctx) { ctx.save(); }
-function ctx_restore(ctx) { ctx.restore(); }
 
 function hexAlpha(hex, alpha) {
   const value = compact(hex).replace("#", "");
@@ -2706,211 +2409,10 @@ function hexAlpha(hex, alpha) {
   return "rgba(" + r + "," + g + "," + b + "," + clamp(alpha, 0, 1).toFixed(3) + ")";
 }
 
-/* ------------------------------------------------------------
-   知识星图视图
-   ------------------------------------------------------------ */
-let galaxyInstance = null;
 
-defineView("starmap", {
-  title: "知识星图",
-  navLabel: "知识星图",
-  eyebrow: "Insight · Star Map",
-  hint: "选中的记忆是中央恒星，关联记忆按强度落在内 / 中 / 外三条星轨上；点击卫星即可升为新的恒星",
-  async load(options) {
-    const opts = options || {};
-    const pool = await loadPool();
-    const centerId = opts.center || (state.starmap && state.starmap.centerId) || "";
-    const galaxy = buildGalaxy(pool, centerId);
-    return { galaxy, poolSize: pool.length };
-  },
-  render(data) {
-    const galaxy = data.galaxy;
-    if (!galaxy) {
-      return emptyState("记忆库还是空的", "先产生一些记忆，星图才有可以围绕的恒星。");
-    }
-    const legend = ORBIT_TIERS.map(
-      (tier) =>
-        '<span class="legend-item" style="color:' + tier.color + '"><i></i><span style="color:var(--text-3)">' + esc(tier.label) + "</span></span>"
-    ).join("");
 
-    return (
-      '<div class="starmap-wrap">' +
-        '<div class="starmap-card" id="starmapCard">' +
-          '<div class="starmap-hud"><span class="hud-title">知识星图</span>' +
-            '<span class="hud-sub">' + fmtInt(data.poolSize) + " 条记忆参与关联计算 · 悬停暂停公转</span></div>" +
-          '<div class="starmap-tools">' +
-            '<button class="pill" type="button" id="starPauseBtn">暂停公转</button>' +
-            '<button class="pill" type="button" id="starReseedBtn">换一颗恒星</button>' +
-          "</div>" +
-          '<canvas class="starmap-canvas" id="starmapCanvas"></canvas>' +
-          '<div class="starmap-tip" id="starmapTip"></div>' +
-          '<div class="star-legend">' + legend + "</div>" +
-        "</div>" +
-        '<div class="star-panel" id="starPanel">' + starPanelHtml(galaxy) + "</div>" +
-      "</div>"
-    );
-  },
-  mount(node, data) {
-    const canvas = $("#starmapCanvas", node);
-    if (!canvas) return;
-    if (galaxyInstance) galaxyInstance.destroy();
-    galaxyInstance = new GalaxyView(canvas);
-    galaxyInstance.setGalaxy(data.galaxy);
-    state.starmap = { centerId: data.galaxy.center.id };
 
-    const tip = $("#starmapTip", node);
 
-    galaxyInstance.onHover = (hoverNode, mx, my) => {
-      galaxyInstance.paused = Boolean(hoverNode);
-      if (!hoverNode) {
-        tip.classList.remove("is-on");
-        return;
-      }
-      const memory = hoverNode.memory;
-      const weights = memory.persona_weights && typeof memory.persona_weights === "object" ? memory.persona_weights : {};
-      const weightKeys = Object.keys(weights).slice(0, 4);
-      tip.innerHTML =
-        '<div class="tip-head">' +
-          badge(typeLabel(memory), toneOfColor(hoverNode.color)) +
-          badge("关联 " + num(hoverNode.score), "accent") +
-        "</div>" +
-        '<div class="tip-body">' + esc(clip(memoryTitle(memory), 62)) + "</div>" +
-        (weightKeys.length
-          ? '<div class="tip-weights">' + weightKeys.map((key) => badge((WEIGHT_LABEL[key] || key) + " " + num(weights[key]), "accent")).join("") + "</div>"
-          : "") +
-        '<div class="tip-hint">悬停暂停公转 · 点击升为恒星</div>';
-      tip.style.left = clamp(mx, 130, galaxyInstance.w - 130) + "px";
-      tip.style.top = my + "px";
-      tip.classList.add("is-on");
-    };
-
-    galaxyInstance.onSelect = (selectedNode) => {
-      if (!selectedNode) return;
-      tip.classList.remove("is-on");
-      go("starmap", { center: selectedNode.id });
-    };
-
-    const pauseBtn = $("#starPauseBtn", node);
-    if (pauseBtn) {
-      pauseBtn.addEventListener("click", () => {
-        galaxyInstance.userPaused = !galaxyInstance.userPaused;
-        if (galaxyInstance.userPaused) galaxyInstance.paused = true;
-        pauseBtn.classList.toggle("is-active", galaxyInstance.userPaused);
-        pauseBtn.textContent = galaxyInstance.userPaused ? "继续公转" : "暂停公转";
-      });
-    }
-    const reseedBtn = $("#starReseedBtn", node);
-    if (reseedBtn) {
-      reseedBtn.addEventListener("click", () => {
-        const pool = state.pool || [];
-        if (!pool.length) return;
-        const current = state.starmap ? state.starmap.centerId : "";
-        const ranked = pool.slice().sort((a, b) => Number(b.importance || 0) - Number(a.importance || 0));
-        const next = ranked.find((m) => m.id !== current && m.id !== (data.galaxy.center && data.galaxy.center.id));
-        if (next) go("starmap", { center: next.id });
-      });
-    }
-
-    $$("[data-star-open]", node).forEach((button) => {
-      button.addEventListener("click", () => openMemory(button.dataset.starOpen));
-    });
-  },
-});
-
-function toneOfColor(color) {
-  const map = {
-    "#f472b6": "relation",
-    "#60a5fa": "fact",
-    "#2dd4bf": "group",
-    "#fb923c": "personal",
-    "#fcd34d": "gold",
-    "#7dd3fc": "external",
-    "#a99bff": "private",
-  };
-  return map[color] || "accent";
-}
-
-function starPanelHtml(galaxy) {
-  const center = galaxy.center;
-  const weights = center.persona_weights && typeof center.persona_weights === "object" ? center.persona_weights : {};
-  const weightKeys = Object.keys(weights).filter((key) => Number.isFinite(Number(weights[key])));
-  const tags = Array.isArray(center.tags) ? center.tags : [];
-
-  const paramRows = [
-    ["记忆 ID", shortId(center.id)],
-    ["类型", typeLabel(center) + "（" + compact(center.memory_type) + "）"],
-    ["范围", (SCOPE_META[compact(center.scope)] ? SCOPE_META[compact(center.scope)].label : compact(center.scope)) || "-"],
-    ["主体", compact(center.subject && center.subject.name) || "-"],
-    ["重要性", num(center.importance)],
-    ["置信度", num(center.confidence)],
-    ["显著性", num(center.salience)],
-    ["强化分", num(center.reinforcement_score)],
-    ["注入次数", String(int(center.injection_count))],
-    ["最近注入", compact(center.last_injected_at) ? fmtTime(center.last_injected_at) : "从未"],
-    ["可见性", VISIBILITY_LABEL[compact(center.visibility)] || compact(center.visibility) || "-"],
-    ["生命周期", LIFECYCLE_LABEL[compact(center.lifecycle)] || compact(center.lifecycle) || "-"],
-    ["时效", VALIDITY_LABEL[compact(center.validity_status)] || compact(center.validity_status) || "-"],
-    ["持久度", DURABILITY_LABEL[compact(center.durability)] || compact(center.durability) || "-"],
-    ["敏感度", SENSITIVITY_LABEL[compact(center.sensitivity)] || compact(center.sensitivity) || "-"],
-    ["现实层级", REALITY_LABEL[compact(center.reality_level)] || compact(center.reality_level) || "-"],
-    ["可提及分", center.mentionability_score === null || center.mentionability_score === undefined ? "-" : num(center.mentionability_score)],
-    ["关系阶段", compact(center.relationship_phase) || "-"],
-    ["来源插件", compact(center.source_plugin) || "本插件"],
-    ["导入批次", compact(center.import_batch_id) || "-"],
-    ["会话", compact(center.session_id) || "-"],
-    ["发生时间", compact(center.occurred_at_local) || fmtTime(center.occurred_at)],
-    ["更新时间", compact(center.updated_at_local) || fmtTime(center.updated_at)],
-  ]
-    .map((row) => '<div class="param-row"><span>' + esc(row[0]) + "</span><div>" + esc(row[1]) + "</div></div>")
-    .join("");
-
-  const orbitRows = ORBIT_TIERS.map((tier, index) => {
-    const nodes = galaxy.nodes.filter((node) => node.tier === index);
-    return (
-      '<div style="margin-bottom:4px"><div class="orbit-row" style="cursor:default;background:transparent;padding:4px 2px">' +
-      '<i style="background:' + tier.color + '"></i><b style="color:var(--text-2)">' + esc(tier.label) + "</b>" +
-      "<span>" + nodes.length + " 颗卫星</span></div>" +
-      (nodes.length
-        ? '<div style="display:grid;gap:3px;padding-left:14px">' +
-          nodes
-            .slice(0, 6)
-            .map(
-              (node) =>
-                '<button class="orbit-row" type="button" data-star-open="' + esc(node.id) + '">' +
-                '<i style="background:' + node.color + '"></i>' +
-                "<span>" + esc(clip(memoryTitle(node.memory), 22)) + "</span>" +
-                "<em>" + num(node.score) + "</em></button>"
-            )
-            .join("") +
-          "</div>"
-        : "") +
-      "</div>"
-    );
-  }).join("");
-
-  return (
-    '<section class="star-core">' +
-      '<span class="core-kicker">当前恒星 · 关联 ' + galaxy.nodes.length + " 条</span>" +
-      '<h3 class="core-title">' + esc(clip(memoryTitle(center), 46)) + "</h3>" +
-      '<p class="core-content">' + esc(clip(compact(center.content), 220)) + "</p>" +
-      '<div class="pill-row" style="margin-top:11px;position:relative">' +
-        badge(typeLabel(center), toneOfColor(satelliteColor(center))) +
-        badge("重要 " + num(center.importance), "accent") +
-        '<button class="btn is-sm is-ghost" type="button" data-star-open="' + esc(center.id) + '">完整参数</button>' +
-      "</div>" +
-    "</section>" +
-    card(
-      "选中记忆 · 参数明细",
-      weightKeys.length ? "含 " + weightKeys.length + " 项人格权重" : "基础属性",
-      '<div class="star-params">' + paramRows + "</div>" +
-        (weightKeys.length
-          ? '<div class="tag-row" style="margin-top:10px">' + weightKeys.map((key) => badge((WEIGHT_LABEL[key] || key) + " " + num(weights[key]), "accent")).join("") + "</div>"
-          : "") +
-        (tags.length ? '<div class="tag-row" style="margin-top:8px">' + tags.map((tag) => badge(tag, "fact")).join("") + "</div>" : "")
-    ) +
-    card("星轨构成", "点击任一行查看该记忆", orbitRows || emptyState("暂无关联记忆", "这条记忆与其他记忆没有足够的属性重合。"))
-  );
-}
 
 /* ============================================================
    视图：记忆显微镜
@@ -3532,11 +3034,22 @@ defineView("chatimport", {
           return;
         }
         await withBusy("正在读取历史…", async () => {
-          const result = await apiPost("/conversation-import/qq/preview", payload);
-          importState.preview = result.result || result;
-          toast("预览已生成", "ok");
-          go("chatimport");
-        });
+          try {
+            const result = await apiPost("/conversation-import/qq/preview", payload);
+            const preview = result.result || result;
+            const previewStats = preview && preview.stats && typeof preview.stats === "object" ? preview.stats : {};
+            const messageCount = int(previewStats.message_count ?? previewStats.messages ?? 0);
+            if (!preview || messageCount <= 0) {
+              toast("没读到这个 QQ 号的历史消息：确认号是否填对、时间范围覆盖到聊天、当前连接支持读取历史", "warn");
+              return;
+            }
+            importState.preview = preview;
+            toast("预览已生成：" + messageCount + " 条消息", "ok");
+            go("chatimport");
+          } catch (error) {
+            toast("读取失败：" + (error.message || error), "error");
+          }
+        }, 1200);
       });
     }
 
@@ -3860,125 +3373,207 @@ defineView("migrate", {
    ============================================================ */
 const QUARANTINE_PAGE_SIZE = 50;
 let quarantineOffset = 0;
+let queueOffset = 0;
+let processedOffset = 0;
+let quarantineTab = "quarantined";
 
-defineView("quarantine", {
-  title: "待修复批次",
-  navLabel: "待修复批次",
-  eyebrow: "Quarantine · Review",
-  hint: "被隔离的总结批次：原文事件已冻结，需人工复核后重新排队或放弃",
-  async load() {
-    return apiTry(
-      () => apiGet("/maintenance/summary_batches?limit=" + QUARANTINE_PAGE_SIZE + "&offset=" + quarantineOffset),
-      { total: 0, legacy_failures: 0, batches: [] }
-    );
+const BATCH_TAB_META = {
+  quarantined: {
+    title: "待修复批次",
+    eyebrow: "Quarantine · Review",
+    hint: "被隔离的总结批次：原文事件已冻结，需人工复核后重新排队或放弃",
   },
-  render(data) {
-    const total = int(data.total);
-    const legacy = int(data.legacy_failures);
-    const batches = Array.isArray(data.batches) ? data.batches : [];
-    const pageTo = quarantineOffset + batches.length;
+  pending: {
+    title: "排队处理",
+    eyebrow: "Queue · Pending",
+    hint: "正常排队等后台总结的批次，只读；总结失败的会进入「待修复」",
+  },
+  processed: {
+    title: "已处理批次",
+    eyebrow: "Processed · History",
+    hint: "已经总结完的批次：产出记忆或确认没有新增，只读",
+  },
+};
 
-    const summary =
-      '<div class="pill-row" style="gap:8px;margin-bottom:12px">' +
-      badge("待修复批次 " + fmtInt(total), "gold") +
-      badge("旧版失败记录 " + fmtInt(legacy), "fact") +
-      "</div>";
+const batchesView = (fixedTab, viewId, getOffset, setOffset) => {
+  const meta = BATCH_TAB_META[fixedTab];
+  const isRepair = fixedTab === "quarantined";
+  return {
+    title: meta.title,
+    navLabel: meta.title,
+    eyebrow: meta.eyebrow,
+    hint: meta.hint,
+    async load() {
+      return apiTry(
+        () => apiGet("/maintenance/summary_batches?state=" + fixedTab + "&limit=" + QUARANTINE_PAGE_SIZE + "&offset=" + getOffset()),
+        { total: 0, legacy_failures: 0, batches: [] }
+      );
+    },
+    render(data) {
+      const total = int(data.total);
+      const legacy = int(data.legacy_failures);
+      const batches = Array.isArray(data.batches) ? data.batches : [];
+      const offset = getOffset();
+      const pageTo = offset + batches.length;
 
-    const bulk =
-      '<div class="tool-actions" style="margin-bottom:12px">' +
-      '<button class="btn is-sm" type="button" id="qRetryAllBtn">全部重新排队</button>' +
-      '<button class="btn is-sm is-danger" type="button" id="qDiscardAllBtn">全部放弃</button>' +
-      '<button class="btn is-sm" type="button" id="qRefreshBtn">刷新</button>' +
-      "</div>";
+      const tone = isRepair ? "gold" : fixedTab === "pending" ? "accent" : "private";
+      const summary =
+        '<div class="pill-row" style="gap:8px;margin-bottom:12px">' +
+        badge(meta.title + " " + fmtInt(total), tone) +
+        (isRepair ? badge("旧版失败记录 " + fmtInt(legacy), "fact") : "") +
+        "</div>";
 
-    const pager =
-      '<div class="pill-row" style="justify-content:space-between;align-items:center;margin-top:12px">' +
-      '<button class="btn is-sm" type="button" id="qPrevBtn"' + (quarantineOffset <= 0 ? " disabled" : "") + ">上一页</button>" +
-      '<span class="kpi-foot">' + (batches.length ? quarantineOffset + 1 + "–" + pageTo + " / " + fmtInt(total) : "无记录") + "</span>" +
-      '<button class="btn is-sm" type="button" id="qNextBtn"' + (pageTo >= total ? " disabled" : "") + ">下一页</button>" +
-      "</div>";
+      const bulk = isRepair
+        ? '<div class="tool-actions" style="margin-bottom:12px">' +
+          '<button class="btn is-sm" type="button" id="qRetryAllBtn">全部重新排队</button>' +
+          '<button class="btn is-sm is-danger" type="button" id="qDiscardAllBtn">全部放弃</button>' +
+          '<button class="btn is-sm" type="button" id="qRefreshBtn">刷新</button>' +
+          '<button class="btn is-sm" type="button" data-goto="queue">看排队处理</button>' +
+          '<button class="btn is-sm" type="button" data-goto="processed">看已处理</button>' +
+          "</div>"
+        : '<div class="tool-actions" style="margin-bottom:12px">' +
+          '<span class="kpi-foot" style="align-self:center">' +
+          (fixedTab === "pending"
+            ? "这些批次在正常排队等总结，不需要处理；失败的会进「待修复」。"
+            : "这些批次已经处理完，仅供查阅；失败的会进「待修复」。") +
+          "</span>" +
+          '<button class="btn is-sm" type="button" id="qRefreshBtn">刷新</button>' +
+          '<button class="btn is-sm" type="button" data-goto="quarantine">去待修复</button>' +
+          (fixedTab === "pending"
+            ? '<button class="btn is-sm" type="button" data-goto="processed">看已处理</button>'
+            : '<button class="btn is-sm" type="button" data-goto="queue">看排队处理</button>') +
+          "</div>";
 
-    const rows = batches.length
-      ? '<div class="row-list">' +
-        batches
-          .map((item) =>
-            '<div class="row">' +
-            '<div class="row-main">' +
-            '<div class="row-title">' + esc(compact(item.session_id)) + "</div>" +
-            '<div class="row-sub">' + esc(compact(item.last_error) || "（无错误摘要）") + "</div>" +
-            '<div class="row-sub" style="font-family:var(--font-mono)">' + esc(item.id) + "</div>" +
-            '<div class="row-meta">' +
-            badge("事件 " + fmtInt(item.event_count), "group") +
-            badge(compact(item.scope), "fact") +
-            badge(String(item.updated_at || "").slice(0, 16), "private") +
-            "</div></div>" +
-            '<div class="tool-actions" style="margin-top:0">' +
-            '<button class="btn is-sm" type="button" data-q-action="retry" data-q-batch="' + esc(item.id) + '">重新排队</button>' +
-            '<button class="btn is-sm is-danger" type="button" data-q-action="discard" data-q-batch="' + esc(item.id) + '">放弃</button>' +
-            "</div></div>"
-          )
-          .join("") +
+      const pager =
+        '<div class="pill-row" style="justify-content:space-between;align-items:center;margin-top:12px">' +
+        '<button class="btn is-sm" type="button" id="qPrevBtn"' + (offset <= 0 ? " disabled" : "") + ">上一页</button>" +
+        '<span class="kpi-foot">' + (batches.length ? offset + 1 + "–" + pageTo + " / " + fmtInt(total) : "无记录") + "</span>" +
+        '<button class="btn is-sm" type="button" id="qNextBtn"' + (pageTo >= total ? " disabled" : "") + ">下一页</button>" +
+        "</div>";
+
+      const rows = batches.length
+        ? '<div class="row-list">' +
+          batches
+            .map((item) =>
+              '<div class="row">' +
+              '<div class="row-main">' +
+              '<div class="row-title">' + esc(compact(item.session_id)) + "</div>" +
+              '<div class="row-sub">' + esc(compact(item.last_error) || "（无错误摘要）") + "</div>" +
+              '<div class="row-sub" style="font-family:var(--font-mono)">' + esc(item.id) + "</div>" +
+              '<div class="row-meta">' +
+              badge("事件 " + fmtInt(item.event_count), "group") +
+              badge(compact(item.scope), "fact") +
+              (fixedTab === "processed"
+                ? badge(item.state === "no_memory" ? "无新增记忆" : "已总结", item.state === "no_memory" ? "gold" : "accent")
+                : "") +
+              badge(String(item.updated_at || "").slice(0, 16), "private") +
+              "</div></div>" +
+              (isRepair
+                ? '<div class="tool-actions" style="margin-top:0">' +
+                  '<button class="btn is-sm" type="button" data-q-action="retry" data-q-batch="' + esc(item.id) + '">重新排队</button>' +
+                  '<button class="btn is-sm is-danger" type="button" data-q-action="discard" data-q-batch="' + esc(item.id) + '">放弃</button>' +
+                  "</div>"
+                : "") + "</div>"
+            )
+            .join("") +
+          "</div>"
+        : isRepair
+          ? emptyState("没有待修复批次", "被隔离的总结批次会出现在这里，可逐条或整批重新排队 / 放弃。")
+          : fixedTab === "pending"
+            ? emptyState("没有排队中的批次", "所有批次都已总结完，或正由后台处理。")
+            : emptyState("没有已处理批次", "总结完成的批次会出现在这里。");
+
+      return (
+        '<div class="grid">' +
+        card(
+          meta.title,
+          isRepair
+            ? "隔离批次持有其原文事件，释放后事件才会重新进入总结流程"
+            : fixedTab === "pending"
+              ? "正常排队等后台总结的批次，只读；总结失败的会进入「待修复」"
+              : "已完成的总结批次，仅供查阅",
+          summary + bulk + rows + pager
+        ) +
         "</div>"
-      : emptyState("没有待修复批次", "被隔离的总结批次会出现在这里，可逐条或整批重新排队 / 放弃。");
+      );
+    },
+    mount(node) {
+      const run = async (label, fn, minMs) => {
+        await withBusy(label + "…", async () => {
+          try {
+            const result = await fn();
+            const payload = result && typeof result === "object"
+              ? (result.data && typeof result.data === "object" ? result.data : result)
+              : {};
+            const released = payload.released;
+            toast(label + (released !== undefined ? "：" + released + " 条" : "完成"), "ok");
+          } catch (error) {
+            toast(label + "失败：" + error.message, "error");
+          }
+          go(viewId);
+        }, minMs === undefined ? 3000 : minMs);
+      };
+      const bulkRelease = async (mode, label) => {
+        const info = await apiTry(() => apiGet("/maintenance/summary_batches?state=quarantined&limit=1&offset=0"), { total: 0 });
+        const total = int(info.total);
+        let done = 0;
+        let guard = 0;
+        while (guard < 500) {
+          guard += 1;
+          setBusyText(label + " " + done + " / " + total);
+          const result = await apiPost("/maintenance/release_summary_batches", { all: true, mode, limit: 10 });
+          const payload = result && typeof result === "object"
+            ? (result.data && typeof result.data === "object" ? result.data : result)
+            : {};
+          const released = int(payload.released);
+          if (released <= 0) break;
+          done += released;
+        }
+        setBusyText(label + " " + done + " / " + total + " · 完成");
+        return { data: { released: done, total } };
+      };
+      const bind = (id, fn, label, minMs) => {
+        const button = $(id, node);
+        if (button) button.addEventListener("click", () => run(label, fn, minMs));
+      };
+      bind("#qRefreshBtn", () => Promise.resolve({}), "刷新");
+      if (isRepair) {
+        bind("#qRetryAllBtn", async () => {
+          const confirmed = await showInlineConfirmation("全部重新排队", "把全部待修复批次的事件交还，交给后续会话重新总结。确定继续？", "重新排队");
+          if (!confirmed) throw new Error("已取消");
+          return bulkRelease("retry", "已重新排队");
+        }, "全部重新排队", 800);
+        bind("#qDiscardAllBtn", async () => {
+          const confirmed = await showInlineConfirmation("全部放弃", "把全部待修复批次的原文标记为已总结，等于承认它们不再进入长期记忆。确定继续？", "全部放弃");
+          if (!confirmed) throw new Error("已取消");
+          return bulkRelease("discard", "已放弃");
+        }, "全部放弃", 800);
+      }
+      const prev = $("#qPrevBtn", node);
+      if (prev) prev.addEventListener("click", () => { setOffset(Math.max(0, getOffset() - QUARANTINE_PAGE_SIZE)); go(viewId); });
+      const next = $("#qNextBtn", node);
+      if (next) next.addEventListener("click", () => { setOffset(getOffset() + QUARANTINE_PAGE_SIZE); go(viewId); });
+      $$("[data-q-action]", node).forEach((button) => {
+        button.addEventListener("click", () => {
+          const batchId = button.dataset.qBatch;
+          if (button.dataset.qAction === "discard") {
+            run("放弃批次", async () => {
+              const confirmed = await showInlineConfirmation("放弃该批次", "该批次的原文将被标记为已总结，不再进入长期记忆。确定继续？", "放弃");
+              if (!confirmed) throw new Error("已取消");
+              return apiPost("/maintenance/release_summary_batches", { batch_ids: [batchId], mode: "discard" });
+            });
+          } else {
+            run("重新排队", () => apiPost("/maintenance/release_summary_batches", { batch_ids: [batchId], mode: "retry" }));
+          }
+        });
+      });
+    },
+  };
+};
 
-    return (
-      '<div class="grid">' +
-      card(
-        "待修复批次",
-        "隔离批次持有其原文事件，释放后事件才会重新进入总结流程",
-        summary + bulk + rows + pager
-      ) +
-      "</div>"
-    );
-  },
-  mount(node) {
-    const run = async (label, fn) => {
-      await withBusy(label + "…", async () => {
-        try {
-          const result = await fn();
-          const payload = (result && result.data) || {};
-          toast(label + "完成" + (payload.released !== undefined ? "：" + payload.released + " 条" : ""), "ok");
-        } catch (error) {
-          toast(label + "失败：" + error.message, "error");
-        }
-        go("quarantine");
-      });
-    };
-    const bind = (id, fn, label) => {
-      const button = $(id, node);
-      if (button) button.addEventListener("click", () => run(label, fn));
-    };
-    bind("#qRefreshBtn", () => Promise.resolve({}), "刷新");
-    bind("#qRetryAllBtn", async () => {
-      const confirmed = await showInlineConfirmation("全部重新排队", "把全部待修复批次的事件交还，交给后续会话重新总结。确定继续？", "重新排队");
-      if (!confirmed) throw new Error("已取消");
-      return apiPost("/maintenance/release_summary_batches", { all: true, mode: "retry" });
-    }, "全部重新排队");
-    bind("#qDiscardAllBtn", async () => {
-      const confirmed = await showInlineConfirmation("全部放弃", "把全部待修复批次的原文标记为已总结，等于承认它们不再进入长期记忆。确定继续？", "全部放弃");
-      if (!confirmed) throw new Error("已取消");
-      return apiPost("/maintenance/release_summary_batches", { all: true, mode: "discard" });
-    }, "全部放弃");
-    const prev = $("#qPrevBtn", node);
-    if (prev) prev.addEventListener("click", () => { quarantineOffset = Math.max(0, quarantineOffset - QUARANTINE_PAGE_SIZE); go("quarantine"); });
-    const next = $("#qNextBtn", node);
-    if (next) next.addEventListener("click", () => { quarantineOffset += QUARANTINE_PAGE_SIZE; go("quarantine"); });
-    $$("[data-q-action]", node).forEach((button) => {
-      button.addEventListener("click", () => {
-        const batchId = button.dataset.qBatch;
-        if (button.dataset.qAction === "discard") {
-          run("放弃批次", async () => {
-            const confirmed = await showInlineConfirmation("放弃该批次", "该批次的原文将被标记为已总结，不再进入长期记忆。确定继续？", "放弃");
-            if (!confirmed) throw new Error("已取消");
-            return apiPost("/maintenance/release_summary_batches", { batch_ids: [batchId], mode: "discard" });
-          });
-        } else {
-          run("重新排队", () => apiPost("/maintenance/release_summary_batches", { batch_ids: [batchId], mode: "retry" }));
-        }
-      });
-    });
-  },
-});
+defineView("quarantine", batchesView("quarantined", "quarantine", () => quarantineOffset, (value) => { quarantineOffset = value; }));
+defineView("queue", batchesView("pending", "queue", () => queueOffset, (value) => { queueOffset = value; }));
+defineView("processed", batchesView("processed", "processed", () => processedOffset, (value) => { processedOffset = value; }));
 
 /* ============================================================
    视图：模块配置
@@ -4010,6 +3605,59 @@ const MODULE_LABELS = {
   memory_assertions: "记忆断言",
   source_semantic: "原文语义",
   startup: "启动",
+};
+
+// 2.6.2：面板里只把每个模块最常用的几项摆在明面上，其余收进「高级项」折叠，
+// 免得一个模块几十个输入框糊一屏、找不到该改哪一项。完整配置仍在 AstrBot 配置页。
+const CONFIG_COMMON_KEYS = {
+  appearance: ["theme", "ui_style"],
+  memory_capture: ["enabled", "capture_user_messages", "capture_bot_responses", "extract_stable_facts"],
+  scope_control: [
+    "private_capture_enabled",
+    "group_capture_enabled",
+    "private_recall_enabled",
+    "group_recall_enabled",
+    "private_topology_enabled",
+    "group_topology_enabled",
+  ],
+  portrait: ["daily_dispatch_enabled", "min_independent_evidence", "daily_success_limit_per_person"],
+  memory_assertions: ["enabled", "max_per_batch"],
+  memory_summary: [
+    "enabled",
+    "provider_id",
+    "private_provider_id",
+    "group_provider_id",
+    "trigger_event_count",
+    "trigger_interval_minutes",
+    "max_summary_chars",
+  ],
+  historical_chat_import: ["qq_max_range_days", "qq_max_messages", "max_retries"],
+  retrieval: ["embedding_enabled", "embedding_provider_id", "mode", "rerank_provider_id"],
+  retrieval_advanced: ["embedding_top_k", "embedding_weight", "embedding_score_threshold", "mmr_redundancy_weight"],
+  source_semantic: ["enabled", "provider_id"],
+  memory_injection: ["enabled", "top_k", "max_chars", "enable_injection_logs"],
+  memory_humanization: ["enabled", "vivid_full_days", "no_recall_hint_enabled"],
+  conversation_memory: ["enabled", "capture_private_messages", "capture_group_messages", "idle_gap_minutes"],
+  conversation_memory_advanced: [
+    "cross_window_group_to_private_enabled",
+    "cross_window_private_to_group_enabled",
+    "recent_fact_guard_enabled",
+    "topic_shift_guard_enabled",
+  ],
+  core_memory: ["enabled", "max_blocks", "max_chars"],
+  context_orchestration: ["enabled", "query_mode", "include_intent_context"],
+  context_orchestration_advanced: ["stable_memory_limit", "user_profile_limit", "current_window_limit"],
+  persona_memory: ["enabled", "max_chars", "max_items"],
+  private_companion_bridge: ["enabled", "prefer_memory_companion_memory", "accept_external_records"],
+  visibility: ["allow_group_public_in_private", "hide_pending_review", "enable_acl_rules"],
+  memory_tools: ["enable_recall_tool", "enable_remember_tool", "allow_group_remember", "enable_query_progress"],
+  memory_reconstruction: ["enabled", "max_steps", "per_step_limit"],
+  knowledge_graph: ["enabled", "retrieval_expansion_enabled"],
+  livingmemory_migration: ["import_limit", "livingmemory_db_path"],
+  maintenance: ["memory_decay_enabled", "auto_schedule_enabled", "retention_raw_event_days", "backup_before_import"],
+  maintenance_audit: ["enabled", "max_candidates"],
+  maintenance_decay: ["memory_decay_after_days", "memory_decay_idle_days", "memory_decay_gradual_enabled"],
+  startup: ["background_grace_seconds"],
 };
 
 // P8：后端下发的受保护键（可见性 / 桥接闸门 / 凭据类）在面板里只读，
@@ -4054,8 +3702,12 @@ defineView("config", {
       )
       .join("");
 
-    const fields = Object.keys(items)
-      .map((key) => {
+    const commonKeySet = new Set(CONFIG_COMMON_KEYS[moduleId] || []);
+    const commonKeys = Object.keys(items).filter((key) => commonKeySet.has(key));
+    const advancedKeys = Object.keys(items).filter((key) => !commonKeySet.has(key));
+    const renderFields = (keys) =>
+      keys
+        .map((key) => {
         const item = items[key] || {};
         const value = moduleValues[key] === undefined ? item.default : moduleValues[key];
         const desc = compact(item.description) || key;
@@ -4089,6 +3741,8 @@ defineView("config", {
         );
       })
       .join("");
+    const fields = renderFields(commonKeys);
+    const advancedFields = renderFields(advancedKeys);
 
     return (
       '<div class="config-layout">' +
@@ -4097,7 +3751,12 @@ defineView("config", {
         card(
           MODULE_LABELS[moduleId] || moduleId,
           compact(moduleSchema.description) || moduleId,
-          '<form id="configForm" class="config-form">' + (fields || emptyState("该模块没有可配置项", "")) + "</form>",
+          '<form id="configForm" class="config-form">' +
+  (fields || (advancedFields ? "" : emptyState("该模块没有可配置项", ""))) +
+  (advancedFields
+    ? '<details class="config-advanced"><summary>高级项（' + advancedKeys.length + " 个）· 一般不用改</summary>" + advancedFields + "</details>"
+    : "") +
+  "</form>",
           '<button class="btn is-primary is-sm" type="button" id="configSaveBtn">保存本模块</button>'
         ) +
         (moduleSchema.hint ? '<p class="section-note">' + esc(moduleSchema.hint) + "</p>" : "") +
@@ -4655,10 +4314,6 @@ function bindShell() {
     applyTheme(state.theme === "dark" ? "light" : "dark");
   });
 
-  window.addEventListener("mc:theme", () => {
-    if (galaxyInstance) galaxyInstance.buildStarfield();
-  });
-
   $("#drawerClose").addEventListener("click", closeDrawer);
   $("#scrim").addEventListener("click", closeDrawer);
   $("#assemblyViewerClose")?.addEventListener("click", closeAssemblyViewer);
@@ -4707,13 +4362,21 @@ function bindShell() {
     const options = {};
     if (compact(target.dataset.scope)) options.scope = target.dataset.scope;
     if (compact(target.dataset.target)) options.target = target.dataset.target;
-    if (filter) {
+    const ownerBot = compact(target.dataset.ownerBot);
+    if (ownerBot) {
+      state.filters = { scope: "", q: "", visibility: "", lifecycle: "", memoryType: "", target: "", ownerBot: ownerBot };
+    } else if (filter === "all") {
+      state.filters = { scope: "", q: "", visibility: "", lifecycle: "", memoryType: "", target: "" };
+    } else if (filter) {
       if (filter.indexOf("scope:") === 0) {
         state.filters = { scope: filter.slice(6), q: "", visibility: "", lifecycle: "", memoryType: "", target: "" };
       } else if (filter === "profile") {
         state.filters = { scope: "profile", q: "", visibility: "", lifecycle: "", memoryType: "", target: "" };
       } else if (filter.indexOf("external:") === 0) {
         state.filters = { scope: "", q: "", visibility: "", lifecycle: "", memoryType: "", target: "" };
+      } else if (filter.indexOf("tab:") === 0) {
+        quarantineTab = filter.slice(4) === "pending" ? "pending" : "quarantined";
+        quarantineOffset = 0;
       }
     }
     go(view, options);

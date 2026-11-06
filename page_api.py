@@ -496,6 +496,7 @@ class PluginPageApi:
             ("/conversation-import/resume", self.conversation_import_resume, ["POST"], "MemoryCompanion historical chat resume"),
             ("/conversation-import/rebind", self.conversation_import_rebind, ["POST"], "MemoryCompanion historical chat rebind"),
             ("/conversation-import/rollback", self.conversation_import_rollback, ["POST"], "MemoryCompanion historical chat rollback"),
+            ("/bots", self.bots, ["GET"], "MemoryCompanion bot memory owners"),
             ("/profiles", self.profiles, ["GET"], "MemoryCompanion Bot Profiles"),
             ("/user-memory-summary", self.user_memory_summary, ["GET"], "MemoryCompanion User Memory workspace summary"),
             ("/portrait/profiles", self.portrait_profiles, ["GET"], "MemoryCompanion unified portrait profiles"),
@@ -1231,7 +1232,65 @@ class PluginPageApi:
         stats = await self.plugin.service.store.stats()
         stats.pop("pending_review", None)
         stats["summary_progress"] = await self.plugin.service.store.summary_progress()
+        drain = getattr(self.plugin.service, "_summary_drain_status", None)
+        if isinstance(drain, dict):
+            stats["summary_drain"] = dict(drain)
         return self._ok({"stats": stats})
+
+
+    async def bots(self):
+        """按 Bot 归属列出记忆条数，并尽量带上人格设定里的名字。"""
+        stats = await self.plugin.service.store.stats()
+        owners = stats.get("by_owner_bot") or {}
+        persona_name = self._current_persona_name()
+        bots: list[dict[str, Any]] = []
+        for key, count in owners.items():
+            raw_id = "" if key == "<empty>" else clean_text(key, 120)
+            name = ""
+            if raw_id in {"", "self"} and persona_name:
+                name = persona_name
+            bots.append({"id": raw_id, "name": name, "count": int(count or 0)})
+        bots.sort(key=lambda item: item["count"], reverse=True)
+        return self._ok({"bots": bots, "persona": persona_name})
+
+    def _current_persona_name(self) -> str:
+        """读当前默认人格的显示名；拿不到就返回空串，由前端兜底。"""
+        try:
+            manager = getattr(getattr(self.plugin, "context", None), "persona_manager", None)
+        except Exception:
+            manager = None
+        if manager is None:
+            return ""
+        try:
+            default_v3 = getattr(manager, "selected_default_persona_v3", None)
+            if isinstance(default_v3, dict):
+                name = clean_text(default_v3.get("name"), 80)
+                if name:
+                    return name
+        except Exception:
+            pass
+        default_id = ""
+        try:
+            default_id = clean_text(getattr(manager, "default_persona", ""), 80)
+        except Exception:
+            default_id = ""
+        try:
+            for item in getattr(manager, "personas_v3", None) or []:
+                if not isinstance(item, dict):
+                    continue
+                name = clean_text(item.get("name"), 80)
+                if name and (not default_id or name == default_id):
+                    return name
+        except Exception:
+            pass
+        try:
+            for persona in getattr(manager, "personas", None) or []:
+                persona_id = clean_text(getattr(persona, "persona_id", ""), 80)
+                if persona_id and persona_id == default_id and persona_id not in {"default", "系统默认"}:
+                    return persona_id
+        except Exception:
+            pass
+        return ""
 
     async def profiles(self):
         profile = clean_text(request.args.get("profile", ""), 80)
@@ -1878,6 +1937,9 @@ class PluginPageApi:
         except (TypeError, ValueError):
             offset = 0
         query = clean_text(request.args.get("q", ""), 200)
+        raw_owner_bot = clean_text(request.args.get("owner_bot", ""), 120)
+        owner_bot = "" if raw_owner_bot == "__empty__" else raw_owner_bot
+        owner_bot_strict = bool(raw_owner_bot)
         visibility = clean_text(request.args.get("visibility", ""), 40)
         lifecycle = clean_text(request.args.get("lifecycle", ""), 40)
         lifecycle_values = MEMORY_LIFECYCLE_FILTERS.get(lifecycle)
@@ -1907,6 +1969,8 @@ class PluginPageApi:
             group_id=clean_text(request.args.get("group_id", ""), 120),
             entity_id=entity_id,
             offset=offset,
+            owner_bot_id=owner_bot,
+            owner_bot_strict=owner_bot_strict,
         )
         if scope == "external":
             records = [record for record in records if clean_text(getattr(record, "source_plugin", ""), 120) != PLUGIN_NAME]
@@ -4121,12 +4185,16 @@ class PluginPageApi:
         id, so without this read side the freeze was effectively unactionable.
         """
         state = clean_text(request.args.get("state", "quarantined"), 40) or "quarantined"
-        if state != "quarantined":
+        limit = max(1, min(500, self._int(request.args.get("limit"), 50)))
+        offset = max(0, self._int(request.args.get("offset"), 0))
+        if state == "quarantined":
+            result = await self.plugin.service.store.list_quarantined_batches(limit=limit, offset=offset)
+        elif state == "pending":
+            result = await self.plugin.service.store.list_pending_batches(limit=limit, offset=offset)
+        elif state == "processed":
+            result = await self.plugin.service.store.list_processed_batches(limit=limit, offset=offset)
+        else:
             return self._err("unsupported_state", 400)
-        result = await self.plugin.service.store.list_quarantined_batches(
-            limit=max(1, min(500, self._int(request.args.get("limit"), 50))),
-            offset=max(0, self._int(request.args.get("offset"), 0)),
-        )
         return self._ok({"data": result})
 
     async def release_summary_batches(self):

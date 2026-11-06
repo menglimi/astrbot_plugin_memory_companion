@@ -433,6 +433,13 @@ class MemoryCompanionService:
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._portrait_dispatch_task: asyncio.Task[Any] | None = None
         self._maintenance_dispatch_task: asyncio.Task[Any] | None = None
+        self._summary_drain_task: asyncio.Task[Any] | None = None
+        self._summary_drain_status: dict[str, Any] = {
+            "state": "idle",
+            "last_error": "",
+            "last_completed_at": "",
+            "last_result": "",
+        }
         self._maintenance_dispatch_status: dict[str, Any] = {
             "state": "idle",
             "last_error": "",
@@ -1685,6 +1692,117 @@ class MemoryCompanionService:
         if task is not None:
             self._maintenance_dispatch_status["state"] = "scheduled"
 
+    @staticmethod
+    def _core_distill_line(record: Any) -> str:
+        return clean_text(record.content, 120)
+
+    async def auto_distill_core_memory(self) -> dict[str, Any]:
+        """把长期积累的高价值记忆沉淀为核心记忆块（只补到上限，不覆盖已有块）。"""
+        if not self.config.bool("core_memory.enabled", True):
+            return {"ok": True, "code": "core_memory_disabled"}
+        if not self.config.bool("core_memory.auto_distill_enabled", True):
+            return {"ok": True, "code": "auto_distill_disabled"}
+        max_blocks = max(1, self.config.int("core_memory.auto_distill_max_blocks", 3))
+        existing = await self.list_core_memory_blocks()
+        if len(existing) >= max_blocks:
+            return {"ok": True, "code": "core_memory_full", "blocks": len(existing)}
+        min_salience = self.config.float("core_memory.auto_distill_min_salience", 0.45)
+        try:
+            memories = await self.store.list_memories(limit=1200, include_pending=False)
+        except Exception as exc:
+            return {"ok": False, "code": "list_failed", "error": self._describe_exception(exc)}
+        buckets: dict[str, list[Any]] = {"global": [], "private": [], "group": []}
+        for record in memories:
+            if record.memory_type == "core_memory":
+                continue
+            if record.lifecycle not in {"stable_memory", "working_memory", ""}:
+                continue
+            try:
+                score = float(record.salience or 0.0)
+            except (TypeError, ValueError):
+                score = 0.0
+            if score < min_salience:
+                continue
+            bucket = clean_text(record.scope, 24).lower() or "global"
+            if bucket not in buckets:
+                bucket = "global"
+            buckets[bucket].append(record)
+        created = 0
+        for bucket in ("global", "private", "group"):
+            if len(existing) + created >= max_blocks:
+                break
+            rows = sorted(buckets[bucket], key=lambda item: float(item.salience or 0.0), reverse=True)
+            if len(rows) < 2:
+                continue
+            facts: list[str] = []
+            seen: set[str] = set()
+            for record in rows:
+                text = self._core_distill_line(record)
+                if not text:
+                    continue
+                key = text.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                facts.append(text)
+                if len(facts) >= 6:
+                    break
+            if not facts:
+                continue
+            target_id = ""
+            bot_id = "self"
+            if bucket == "private":
+                subject_id = clean_text(getattr(rows[0].subject, "id", ""), 160)
+                if not subject_id or subject_id == "self":
+                    continue
+                target_id = subject_id
+                bot_id = clean_text(rows[0].owner_bot_id, 120) or "self"
+            elif bucket == "group":
+                group_id = clean_text(rows[0].group_id, 160)
+                if not group_id:
+                    continue
+                target_id = group_id
+                bot_id = clean_text(rows[0].owner_bot_id, 120) or "self"
+            label = "长期记忆·" + {"global": "整体", "private": "私聊", "group": "群聊"}[bucket]
+            payload = {
+                "label": label,
+                "content": "；".join(facts),
+                "scope": bucket,
+                "target_id": target_id,
+                "kind": "fact",
+                "priority": 60,
+                "bot_id": bot_id,
+            }
+            # 同名块已存在时合并更新（保留最近 20 条事实），否则每轮都会
+            # 因 label 冲突失败、核心记忆永远停在第一条。
+            for block in existing:
+                if not isinstance(block, dict):
+                    continue
+                if clean_text(block.get("label"), 80) != label:
+                    continue
+                if clean_text(block.get("scope"), 24) != bucket:
+                    continue
+                merged = [
+                    part.strip()
+                    for part in clean_text(block.get("content"), 4000).split("；")
+                    if part.strip()
+                ]
+                for fact in facts:
+                    if fact not in merged:
+                        merged.append(fact)
+                payload["content"] = "；".join(merged[-20:])
+                payload["id"] = clean_text(block.get("id"), 160)
+                break
+            result = await self.save_core_memory_block(payload)
+            if result.get("ok"):
+                created += 1
+                logger.info(
+                    "[MemoryCompanion] 自动沉淀核心记忆块: %s%s",
+                    label,
+                    "（合并更新）" if payload.get("id") else "",
+                )
+        return {"ok": True, "code": "distilled", "created": created, "blocks": len(existing) + created}
+
     async def _lifecycle_maintenance_dispatch_loop(self) -> None:
         startup_delay = max(
             5,
@@ -1703,6 +1821,10 @@ class MemoryCompanionService:
             try:
                 self._maintenance_dispatch_status["state"] = "running"
                 result = await self.sleep_maintenance(reason="scheduled_natural_forgetting")
+                try:
+                    await self.auto_distill_core_memory()
+                except Exception as exc:
+                    logger.warning("[MemoryCompanion] 核心记忆自动沉淀失败: %s", exc)
                 quarantine_days = self.config.int("memory_summary.quarantine_auto_retry_days", 7)
                 if quarantine_days > 0:
                     await self.store.reap_stale_quarantined_batches(
@@ -1728,6 +1850,107 @@ class MemoryCompanionService:
                 )
                 logger.warning("[MemoryCompanion] 自动自然遗忘维护失败: %s", exc, exc_info=True)
             await asyncio.sleep(interval_hours * 3600)
+
+    def _ensure_summary_drain_dispatcher(self) -> None:
+        """Start the retained backlog drain: raw timeline -> memory, oldest first."""
+        if self._closing or self._closed or not self.config.bool("memory_summary.auto_drain_enabled", True):
+            return
+        if self._summary_drain_task is not None and not self._summary_drain_task.done():
+            return
+        task = self._spawn_background(
+            self._summary_drain_dispatch_loop(),
+            label="summary-drain",
+            defer_during_grace=True,
+        )
+        self._summary_drain_task = task
+        if task is not None:
+            self._summary_drain_status["state"] = "scheduled"
+
+    async def _summary_drain_dispatch_loop(self) -> None:
+        startup_delay = max(10, self.config.int("memory_summary.auto_drain_startup_delay_seconds", 120))
+        await asyncio.sleep(startup_delay)
+        orphan_cleaned = False
+        while not self._closing and not self._closed and self.config.bool("memory_summary.auto_drain_enabled", True):
+            try:
+                if not orphan_cleaned:
+                    try:
+                        retired = await self.store.close_orphan_retry_batches()
+                        if retired:
+                            logger.info("[MemoryCompanion] 清理无原文的排队批次: %s 条", retired)
+                    except Exception as exc:
+                        logger.warning("[MemoryCompanion] 清理无原文批次失败: %s", exc)
+                    orphan_cleaned = True
+                try:
+                    distilled = await self.auto_distill_core_memory()
+                    if distilled and distilled.get("created"):
+                        logger.info(
+                            "[MemoryCompanion] 核心记忆自动沉淀: %s 块", distilled.get("created")
+                        )
+                except Exception as exc:
+                    logger.warning("[MemoryCompanion] 核心记忆自动沉淀失败: %s", exc)
+                per_round = max(1, self.config.int("memory_summary.auto_drain_sessions_per_round", 5))
+                sessions = await self.store.list_summary_backlog_sessions(limit=per_round)
+                self._summary_drain_status.update(
+                    {"state": "running", "last_result": "backlog=%d" % len(sessions), "last_error": ""}
+                )
+                for item in sessions:
+                    if self._closing or self._closed:
+                        break
+                    session_id = clean_text(item.get("session_id"), 200)
+                    if not session_id:
+                        continue
+                    ctx = SessionContext(
+                        session_id=session_id,
+                        scope=clean_text(item.get("scope"), 40),
+                        bot_id=clean_text(item.get("bot_id"), 120),
+                    )
+                    oldest_raw = clean_text(item.get("oldest"), 60)
+                    pending_events = int(item.get("pending_events") or 0)
+                    force = False
+                    if oldest_raw and pending_events >= 2:
+                        try:
+                            oldest_at = datetime.fromisoformat(
+                                oldest_raw.replace("Z", "+00:00")
+                            )
+                            if oldest_at.tzinfo is None:
+                                oldest_at = oldest_at.replace(tzinfo=timezone.utc)
+                            force = (datetime.now(timezone.utc) - oldest_at).days >= 2
+                        except Exception:
+                            force = False
+                    try:
+                        memory_id = await self.maybe_summarize_session(ctx, force=force)
+                        if memory_id:
+                            logger.info(
+                                "[MemoryCompanion] 自动消化完成: session=%s memory=%s", session_id, memory_id
+                            )
+                        else:
+                            logger.info(
+                                "[MemoryCompanion] 自动消化跳过: session=%s force=%s",
+                                session_id,
+                                force,
+                            )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "[MemoryCompanion] 自动消化失败: session=%s error=%s",
+                            session_id,
+                            self._describe_exception(exc),
+                        )
+                    await asyncio.sleep(2)
+                self._summary_drain_status.update(
+                    {"state": "scheduled", "last_completed_at": utc_now()}
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._summary_drain_status.update(
+                    {"state": "degraded", "last_error": self._describe_exception(exc)}
+                )
+                logger.warning("[MemoryCompanion] 自动消化循环异常: %s", exc, exc_info=True)
+            await asyncio.sleep(
+                max(60, self.config.int("memory_summary.auto_drain_interval_minutes", 10) * 60)
+            )
 
     async def _portrait_daily_dispatch_loop(self) -> None:
         """Run only in the configured daily window, never on a message path."""
@@ -6044,6 +6267,7 @@ class MemoryCompanionService:
             self._schedule_memory_embedding(memory_id, record)
             await self._persist_assertions(ctx, payload or {}, memory_id, rows)
             await self._record_verified_group_bot_self_facts(ctx, rows, payload or {}, memory_id)
+            await self._record_self_experience(ctx, rows, payload or {}, memory_id)
             await self._index_summary_knowledge_graph(ctx, record, payload or {}, memory_id)
             marked = len(rows)
             logger.info(
@@ -6312,6 +6536,77 @@ class MemoryCompanionService:
                 "policy_version": "memory_assertion_v1",
             },
         )
+
+
+    async def _record_self_experience(
+        self,
+        ctx: SessionContext,
+        rows: list[dict[str, Any]],
+        payload: dict[str, Any],
+        summary_memory_id: str,
+    ) -> int:
+        """把 Bot 视角的脱敏经历写成 bot_self 记忆，让她在别的会话里也能想起自己经历过什么。"""
+        if not self.config.bool("memory_summary.self_experience_enabled", True):
+            return 0
+        text = clean_text(
+            (payload or {}).get("self_experience"),
+            self.config.int("memory_summary.self_experience_max_chars", 200),
+        )
+        if len(text) < 8:
+            return 0
+        if self.summarizer._looks_like_prompt_injection(text):
+            return 0
+        current_bot_id = self._bot_subject_id(ctx)
+        occurred_at = ""
+        for row in reversed(rows or []):
+            occurred_at = clean_text(row.get("occurred_at") or row.get("created_at"), 80)
+            if occurred_at:
+                break
+        if ctx.scope == "group":
+            target = EntityRef(kind="group", id=ctx.group_id, name=ctx.group_name, role="group")
+        else:
+            target = EntityRef(kind="user", id=ctx.user_id, name=ctx.user_name, role="user")
+        record = MemoryRecord(
+            id=self.stable_id("self_experience", ctx.session_id, summary_memory_id, text),
+            memory_type="self_action",
+            subject=self._bot_entity(ctx),
+            object=target,
+            scope=ctx.scope or "private",
+            session_id=ctx.session_id,
+            platform=ctx.platform,
+            group_id=ctx.group_id,
+            visibility="bot_self",
+            sayability="indirect",
+            reality_level="bot_action",
+            lifecycle="stable_memory",
+            content=text,
+            evidence=text,
+            confidence=0.8,
+            importance=0.58,
+            review_status="auto",
+            tags=["self_experience", ctx.scope or "private"],
+            metadata={
+                "self_experience": True,
+                "source_summary_id": summary_memory_id,
+                "owner_bot_id": current_bot_id,
+                "persona_id": clean_text(ctx.persona_id, 96),
+                "origin_scope": ctx.scope,
+            },
+            occurred_at=occurred_at,
+            source_plugin="memory_companion",
+        )
+        try:
+            self.importance.calibrate(record, source="self_experience")
+            memory_id = await self.store.insert_memory(record)
+            self._schedule_memory_embedding(memory_id, record)
+            return 1
+        except Exception as exc:
+            logger.warning(
+                "[MemoryCompanion] 自身经历写入失败: session=%s error=%s",
+                ctx.session_id,
+                exc,
+            )
+            return 0
 
     async def _record_verified_group_bot_self_facts(
         self,
@@ -6924,7 +7219,7 @@ class MemoryCompanionService:
         ctx = self._normalized_session_context(ctx)
         result_limit = max(
             1,
-            int(limit) if limit is not None else self.config.int("core_memory.max_blocks", 8),
+            int(limit) if limit is not None else self.config.int("core_memory.max_blocks", 12),
         )
         candidates = await self.store.list_core_memories(
             limit=max(20, result_limit, self.config.int("core_memory.scan_limit", 200))
@@ -9778,7 +10073,7 @@ class MemoryCompanionService:
         budget = int(
             max_chars or self.config.int("persona_memory.max_chars", 420)
         )
-        items = int(max_items or self.config.int("persona_memory.max_items", 4))
+        items = int(max_items or self.config.int("persona_memory.max_items", 6))
 
         cache = getattr(self, "_person_card_cache", None)
         if not isinstance(cache, dict):
@@ -13200,11 +13495,15 @@ class MemoryCompanionService:
         return clean_text(query, 1400)
 
     def _retrieval_top_k_for_query(self, ctx: SessionContext, query: str, *, time_intent: TimeIntent | None = None) -> int:
-        base = self.config.int("memory_injection.top_k", 4)
+        base = self.config.int("memory_injection.top_k", 8)
         if (time_intent is not None and time_intent.active) or self._message_requests_temporal_aggregate(ctx.message_text or query):
             if time_intent is not None and time_intent.summary_like:
                 return max(base, 12)
             return max(base, 10)
+        # 信息量大的问句（长句、多问号）多给几条，短寒暄保持精简。
+        probe = clean_text(ctx.message_text or query, 600)
+        if len(probe) >= 40 or probe.count("？") + probe.count("?") >= 2:
+            return min(base + 2, 20)
         return base
 
     def _injection_max_chars_for_query(self, ctx: SessionContext, query: str, *, time_intent: TimeIntent | None = None) -> int:
@@ -13228,7 +13527,7 @@ class MemoryCompanionService:
 
     def _slot_limits(self, top_k: int, *, query: str = "", time_intent: TimeIntent | None = None) -> dict[str, int]:
         total = max(1, int(top_k or 1))
-        conversation_limit = self.config.int("context_orchestration.conversation_summary_limit", 2)
+        conversation_limit = self.config.int("context_orchestration.conversation_summary_limit", 3)
         open_loop_limit = 1
         if self._message_is_vague_recent_followup(query):
             open_loop_limit = min(total, 3)
@@ -13237,11 +13536,11 @@ class MemoryCompanionService:
             open_loop_limit = max(open_loop_limit, min(total, 2))
         return {
             "open_loop": min(total, open_loop_limit),
-            "self_timeline": min(total, self.config.int("context_orchestration.self_timeline_limit", 2)),
+            "self_timeline": min(total, self.config.int("context_orchestration.self_timeline_limit", 4)),
             "user_profile": min(total, self.config.int("context_orchestration.user_profile_limit", 2)),
             "current_window": min(total, self.config.int("context_orchestration.current_window_limit", 3)),
             "conversation_summary": min(total, conversation_limit),
-            "stable_memory": min(total, self.config.int("context_orchestration.stable_memory_limit", 3)),
+            "stable_memory": min(total, self.config.int("context_orchestration.stable_memory_limit", 4)),
         }
 
     def _slot_capped_slots(
