@@ -80,7 +80,9 @@ async def test_private_card_can_opt_into_group_public_memories(store):
 
 
 @pytest.mark.asyncio
-async def test_group_card_only_shows_its_own_group_public_memories(store):
+async def test_group_card_shows_same_person_across_groups(store):
+    # 2.6.3：一个人的记忆跟着人走——记忆主体就是当前用户时，别的群的 group_public 也可见；
+    # 别人的群公开记忆仍然不进来。
     await seed(store)
     snapshot = await store.person_snapshot(user_id="user", scope="group", group_id="g1")
-    assert ids(snapshot) == {"mem-shareable", "mem-g1-public"}
+    assert ids(snapshot) == {"mem-shareable", "mem-g1-public", "mem-g2-public"}

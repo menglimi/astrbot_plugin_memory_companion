@@ -237,7 +237,7 @@ function renderGrid() {
   }
   empty.hidden = true;
   grid.innerHTML = state.items.map((item) => {
-    const top = Array.isArray(item.top) ? item.top.slice(0, 2) : [];
+    const top = Array.isArray(item.top) ? item.top.slice(0, 1) : [];
     const chips = [`<span class="chip band ${bandClass(item.band)}">${esc(item.band_label)}</span>`];
     if (item.address) chips.push(`<span class="chip">叫她「${esc(item.address)}」</span>`);
     if (item.relation_label) chips.push(`<span class="chip">${esc(item.relation_label)}</span>`);

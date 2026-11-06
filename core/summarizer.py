@@ -461,6 +461,10 @@ class MemorySummarizer:
             "20. 按人分开写：同一批里每个人的事贴回每个人自己身上，用消息前缀里的昵称或稳定 ID，"
             "不要混成「大家」「有人」；谁第一次说出自己的称呼、关系或身份，把原话和日期留下。"
             "Bot 自己的事写在她自己身上，不要算到用户头上。\n"
+            "21. self_experience 是 Bot 自己的经历记忆，会跨会话、跨群可见，所以必须脱敏："
+            "用第一人称写 40-80 字，只写我在这段对话里做了什么、感受到什么、留下什么印象；"
+            "不得出现对方的名字、住址、联系方式、私密事件细节，不得复述别人的原话，"
+            "不得写只有本群或本人才知道的具体内容；没有值得记的就输出空字符串。\n\n"
             "输出前先在心里检查所有字段是否闭合、所有字符串是否使用双引号且已转义；"
             "请只输出一个 JSON 对象，不要 Markdown 代码围栏、不要解释、不要前后缀。格式：\n"
             "{\n"
@@ -475,6 +479,7 @@ class MemorySummarizer:
             '\n  "associations": [{"cue": "自然联想线索", "tag": "关联维度", "content": "有原文依据的简洁陈述", "refs": ["直接支持该陈述的 event_id"], "layer": "episodic|semantic|abstraction"}],'
             '\n  "routine_check_notes": ["如果本窗口包含例行检查后的具体内容，写检查项、结果、异常或待办；没有则留空数组"],'
             f"{bot_self_fact_field}"
+            '  "self_experience": "第一人称、脱敏、40-80 字的自身经历；没有就空字符串",\n'
             f"{participant_rule}\n"
             '  "sentiment": "positive|neutral|negative",\n'
             '  "importance": 0.7\n'
@@ -557,6 +562,9 @@ class MemorySummarizer:
             for item in routine_check_notes
         ]
         bot_self_facts = self._normalize_bot_self_facts(payload.get("bot_self_facts"), rows)
+        self_experience = clean_text(payload.get("self_experience"), 200)
+        if self_experience and self._looks_like_prompt_injection(self_experience):
+            self_experience = ""
         assertions, assertion_warnings = self._normalize_assertions(payload.get("assertions"), rows)
         if not participants:
             participants = self._participants_from_rows(rows)
@@ -619,8 +627,15 @@ class MemorySummarizer:
             # 否则含注入的批次会永远被判「缺乏对应」而反复重试。
             warnings.append("摘要正文含疑似提示词注入指令，已降级为不可执行事件记录")
         elif summary and self.citation_check(summary, rows)[0] == "unsupported":
-            errors.append("摘要正文与本批原文缺乏对应，请贴近原文纠正")
-            warnings.append("摘要正文与所引用消息的词面对应较弱")
+            # 摘要正文是改写过的长文本，要求它与本批原文词面完全对上过严：
+            # 以前这里直接判错，导致「校验未通过」反复重试、最终冻结整批。
+            # 只要还能从原文里找到至少一个实词依据，就降级为警告保留本批；
+            # 完全找不到任何依据才算编造，仍走修复轮。
+            if self._summary_has_any_grounding(summary, rows):
+                warnings.append("摘要正文与本批原文的词面对应较弱，已保留本批")
+            else:
+                errors.append("摘要正文与本批原文缺乏对应，请贴近原文纠正")
+                warnings.append("摘要正文与所引用消息的词面对应较弱")
         elif refs and summary:
             cited = [row for row in rows if clean_text(row.get("id"), 160) in refs]
             if cited and self.citation_check(summary, cited)[0] == "unsupported":
@@ -658,6 +673,7 @@ class MemorySummarizer:
                 "associations": associations,
                 "routine_check_notes": routine_check_notes,
                 "bot_self_facts": bot_self_facts,
+                "self_experience": self_experience,
                 "assertions": assertions,
                 "participants": participants,
                 "sentiment": sentiment,
@@ -817,6 +833,24 @@ class MemorySummarizer:
     #: acceptance.  It downgrades the batch to an evidence candidate instead.
     NEGATION_MARKERS: tuple[str, ...] = ("不", "没", "未", "无", "别", "禁止")
     POLARITY_WINDOW = 8
+
+    @classmethod
+    def _summary_has_any_grounding(cls, summary: str, rows: list[dict[str, Any]]) -> bool:
+        """摘要正文是否至少有一个实词能在本批原文里找到。"""
+        text = re.sub(r"\s+", "", "；".join(clean_text(row.get("content"), 1000) for row in rows)).casefold()
+        if not text:
+            return False
+        terms = message_terms(clean_text(summary, 300), limit=80)
+        # 只命中一个词（往往只是人名/地名）不足以证明正文有依据：
+        # 完全跑题的改写摘要也能撞上同一个名字。要求至少两个不同实词
+        # 在本批原文里出现，才算「有依据、可降级为警告保留本批」。
+        hits = 0
+        for term in terms:
+            if term and term in text:
+                hits += 1
+                if hits >= 2:
+                    return True
+        return False
 
     @classmethod
     def citation_check(cls, fact: Any, rows: list[dict[str, Any]]) -> tuple[str, str]:

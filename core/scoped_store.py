@@ -86,6 +86,12 @@ class ScopedStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock if callable(clock) else time.time
         self._lock = threading.RLock()
+        # 复用连接：每次操作都 sqlite3.connect() + close() 会让机械盘上的
+        # WAL/fsync 成本被放大数倍（见 issue #61），这里改成每线程一条长连接。
+        self._local = threading.local()
+        self._connections: list[sqlite3.Connection] = []
+        self._connections_lock = threading.Lock()
+        self._closed = False
         self._active_epoch = ""
         self._active_policy_version = ""
         self._epoch_revision = 0
@@ -94,11 +100,34 @@ class ScopedStore:
             self.initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.path), timeout=15.0, isolation_level=None)
+        # check_same_thread=False：连接仍然按线程隔离（每线程一条），
+        # 但 close() 需要能从任意线程关掉其它线程的连接——默认的
+        # check_same_thread=True 会让跨线程 close() 抛 ProgrammingError，
+        # 在 Windows 上表现为 sqlite 文件被锁死、临时目录删不掉。
+        conn = sqlite3.connect(
+            str(self.path), timeout=15.0, isolation_level=None, check_same_thread=False
+        )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
         conn.execute("PRAGMA secure_delete=ON")
+        return conn
+
+    def _thread_connection(self) -> sqlite3.Connection:
+        """Return this thread's reusable connection, opening it on first use."""
+        if self._closed:
+            raise ScopedStoreError("scoped_store_closed")
+        conn = getattr(self._local, "connection", None)
+        if conn is not None:
+            return conn
+        conn = self._connect()
+        self._local.connection = conn
+        with self._connections_lock:
+            if self._closed:
+                conn.close()
+                self._local.connection = None
+                raise ScopedStoreError("scoped_store_closed")
+            self._connections.append(conn)
         return conn
 
     def _truncate_wal(self) -> None:
@@ -107,16 +136,26 @@ class ScopedStore:
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        conn = self._connect()
+        conn = self._thread_connection()
         try:
             yield conn
-        finally:
-            conn.close()
+        except Exception:
+            # 只读路径不该留悬挂事务；显式回滚，别把坏状态留给下一个调用。
+            if conn.in_transaction:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+            raise
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
-            conn = self._connect()
+            conn = self._thread_connection()
+            if conn.in_transaction:
+                # 嵌套调用复用外层事务，避免第二次 BEGIN 直接报错。
+                yield conn
+                return
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 yield conn
@@ -126,8 +165,38 @@ class ScopedStore:
                 if conn.in_transaction:
                     conn.execute("ROLLBACK")
                 raise
-            finally:
+
+    def close(self) -> None:
+        """Close every connection this store opened, on all threads."""
+        with self._connections_lock:
+            connections = list(self._connections)
+            self._connections.clear()
+            self._closed = True
+        for conn in connections:
+            try:
                 conn.close()
+            except Exception:  # pragma: no cover - 收尾失败不该盖住调用方
+                pass
+        try:
+            self._local.connection = None
+        except Exception:  # pragma: no cover
+            pass
+
+    def reset_connection_after_failed_initialize(self) -> None:
+        """Recycle thread-local handles after a failed initialize()."""
+        with self._connections_lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        for conn in connections:
+            try:
+                conn.close()
+            except Exception:  # pragma: no cover
+                pass
+        try:
+            self._local.connection = None
+        except Exception:  # pragma: no cover
+            pass
+        self._closed = False
 
     def initialize(self) -> None:
         with self._lock:

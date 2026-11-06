@@ -129,8 +129,10 @@ class PersonSnapshotVisibilityTests(unittest.IsolatedAsyncioTestCase):
         ids = {row["id"] for row in snapshot["memories"]}
         self.assertIn("group-own", ids)
         self.assertNotIn("private-secret", ids)
-        self.assertNotIn("group-other", ids)
-        self.assertEqual(snapshot["total"], 1)
+        # 2.6.3 起「一个人的记忆跟着人走」：她在别的群的公开记忆也会出现在
+        # 这张卡上（别人的群公开记忆仍然不可见）。
+        self.assertIn("group-other", ids)
+        self.assertEqual(snapshot["total"], 2)
 
     async def test_private_card_keeps_private_memories(self) -> None:
         await self._insert(

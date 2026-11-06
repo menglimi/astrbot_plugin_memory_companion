@@ -14,13 +14,14 @@ from astrbot.api.star import Context, Star, StarTools, register
 
 from .core.bridge import MemoryCompanionBridge
 from .core.commands import MemoryCompanionCommandHandler
+from .core.companion_linkage import CompanionMemoryLinkage
 from .core.models import json_dumps
 from .core.event_query import bind_event_tool_schema
 from .core.query_session import bind_query_tool_schema, bind_query_tool_v3_schema, bind_source_query_v2_schema
 from .core.service import MemoryCompanionService
 
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
-PLUGIN_VERSION = "2.6.1"
+PLUGIN_VERSION = "2.6.5"
 
 _ACTIVE_BRIDGE: MemoryCompanionBridge | None = None
 
@@ -107,6 +108,7 @@ class MemoryCompanionPlugin(Star):
         global _ACTIVE_BRIDGE
         _ACTIVE_BRIDGE = self.memory_companion if self.service.config.bool("private_companion_bridge.enabled", True) else None
         self._register_page_api_if_available()
+        self.companion_linkage = CompanionMemoryLinkage(self)
 
         logger.info("[MemoryCompanion] 我会牢牢记住你 已启动，数据目录=%s", self.service.data_dir)
 
@@ -193,6 +195,11 @@ class MemoryCompanionPlugin(Star):
             self._log_disabled_tools()
             self.service._ensure_lifecycle_maintenance_dispatcher()
             self.service._ensure_portrait_daily_dispatcher()
+            self.service._ensure_summary_drain_dispatcher()
+            try:
+                self.companion_linkage.start()
+            except Exception as exc:  # pragma: no cover - 注册失败不降级插件
+                logger.debug("[MemoryCompanion] companion linkage start failed: %s", exc)
             self.service.capture.start()
         except Exception:
             # 初始化失败只降级本插件：宿主 star_manager 外层是 except BaseException，
@@ -211,6 +218,14 @@ class MemoryCompanionPlugin(Star):
 
         探测失败就退回启动快照，至少不返回空。
         """
+        linkage = getattr(self, "companion_linkage", None)
+        if linkage is not None:
+            try:
+                # 面板每次打开都试一次：private_companion 可能后装/后启用，
+                # 启动重试窗口之外的场景靠这里接上。
+                linkage.register()
+            except Exception:
+                pass
         probe = getattr(self.memory_companion, "probe_capability_snapshot", None)
         if callable(probe):
             try:
@@ -965,6 +980,12 @@ class MemoryCompanionPlugin(Star):
             except Exception as exc:  # pragma: no cover - 宿主差异兜底
                 logger.warning("[MemoryCompanion] page api unregister failed: %s", exc)
         global _ACTIVE_BRIDGE
+        linkage = getattr(self, "companion_linkage", None)
+        if linkage is not None:
+            try:
+                await linkage.close()
+            except Exception as exc:  # pragma: no cover - 宿主差异兜底
+                logger.debug("[MemoryCompanion] companion linkage close failed: %s", exc)
         self.memory_companion.deactivate()
         if _ACTIVE_BRIDGE is self.memory_companion:
             _ACTIVE_BRIDGE = None

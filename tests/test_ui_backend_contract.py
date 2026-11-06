@@ -203,15 +203,18 @@ class UiBackendContractTests(unittest.TestCase):
             self.assertTrue(endpoints, view)
             self.assertEqual(set(), set(endpoints) - routes, view)
 
-    def test_recent_injection_trace_is_wired_to_both_panel_modes(self) -> None:
+    def test_recent_injection_trace_survives_starmap_removal(self) -> None:
+        # 2.6.4 删三维终端时一并移除了 injection-status.js；
+        # 总览的「最近注入」改由控制台 app.js 直接渲染，接口契约不变。
         views = literal(assignment(self.tree, "UI_VIEW_ENDPOINTS"))
         self.assertIn("/logs", views["overview"])
-        modern = (ROOT / "pages" / "记忆面板" / "modern.html").read_text(encoding="utf-8")
-        injection_script = (ROOT / "pages" / "记忆面板" / "injection-status.js").read_text(encoding="utf-8")
-        self.assertIn("./injection-status.js?v=", modern)
-        self.assertIn('bridge.apiGet("page/logs"', injection_script)
-        self.assertIn("/logs?limit=", injection_script)
-        self.assertIn("最近注入", injection_script)
+        panel = ROOT / "pages" / "记忆面板"
+        modern = (panel / "modern.html").read_text(encoding="utf-8")
+        self.assertNotIn("injection-status.js", modern)
+        self.assertFalse((panel / "injection-status.js").exists())
+        console = (panel / "app.js").read_text(encoding="utf-8")
+        self.assertIn("/logs?limit=", console)
+        self.assertIn("最近注入", console)
 
 
 # ---- L8：真实接口契约（直调 page_api，而不是只 grep 标签字符串）----------------

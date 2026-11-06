@@ -30,8 +30,8 @@ DEFAULT_INJECTION_CHARS = 1800
 MIN_INJECTION_CHARS = 300
 SHORT_REPLY_INJECTION_CHARS = 1050
 TEMPORAL_INJECTION_CHARS = 3600
-DEFAULT_CORE_MEMORY_CHARS = 800
-DEFAULT_MAX_ITEM_CHARS = 320
+DEFAULT_CORE_MEMORY_CHARS = 1200
+DEFAULT_MAX_ITEM_CHARS = 240
 INJECTION_BUDGETS = {
     "total": MAX_INJECTION_CHARS,
     "default": DEFAULT_INJECTION_CHARS,
@@ -50,7 +50,7 @@ class InjectionComposer:
         "enabled": False,
         "fuzzy_impression_max_items": 2,
         "fuzzy_item_max_chars": 160,
-        "vivid_full_days": 45.0,
+        "vivid_full_days": 180.0,
         "vivid_fuzzy_days": 540.0,
         "no_recall_hint_enabled": True,
         # R11：空召回时是否补一句「没检索到记忆」。默认不写（噪音）。

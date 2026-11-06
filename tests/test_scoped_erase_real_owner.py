@@ -47,6 +47,10 @@ class ScopedEraseRealOwnerTests(unittest.TestCase):
         self.group_b = _context("group_member", group="group-b")
 
     def tearDown(self) -> None:
+        # Windows 上被打开的 sqlite 文件无法删除：先关连接再清临时目录。
+        close = getattr(self.store, "close", None)
+        if callable(close):
+            close()
         self.tmp.cleanup()
 
     def _write(self, context, record_kind, record_id, source_kind, domain="memory", **kwargs) -> None:

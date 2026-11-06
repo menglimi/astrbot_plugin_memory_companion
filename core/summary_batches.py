@@ -344,7 +344,7 @@ class SummaryBatchStore:
 
         - ``retry``: drop the ownership rows and re-open the batch, so the
           events become eligible for a new batch.
-        - ``discard``: mark the owned events summarized and close the batch,
+        - ``discard``: delete the owned timeline rows and close the batch,
           accepting the loss instead of leaving them dangling.
         """
         normalized_mode = clean_text(mode, 20).lower()
@@ -375,8 +375,8 @@ class SummaryBatchStore:
                 if normalized_mode == 'discard' and event_ids:
                     placeholders = ','.join('?' for _ in event_ids)
                     self._conn.execute(
-                        f"UPDATE timeline SET summarized_at=? WHERE id IN ({placeholders}) AND summarized_at=''",
-                        [utc_now(), *event_ids],
+                        f"DELETE FROM timeline WHERE id IN ({placeholders})",
+                        event_ids,
                     )
                 self._conn.execute('DELETE FROM summary_batch_events WHERE batch_id=?', (batch_id,))
                 if normalized_mode == 'retry':
@@ -430,6 +430,82 @@ class SummaryBatchStore:
                 }
         return await asyncio.to_thread(read)
 
+    async def close_orphan_retry_batches(self) -> int:
+        """Retire queued batches whose raw events are gone; they can never run."""
+
+        def update():
+            with self._lock:
+                with self._transaction_sync():
+                    cursor = self._conn.execute(
+                        """UPDATE summary_batches
+                           SET state='completed', next_retry_at=NULL, retry_reason='',
+                               last_error='', updated_at=?
+                           WHERE state IN ('pending','retry_pending')
+                             AND NOT EXISTS(
+                                 SELECT 1 FROM summary_batch_events e
+                                 WHERE e.batch_id=summary_batches.id)""",
+                        (utc_now(),),
+                    )
+                    return int(cursor.rowcount or 0)
+
+        return await asyncio.to_thread(update)
+
+    async def list_pending_batches(self, *, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        """Read the batches still waiting for a normal summary pass.
+
+        This is the read-only counterpart of the overview ``待处理批次`` count:
+        it is a queue, not an error list, so the panel only shows it and never
+        offers release actions for these rows.
+        """
+        def read():
+            with self._lock:
+                total = self._conn.execute(
+                    "SELECT COUNT(*) FROM summary_batches b "
+                    "WHERE b.state IN ('pending','retry_pending') "
+                    "AND EXISTS(SELECT 1 FROM summary_batch_events e WHERE e.batch_id=b.id)"
+                ).fetchone()[0]
+                rows = self._conn.execute(
+                    "SELECT b.id, b.session_id, b.scope, b.automatic_calls, b.repair_used, "
+                    "b.last_error, b.created_at, b.updated_at, "
+                    "(SELECT COUNT(*) FROM summary_batch_events e WHERE e.batch_id=b.id) AS event_count "
+                    "FROM summary_batches b "
+                    "WHERE b.state IN ('pending','retry_pending') "
+                    "AND EXISTS(SELECT 1 FROM summary_batch_events e WHERE e.batch_id=b.id) "
+                    "ORDER BY b.updated_at DESC, b.id LIMIT ? OFFSET ?",
+                    (max(1, int(limit)), max(0, int(offset)))).fetchall()
+                return {
+                    "total": int(total or 0),
+                    "legacy_failures": 0,
+                    "batches": [dict(row) for row in rows],
+                }
+        return await asyncio.to_thread(read)
+
+    async def list_processed_batches(self, *, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        """Read batches that already finished, most recently touched first.
+
+        ``completed`` batches produced memories, ``no_memory`` batches finished
+        without anything worth keeping.  Both are history, so the panel shows
+        them read-only and never offers release actions.
+        """
+        def read():
+            with self._lock:
+                total = self._conn.execute(
+                    "SELECT COUNT(*) FROM summary_batches WHERE state IN ('completed','no_memory')"
+                ).fetchone()[0]
+                rows = self._conn.execute('''
+                    SELECT b.id, b.session_id, b.scope, b.automatic_calls, b.repair_used,
+                           b.last_error, b.created_at, b.updated_at, b.state,
+                           (SELECT COUNT(*) FROM summary_batch_events e WHERE e.batch_id=b.id) AS event_count
+                    FROM summary_batches b WHERE b.state IN ('completed','no_memory')
+                    ORDER BY b.updated_at DESC, b.id LIMIT ? OFFSET ?''',
+                    (max(1, int(limit)), max(0, int(offset)))).fetchall()
+                return {
+                    "total": int(total or 0),
+                    "legacy_failures": 0,
+                    "batches": [dict(row) for row in rows],
+                }
+        return await asyncio.to_thread(read)
+
     async def release_quarantined_batches(
         self, *, mode: str = "retry", batch_ids=None, all_quarantined: bool = False, limit=None
     ) -> dict[str, Any]:
@@ -438,7 +514,7 @@ class SummaryBatchStore:
         ``release_summary_batch`` handles a single human-chosen batch; the panel
         also needs to clear a backlog of hundreds, which would otherwise mean one
         round-trip per id.  ``mode='retry'`` hands the events back for a later
-        batch, ``mode='discard'`` marks them summarized and accepts the loss.
+        batch, ``mode='discard'`` deletes them and accepts the loss.
         """
         normalized_mode = clean_text(mode, 20).lower()
         if normalized_mode not in {"retry", "discard"}:
@@ -475,8 +551,8 @@ class SummaryBatchStore:
                     if normalized_mode == "discard" and event_ids:
                         placeholders = ",".join("?" for _ in event_ids)
                         self._conn.execute(
-                            f"UPDATE timeline SET summarized_at=? WHERE id IN ({placeholders}) AND summarized_at=''",
-                            [utc_now(), *event_ids],
+                            f"DELETE FROM timeline WHERE id IN ({placeholders})",
+                            event_ids,
                         )
                     self._conn.execute("DELETE FROM summary_batch_events WHERE batch_id=?", (batch_id,))
                     if normalized_mode == "retry":

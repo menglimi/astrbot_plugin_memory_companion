@@ -333,8 +333,8 @@ class StoreProjectionTests(unittest.IsolatedAsyncioTestCase):
         result = await self.store.release_summary_batch(batch_id, mode="discard")
         self.assertEqual(1, result["released_events"])
         self.assertEqual("completed", result["state"])
-        record = (await self.store.get_timeline_by_ids([event_id]))[event_id]
-        self.assertTrue(record["summarized_at"])
+        # 2.6.4 起 discard 是「连原文一起删」：timeline 行不再保留标记。
+        self.assertEqual({}, await self.store.get_timeline_by_ids([event_id]))
         window = await self.store.unsummarized_timeline_window(
             session_id=SESSION_ID, exclude_assigned=True
         )

@@ -1,6 +1,172 @@
+## 2.6.5 - 2026-11-06（Bot 经历时间线）
+
+### 问题修复（来自上游 issue #46 / #47 / #54 / #55 / #56 / #60 / #61）
+- **#61 磁盘写放大**：`ScopedStore` 原来每次操作都新建 sqlite 连接并立刻关闭，每次连接都要重设 `journal_mode=WAL` / `synchronous=FULL`，机械盘上把 WAL 与 fsync 成本放大数倍。改为每线程复用一条长连接，事务嵌套复用外层事务，`close()` 统一回收所有线程的连接。
+- **#61 附带修复（Windows 文件锁）**：连接默认 `check_same_thread=True`，插件关闭时在线程池线程里 `close()` 会抛 `ProgrammingError` 并被静默吞掉，导致 sqlite 句柄不释放、数据目录删不掉。改为 `check_same_thread=False`（连接仍按线程隔离）。
+- **#54 严格 provider 的 400**：把契约 schema 整份当成 tool parameters 发给模型，`const` / `oneOf` / 无 `items` 的数组等写法会让 Gemini 等严格 provider 直接 400。新增 `core/tool_schema.py`，把契约转换成标准 JSON Schema 子集：`const: ""` → `pattern: "^$"`，`const: 其他` → `enum`，剥掉 `null` / `[]` 的 enum，数组补 `items`，`oneOf` / `anyOf` / `allOf` 保留结构只递归清洗。`query_session` / `event_query` 的全部工具参数绑定改走这个转换。
+- **#47 全表扫描**：`julianday(...)` 包住时间列，任何索引都用不上。新增四个表达式索引（`occurred_at` / `created_at` / `updated_at` / `COALESCE` 组合）并在建好后对 `memories` 单表 `ANALYZE`，查询计划从 `SCAN memories` + `TEMP B-TREE` 变成 `MULTI-INDEX OR`。
+- **#55 / #56 / #60**：docstring 里的 `confidence/importance` 已拆成四行独立参数；`sanitize_request_history()` 的主动消息清理默认关闭，不再按工具名单独删行，避免 `[CronJob]` 记录和 `role=tool` 回执被误删后导致 `tool_calls` 孤儿。
+- **#46**：写入侧的 `owner_bot_id` 已使用真实 bot 号，不再写成 platform 名（存量仅剩 9 行 `webchat` 与 22 行 `astrbot` 历史数据）。
+
+### 面板：深色/浅色选择不再丢
+- 主题原来只存浏览器 `localStorage`，部分 WebView（手机端、内置浏览器）重开页面会清空，表现就是「选了深色，下次打开还是白的」。
+- 新增 `POST /ui-preferences/save` 把选择写到 `data_dir/ui_preferences.json`；`GET /ui-preferences` 一并返回 `dark_mode`。打开面板时先用本地缓存保证首帧不闪，连上后端后再用文件里的值校正。
+- 单独开一个 POST 路由而不是给 `/ui-preferences` 加方法：AstrBot 的 `register_web_api` 只在「路由 + 方法列表完全一致」时替换旧条目，改方法列表会在插件重载后残留旧 GET 条目，请求先命中旧 handler 返回 503。
+
+### 面板：`/bots` 路由补策略声明
+- 新增的 `/bots` 只读端点漏了 `UI_READ_ENDPOINTS` 声明，面板策略自检会判定「没有显式策略」，补齐。
+
+### 测试
+- 修掉 40 个因行为变更而过时的断言：预设默认值（`top_k` 8 / `max_item_chars` 240）、星图视图已删除、跨群同人可见、摘要校验改为「至少两个实词命中」、`injection-status.js` 已移除、隔离批次改为真删原文、情绪衰减测试改用相对时间。
+- 新增 `ScopedStore` 连接复用、`tool_schema` 契约转换的单元测试。
+
+
+### 新增：Bot 自己的经历记忆
+- 总结时额外产出一条 Bot 视角的脱敏经历（`self_experience`），40-80 字，只写「我做了什么、感受到什么、留下什么印象」，不写对方隐私、不复述他人原话。
+- 以 `bot_self` 可见性写入 `self_action`，跨会话、跨群可见——她在群 A 经历过的事，在群 B 也能想起来。
+- 开关：`memory_summary.self_experience_enabled`（默认开）、`memory_summary.self_experience_max_chars`（默认 200）。
+
+## 2.6.4 - 2026-11-06（记忆体检修复）
+
+### 消化链路
+- 修复自动消化调度器从未启动：`_spawn_background` 的启动宽限期会把任务直接关闭，补 `defer_during_grace=True`。
+- 清理孤儿批次：1,158 条 `pending/retry_pending` 没有任何原文事件，永远不可能执行，新增 `close_orphan_retry_batches()` 一次性归入 completed。
+- 老会话绕过门槛：最旧超过 2 天且至少 2 条原文的会话走 `force`，不再卡在 `min_events=12`（518 个 backlog 会话里 335 个达不到门槛）。
+- 修复 drain 传 `scope="unknown"` 导致窗口查询恒为空的问题（空 scope 改传空串）。
+- 每轮消化顺带执行核心记忆自动沉淀，并加「自动消化跳过」诊断日志。
+
+### 核心记忆
+- 自动沉淀从 24 小时维护循环挪到消化循环（每轮都检查）。
+- 同名块改为合并更新（保留最近 20 条事实），不再因 label 冲突导致永远只有第一条。
+- 样本从最近 400 条扩到 1,200 条，每桶门槛从 3 条降到 2 条。
+
+### 摘要校验
+- 「摘要正文与本批原文缺乏对应」从硬错误降级为警告：只要有一个实词能在原文找到就保留本批，只有完全无依据才判编造。此前该判定直接冻结整批并重试。
+
+### 注入
+- `suppress_memory_on_low_information`、`suppress_memory_on_topic_shift` 默认改为关闭抑制：真实聊天里短句占多数，抑制会让记忆长期不出现。
+- `relax_keyword_min_hits` 默认开启：查询词命中 1 个也进入候选。
+- `memory_injection.top_k` 默认 4 → 8。
+
+### 修复：待修复批次「全部放弃」不生效
+- 批量释放循环把 API 返回又套了一层 `.data` 去读 `released`，读到的永远是 `undefined`，第一次请求后就 `break`，进度文案显示 0 且不再继续；`run()` 的完成提示同样读不到条数。
+- 改为兼容内层/外层两种返回结构，进度按真实条数递增，完成提示显示「已放弃 N 条」。
+- 后端实测：33 条隔离批次 + 655 行原文，一次 `discard` 1.01 秒完成，非性能问题。
+
+### 面板
+- 总览新增「自动消化」卡片（状态 / 上次结果 / 上次完成时间 / 最近错误），可直接跳转排队中。
+- `/stats` 暴露 `summary_drain`。
+- 清理 app.css 里 125 行星图残留样式（17 个类，零引用）。
+
+### 默认值（拟人化调优）
+- 记忆槽位：`self_timeline_limit` 2→4、`conversation_summary_limit` 2→3、`stable_memory_limit` 3→4、`persona_memory.max_items` 4→6。
+- 核心记忆：`max_blocks` 8→12、`max_chars` 800→1200、`auto_distill_max_blocks` 3→6。
+- 总结节奏：`min_events` 12→8、`trigger_event_count` 12→8。
+- 画像：`daily_success_limit_per_person` 1→3、`daily_attempt_limit_per_person` 2→6、`min_independent_evidence` 3→2。
+- 注入单条 320→240 字：条数更多、每条更短，更像人嘴里的细节。
+- 衰减分阈值 75→65：在乎的人淡得慢一点。
+- 跨窗口衔接 30→120 分钟；细节清晰期 45→30 天（近一个月的事记得清）。
+- 同步 `core/operations.py` 三档预设与 `core/service.py` 运行时兜底；`DEFAULT_CORE_MEMORY_CHARS` 800→1200、`DEFAULT_MAX_ITEM_CHARS` 320→240。
+
+### 批次视图拆分
+- 「导入」下拆成三个独立入口：**待修复批次**（quarantined，可逐条 / 整批重新排队或放弃）、**排队处理**（pending，只读）、**已处理批次**（completed + no_memory，只读，标注「已总结 / 无新增记忆」）。
+- 总览三个 KPI（待处理批次 / 待修复批次 / 已处理无新增记忆）分别跳到对应视图，不再挤在同一个页面里。
+- 后端新增 `list_processed_batches()` 与 `/maintenance/summary_batches?state=processed`；缓存串升到 `2.6.2.5`。
+
 # Changelog
 
 本项目遵循面向用户体验的版本记录。日期使用北京时间。
+
+## 2.6.3 - 2026-11-06
+
+> 修消化（记忆真正记得住）+ 注入增强 + 跨群「一个人的记忆」+ 自动沉淀。
+
+### 消化链路：新增全局积压消化
+- 以前只有「这个会话来新消息」才会触发总结，老会话的原文会一直躺在 timeline 里没人处理。
+  现在新增后台消化调度：启动后延迟 120 秒开始，每 10 分钟扫一轮，把「未总结且没有排队批次」的会话
+  按最老优先补上总结，每轮最多 5 个会话（`memory_summary.auto_drain_*`）。
+- 清理「孤儿批次」：没有任何原文事件的 pending/retry 批次直接归档为 completed，不再占着「待处理」的数字。
+- 实测基线：未总结原文 28,078 条，其中 20,506 条从未被分配批次；孤儿 retry 批次 1,158 条。新调度会逐步消化。
+
+### 注入增强
+- `memory_injection.top_k` 默认 4 → 8；长问题（40 字以上或含多个问号）自动 +2（上限 20），
+  时间类问题保持更宽的召回。
+- `retrieval_advanced.dedupe_content_ratio` 默认 0.0 → 0.85：内容高度相似的记忆在注入前合并，省上下文。
+- `memory_summary.min_events` 20→12、`trigger_event_count` 20→12、`trigger_interval_minutes` 60→30：
+  更早开始总结，不用攒一大坨。
+
+### 跨群「一个人的记忆」
+- 同一个人在 A 群说过的话，本人在 B 群时也能被回忆起（`same_person_other_group`）；
+  别人的群公开记忆仍然不可见，隐私边界不变。
+- `visibility.allow_group_public_in_private` 默认 False → True：私聊里可以带出群聊公开记忆（可在配置里关）。
+
+### 自动沉淀
+- 维护任务每轮从高重要度的长期记忆里挑事实，补成核心记忆块（默认最多 3 块，不覆盖你手写的块）。
+- 新增配置：`core_memory.auto_distill_enabled` / `auto_distill_max_blocks` / `auto_distill_min_salience`。
+
+### private_companion v2 联动
+- 向 private_companion 7.x 的 `_private_companion_memory_providers` 注册表注册外部记忆 provider
+  （协议 `companion.external-memory.v1`，声明 `handles_model_memory=False`）：
+  私聊回复前它会调用本插件的 read 召回记忆并注入「【外部记忆参考】」，记忆面板的 summary 统计也走本插件。
+- 注册在插件启动后后台重试，private_companion 比本插件晚加载也能接上；插件停止时自动注销。
+- 原来的 v1 探测（`get_memory_companion_bridge()`）保持不变，两条路互不冲突。
+
+## 2.6.2 - 2026-11-06（本地补丁）
+
+> 删掉三维终端面板，控制台显示优化。
+
+### 删除三维终端
+- `modern.html` 的三维场景移除，改成跳转到控制台（旧配置/缓存打开也不 404）。
+- 删除 `assets/index-URVgTPOQ.js`、`assets/index-CWNk7gDr.css`、`fonts/`（4 个 MiSans 字体约 19 MB）、
+  `archives/`（80 个死数据 txt）、`injection-status.css/js`、`summary-status.js`。
+- 保留 `assets/*.glb` 与 `cinema-3d.bundle.js`，控制台的终端模式仍可用。
+- 默认 `appearance.ui_style` 回到「控制台」。
+
+### 控制台显示优化
+- 配色首帧缓存：`appearance.theme` 对应的 palette 写入 localStorage，刷新/重载不再闪默认紫。
+- 深浅切换加 0.3s 过渡（`prefers-reduced-motion` 下关闭）。
+- 移动端（≤640px）：导航改底部条、子菜单浮层、抽屉全宽、卡片单列、顶栏紧凑。
+- 卡片/KPI/列表 hover 与抽屉滚动条细节打磨。
+
+### 总览 KPI
+- 11 个总览指标卡换成渐变描边卡：图标、色调光晕、渐变数字、悬停抬升、入场阶梯动画。
+- 每张卡可直接点击跳转：记忆总量/私聊/群聊/原文/会话记忆 → 记忆库对应筛选，用户档案 → 用户档案，
+  核心记忆 → 核心记忆，开放线程 → 导航，待处理/待修复/已处理 → 待复核区。
+
+### 知识星图：删除
+- 「知识星图」视图整块移除（导航入口、总览入口、画布代码约 49 KB）。总览的「时间线事件 / 关系边」
+  两张卡改为跳转到记忆库，不再指向星图。
+
+### 面板细节
+- 核心记忆：每个块可「删除此块」，二次确认后调 `/core-memory/delete`，删完刷新列表。
+- 待修复批次：单条重试/丢弃的忙碌动画最短 3 秒，慢设备上也能看清状态再跳转；「全部重新排队 / 全部放弃」改成分批执行（每批 10 条），忙碌层实时显示「已放弃 x / y」「已重新排队 x / y」，不再一次请求干等。
+- 待修复批次分两个页签：「待修复」（隔离失败，可重试 / 放弃）与「排队中」（正常排队等总结的批次，只读），
+  避免把「待处理 400 条」误当成 17 条故障。
+- 「放弃」现在是真删：连批次持有的原文事件一起从 timeline 物理删除（DELETE 会触发 FTS 索引与
+  tombstone 清理），不再只标记 summarized_at、把原文留在库里占空间。
+- 总览 KPI 口径澄清：「待处理批次」= 正常排队等总结的批次（不是错误），「待修复批次」= 总结失败被隔离的批次（冻结原文 x 条），避免两者被误读成同一个数。
+- 总览新增「Bot 记忆分布」：按归属 Bot 分块，显示 Bot 名字（取自人格设定）与记忆条数，点名字直接进记忆库并按该 Bot 过滤；未标记归属的旧数据显示「未标记归属」。
+- 记忆检视顶部新增 Bot 分区条：「全部 Bot」+ 每个 Bot 名字·条数，点一下只看这个 Bot 的记忆。
+- 页面资源版本串升到 `?v=2.6.2.2`，强制浏览器拉新脚本，避免旧缓存让改动看起来「没生效」。
+- 人物页：卡片从大方块改成横向圆润条块，头像 36px、摘要一行，一屏能看更多人。
+- 历史聊天：QQ 号预览失败或没读到消息时给出明确提示（号填错 / 时间范围没覆盖 / 连接不支持），不再静默。
+- 最近注入日志：每条记忆标出「私聊· / 群聊· / 档案· / Bot·」，跨窗口注入标「↔跨窗口」，
+  便于确认群聊与私聊之间的记忆互传。
+
+### 核心记忆
+- 核心记忆卡片新增「从记忆提炼核心块」：把现有记忆按私聊 / 群聊 / 档案 / 全局各汇总成一条候选块，
+  确认后批量写入，之后可在列表里逐条改或删。核心块本身不会自动生成，空库时面板会提示先聊几轮。
+
+### 配置面板
+- 每个模块只把最常用的几项摆在明面，其余收进「高级项（N 个）· 一般不用改」折叠，避免一屏几十个输入框。
+- 完整配置仍在 AstrBot 插件配置页，两边改同一份配置。
+
+### 群聊记忆补全
+- `conversation_memory.capture_group_messages` 默认值从「关闭」改为「开启」：群聊里 @ 机器人、
+  回复机器人或命中关键词的发言会写入记忆，私聊时才有素材想起群里聊过的事；群聊普通闲聊仍不记录。
+- 本机配置同时把 `scope_control.group_capture_enabled` 打开（原来关着，等于群聊完全不捕获）。
+- 想让私聊直接看到群里的公开记忆，还需在「隔离与可见性」里打开「私聊可见群公共记忆」
+  （`visibility.allow_group_public_in_private`，默认关闭，属隐私项，本次未擅自改）。
 
 ## 2.6.1 - 2026-10-30（本地补丁，非上游；娜莉灵 修改）
 

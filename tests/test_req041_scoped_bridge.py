@@ -52,6 +52,11 @@ class ScopedBridgeTests(unittest.TestCase):
         self.assertIsNotNone(self.capability)
 
     def tearDown(self) -> None:
+        # Windows 上被打开的 sqlite 文件无法删除：先关连接再清临时目录。
+        for store in (self.store, getattr(self, "reopened_store", None)):
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
         self.tmp.cleanup()
 
     def _bind(self, **changes: str):
@@ -207,6 +212,7 @@ class ScopedBridgeTests(unittest.TestCase):
             payload={"value": "stable"}, event_id="write-1",
         )
         reopened_store = ScopedStore(self.path, clock=lambda: 200.0)
+        self.reopened_store = reopened_store
         reopened_service = SimpleNamespace(scoped_store=reopened_store, context=self.context)
         reopened_bridge = MemoryCompanionBridge(reopened_service)
         reopened_capability = reopened_bridge.register_private_companion(self.companion)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from core.retrieval import RetrievalEngine
 
@@ -103,7 +104,7 @@ class EmotionRetrievalMoodTests(unittest.IsolatedAsyncioTestCase):
                         "event_type": "hurt",
                         "valence_hint": -0.8,
                         "arousal_hint": 0.7,
-                        "occurred_at": "2026-10-30T12:00:00+00:00",
+                        "occurred_at": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
                     }
                 ]
 

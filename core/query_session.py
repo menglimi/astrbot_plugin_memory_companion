@@ -15,6 +15,7 @@ from typing import Any
 
 from .models import json_dumps
 from . import query_notes
+from .tool_schema import tool_parameters_from_contract
 
 
 PROFILE = "memory.local-query-session.v1"
@@ -544,7 +545,9 @@ def bind_query_tool_schema(manager: Any, module_path: str) -> bool:
     tool = manager.get_func(TOOL_NAME)
     if tool is None or tool.handler_module_path != module_path:
         return False
-    tool.parameters = {k: deepcopy(v) for k, v in request_schema().items() if k not in {"$schema", "$id", "title"}}
+    tool.parameters = tool_parameters_from_contract(
+        {k: deepcopy(v) for k, v in request_schema().items() if k not in {"$schema", "$id", "title"}}
+    )
     source = manager.get_func("memory_companion_sources")
     if source is not None and source.handler_module_path == module_path:
         source.parameters.get("properties", {}).pop("query_note", None)
@@ -577,7 +580,7 @@ def bind_source_query_v2_schema(manager: Any, module_path: str) -> bool:
         schema = _legacy_source_schema()
     except (OSError, ValueError, KeyError, ImportError):
         return False
-    source.parameters = deepcopy(schema)
+    source.parameters = tool_parameters_from_contract(schema)
     function = inspect.unwrap(source.handler)
     setattr(function, "_memory_source_query_profile", SOURCE_QUERY_PROFILE_V2)
     setattr(function, "_memory_source_query_module", module_path)
@@ -588,7 +591,7 @@ def bind_source_query_v2_schema(manager: Any, module_path: str) -> bool:
 def _legacy_source_schema() -> dict[str, Any]:
     root = Path(__file__).resolve().parents[1] / "docs/contracts/source-query/v1"
     schema = json.loads((root / "schemas/request.schema.json").read_text(encoding="utf-8"))
-    return {k: v for k, v in schema.items() if k not in {"$schema", "$id", "title"}}
+    return tool_parameters_from_contract(schema)
 
 
 def _marked_source_v2_handler(tool: Any) -> bool:
@@ -637,9 +640,9 @@ def bind_query_tool_v3_schema(manager: Any, module_path: str) -> bool:
         request_validator_v3()
     except (OSError, ValueError, KeyError, ImportError):
         return False
-    wrapper.parameters = {
-        k: deepcopy(v) for k, v in schema.items() if k not in {"$schema", "$id", "title"}
-    }
+    wrapper.parameters = tool_parameters_from_contract(
+        {k: deepcopy(v) for k, v in schema.items() if k not in {"$schema", "$id", "title"}}
+    )
     # Mark the unwrapped callables so request-local projection can prove that
     # the tool was registered by this plugin, rather than trusting a same-name
     # tool supplied by another extension.
@@ -720,11 +723,13 @@ def offer_query_tool(service: Any, req: Any, ctx: Any, event: Any) -> None:
         if item.name == "memory_companion_sources" and _marked_source_v2_handler(item):
             from .source_query_v2 import request_schema as batch_schema
             item = copy(item)
-            item.parameters = deepcopy(_legacy_source_schema())
+            item.parameters = tool_parameters_from_contract(_legacy_source_schema())
             if (event is not None and service.config.bool("memory_tools.enable_source_query_v2", False)
                     and service._memory_reconstruction_enabled(ctx)):
                 legacy = deepcopy(item.parameters)
-                batch = {k: deepcopy(v) for k, v in batch_schema().items() if k not in {"$schema", "$id", "title"}}
+                batch = tool_parameters_from_contract(
+                    {k: deepcopy(v) for k, v in batch_schema().items() if k not in {"$schema", "$id", "title"}}
+                )
                 item.parameters = {"type": "object", "additionalProperties": False,
                                    "properties": deepcopy(legacy["properties"]), "anyOf": [legacy, batch]}
                 item.parameters["properties"]["action"]["enum"].append("range_batch")
@@ -793,10 +798,13 @@ def offer_query_tool(service: Any, req: Any, ctx: Any, event: Any) -> None:
                 note_schema = None
             if note_schema is not None:
                 note_source = copy(source)
-                note_source.parameters = deepcopy(source.parameters)
+                note_source.parameters = tool_parameters_from_contract(source.parameters)
                 note_source.parameters.setdefault("properties", {})["query_note"] = note_schema
                 for branch in note_source.parameters.get("anyOf", []):
                     branch.setdefault("properties", {})["query_note"] = deepcopy(note_schema)
+                # The injected query_note fragment is taken from a contract file
+                # as well, so the composed parameters are cleaned once more.
+                note_source.parameters = tool_parameters_from_contract(note_source.parameters)
                 tools = [note_source if t is source else t for t in tools]
                 projected.parameters["properties"]["parameters"] = query_notes.status_parameters()
                 projected.description += " sources 可随查询附 query_note，保留此前已读材料的简短理解和引用；足够回答无需记事。status 可用 note_ids 回看，便笺是模型理解，日期和补充细节仍以原文为据。"
