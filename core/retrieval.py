@@ -10,6 +10,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .identity import session_target_id
+from .latency import (
+    MAX_MODEL_CALL_TIMEOUT_MS,
+    await_with_timeout,
+    bounded_model_call_timeout_ms,
+    exclude_model_call_wait,
+)
 from .memory_lifecycle import apply_lifecycle_score, evaluate_memory_lifecycle
 from .models import (
     MemoryRecord,
@@ -43,7 +49,7 @@ class RetrievalEngine:
         rerank_provider_id: str = "",
         rerank_candidate_multiplier: int = 5,
         rerank_candidate_limit: int = 32,
-        rerank_timeout_ms: int = 1200,
+        rerank_timeout_ms: int = MAX_MODEL_CALL_TIMEOUT_MS,
         latency_budget_ms: int = 0,
         query_vector_cache_ttl_seconds: float = 0.0,
         embedding_provider: Any = None,
@@ -53,7 +59,7 @@ class RetrievalEngine:
         embedding_top_k: int = 32,
         embedding_score_threshold: float = 0.34,
         embedding_weight: float = 0.55,
-        embedding_timeout_ms: int = 5000,
+        embedding_timeout_ms: int = MAX_MODEL_CALL_TIMEOUT_MS,
         embedding_max_text_chars: int = 1200,
         current_window_candidate_limit: int = 600,
         keyword_fallback_min_fts_candidates: int = 80,
@@ -76,7 +82,7 @@ class RetrievalEngine:
         self.rerank_provider_id = clean_text(rerank_provider_id, 160)
         self.rerank_candidate_multiplier = max(1, int(rerank_candidate_multiplier or 5))
         self.rerank_candidate_limit = max(1, int(rerank_candidate_limit or 32))
-        self.rerank_timeout_ms = max(0, int(rerank_timeout_ms or 0))
+        self.rerank_timeout_ms = bounded_model_call_timeout_ms(rerank_timeout_ms)
         # A latency budget is spent on optional model calls, never on results.
         # Lowering top_k to go faster removes exactly the context this plugin
         # exists to supply, so the speed has to come from somewhere else.
@@ -93,7 +99,7 @@ class RetrievalEngine:
         self.embedding_top_k = max(1, int(embedding_top_k or 32))
         self.embedding_score_threshold = max(0.0, min(1.0, float(embedding_score_threshold or 0.0)))
         self.embedding_weight = max(0.0, min(2.0, float(embedding_weight or 0.0)))
-        self.embedding_timeout_ms = max(0, int(embedding_timeout_ms or 0))
+        self.embedding_timeout_ms = bounded_model_call_timeout_ms(embedding_timeout_ms)
         self.embedding_max_text_chars = max(200, int(embedding_max_text_chars or 1200))
         self.current_window_candidate_limit = max(1, int(current_window_candidate_limit or 600))
         self.keyword_fallback_min_fts_candidates = max(
@@ -852,15 +858,25 @@ class RetrievalEngine:
         resp: Any = None
         success = False
         error = ""
-        try:
-            result = method(**kwargs)
-            if inspect.isawaitable(result):
-                if self.rerank_timeout_ms > 0:
-                    resp = await asyncio.wait_for(result, timeout=self.rerank_timeout_ms / 1000.0)
-                else:
-                    resp = await result
+
+        async def invoke_provider() -> Any:
+            if inspect.iscoroutinefunction(method):
+                result = method(**kwargs)
             else:
-                resp = result
+                result = await asyncio.to_thread(method, **kwargs)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+
+        try:
+            async with exclude_model_call_wait():
+                if self.rerank_timeout_ms > 0:
+                    resp = await await_with_timeout(
+                        invoke_provider(),
+                        self.rerank_timeout_ms / 1000.0,
+                    )
+                else:
+                    resp = await invoke_provider()
             success = True
             return resp
         except Exception as exc:
@@ -1411,10 +1427,12 @@ class RetrievalEngine:
         time_window_spec: tuple[str, str, int] | None = None
         if time_intent is not None and time_intent.active:
             time_window_spec = (time_intent.start_at, time_intent.end_at, 1600)
-        bundle: dict[str, Any] | None = None
-        try:
-            bundle, vector_result = await asyncio.gather(
-                self.store.list_retrieval_candidate_bundle(
+        bundle_error_type = ""
+
+        async def load_candidate_bundle() -> dict[str, Any] | None:
+            nonlocal bundle_error_type
+            try:
+                return await self.store.list_retrieval_candidate_bundle(
                     materialize_limit=self.DEFAULT_MATERIALIZE_LIMIT,
                     current_window={
                         "scope": ctx.scope,
@@ -1430,22 +1448,22 @@ class RetrievalEngine:
                     keyword_fallback_min_fts=self.keyword_fallback_min_fts_candidates,
                     time_window=time_window_spec,
                     include_pending=include_pending,
-                ),
-                self._embedding_candidate_memories(
-                    query,
-                    ctx,
-                    include_pending=include_pending,
-                    time_intent=time_intent,
-                ),
-            )
-        except Exception:
-            bundle = None
-            vector_result = await self._embedding_candidate_memories(
+                )
+            except Exception as error:
+                bundle_error_type = type(error).__name__
+                return None
+
+        # A local read failure must not restart the concurrent model request.
+        # Keep its one bounded attempt and fall back only the failed source.
+        bundle, vector_result = await asyncio.gather(
+            load_candidate_bundle(),
+            self._embedding_candidate_memories(
                 query,
                 ctx,
                 include_pending=include_pending,
                 time_intent=time_intent,
-            )
+            ),
+        )
         if bundle is not None:
             bundle_timing = bundle.pop("_timing", None) or {}
             ranked_candidates = bundle["ranked_candidates"]
@@ -1503,6 +1521,8 @@ class RetrievalEngine:
         self._rank_path_info = embedding_info
         self._rank_path_info["candidate_load_ms"] = int((time.perf_counter() - load_started) * 1000)
         self._rank_path_info["candidate_bundle"] = bundle is not None
+        if bundle_error_type:
+            self._rank_path_info["candidate_bundle_error_type"] = bundle_error_type
         if bundle_timing:
             self._rank_path_info["bundle_lock_wait_ms"] = bundle_timing.get("lock_wait_ms", 0)
             self._rank_path_info["bundle_queries_ms"] = bundle_timing.get("queries_ms", 0)
@@ -1714,6 +1734,8 @@ class RetrievalEngine:
             query_vector = self._normalize_vector(query_vector)
         except Exception as error:
             info["embedding_reason"] = f"embedding_query_error:{clean_text(self._describe_exception(error), 120)}"
+            info["embedding_fallback"] = "local_fts_keyword"
+            info["embedding_timeout_ms"] = self.embedding_timeout_ms
             return [], {}, info
         if not query_vector:
             info["embedding_reason"] = "empty_query_vector"
@@ -1803,13 +1825,26 @@ class RetrievalEngine:
         cached = self._cached_query_vector(text)
         if cached:
             return cached
+        deadline = time.monotonic() + self.embedding_timeout_ms / 1000.0
 
-        async def maybe_wait(value: Any) -> Any:
-            if inspect.isawaitable(value):
-                if self.embedding_timeout_ms > 0:
-                    return await asyncio.wait_for(value, timeout=self.embedding_timeout_ms / 1000.0)
-                return await value
-            return value
+        async def maybe_wait(method: Any, *args: Any, **kwargs: Any) -> Any:
+            async def invoke() -> Any:
+                is_async = inspect.iscoroutinefunction(method) or inspect.iscoroutinefunction(
+                    getattr(method, "__call__", None)
+                )
+                if is_async:
+                    result = method(*args, **kwargs)
+                else:
+                    result = await asyncio.to_thread(method, *args, **kwargs)
+                if inspect.isawaitable(result):
+                    return await result
+                return result
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            async with exclude_model_call_wait():
+                return await await_with_timeout(invoke(), remaining)
 
         get_embedding = getattr(provider, "get_embedding", None)
         get_embeddings = getattr(provider, "get_embeddings", None)
@@ -1822,7 +1857,7 @@ class RetrievalEngine:
         try:
             if callable(get_embedding):
                 called_provider = True
-                payload = await maybe_wait(get_embedding(text))
+                payload = await maybe_wait(get_embedding, text)
                 success = True
                 vector = self._coerce_vector(payload)
                 self._store_query_vector(text, vector)
@@ -1830,7 +1865,7 @@ class RetrievalEngine:
 
             if callable(get_embeddings):
                 called_provider = True
-                payload = await maybe_wait(get_embeddings([text]))
+                payload = await maybe_wait(get_embeddings, [text])
                 success = True
                 vector = self._first_vector(payload)
                 self._store_query_vector(text, vector)
@@ -1840,10 +1875,14 @@ class RetrievalEngine:
                 called_provider = True
                 try:
                     payload = await maybe_wait(
-                        get_embeddings_batch([text], batch_size=1, tasks_limit=1, max_retries=1)
+                        get_embeddings_batch,
+                        [text],
+                        batch_size=1,
+                        tasks_limit=1,
+                        max_retries=1,
                     )
                 except TypeError:
-                    payload = await maybe_wait(get_embeddings_batch([text]))
+                    payload = await maybe_wait(get_embeddings_batch, [text])
                 success = True
                 return self._first_vector(payload)
             return []
@@ -3133,8 +3172,20 @@ class RetrievalEngine:
             "上次那个",
             "没说完",
             "还没说完",
+            "那件事",
+            "这件事",
+            "怎么样了",
+            "后来怎么样",
+            "有结果了吗",
+            "结果出来了",
+            "处理好了",
+            "已经解决",
+            "搞定了",
+            "办好了",
+            "还没弄",
+            "拿到了吗",
         )
-        return any(marker in compact for marker in markers) and len(compact) <= 18
+        return any(marker in compact for marker in markers) and len(compact) <= 32
 
     @staticmethod
     def _is_query_scaffold_term(term: str) -> bool:

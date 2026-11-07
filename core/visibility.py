@@ -100,6 +100,9 @@ class VisibilityPolicy:
         """Keep bot-perspective group memories tied to the bot that produced them."""
         metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
         owner_bot_id = _clean_id(metadata.get("owner_bot_id"))
+        platform_id = _clean_id(memory.platform)
+        if owner_bot_id and platform_id and owner_bot_id.casefold() == platform_id.casefold():
+            owner_bot_id = ""
         bot_entity_ids = {
             _clean_id(entity.id)
             for entity in (memory.subject, memory.object)
@@ -126,7 +129,11 @@ class VisibilityPolicy:
             return False
         if memory.scope != "group" and memory.visibility != "group_public":
             return False
-        if _clean_id(metadata.get("owner_bot_id")):
+        owner_bot_id = _clean_id(metadata.get("owner_bot_id"))
+        platform_id = _clean_id(memory.platform)
+        if owner_bot_id and not (
+            platform_id and owner_bot_id.casefold() == platform_id.casefold()
+        ):
             return False
         return _clean_id(metadata.get("summarizer")) == "companion_memory_schema_v1" or _clean_id(
             metadata.get("summary_schema_version")

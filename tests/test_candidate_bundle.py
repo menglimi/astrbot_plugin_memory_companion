@@ -189,6 +189,27 @@ class CandidateBundleStoreTests(unittest.IsolatedAsyncioTestCase):
             "SELECT 1 FROM memory_embeddings WHERE memory_id=?", (bridge_row.id,)
         ).fetchone())
 
+    def test_time_window_expression_indexes_support_each_date_predicate(self) -> None:
+        store = self.make_store()
+        expected = {
+            "occurred_at": "idx_memories_jd_occurred_at",
+            "created_at": "idx_memories_jd_created_at",
+            "updated_at": "idx_memories_jd_updated_at",
+        }
+
+        predicates = " OR ".join(
+            f"(julianday({column}) >= julianday(?) AND julianday({column}) < julianday(?))"
+            for column in expected
+        )
+        params = ("2026-08-25T00:00:00+00:00", "2026-08-26T00:00:00+00:00") * len(expected)
+        plan = store._conn.execute(
+            f"EXPLAIN QUERY PLAN SELECT id FROM memories WHERE {predicates}", params
+        ).fetchall()
+        plan_details = "\n".join(str(row["detail"]) for row in plan)
+
+        for index_name in expected.values():
+            self.assertIn(index_name, plan_details, plan_details)
+
     async def test_direct_candidate_filter_blocks_placeholder_memory(self) -> None:
         store = self.make_store()
         bridge_row = _memory("bridge-direct", "Bot Personal archive reference [schedule_fragment]")

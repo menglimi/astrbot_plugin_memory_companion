@@ -15,6 +15,11 @@ from .core.bridge import MemoryCompanionBridge
 from .core.commands import MemoryCompanionCommandHandler
 from .core.models import json_dumps
 from .core.event_query import bind_event_tool_schema
+from .core.latency import (
+    MAX_MEMORY_HOOK_BUDGET_SECONDS,
+    await_with_memory_hook_budget,
+    bounded_memory_hook_budget_seconds,
+)
 from .core.query_session import bind_query_tool_schema, bind_query_tool_v3_schema, bind_source_query_v2_schema
 from .core.service import MemoryCompanionService
 
@@ -125,24 +130,32 @@ class MemoryCompanionPlugin(Star):
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         """LLM 请求前钩子：注入记忆上下文，支持可配置的熔断预算。
 
-        对应 ``optimization_plan.md §3.1``：当 ``hook_request_budget_seconds``
-        配置为正数时，整个钩子被 ``asyncio.wait_for`` 包裹，超时即降级放行
-        （本轮无记忆注入），绝不拖死全轮对话。默认值 0 = 关闭，完全向后兼容。
+        插件自身处理预算最多为 1 秒，不含记忆 Provider 的模型调用等待。
         """
-        if not await self.service.initialize_database():
-            return
-        budget = self.service.config.float("hook_request_budget_seconds", 0.0)
-        if budget <= 0:
+        budget = bounded_memory_hook_budget_seconds(
+            self.service.config.float(
+                "hook_request_budget_seconds",
+                MAX_MEMORY_HOOK_BUDGET_SECONDS,
+            )
+        )
+        stage = "database_init"
+
+        async def initialize_and_handle_request() -> None:
+            nonlocal stage
+            if not await self.service.initialize_database():
+                return
+            stage = "memory_hook"
             await self.service.handle_llm_request(event, req)
-            return
+
         try:
-            await asyncio.wait_for(
-                self.service.handle_llm_request(event, req),
-                timeout=budget,
+            await await_with_memory_hook_budget(
+                initialize_and_handle_request(),
+                budget,
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "[MemoryCompanion] on_llm_request 钩子超时 %.1fs，本轮降级放行（无记忆注入）",
+                "[MemoryCompanion] on_llm_request 处理预算耗尽 stage=%s budget=%.1fs，本轮放行",
+                stage,
                 budget,
             )
         except Exception:

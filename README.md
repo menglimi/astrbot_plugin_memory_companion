@@ -6,10 +6,14 @@
 
 - 插件名：`astrbot_plugin_memory_companion`
 - 中文名：`我会牢牢记住你`
-- 版本：`2.3.2`
+- 版本：`2.3.3`
 - 适配平台：`aiocqhttp`
 - AstrBot 版本：`>=4.22.0`
 - 编码要求：UTF-8
+
+## 2.3.3 延迟预算与删除恢复
+
+记忆插件自身处理本轮对话默认最多 1 秒，嵌入与重排各自最多等 2 秒且不计入这 1 秒；同步 Provider 不再阻塞事件循环。面板删除记忆失败时返回 503 与真实原因，记忆保持原样。核心记忆与近期时间线读取改用独立连接，不再排在写事务后面。未闭环话题默认 30 天过期，同一窗口近期提过的不再重复复述；`owner_bot_id` 等于平台名时不再被当成具体 Bot。升级后重载插件。
 
 ## 2.3.2 注入记录可见性修复
 
@@ -558,6 +562,14 @@ blocked_count: ...
 - `actual_injection`：最终进入主链的真实记忆包。
 
 ## 常见问题
+
+### 删除记忆报 `unable to open database file` / 面板提示 500 怎么办？
+
+SQLite 把「库文件不存在、目录不可写、被别的进程占用、文件不是数据库」都报成同一句 `unable to open database file`，所以插件现在会在写失败时自动重连并重试（3 次，50/200/500ms 退避），仍然失败时把真实原因写进返回信息：
+
+- 面板返回 503 并显示中文原因与路径，记忆**不会被删除**；`/stats` 的 `wal.last_recovery_failure` 和「运维诊断」的警告里保留原因码（如 `database_directory_not_writable`、`database_file_missing`、`database_schema_missing`）。
+- 先检查数据目录 `data/plugin_data/astrbot_plugin_memory_companion/` 是否存在且可写，`memory_companion.db` 是否被同步盘、杀毒软件或备份任务占用；让这些工具排除该目录后再重试。
+- 库文件丢失时不要新建空文件：从备份恢复 `memory_companion.db` 再重启插件，插件不会用空库替换现有记忆。
 
 ### 为什么没有注入记忆？
 

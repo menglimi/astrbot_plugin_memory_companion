@@ -124,6 +124,42 @@ class AsyncDatabaseStartupTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(service.store._closed)
         self.assertFalse(await service.initialize_database())
 
+    async def test_cancelled_waiter_reuses_inflight_initialization(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        service = MemoryCompanionService(
+            context=None,
+            config={},
+            plugin_root=ROOT,
+            data_dir=Path(temp_dir.name),
+            defer_database_initialization=True,
+        )
+        self.addCleanup(service.close)
+        initialize = service.store.initialize
+        started = threading.Event()
+        release = threading.Event()
+        calls = 0
+
+        def block_initialization() -> None:
+            nonlocal calls
+            calls += 1
+            started.set()
+            if not release.wait(5.0):
+                raise TimeoutError("test initialization was not released")
+            initialize()
+
+        service.store.initialize = block_initialization
+        first_waiter = asyncio.create_task(service.initialize_database())
+        self.assertTrue(await asyncio.to_thread(started.wait, 2.0))
+        first_waiter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await first_waiter
+
+        second_waiter = asyncio.create_task(service.initialize_database())
+        release.set()
+        self.assertTrue(await asyncio.wait_for(second_waiter, timeout=10.0))
+        self.assertEqual(1, calls)
+
 
 if __name__ == "__main__":
     unittest.main()

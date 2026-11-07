@@ -40,6 +40,12 @@ class ConfigSchemaCoverageTests(unittest.TestCase):
             with self.subTest(section=section):
                 self.assertTrue(keys <= set(schema[section]["items"]))
 
+        hook_budget = schema["memory_injection"]["items"]["hook_request_budget_seconds"]
+        self.assertEqual("float", hook_budget["type"])
+        self.assertEqual(1.0, hook_budget["default"])
+        self.assertEqual(2000, schema["retrieval_advanced"]["items"]["embedding_timeout_ms"]["default"])
+        self.assertEqual(2000, schema["retrieval_advanced"]["items"]["rerank_timeout_ms"]["default"])
+
     def test_unconsumed_controls_are_not_exposed(self) -> None:
         schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
         self.assertFalse(

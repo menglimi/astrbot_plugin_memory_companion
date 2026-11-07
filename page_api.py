@@ -9,6 +9,7 @@ import inspect
 import logging
 import mimetypes
 import re
+import sqlite3
 import sys
 from datetime import datetime
 from io import BytesIO
@@ -30,6 +31,7 @@ from .core.coordination_status import build_coordination_status, project_p6_stat
 from .core.identity import normalize_session_context_fields, parse_scope_from_session
 from .core.memory_atom import DURABILITY_LEVELS, SENSITIVITY_LEVELS, VALIDITY_STATUSES
 from .core.models import SessionContext, clean_text
+from .core.store import MemoryStoreUnavailableError
 from .companion_page_bridge import (
     COMPANION_PLUGIN_ID,
     CompanionPageBridge,
@@ -1135,10 +1137,49 @@ class PluginPageApi:
             logger.exception("记忆 Bot 归属修正失败")
             return self._err(f"记忆 Bot 归属修正失败: {exc}", 500)
 
+    @staticmethod
+    def _database_unavailable_message(exc: BaseException) -> str:
+        message = clean_text(exc, 900) or "记忆库暂时无法写入"
+        reason = clean_text(getattr(exc, "reason", ""), 80)
+        if reason and reason not in message:
+            return f"{message}（{reason}）"
+        return message
+
     async def memory_delete(self):
         payload = await self._json()
-        ok = await self.plugin.service.store.delete_memory(clean_text(payload.get("id"), 120))
-        return self._ok({"deleted": ok})
+        memory_id = clean_text(payload.get("id"), 120)
+        if not memory_id:
+            return self._err("missing id", 400)
+        try:
+            ok = await self.plugin.service.store.delete_memory(memory_id)
+        except MemoryStoreUnavailableError as exc:
+            # A bare 500 with no body is what made this look like a random
+            # plugin bug: the memory stayed in place and the panel only said
+            # "Internal server error".  Report what actually blocked the write
+            # and keep the original diagnostic for the operations page.
+            logger.warning(
+                "[MemoryCompanion] 删除记忆时记忆库不可写 id=%s reason=%s 诊断=%s",
+                memory_id,
+                exc.reason or "unknown",
+                json.dumps(exc.diagnostics, ensure_ascii=False),
+            )
+            return self._err(
+                f"删除失败：{self._database_unavailable_message(exc)}",
+                503,
+                extra={
+                    "code": "database_unavailable",
+                    "reason": exc.reason or "database_unavailable",
+                    "detail": exc.diagnostics,
+                },
+            )
+        except sqlite3.Error as exc:
+            logger.exception("[MemoryCompanion] 删除记忆时 SQLite 写入异常 id=%s", memory_id)
+            return self._err(
+                f"删除失败：记忆库写入异常（{clean_text(exc, 300)}），原记忆未被删除",
+                503,
+                extra={"code": "database_error"},
+            )
+        return self._ok({"deleted": bool(ok)})
 
     async def memory_visibility(self):
         payload = await self._json()
@@ -1211,7 +1252,30 @@ class PluginPageApi:
         memory_id = clean_text(payload.get("id"), 120)
         if not memory_id:
             return self._err("missing id", 400)
-        result = await self.plugin.service.delete_core_memory_block(memory_id)
+        try:
+            result = await self.plugin.service.delete_core_memory_block(memory_id)
+        except MemoryStoreUnavailableError as exc:
+            logger.warning(
+                "[MemoryCompanion] 删除核心记忆时记忆库不可写 id=%s reason=%s",
+                memory_id,
+                exc.reason or "unknown",
+            )
+            return self._err(
+                f"删除失败：{self._database_unavailable_message(exc)}",
+                503,
+                extra={
+                    "code": "database_unavailable",
+                    "reason": exc.reason or "database_unavailable",
+                    "detail": exc.diagnostics,
+                },
+            )
+        except sqlite3.Error as exc:
+            logger.exception("[MemoryCompanion] 删除核心记忆时 SQLite 写入异常 id=%s", memory_id)
+            return self._err(
+                f"删除失败：记忆库写入异常（{clean_text(exc, 300)}）",
+                503,
+                extra={"code": "database_error"},
+            )
         if result.get("ok"):
             return self._ok({"deleted": True})
         code = clean_text(result.get("code"), 80) or "core_memory_delete_failed"
@@ -1596,14 +1660,14 @@ class PluginPageApi:
                     "rerank_provider_id": str(config.get("retrieval.rerank_provider_id", "") or ""),
                     "rerank_candidate_multiplier": config.int("retrieval.rerank_candidate_multiplier", 5),
                     "rerank_candidate_limit": config.int("retrieval.rerank_candidate_limit", 32),
-                    "rerank_timeout_ms": config.int("retrieval.rerank_timeout_ms", 1200),
+                    "rerank_timeout_ms": config.int("retrieval.rerank_timeout_ms", 2000),
                     "embedding_enabled": config.bool("retrieval.embedding_enabled", False),
                     "embedding_provider_id": str(config.get("retrieval.embedding_provider_id", "") or ""),
                     "embedding_candidate_limit": config.int("retrieval.embedding_candidate_limit", 1200),
                     "embedding_top_k": config.int("retrieval.embedding_top_k", 32),
                     "embedding_score_threshold": config.float("retrieval.embedding_score_threshold", 0.34),
                     "embedding_weight": config.float("retrieval.embedding_weight", 0.55),
-                    "embedding_timeout_ms": config.int("retrieval.embedding_timeout_ms", 5000),
+                    "embedding_timeout_ms": config.int("retrieval.embedding_timeout_ms", 2000),
                     "embedding_max_text_chars": config.int("retrieval.embedding_max_text_chars", 1200),
                     "embedding_backfill_enabled": config.bool("retrieval.embedding_backfill_enabled", True),
                     "embedding_backfill_batch_size": config.int("retrieval.embedding_backfill_batch_size", 50),
@@ -1766,12 +1830,12 @@ class PluginPageApi:
             "embedding_provider_id": clean_text(payload.get("embedding_provider_id"), 160),
         }
         advanced_values = {
-            "rerank_timeout_ms": max(0, self._int(payload.get("rerank_timeout_ms"), 1200)),
+            "rerank_timeout_ms": max(0, self._int(payload.get("rerank_timeout_ms"), 2000)),
             "embedding_candidate_limit": max(1, self._int(payload.get("embedding_candidate_limit"), 1200)),
             "embedding_top_k": max(1, self._int(payload.get("embedding_top_k"), 32)),
             "embedding_score_threshold": max(0.0, min(1.0, self._float(payload.get("embedding_score_threshold"), 0.34))),
             "embedding_weight": max(0.0, min(2.0, self._float(payload.get("embedding_weight"), 0.55))),
-            "embedding_timeout_ms": max(0, self._int(payload.get("embedding_timeout_ms"), 5000)),
+            "embedding_timeout_ms": max(0, self._int(payload.get("embedding_timeout_ms"), 2000)),
             "embedding_max_text_chars": max(200, self._int(payload.get("embedding_max_text_chars"), 1200)),
             "embedding_backfill_enabled": bool(payload.get("embedding_backfill_enabled", True)),
             "embedding_backfill_batch_size": max(1, self._int(payload.get("embedding_backfill_batch_size"), 50)),
@@ -3253,8 +3317,11 @@ class PluginPageApi:
         return {key: payload[key] for key in fields if key in payload}
 
     @staticmethod
-    def _err(message: str, status: int = 500):
-        response = jsonify({"success": False, "error": message})
+    def _err(message: str, status: int = 500, extra: dict[str, Any] | None = None):
+        body: dict[str, Any] = {"success": False, "error": message}
+        if extra:
+            body.update(extra)
+        response = jsonify(body)
         response.status_code = status
         return response
 

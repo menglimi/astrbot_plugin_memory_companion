@@ -8,7 +8,7 @@ rows and legacy rows whose governance values still live in metadata.
 
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .models import MemoryRecord, SessionContext, clean_text, clamp_float
@@ -25,6 +25,9 @@ HALF_LIFE_DAYS = {
     "durable": 730.0,
     "pinned": math.inf,
 }
+OPEN_LOOP_DEFAULT_TTL = timedelta(days=30)
+OPEN_LOOP_MEMORY_TYPES = frozenset({"open_loop", "promise", "todo_memory", "emotional_debt"})
+OPEN_LOOP_TAGS = frozenset({"open_loop", "promise", "todo", "unfinished", "emotional_debt"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +49,51 @@ def _field(memory: MemoryRecord, name: str, default: Any = "") -> Any:
     if value not in (None, ""):
         return value
     return _metadata(memory).get(name, default)
+
+
+def is_open_loop_candidate(memory: MemoryRecord) -> bool:
+    if clean_text(getattr(memory, "memory_type", ""), 80).lower() in OPEN_LOOP_MEMORY_TYPES:
+        return True
+    metadata = _metadata(memory)
+    tags = {clean_text(tag, 64).lower() for tag in (getattr(memory, "tags", None) or [])}
+    if tags & OPEN_LOOP_TAGS:
+        return True
+    for key in ("open_loop_weight", "promise_weight", "emotional_debt_weight"):
+        try:
+            if float(metadata.get(key) or 0.0) >= 0.30:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def open_loop_expired(memory: MemoryRecord, *, now: datetime | None = None) -> bool:
+    if not is_open_loop_candidate(memory):
+        return False
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    metadata = _metadata(memory)
+    explicit_ends = [
+        clean_text(_field(memory, "valid_to", ""), 96),
+        clean_text(metadata.get("expires_at"), 96),
+    ]
+    explicit_ends = [value for value in explicit_ends if value]
+    if explicit_ends:
+        parsed = [_moment(value) for value in explicit_ends]
+        if any(value is None for value in parsed):
+            return True
+        return current >= min(value for value in parsed if value is not None)
+    created = _moment(getattr(memory, "created_at", ""))
+    occurred = _moment(getattr(memory, "occurred_at", ""))
+    updated = _moment(getattr(memory, "updated_at", ""))
+    base = created or occurred or updated
+    return base is not None and current >= base + OPEN_LOOP_DEFAULT_TTL
+
+
+def _is_dedicated_open_loop(memory: MemoryRecord) -> bool:
+    if clean_text(getattr(memory, "memory_type", ""), 80).lower() in OPEN_LOOP_MEMORY_TYPES:
+        return True
+    tags = {clean_text(tag, 64).lower() for tag in (getattr(memory, "tags", None) or [])}
+    return bool(tags & OPEN_LOOP_TAGS)
 
 
 def _moment(value: Any) -> datetime | None:
@@ -99,16 +147,19 @@ def evaluate_memory_lifecycle(
         return LifecycleScore(False, "validity=not_started", 0.0, 0.0, 0.0)
     if valid_to is not None and current >= valid_to:
         return LifecycleScore(False, "validity=expired", 0.0, 0.0, 0.0)
+    if _is_dedicated_open_loop(memory) and open_loop_expired(memory, now=current):
+        return LifecycleScore(False, "validity=open_loop_expired", 0.0, 0.0, 0.0)
 
     sensitivity = clean_text(_field(memory, "sensitivity", "internal"), 32).lower() or "internal"
     if sensitivity == "restricted":
         return LifecycleScore(False, "sensitivity=restricted", 0.0, 0.0, 0.0)
 
     owner_bot_id = clean_text(_field(memory, "owner_bot_id", ""), 160)
+    platform_id = clean_text(_field(memory, "platform", ""), 160)
+    if owner_bot_id and platform_id and owner_bot_id.casefold() == platform_id.casefold():
+        owner_bot_id = ""
     context_bot_id = clean_text(getattr(ctx, "bot_id", ""), 160)
-    # Empty or ``self`` owner means no specific bot owner. Keep that memory
-    # visible while still diagnosing a missing runtime bot context for all
-    # other explicit owners.
+    # Empty, ``self``, or a platform label does not identify a specific bot.
     if owner_bot_id and owner_bot_id != "self" and not context_bot_id:
         return LifecycleScore(False, "owner_bot_context_missing", 0.0, 0.0, 0.0)
     if owner_bot_id and owner_bot_id != "self" and owner_bot_id != context_bot_id:
@@ -154,6 +205,9 @@ __all__ = [
     "HALF_LIFE_DAYS",
     "LifecycleScore",
     "NON_RETRIEVABLE_STATUSES",
+    "OPEN_LOOP_DEFAULT_TTL",
     "apply_lifecycle_score",
     "evaluate_memory_lifecycle",
+    "is_open_loop_candidate",
+    "open_loop_expired",
 ]

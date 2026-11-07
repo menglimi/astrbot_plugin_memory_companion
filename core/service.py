@@ -13,6 +13,7 @@ import hashlib
 import inspect
 import secrets
 import re
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -56,6 +57,7 @@ from .config import ConfigView
 from .context_orchestrator import RetrievalIntent, RetrievalIntentBuilder
 from .continuity import build_context_snapshot
 from .memory_revision import current_memory, memory_ref
+from .memory_lifecycle import is_open_loop_candidate, open_loop_expired
 from .emotion_event_contract import normalize_emotion_event
 from .emotion_targeting import memory_emotion_refs
 from .identity import IdentityResolver, looks_like_command, maybe_await, normalize_session_context_fields, session_target_id
@@ -93,6 +95,11 @@ from .provenance_store import ProvenanceLedger
 from .portrait_service import PortraitService
 from .qq_history import QQHistoryReader
 from .reply_chain import ReplyChainResolver
+from .latency import (
+    MAX_MODEL_CALL_TIMEOUT_MS,
+    await_with_timeout,
+    bounded_model_call_timeout_ms,
+)
 from .retrieval import RetrievalEngine
 from .store import MemoryStore
 from .source_query import query_sources, source_visible
@@ -284,12 +291,13 @@ class _HookStageTimer:
     关闭时几乎零开销。
     """
 
-    __slots__ = ("enabled", "_marks", "_last")
+    __slots__ = ("enabled", "_marks", "_last", "_started")
 
     def __init__(self, enabled: bool) -> None:
         self.enabled = bool(enabled)
         self._marks: list[tuple[str, int]] = []
         self._last = time.perf_counter_ns()
+        self._started = self._last
 
     def mark(self, name: str) -> None:
         if not self.enabled:
@@ -298,13 +306,23 @@ class _HookStageTimer:
         self._marks.append((name, int(round((now - self._last) / 1_000_000))))
         self._last = now
 
+    def record_duration(self, name: str, elapsed_ns: int) -> None:
+        if self.enabled:
+            self._marks.append((name, int(round(elapsed_ns / 1_000_000))))
+
+    def checkpoint(self) -> None:
+        if self.enabled:
+            self._last = time.perf_counter_ns()
+
     def summary(self) -> str:
         if not self._marks:
             return "no_stages"
         return " ".join(f"{name}={ms}ms" for name, ms in self._marks)
 
     def total_ms(self) -> int:
-        return sum(ms for _, ms in self._marks)
+        if not self.enabled:
+            return 0
+        return int(round((time.perf_counter_ns() - self._started) / 1_000_000))
 
 
 class MemoryCompanionService:
@@ -344,6 +362,7 @@ class MemoryCompanionService:
         )
         self._database_init_lock = threading.Lock()
         self._database_initialized = False
+        self._database_init_task: asyncio.Task[bool] | None = None
         if not defer_database_initialization:
             try:
                 self._initialize_database_sync()
@@ -1002,14 +1021,32 @@ class MemoryCompanionService:
         stage_timer = _HookStageTimer(
             self.config.bool("memory_injection.debug_stage_timing_enabled", False)
         )
+
+        ctx: SessionContext | None = None
+
+        async def await_hook_stage(awaitable: Any, name: str) -> Any:
+            try:
+                return await self._await_profiled_stage(awaitable, stage_timer, name)
+            except asyncio.CancelledError:
+                self._emit_hook_stage_timing(
+                    stage_timer,
+                    ctx,
+                    note=f"cancelled:{name}",
+                )
+                raise
+
         self._ensure_lifecycle_maintenance_dispatcher()
         self._ensure_wal_checkpoint_loop()
         self._ensure_acl_projection_reconcile_loop()
-        ctx = await self.identity.resolve_event_context(event)
+        ctx = await await_hook_stage(
+            self.identity.resolve_event_context(event), "identity"
+        )
         stage_timer.mark("identity")
         capture_runtime = getattr(self, "capture", None)
         if capture_runtime is not None:
-            source_receipt = await capture_runtime.incoming(event, ctx)
+            source_receipt = await await_hook_stage(
+                capture_runtime.incoming(event, ctx), "capture_incoming"
+            )
             if source_receipt and source_receipt.get("status") == "committed" and source_receipt.get("source_state") == "current":
                 from .source_evidence import remember_source_reads
                 remember_source_reads(event, ctx, [source_receipt])
@@ -1040,17 +1077,23 @@ class MemoryCompanionService:
         capture_enabled = self._scope_feature_enabled(ctx, "capture")
         # note_identity（身份双写）已移入 _capture_async 后台执行，不阻塞请求关键路径。
         stage_timer.mark("note_identity")
-        reply_chain = await self._reply_chain_for_event(event)
+        reply_chain = await await_hook_stage(
+            self._reply_chain_for_event(event), "reply_chain"
+        )
         stage_timer.mark("reply_chain")
 
         if capture_enabled:
-            await self._apply_user_reaction_feedback(ctx)
+            await await_hook_stage(
+                self._apply_user_reaction_feedback(ctx), "feedback"
+            )
             self._update_address_evolution(ctx, ctx.message_text or "")
         stage_timer.mark("feedback")
 
         self._hook_stage_timer = stage_timer
         try:
-            await self.inject_memories(ctx, req, event=event)
+            await await_hook_stage(
+                self.inject_memories(ctx, req, event=event), "memory_injection"
+            )
         except Exception as exc:
             logger.warning(
                 "[MemoryCompanion] 记忆注入失败，已放行本轮 LLM 请求: session=%s error=%s",
@@ -1078,6 +1121,61 @@ class MemoryCompanionService:
             )
         stage_timer.mark("finalize")
         self._emit_hook_stage_timing(stage_timer, ctx, note="ok")
+
+    @staticmethod
+    async def _await_profiled_stage(
+        awaitable: Any,
+        stage_timer: _HookStageTimer | None,
+        name: str,
+    ) -> Any:
+        try:
+            return await awaitable
+        except asyncio.CancelledError:
+            if stage_timer is not None:
+                stage_timer.mark(f"{name}_cancelled")
+            raise
+
+    async def _load_static_memory_context(
+        self,
+        ctx: SessionContext,
+        stage_timer: _HookStageTimer | None,
+    ) -> tuple[list[MemoryRecord], str, str]:
+        stages = (
+            ("core_memories", self.core_memories_for_context(ctx)),
+            ("recent_fact", self._recent_fact_guard_context(ctx)),
+            ("cross_window", self._recent_cross_window_context(ctx)),
+        )
+
+        async def run_stage(name: str, awaitable: Any) -> Any:
+            started = time.perf_counter_ns() if stage_timer and stage_timer.enabled else None
+            try:
+                result = await self._await_profiled_stage(awaitable, None, name)
+            except asyncio.CancelledError:
+                if started is not None:
+                    stage_timer.record_duration(
+                        f"{name}_cancelled", time.perf_counter_ns() - started
+                    )
+                raise
+            if started is not None:
+                stage_timer.record_duration(name, time.perf_counter_ns() - started)
+            return result
+
+        tasks = [
+            asyncio.create_task(run_stage(name, awaitable), name=f"memory-hook-{name}")
+            for name, awaitable in stages
+        ]
+        try:
+            results = await asyncio.gather(*tasks)
+            return results[0], results[1], results[2]
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        finally:
+            if stage_timer is not None:
+                stage_timer.checkpoint()
 
     def _emit_hook_stage_timing(
         self,
@@ -3146,6 +3244,41 @@ class MemoryCompanionService:
             for item in selected
         ]
 
+    async def _recently_injected_memory_ids(
+        self,
+        *,
+        session_id: str,
+        scope: str,
+        now: datetime | None = None,
+    ) -> set[str]:
+        if not session_id:
+            return set()
+        reader = getattr(getattr(self, "store", None), "recent_injection_logs", None)
+        if not callable(reader):
+            return set()
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        cutoff = current - timedelta(days=3)
+        try:
+            logs = await reader(limit=48, scope=scope, session_id=session_id)
+        except Exception:
+            return set()
+        selected: set[str] = set()
+        for row in logs or []:
+            created = clean_text(row.get("created_at"), 96)
+            try:
+                logged_at = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                if logged_at.tzinfo is None:
+                    logged_at = logged_at.replace(tzinfo=timezone.utc)
+                logged_at = logged_at.astimezone(timezone.utc)
+            except (TypeError, ValueError):
+                continue
+            if not cutoff <= logged_at <= current:
+                continue
+            ids = row.get("selected_memory_ids")
+            if isinstance(ids, (list, tuple)):
+                selected.update(clean_text(memory_id, 160) for memory_id in ids if clean_text(memory_id, 160))
+        return selected
+
     async def bridge_search_open_loops(self, *, session_id: str = "", limit: int = 3) -> list[dict[str, Any]]:
         """Search for unresolved open-loop / promise memories for proactive companionship."""
         ctx = SessionContext(session_id=session_id or "", scope="private")
@@ -3159,17 +3292,23 @@ class MemoryCompanionService:
             return []
         open_loops: list[dict[str, Any]] = []
         now = time.time()
+        recently_injected = await self._recently_injected_memory_ids(
+            session_id=session_id, scope="private",
+        )
         for item in results:
             memory = item.memory
             metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
             try:
                 open_loop_w = float(metadata.get("open_loop_weight") or 0.0)
                 promise_w = float(metadata.get("promise_weight") or 0.0)
+                emotional_debt_w = float(metadata.get("emotional_debt_weight") or 0.0)
             except Exception:
-                open_loop_w = promise_w = 0.0
-            if max(open_loop_w, promise_w) < 0.30:
+                open_loop_w = promise_w = emotional_debt_w = 0.0
+            if max(open_loop_w, promise_w, emotional_debt_w) < 0.30 and not is_open_loop_candidate(memory):
                 continue
             if metadata.get("resolved_at"):
+                continue
+            if open_loop_expired(memory) or memory.id in recently_injected:
                 continue
             occurred = clean_text(memory.occurred_at or memory.created_at, 40)
             age_days = None
@@ -3451,7 +3590,9 @@ class MemoryCompanionService:
             "rerank_provider_id": clean_text(self.config.get("retrieval.rerank_provider_id", ""), 160),
             "rerank_candidate_multiplier": self.config.int("retrieval.rerank_candidate_multiplier", 5),
             "rerank_candidate_limit": self.config.int("retrieval.rerank_candidate_limit", 32),
-            "rerank_timeout_ms": self.config.int("retrieval.rerank_timeout_ms", 1200),
+            "rerank_timeout_ms": bounded_model_call_timeout_ms(
+                self.config.int("retrieval.rerank_timeout_ms", MAX_MODEL_CALL_TIMEOUT_MS)
+            ),
             "latency_budget_ms": self.config.int("retrieval_advanced.recall_latency_budget_ms", 0),
             "query_vector_cache_ttl_seconds": self.config.float(
                 "retrieval_advanced.query_vector_cache_ttl_seconds", 0.0
@@ -3780,7 +3921,9 @@ class MemoryCompanionService:
             rerank_provider_id=provider_id,
             rerank_candidate_multiplier=self.config.int("retrieval.rerank_candidate_multiplier", 5),
             rerank_candidate_limit=self.config.int("retrieval.rerank_candidate_limit", 32),
-            rerank_timeout_ms=self.config.int("retrieval.rerank_timeout_ms", 1200),
+            rerank_timeout_ms=bounded_model_call_timeout_ms(
+                self.config.int("retrieval.rerank_timeout_ms", MAX_MODEL_CALL_TIMEOUT_MS)
+            ),
             latency_budget_ms=self.config.int("retrieval_advanced.recall_latency_budget_ms", 0),
             query_vector_cache_ttl_seconds=self.config.float(
                 "retrieval_advanced.query_vector_cache_ttl_seconds", 0.0
@@ -5104,13 +5247,26 @@ class MemoryCompanionService:
         else:
             text = clean_text(text, max(200, self.config.int("retrieval.embedding_max_text_chars", 1200)))
 
-        async def wait_result(value: Any) -> Any:
-            if inspect.isawaitable(value):
-                timeout_ms = self._embedding_timeout_ms()
-                if timeout_ms > 0:
-                    return await asyncio.wait_for(value, timeout=timeout_ms / 1000.0)
-                return await value
-            return value
+        timeout_ms = self._embedding_timeout_ms()
+        deadline = time.monotonic() + timeout_ms / 1000.0
+
+        async def wait_result(method: Any, *args: Any, **kwargs: Any) -> Any:
+            async def invoke() -> Any:
+                is_async = inspect.iscoroutinefunction(method) or inspect.iscoroutinefunction(
+                    getattr(method, "__call__", None)
+                )
+                if is_async:
+                    result = method(*args, **kwargs)
+                else:
+                    result = await asyncio.to_thread(method, *args, **kwargs)
+                if inspect.isawaitable(result):
+                    return await result
+                return result
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            return await await_with_timeout(invoke(), remaining)
 
         get_embedding = getattr(provider, "get_embedding", None)
         get_embeddings = getattr(provider, "get_embeddings", None)
@@ -5123,7 +5279,7 @@ class MemoryCompanionService:
         try:
             if callable(get_embedding):
                 called_provider = True
-                payload = await wait_result(get_embedding(text))
+                payload = await wait_result(get_embedding, text)
                 success = True
                 return (
                     self._coerce_single_embedding_response(payload)
@@ -5132,7 +5288,7 @@ class MemoryCompanionService:
 
             if callable(get_embeddings):
                 called_provider = True
-                payload = await wait_result(get_embeddings([text]))
+                payload = await wait_result(get_embeddings, [text])
                 success = True
                 return (
                     self._coerce_single_embedding_response(payload)
@@ -5142,14 +5298,18 @@ class MemoryCompanionService:
             if callable(get_embeddings_batch):
                 called_provider = True
                 if strict_input:
-                    payload = await wait_result(get_embeddings_batch([text]))
+                    payload = await wait_result(get_embeddings_batch, [text])
                 else:
                     try:
                         payload = await wait_result(
-                            get_embeddings_batch([text], batch_size=1, tasks_limit=1, max_retries=1)
+                            get_embeddings_batch,
+                            [text],
+                            batch_size=1,
+                            tasks_limit=1,
+                            max_retries=1,
                         )
                     except TypeError:
-                        payload = await wait_result(get_embeddings_batch([text]))
+                        payload = await wait_result(get_embeddings_batch, [text])
                 success = True
                 return (
                     self._coerce_single_embedding_response(payload)
@@ -5176,13 +5336,9 @@ class MemoryCompanionService:
                 )
 
     def _embedding_timeout_ms(self) -> int:
-        timeout_ms = self.config.int("retrieval.embedding_timeout_ms", 5000)
-        if timeout_ms <= 0:
-            return 0
-        # 1.4.1 的默认 1500ms 对不少 OpenAI 兼容 embedding 公益站过紧，API 最终成功时插件已先超时。
-        if timeout_ms == 1500:
-            return 5000
-        return timeout_ms
+        return bounded_model_call_timeout_ms(
+            self.config.int("retrieval.embedding_timeout_ms", MAX_MODEL_CALL_TIMEOUT_MS)
+        )
 
     @staticmethod
     def _describe_exception(error: BaseException) -> str:
@@ -6927,7 +7083,15 @@ class MemoryCompanionService:
         if normalized_action == "delete":
             if existing is None:
                 return {"ok": False, "code": "not_found"}
-            return await self.delete_core_memory_block(existing.id)
+            try:
+                return await self.delete_core_memory_block(existing.id)
+            except sqlite3.OperationalError as exc:
+                # The model should be able to tell the user the block was kept.
+                return {
+                    "ok": False,
+                    "code": "database_unavailable",
+                    "error": clean_text(exc, 600),
+                }
 
         if not clean_text(content, 4000):
             return {"ok": False, "code": "missing_content"}
@@ -8328,7 +8492,14 @@ class MemoryCompanionService:
                     ],
                 }
 
-        deleted = await self.store.delete_memory(record.id)
+        try:
+            deleted = await self.store.delete_memory(record.id)
+        except sqlite3.OperationalError as exc:
+            return {
+                "ok": False,
+                "error": "database unavailable, note kept",
+                "detail": clean_text(exc, 600),
+            }
         if not deleted:
             return {"ok": False, "error": "note not found"}
         return {
@@ -9392,7 +9563,7 @@ class MemoryCompanionService:
         results = self._flatten_slot_map(slot_map)
 
         await self._add_time_window_timeline_slot(ctx, slot_map, time_intent)
-        slot_map = self._apply_memory_expression_policy(
+        slot_map = await self._apply_memory_expression_policy(
             ctx,
             slot_map,
             decision,
@@ -9513,7 +9684,11 @@ class MemoryCompanionService:
         cache = getattr(self, "_injection_cache", None)
         if isinstance(cache, dict):
             cache.pop(ctx.session_id, None)
-        p5_gate = await self._p5_gate(event=event, sink="memory_recall")
+        p5_gate = await self._await_profiled_stage(
+            self._p5_gate(event=event, sink="memory_recall"),
+            stage_timer,
+            "p5_gate_wait",
+        )
         if stage_timer:
             stage_timer.mark("p5_gate")
         if not p5_gate.get("ok"):
@@ -9546,14 +9721,16 @@ class MemoryCompanionService:
             core_memories = []
             recent_fact_context = ""
             recent_cross_window_context = ""
+            if stage_timer:
+                stage_timer.mark("core_memories")
+                stage_timer.mark("recent_fact")
+                stage_timer.mark("cross_window")
         else:
-            core_memories = await self.core_memories_for_context(ctx)
-            recent_fact_context = await self._recent_fact_guard_context(ctx)
-            recent_cross_window_context = await self._recent_cross_window_context(ctx)
-        if stage_timer:
-            stage_timer.mark("core_memories")
-            stage_timer.mark("recent_fact")
-            stage_timer.mark("cross_window")
+            (
+                core_memories,
+                recent_fact_context,
+                recent_cross_window_context,
+            ) = await self._load_static_memory_context(ctx, stage_timer)
         core_memory_max_chars = self.config.int("core_memory.max_chars", 800)
         isolate_low_information = False
         isolate_topic_shift = False
@@ -9726,11 +9903,15 @@ class MemoryCompanionService:
             }
         else:
             retrieval_top_k = self._retrieval_top_k_for_query(ctx, retrieval_query, time_intent=time_intent)
-            results, blocked, slot_map = await self.search_context_slots(
-                retrieval_query,
-                ctx,
-                retrieval_top_k,
-                time_intent=time_intent if time_intent.active else None,
+            results, blocked, slot_map = await self._await_profiled_stage(
+                self.search_context_slots(
+                    retrieval_query,
+                    ctx,
+                    retrieval_top_k,
+                    time_intent=time_intent if time_intent.active else None,
+                ),
+                stage_timer,
+                "retrieve",
             )
             retrieval_path_info = dict(self._last_retrieval_path_info or {})
             retrieval_path_info["route_layer"] = decision.layer
@@ -9754,7 +9935,7 @@ class MemoryCompanionService:
         results = self._flatten_slot_map(slot_map)
 
         await self._add_time_window_timeline_slot(ctx, slot_map, time_intent)
-        slot_map = self._apply_memory_expression_policy(
+        slot_map = await self._apply_memory_expression_policy(
             ctx,
             slot_map,
             decision,
@@ -12203,7 +12384,7 @@ class MemoryCompanionService:
                 items.append(item)
         return items
 
-    def _apply_memory_expression_policy(
+    async def _apply_memory_expression_policy(
         self,
         ctx: SessionContext,
         slot_map: dict[str, list[Any]],
@@ -12214,6 +12395,18 @@ class MemoryCompanionService:
     ) -> dict[str, list[Any]]:
         if not slot_map:
             return slot_map
+        text = clean_text(query_text or ctx.message_text, 800)
+        recently_injected = (
+            await self._recently_injected_memory_ids(session_id=ctx.session_id, scope=ctx.scope)
+            if slot_map.get("open_loop") else set()
+        )
+        open_loop_followup = RetrievalEngine._looks_like_open_loop_followup(text)
+        relevance_engine = None
+        if slot_map.get("open_loop") and text:
+            try:
+                relevance_engine = self._retrieval_validation_engine()
+            except Exception:
+                relevance_engine = None
         result: dict[str, list[Any]] = {}
         for slot, items in slot_map.items():
             annotated: list[Any] = []
@@ -12222,6 +12415,22 @@ class MemoryCompanionService:
                 if memory is None:
                     annotated.append(item)
                     continue
+                metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+                if slot == "open_loop" and (
+                    metadata.get("resolved_at")
+                    or clean_text(metadata.get("open_loop_status") or metadata.get("status"), 40).lower()
+                    in {"resolved", "closed", "completed"}
+                    or open_loop_expired(memory)
+                ):
+                    continue
+                open_loop_related = False
+                if slot == "open_loop":
+                    if relevance_engine is not None:
+                        try:
+                            open_loop_related = relevance_engine._strong_lexical_match(text, memory)
+                        except Exception:
+                            open_loop_related = False
+                    open_loop_related = open_loop_related or open_loop_followup
                 expression, reason = self._memory_expression_decision(
                     ctx,
                     memory,
@@ -12230,6 +12439,9 @@ class MemoryCompanionService:
                     decision,
                     time_intent,
                     query_text=query_text,
+                    open_loop_related=open_loop_related,
+                    open_loop_followup=open_loop_followup,
+                    recently_injected=memory.id in recently_injected,
                 )
                 annotated.append(
                     SearchResult(
@@ -12251,6 +12463,9 @@ class MemoryCompanionService:
         time_intent: TimeIntent,
         *,
         query_text: str = "",
+        open_loop_related: bool = False,
+        open_loop_followup: bool = False,
+        recently_injected: bool = False,
     ) -> tuple[str, str]:
         memory_type = clean_text(memory.memory_type, 80).lower()
         reality = clean_text(memory.reality_level, 80).lower()
@@ -12261,13 +12476,19 @@ class MemoryCompanionService:
 
         if confidence < 0.5:
             return "uncertain", "low_confidence"
-        # 总闸：关闭 tone 表达抽象后，跳过后续全部判定，所有记忆直接以正文注入
-        # （candidate）。默认开启保持作者逻辑；关闭后 conversation_summary 等
-        # 记忆主力不再被折叠成「语气提示」占位，模型可直接引用正文。
-        if not self.config.bool("memory_injection.enable_tone_abstraction", True):
-            return ("candidate", "tone_abstraction_disabled")
         text = clean_text(query_text or ctx.message_text, 800)
         explicit_memory = self._message_is_contextual_memory_request(text) or self._message_requests_temporal_aggregate(text)
+        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+        if slot == "open_loop":
+            if metadata.get("resolved_at") or open_loop_expired(memory):
+                return "tone", "open_loop_closed_or_expired"
+            if recently_injected and not (explicit_memory or open_loop_followup):
+                return "tone", "open_loop_recently_surfaced"
+            if not explicit_memory and not open_loop_related:
+                return "tone", "open_loop_not_current_topic"
+        # 关闭语气抽象不会覆盖话头的相关性、解决状态和重复提及约束。
+        if not self.config.bool("memory_injection.enable_tone_abstraction", True):
+            return ("candidate", "tone_abstraction_disabled")
         companion_cap_reason = self._companion_memory_mention_cap(ctx, explicit_memory=explicit_memory)
         if companion_cap_reason:
             return "tone", companion_cap_reason
@@ -12277,7 +12498,6 @@ class MemoryCompanionService:
             item,
         )
         short_rest_check = self._message_is_short_rest_check(text)
-        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
         mention_policy = clean_text(metadata.get("mention_policy"), 60)
         try:
             mentionability = float(metadata.get("mentionability_score", 0.5) or 0.5)
@@ -12316,7 +12536,7 @@ class MemoryCompanionService:
                 return "tone", "open_loop_avoid_unless_asked"
             if mention_policy == "tone_only" and not explicit_memory:
                 return "tone", "open_loop_tone_only"
-            return "mention", "open_loop_or_emotional_debt"
+            return "mention", "open_loop_relevant_followup"
         if decision.layer in {"recent_context", "current_correction", "low_information", "short_context_followup"}:
             return "tone", f"route_layer:{decision.layer}"
         if decision.layer == "current_state_chat":
@@ -13566,7 +13786,13 @@ class MemoryCompanionService:
         if self._closing or self._closed:
             return False
         if not self._database_initialized:
-            initialized = await asyncio.to_thread(self._initialize_database_sync)
+            task = self._database_init_task
+            if task is None or task.done():
+                task = asyncio.create_task(asyncio.to_thread(self._initialize_database_sync))
+                self._database_init_task = task
+            # A timed-out request waiter must not cancel initialization or queue
+            # another executor thread behind the database initialization lock.
+            initialized = await asyncio.shield(task)
             if not initialized:
                 return False
         if self._closing or self._closed:

@@ -266,6 +266,39 @@ class Req029UserMemorySummaryBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("bridge_exception", broken["error_code"])
         self.assertNotIn("sensitive failure details", repr(broken))
 
+    async def test_v2_receives_only_the_exact_private_memory_summary_capability(self) -> None:
+        store = self.make_store()
+        await self.add_private_memory(store, record_id="profile", user_id="u1",
+                                      memory_type="user_profile", content="PRIVATE_SUMMARY_CONTENT")
+        v2 = object()
+        service = MemoryCompanionService.__new__(MemoryCompanionService)
+        service.config = _Config(True)
+        service.store = store
+        service.context = SimpleNamespace(get_all_stars=lambda: [SimpleNamespace(
+            star_cls=v2, star_cls_type=type(v2), root_dir_name="astrbot_plugin_private_companion_v2",
+            name="astrbot_plugin_private_companion_v2", activated=True)])
+        bridge = MemoryCompanionBridge(service)
+
+        self.assertIsNone(bridge.register_private_companion(v2))
+        capability = bridge.register_private_companion_memory_summary_reader(v2)
+        self.assertIsNotNone(capability)
+        self.assertIsNone(bridge.create_emotion_producer_context(capability, bot_id="bot-1", scope="private",
+            platform="qq", user_id="u1", session_id="qq:FriendMessage:u1"))
+        requester = bridge.create_private_companion_memory_summary_context(
+            capability, bot_id="bot-1", scope="private", platform="qq", user_id="u1",
+            session_id="qq:FriendMessage:u1")
+        self.assertIsNotNone(requester)
+        ready = await bridge.read_user_memory_summary("u1", session_id="qq:FriendMessage:u1",
+                                                      requester_context=requester)
+        self.assertTrue(ready["ok"])
+        self.assertEqual(ready["counts"]["profile"], 1)
+        self.assertNotIn("PRIVATE_SUMMARY_CONTENT", repr(ready))
+        denied = await bridge.read_user_memory_summary("u2", requester_context=requester)
+        self.assertEqual(denied["state"], "forbidden")
+        self.assertEqual(denied["counts"]["total"], 0)
+        bridge.deactivate()
+        self.assertIsNone(bridge.register_private_companion_memory_summary_reader(v2))
+
     def test_bridge_and_page_api_expose_only_the_read_only_workspace_contract(self) -> None:
         bridge_source = (ROOT / "core" / "bridge.py").read_text(encoding="utf-8")
         page_source = (ROOT / "page_api.py").read_text(encoding="utf-8")

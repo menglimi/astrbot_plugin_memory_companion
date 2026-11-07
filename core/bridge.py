@@ -121,6 +121,15 @@ class _EmotionProducerCapability:
 
 
 @dataclass(frozen=True, slots=True)
+class _PrivateMemorySummaryCapability:
+    """Count-only summary capability issued to the registered V2 plugin."""
+
+    _bridge: Any
+    _producer: Any
+    _token: object
+
+
+@dataclass(frozen=True, slots=True)
 class _EmotionPageAdminCapability:
     """Non-serializable capability bound to this bridge's Page API instance."""
 
@@ -135,6 +144,19 @@ class _EmotionProducerContext:
 
     _bridge: Any
     _capability: _EmotionProducerCapability
+    bot_id: str
+    platform: str
+    scope: str
+    session_id: str
+    user_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PrivateMemorySummaryContext:
+    """Exact private target context for content-free memory summary reads."""
+
+    _bridge: Any
+    _capability: _PrivateMemorySummaryCapability
     bot_id: str
     platform: str
     scope: str
@@ -460,6 +482,7 @@ class MemoryCompanionBridge:
         self.__scoped_store_resolved = False
         self._capability_cache = CapabilityCache()
         self._emotion_producer_token = object()
+        self._private_memory_summary_token = object()
         self._emotion_page_admin_token = object()
         self._active = True
 
@@ -499,6 +522,7 @@ class MemoryCompanionBridge:
         """Revoke all issued capabilities before plugin service shutdown."""
         self._active = False
         self._emotion_producer_token = object()
+        self._private_memory_summary_token = object()
         self._emotion_page_admin_token = object()
 
     def register_emotion_producer(self, producer: Any) -> Any | None:
@@ -512,6 +536,38 @@ class MemoryCompanionBridge:
         """Issue the shared producer capability used by protected Companion APIs."""
 
         return self.register_emotion_producer(producer)
+
+    def register_private_companion_memory_summary_reader(self, producer: Any) -> Any | None:
+        """Issue only the redacted user-memory summary capability to the registered V2 plugin."""
+
+        if not self._active or not self._is_registered_v2_summary_reader(producer):
+            return None
+        return _PrivateMemorySummaryCapability(self, producer, self._private_memory_summary_token)
+
+    def create_private_companion_memory_summary_context(
+        self,
+        capability: Any,
+        *,
+        bot_id: str,
+        scope: str,
+        platform: str,
+        user_id: str,
+        session_id: str,
+    ) -> Any | None:
+        """Bind the summary-only capability to one explicit private user/window."""
+
+        if not self._is_valid_private_memory_summary_capability(capability):
+            return None
+        normalized = self._normalize_emotion_domain(
+            bot_id=bot_id,
+            scope=scope,
+            platform=platform,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        if normalized is None:
+            return None
+        return _PrivateMemorySummaryContext(self, capability, **normalized)
 
     def register_bot_personal_producer(self, producer: Any) -> Any | None:
         """Compatibility name for the same scoped Private Companion capability."""
@@ -655,6 +711,33 @@ class MemoryCompanionBridge:
                 return True
         return False
 
+    def _is_registered_v2_summary_reader(self, producer: Any) -> bool:
+        """Require the exact live V2 star; this identity receives no general producer capability."""
+
+        context = getattr(self._plugin, "context", None)
+        getter = getattr(context, "get_all_stars", None)
+        if not callable(getter):
+            return False
+        try:
+            stars = getter()
+        except Exception:
+            return False
+        if not isinstance(stars, (list, tuple)):
+            return False
+        for metadata in stars:
+            if getattr(metadata, "activated", True) is not True:
+                continue
+            if clean_text(getattr(metadata, "root_dir_name", ""), 120) != "astrbot_plugin_private_companion_v2":
+                continue
+            registered_instance = getattr(metadata, "star_cls", None)
+            registered_type = getattr(metadata, "star_cls_type", None)
+            if producer is registered_instance:
+                if registered_type is None or type(registered_instance) is registered_type:
+                    return True
+            if producer is registered_type and registered_instance is not None and type(registered_instance) is registered_type:
+                return True
+        return False
+
     def _is_valid_emotion_producer_capability(self, capability: Any) -> bool:
         return (
             self._active
@@ -662,6 +745,15 @@ class MemoryCompanionBridge:
             and capability._bridge is self
             and capability._token is self._emotion_producer_token
             and self._is_registered_private_companion(capability._producer)
+        )
+
+    def _is_valid_private_memory_summary_capability(self, capability: Any) -> bool:
+        return (
+            self._active
+            and type(capability) is _PrivateMemorySummaryCapability
+            and capability._bridge is self
+            and capability._token is self._private_memory_summary_token
+            and self._is_registered_v2_summary_reader(capability._producer)
         )
 
     def _producer_capability_from(self, value: Any) -> Any:
@@ -734,6 +826,23 @@ class MemoryCompanionBridge:
                 session_id=context.session_id,
             ) is not None
         )
+
+    def _is_valid_private_memory_summary_context(self, context: Any) -> bool:
+        return (
+            type(context) is _PrivateMemorySummaryContext
+            and context._bridge is self
+            and self._is_valid_private_memory_summary_capability(context._capability)
+            and self._normalize_emotion_domain(
+                bot_id=context.bot_id,
+                scope=context.scope,
+                platform=context.platform,
+                user_id=context.user_id,
+                session_id=context.session_id,
+            ) is not None
+        )
+
+    def _is_valid_user_memory_summary_context(self, context: Any) -> bool:
+        return self._is_valid_emotion_producer_context(context) or self._is_valid_private_memory_summary_context(context)
 
     def _is_valid_emotion_delivery_context(self, context: Any) -> bool:
         return (
@@ -1349,7 +1458,7 @@ class MemoryCompanionBridge:
         }
         if not identity:
             return {**base, "error_code": "missing_user_id"}
-        if not self._is_valid_emotion_producer_context(requester_context):
+        if not self._is_valid_user_memory_summary_context(requester_context):
             return {
                 **base,
                 "state": "forbidden",

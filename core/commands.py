@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from typing import Any
 
 from .models import clean_text
@@ -94,7 +95,16 @@ class MemoryCompanionCommandHandler:
     async def delete(self, memory_id: str = "") -> str:
         if not memory_id:
             return "用法：/mcomp delete <memory_id>"
-        ok = await self.service.store.delete_memory(memory_id)
+        try:
+            ok = await self.service.store.delete_memory(memory_id)
+        except sqlite3.OperationalError as exc:
+            # Keep the memory instead of implying success: the row is still
+            # there and the user needs to know why the write was refused.
+            return (
+                "删除失败：记忆库暂时无法写入，这条记忆仍然保留。\n"
+                f"原因：{clean_text(exc, 400)}\n"
+                "可在面板「运维诊断」查看库文件路径与最近一次连接重建失败详情。"
+            )
         return "已删除。" if ok else "没有找到这条记忆。"
 
     async def clear_scope(

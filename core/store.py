@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 
 from contextlib import closing, contextmanager
 from copy import deepcopy
@@ -11,6 +12,7 @@ from datetime import datetime, timezone
 import re
 import sqlite3
 import struct
+import tempfile
 import threading
 import time
 import traceback
@@ -53,6 +55,36 @@ from .source_query import SourceQuery, SourceQueryError, source_partition
 
 
 _ACL_UNSET = object()
+
+
+class MemoryStoreUnavailableError(sqlite3.OperationalError):
+    """The memory database cannot be opened for writing.
+
+    SQLite reports every kind of "cannot open" as the same opaque
+    ``unable to open database file``: a missing file, a read-only data
+    directory, an antivirus/backup process holding the file, or a path that is
+    no longer a database all look identical.  Callers used to surface that
+    string as a bare HTTP 500, which tells the user nothing and hides whether
+    the failure is transient or permanent.
+
+    This error subclasses ``sqlite3.OperationalError`` so existing ``except``
+    clauses keep working, and carries the diagnostics collected while the
+    connection was being rebuilt (file presence/size, directory writability,
+    the original SQLite error code and a human readable hint).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str = "",
+        diagnostics: dict[str, Any] | None = None,
+        original: BaseException | None = None,
+    ):
+        super().__init__(message)
+        self.reason = clean_text(reason, 80)
+        self.diagnostics = dict(diagnostics or {})
+        self.original = original
 
 
 def _timeline_time_sql(alias: str = "") -> str:
@@ -187,6 +219,10 @@ class MemoryStore(SummaryBatchStore):
     MAINTENANCE_FINGERPRINT_REPAIR_VERSION = "v1"
     MEMORY_ATOM_BACKFILL_VERSION = "v1"
     SENSITIVE_REDACTION_VERSION = "storage-redaction-v1"
+    # A reopen can lose a race with antivirus/backup/sync tools that hold the
+    # database file for a moment; one attempt made recovery look random.
+    DATABASE_RECOVERY_OPEN_ATTEMPTS = 3
+    DATABASE_RECOVERY_OPEN_BACKOFF_SECONDS = (0.05, 0.2, 0.5)
 
     PROFILE_MEMORY_TYPES = frozenset({"user_profile", "user_preference", "user_habit"})
 
@@ -256,6 +292,9 @@ class MemoryStore(SummaryBatchStore):
         # 不再排队等主连接写锁，对应 optimization_plan.md §6.1。
         self._read_conn: sqlite3.Connection | None = None
         self._read_lock = threading.RLock()
+        # 近期时间线单独使用连接，避免与候选读取共用同一把线程锁。
+        self._timeline_read_conn: sqlite3.Connection | None = None
+        self._timeline_read_lock = threading.RLock()
         self._operation_condition = threading.Condition()
         self._active_tracked_operations = 0
         self._operation_waiters = 0
@@ -291,8 +330,13 @@ class MemoryStore(SummaryBatchStore):
         self.haystack_cache = SharedTextCache(4096)
         self._last_wal_health: dict[str, Any] = {}
         self._last_database_error: dict[str, Any] = {}
+        self._last_recovery_failure: dict[str, Any] = {}
         self._database_recovery_attempts = 0
         self._database_recovery_successes = 0
+        # Set once ``initialize`` proved the file really is our schema.  A
+        # reconnect must never adopt a fresh/foreign file just because SQLite
+        # happily created an empty database at the same path.
+        self._schema_ready = False
         self.last_schema_backup_path = ""
 
     def _open_connection(self) -> sqlite3.Connection:
@@ -345,30 +389,196 @@ class MemoryStore(SummaryBatchStore):
             return self._conn, self._lock
         return self._ensure_read_connection(), self._read_lock
 
+    def _ensure_timeline_read_connection(self) -> sqlite3.Connection:
+        if self._read_only:
+            return self._conn
+        conn = self._timeline_read_conn
+        if conn is None:
+            with self._timeline_read_lock:
+                conn = self._timeline_read_conn
+                if conn is None:
+                    conn = sqlite3.connect(
+                        f"{self.db_path.resolve().as_uri()}?mode=ro",
+                        timeout=3.0,
+                        check_same_thread=False,
+                        uri=True,
+                    )
+                    conn.row_factory = sqlite3.Row
+                    conn.execute("PRAGMA busy_timeout=3000")
+                    self._timeline_read_conn = conn
+        return conn
+
+    def _timeline_read_connection(self) -> tuple[sqlite3.Connection, threading.RLock]:
+        if self._read_only:
+            return self._conn, self._lock
+        return self._ensure_timeline_read_connection(), self._timeline_read_lock
+
     @staticmethod
     def _is_database_path_error(error: BaseException) -> bool:
         if not isinstance(error, sqlite3.OperationalError):
             return False
+        if isinstance(error, MemoryStoreUnavailableError):
+            # Already diagnosed: the reconnect was attempted and reported.
+            # Retrying it again would just multiply the wait.
+            return False
         message = str(error).strip().lower()
         return "unable to open database file" in message or "cannot open database" in message
 
+    @staticmethod
+    def _directory_is_writable(path: Path) -> bool:
+        """Prove writability by creating a file, not by trusting ``os.access``.
+
+        ``os.access`` returns the advisory bits and lies on Windows for
+        inherited/deny ACEs, which is exactly the situation that makes SQLite
+        report "unable to open database file" in the first place.
+        """
+        try:
+            fd, probe = tempfile.mkstemp(prefix=".memory-write-probe-", dir=str(path))
+        except OSError:
+            return False
+        try:
+            os.close(fd)
+            os.unlink(probe)
+        except OSError:
+            return False
+        return True
+
+    def _database_open_diagnostics_sync(self, error: BaseException | None = None) -> dict[str, Any]:
+        """Collect everything needed to explain a failed database open."""
+        snapshot = self._database_file_snapshot()
+        directory = self.db_path.parent
+        directory_exists = directory.is_dir()
+        directory_writable = self._directory_is_writable(directory) if directory_exists else False
+        message = clean_text(error, 500) if error is not None else ""
+        lowered = message.lower()
+        if not directory_exists:
+            reason = "database_directory_missing"
+            hint = f"记忆库目录不存在：{directory}。请检查数据目录是否被移动或删除。"
+        elif not snapshot["db_exists"]:
+            reason = "database_file_missing"
+            hint = (
+                f"记忆库文件不存在：{self.db_path}。"
+                "请从备份恢复 memory_companion.db 后重启插件；插件不会用空库覆盖真实记忆。"
+            )
+        elif not directory_writable:
+            reason = "database_directory_not_writable"
+            hint = (
+                f"记忆库目录不可写：{directory}。"
+                "常见原因是目录权限被改、被设为只读，或被同步盘/杀毒软件的文件夹保护接管。"
+            )
+        elif "readonly" in lowered or "read-only" in lowered:
+            reason = "database_readonly"
+            hint = f"记忆库文件是只读的：{self.db_path}。请去掉只读属性或修正文件权限后重试。"
+        elif "locked" in lowered or "busy" in lowered:
+            reason = "database_locked"
+            hint = f"记忆库被其它进程占用：{self.db_path}。请关闭占用该文件的备份/同步/扫描工具后重试。"
+        elif "not a database" in lowered or "malformed" in lowered:
+            reason = "database_not_a_database"
+            hint = f"记忆库文件不是有效的 SQLite 数据库：{self.db_path}。请从备份恢复该文件。"
+        else:
+            reason = "database_open_failed"
+            hint = (
+                f"无法打开记忆库：{self.db_path}（{message or 'unknown error'}）。"
+                f"数据目录可写={directory_writable}，库文件={snapshot['db_bytes']} 字节。"
+            )
+        return {
+            "recorded_at": utc_now(),
+            "db_path": str(self.db_path),
+            "db_path_exists": snapshot["db_exists"],
+            "db_bytes": snapshot["db_bytes"],
+            "wal_bytes": snapshot["wal_bytes"],
+            "shm_bytes": snapshot["shm_bytes"],
+            "directory": str(directory),
+            "directory_exists": directory_exists,
+            "directory_writable": directory_writable,
+            "message": message,
+            "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+            "sqlite_errorname": clean_text(getattr(error, "sqlite_errorname", ""), 80),
+            "reason": reason,
+            "hint": hint,
+        }
+
+    def _database_unavailable_error(
+        self,
+        error: BaseException | None,
+        *,
+        reason: str = "",
+        attempts: int = 0,
+    ) -> MemoryStoreUnavailableError:
+        diagnostics = self._database_open_diagnostics_sync(error)
+        diagnostics["recovery_attempts"] = max(0, int(attempts))
+        resolved_reason = reason or clean_text(diagnostics.get("reason"), 80) or "database_open_failed"
+        hint = clean_text(diagnostics.get("hint"), 600)
+        detail = clean_text(error, 300) if error is not None else ""
+        message = f"记忆库暂时无法写入（{detail or resolved_reason}）"
+        if hint:
+            message = f"{message}。{hint}"
+        return MemoryStoreUnavailableError(
+            message,
+            reason=resolved_reason,
+            diagnostics=diagnostics,
+            original=error,
+        )
+
+    def _open_verified_connection_sync(self) -> sqlite3.Connection:
+        """Open a replacement connection and verify it is still our database."""
+        replacement = self._open_connection()
+        try:
+            replacement.execute("PRAGMA journal_mode=WAL")
+            replacement.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            if self._schema_ready and not self._connection_has_table(replacement, "memories"):
+                raise MemoryStoreUnavailableError(
+                    f"记忆库文件里没有 memories 表，已放弃用它替换当前连接：{self.db_path}",
+                    reason="database_schema_missing",
+                    diagnostics=self._database_open_diagnostics_sync(),
+                )
+        except BaseException:
+            replacement.close()
+            raise
+        return replacement
+
+    @staticmethod
+    def _connection_has_table(connection: sqlite3.Connection, table: str) -> bool:
+        row = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        return row is not None
+
     def _recover_connection_sync(self) -> None:
-        """Replace a broken connection without ever creating an empty database."""
+        """Replace a broken connection without ever creating an empty database.
+
+        A single reopen is not enough on Windows: antivirus/backup/sync tools
+        hold the database file for a few hundred milliseconds at a time, and a
+        reopen attempted inside that window fails with the very same
+        "unable to open database file".  That is why "retry once" looked like a
+        random failure to users.  Retry with a short backoff instead, and if it
+        still fails, raise a diagnosable error that names the real cause.
+        """
         with self._lock:
             if self._closed:
                 raise sqlite3.ProgrammingError("memory database is closed")
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             if not self.db_path.is_file():
-                raise sqlite3.OperationalError(
-                    f"memory database file is missing: {self.db_path}; restart or restore the data directory"
-                )
-            replacement = self._open_connection()
-            try:
-                replacement.execute("PRAGMA journal_mode=WAL")
-                replacement.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
-            except BaseException:
-                replacement.close()
-                raise
+                raise self._database_unavailable_error(None, reason="database_file_missing")
+            backoff = self.DATABASE_RECOVERY_OPEN_BACKOFF_SECONDS
+            last_error: BaseException | None = None
+            for attempt in range(1, self.DATABASE_RECOVERY_OPEN_ATTEMPTS + 1):
+                try:
+                    replacement = self._open_verified_connection_sync()
+                    break
+                except MemoryStoreUnavailableError:
+                    raise
+                except (sqlite3.Error, OSError) as error:
+                    last_error = error
+                    if attempt >= self.DATABASE_RECOVERY_OPEN_ATTEMPTS:
+                        raise self._database_unavailable_error(
+                            error,
+                            attempts=attempt,
+                        ) from error
+                    time.sleep(backoff[min(attempt - 1, len(backoff) - 1)])
+            else:  # pragma: no cover - the loop always breaks or raises
+                raise self._database_unavailable_error(last_error)
             previous = self._conn
             self._conn = replacement
             try:
@@ -407,8 +617,36 @@ class MemoryStore(SummaryBatchStore):
             with self._lock:
                 if self._conn.in_transaction:
                     self._conn.rollback()
-            self._recover_connection_sync()
+            try:
+                self._recover_connection_sync()
+            except BaseException as recovery_error:
+                failure = {
+                    "recorded_at": utc_now(),
+                    "operation": clean_text(getattr(operation, "__name__", ""), 120),
+                    "sqlite_error": clean_text(error, 500),
+                    "recovery_error": clean_text(recovery_error, 800),
+                    "reason": clean_text(getattr(recovery_error, "reason", ""), 80)
+                    or "database_unavailable",
+                    "diagnostics": dict(
+                        getattr(recovery_error, "diagnostics", {}) or self._database_file_snapshot()
+                    ),
+                    "database_recovery_attempts": self._database_recovery_attempts,
+                }
+                self._last_recovery_failure = failure
+                self._last_wal_health = {
+                    **self._last_wal_health,
+                    "last_recovery_failure": dict(failure),
+                }
+                logger.warning(
+                    "[MemoryCompanion] 记忆库连接重建失败 operation=%s reason=%s: %s",
+                    failure["operation"] or "unknown",
+                    failure["reason"],
+                    failure["recovery_error"],
+                )
+                raise
             self._database_recovery_successes += 1
+            # The standing failure is over; keep it only in the error history.
+            self._last_recovery_failure = {}
             return operation(*args)
 
     async def _run_recoverable_database_operation(self, operation: Any, *args: Any) -> Any:
@@ -764,6 +1002,7 @@ class MemoryStore(SummaryBatchStore):
                 self._source_fts_enabled = bool(self._conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='timeline_source_fts'"
                 ).fetchone())
+                self._schema_ready = True
             return
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
@@ -1423,6 +1662,18 @@ class MemoryStore(SummaryBatchStore):
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON memories(updated_at)"
             )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_jd_occurred_at "
+                "ON memories(julianday(occurred_at))"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_jd_created_at "
+                "ON memories(julianday(created_at))"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_jd_updated_at "
+                "ON memories(julianday(updated_at))"
+            )
             # c5: emotion 投递查询使用 LOWER(scope) 导致 scope 列索引失效，
             #     用表达式索引精确匹配 LOWER(scope) 谓词
             self._conn.execute(
@@ -1442,6 +1693,8 @@ class MemoryStore(SummaryBatchStore):
             self._migrate_summary_batch_retry_state_sync()
             self.rebuild_acl_projection_sync()
             self._acl_projection_revision = self._memory_revision_sync()
+            # From here on a reconnect must find this schema, never a fresh file.
+            self._schema_ready = True
 
     def _cleanup_placeholder_memory_indexes_sync(self) -> int:
         """Remove historical placeholder entries from recall-only indexes.
@@ -3243,6 +3496,7 @@ class MemoryStore(SummaryBatchStore):
         return {
             "main_conn_closed": bool(self._closed),
             "read_conn_closed": self._read_conn is None,
+            "timeline_read_conn_closed": self._timeline_read_conn is None,
             "tracked_ops": tracked_ops,
             "operation_owner_stack": owner_stack,
         }
@@ -3273,6 +3527,13 @@ class MemoryStore(SummaryBatchStore):
                 except sqlite3.Error:
                     pass
                 self._read_conn = None
+        with self._timeline_read_lock:
+            if self._timeline_read_conn is not None:
+                try:
+                    self._timeline_read_conn.close()
+                except sqlite3.Error:
+                    pass
+                self._timeline_read_conn = None
 
     def backup(self, suffix: str = "") -> Path:
         stamp = utc_now().replace(":", "").replace("-", "").replace("+", "_")
@@ -8558,9 +8819,10 @@ class MemoryStore(SummaryBatchStore):
     ) -> list[dict[str, Any]]:
         safe_limit = max(1, int(limit))
         safe_offset = max(0, int(offset))
+        conn, lock = self._timeline_read_connection()
         if scope and session_id and entity_id:
             return self._recent_timeline_entity_split_sync(
-                safe_limit, scope, session_id, entity_id, safe_offset
+                safe_limit, scope, session_id, entity_id, safe_offset, conn, lock
             )
         params: list[Any] = []
         where = "1=1"
@@ -8574,8 +8836,8 @@ class MemoryStore(SummaryBatchStore):
             where += " AND (subject_id=? OR object_id=?)"
             params.extend([entity_id, entity_id])
         event_time_sql = _timeline_time_sql()
-        with self._lock:
-            rows = self._conn.execute(
+        with lock:
+            rows = conn.execute(
                 f"""
                 SELECT * FROM timeline
                 WHERE {where}
@@ -8593,6 +8855,8 @@ class MemoryStore(SummaryBatchStore):
         session_id: str,
         entity_id: str,
         offset: int,
+        conn: sqlite3.Connection,
+        lock: threading.RLock,
     ) -> list[dict[str, Any]]:
         """Read the subject/object branches through dedicated indexes and merge.
 
@@ -8604,9 +8868,9 @@ class MemoryStore(SummaryBatchStore):
         branch_size = limit + offset
         merged: dict[str, dict[str, Any]] = {}
         event_time_sql = _timeline_time_sql()
-        with self._lock:
+        with lock:
             for column in ("subject_id", "object_id"):
-                rows = self._conn.execute(
+                rows = conn.execute(
                     f"""
                     SELECT * FROM timeline
                     WHERE scope=? AND session_id=? AND {column}=?
@@ -9433,8 +9697,9 @@ class MemoryStore(SummaryBatchStore):
 
     def _list_core_memories_sync(self, limit: int) -> list[MemoryRecord]:
         now = utc_now()
-        with self._lock:
-            rows = self._conn.execute(
+        conn, lock = self._read_connection_for_bundle()
+        with lock:
+            rows = conn.execute(
                 """
                 SELECT *
                 FROM memories
@@ -11598,7 +11863,12 @@ class MemoryStore(SummaryBatchStore):
             return cur.rowcount > 0
 
     async def delete_memory(self, memory_id: str) -> bool:
-        return await asyncio.to_thread(self._delete_memory_sync, memory_id)
+        # Deletion is the one management action a user cannot work around from
+        # the chat side, so it must join the same reconnect-and-retry contract
+        # as inserts: a transient "unable to open database file" (antivirus,
+        # backup or a sync client holding the file) earlier returned HTTP 500
+        # to the panel and left the memory in place.
+        return await self._run_recoverable_database_operation(self._delete_memory_sync, memory_id)
 
     @staticmethod
     def _timeline_ids_in_metadata(value: Any) -> set[str]:
@@ -11698,7 +11968,9 @@ class MemoryStore(SummaryBatchStore):
                 return cur.rowcount > 0
 
     async def update_review_status(self, memory_id: str, status: str) -> bool:
-        return await asyncio.to_thread(self._update_review_status_sync, memory_id, status)
+        return await self._run_recoverable_database_operation(
+            self._update_review_status_sync, memory_id, status
+        )
 
     def _update_review_status_sync(self, memory_id: str, status: str) -> bool:
         memory_id = clean_text(memory_id, 120)
@@ -11965,7 +12237,9 @@ class MemoryStore(SummaryBatchStore):
             return cur.rowcount > 0
 
     async def update_memory_visibility(self, memory_id: str, visibility: str) -> bool:
-        return await asyncio.to_thread(self._update_memory_visibility_sync, memory_id, visibility)
+        return await self._run_recoverable_database_operation(
+            self._update_memory_visibility_sync, memory_id, visibility
+        )
 
     def _update_memory_visibility_sync(self, memory_id: str, visibility: str) -> bool:
         memory_id = clean_text(memory_id, 120)
@@ -11993,7 +12267,9 @@ class MemoryStore(SummaryBatchStore):
                 return cur.rowcount > 0
 
     async def update_memory_lifecycle(self, memory_id: str, lifecycle: str) -> bool:
-        return await asyncio.to_thread(self._update_memory_lifecycle_sync, memory_id, lifecycle)
+        return await self._run_recoverable_database_operation(
+            self._update_memory_lifecycle_sync, memory_id, lifecycle
+        )
 
     def _update_memory_lifecycle_sync(self, memory_id: str, lifecycle: str) -> bool:
         lifecycle = clean_text(lifecycle, 40)
@@ -12911,6 +13187,7 @@ class MemoryStore(SummaryBatchStore):
                 "current_files": current_wal_files,
                 "last_health_check": last_wal_health,
                 "last_database_error": dict(self._last_database_error),
+                "last_recovery_failure": dict(self._last_recovery_failure),
                 "database_recovery_attempts": self._database_recovery_attempts,
                 "database_recovery_successes": self._database_recovery_successes,
             },

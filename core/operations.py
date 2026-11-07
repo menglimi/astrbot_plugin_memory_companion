@@ -274,6 +274,15 @@ async def build_operational_report(service: Any) -> dict[str, Any]:
         warnings.append("Embedding 已启用但未指定 Provider，将依赖自动发现。")
     if calls <= 0:
         warnings.append("还没有模型调用统计，Token 与耗时结论暂无样本。")
+    recovery_failure = (stats.get("wal") or {}).get("last_recovery_failure") or {}
+    if isinstance(recovery_failure, dict) and recovery_failure:
+        diagnostics = recovery_failure.get("diagnostics") or {}
+        hint = clean_text(diagnostics.get("hint"), 400)
+        reason = clean_text(recovery_failure.get("reason"), 80) or "database_unavailable"
+        warnings.append(
+            "记忆库最近一次写入被拒绝（原因码：%s）。%s"
+            % (reason, hint or "请在面板重试，或检查数据目录权限与占用情况。")
+        )
     return {
         "preset": detect_preset(service.config),
         "preset_label": PRESET_LABELS[detect_preset(service.config)],
