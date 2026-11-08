@@ -163,6 +163,7 @@ class CaptureAsyncRegistrationTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         self._service._closed = True
         self._service.store.close()
+        self._service.scoped_store.close()
         self._store.close()
 
     async def test_spawn_background_registers_and_cleans(self) -> None:
@@ -197,6 +198,7 @@ class AcloseSummaryWorkerTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         self._service._closed = True
         self._service.store.close()
+        self._service.scoped_store.close()
         self._store.close()
 
     async def test_aclose_waits_summary_workers(self) -> None:
@@ -221,6 +223,7 @@ class ShutdownEvidenceTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         self._service._closed = True
         self._service.store.close()
+        self._service.scoped_store.close()
         self._store.close()
 
     async def test_shutdown_evidence_shape(self) -> None:

@@ -1,0 +1,6 @@
+# 开发/测试依赖：CI 与本地跑 tests/ 用。
+-r requirements.txt
+pytest>=8
+pytest-asyncio>=0.24
+pytest-subtests>=0.12
+jsonschema>=4

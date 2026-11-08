@@ -63,8 +63,6 @@ class ConfigView:
         "context_orchestration.current_window_limit": ("context_orchestration_advanced.current_window_limit",),
         "context_orchestration.conversation_summary_limit": ("context_orchestration_advanced.conversation_summary_limit",),
         "context_orchestration.stable_memory_limit": ("context_orchestration_advanced.stable_memory_limit",),
-        "maintenance.pending_review_max_age_days": ("maintenance.pending_candidate_retention_days",),
-        "maintenance.pending_review_max_age_days": ("maintenance.pending_candidate_retention_days",),
         # maintenance → maintenance_decay
         "maintenance.memory_decay_after_days": ("maintenance_decay.memory_decay_after_days",),
         "maintenance.memory_decay_idle_days": ("maintenance_decay.memory_decay_idle_days",),
@@ -79,6 +77,12 @@ class ConfigView:
         "maintenance.memory_decay_max_items_per_summary": ("maintenance_decay.memory_decay_max_items_per_summary",),
         "maintenance.memory_decay_summary_input_chars": ("maintenance_decay.memory_decay_summary_input_chars",),
         "maintenance.memory_decay_summary_chars": ("maintenance_decay.memory_decay_summary_chars",),
+        # 2.6.0 新增的渐进淡出四个键：service 仍按老前缀读，靠别名接到新 schema 域，
+        # 否则面板上的控件是假的（L2 同类问题）。
+        "maintenance.memory_decay_gradual_enabled": ("maintenance_decay.memory_decay_gradual_enabled",),
+        "maintenance.memory_decay_fade_floor_percent": ("maintenance_decay.memory_decay_fade_floor_percent",),
+        "maintenance.memory_decay_fade_ratio_percent": ("maintenance_decay.memory_decay_fade_ratio_percent",),
+        "maintenance.memory_decay_fade_interval_days": ("maintenance_decay.memory_decay_fade_interval_days",),
     }
 
     def __init__(self, raw: Any):

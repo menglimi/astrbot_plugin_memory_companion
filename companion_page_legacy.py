@@ -25,8 +25,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
+from .core.local_time import local_tz
 from .companion_page_bridge import (
     COMPANION_MODULE_NAMES,
     COMPANION_PLUGIN_ID,
@@ -101,7 +101,7 @@ def _date_from_timestamp(value: Any) -> str:
     if not stamp:
         return ""
     try:
-        return datetime.fromtimestamp(stamp, ZoneInfo("Asia/Shanghai")).date().isoformat()
+        return datetime.fromtimestamp(stamp, local_tz()).date().isoformat()
     except (OSError, OverflowError, ValueError):
         return ""
 

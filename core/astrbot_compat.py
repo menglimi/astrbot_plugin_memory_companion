@@ -10,10 +10,29 @@ try:
 except Exception:  # pragma: no cover - useful for local syntax/unit checks
     logger = logging.getLogger("MemoryCompanion")
 
-try:
-    from astrbot.core.agent.message import TextPart
-except Exception:  # pragma: no cover - old AstrBot or local checks
-    TextPart = None  # type: ignore
+
+# TextPart 统一在这里解析，插件其它模块只从本模块取（A14）。
+# 4.29.3 的公共面 astrbot/api/message_components.py 目前只 re-export
+# core.message.components，TextPart 仍定义在 astrbot.core.agent.message 里，所以
+# 实际会走到回退分支；等上游把 TextPart 导出到公共面后，这里自动切过去，
+# 调用方不用跟着改。解析逻辑抽成 _resolve_text_part() 以便单独断言回退顺序。
+def _resolve_text_part() -> Any:
+    """解析 TextPart：公共面优先，失败再退内部模块，都失败返回 None。"""
+
+    try:
+        from astrbot.api.message_components import TextPart as public_text_part
+    except ImportError:  # pragma: no cover - 4.29.3 公共面尚未导出 TextPart
+        public_text_part = None
+    if public_text_part is not None:
+        return public_text_part
+    try:
+        from astrbot.core.agent.message import TextPart as internal_text_part
+    except ImportError:  # pragma: no cover - old AstrBot or local checks
+        return None
+    return internal_text_part
+
+
+TextPart = _resolve_text_part()
 
 
 def remove_marked_text(text: str, header: str, footer: str) -> str:
@@ -344,6 +363,17 @@ def _is_temp_or_plugin_context(item: Any) -> bool:
     return source in {"private_companion", "astrbot_plugin_private_companion"}
 
 
+def _is_own_proactive_fragment(item: Any) -> bool:
+    """这一项是否本插件生态自己注入的临时件。
+
+    只有带 private_companion 标记、或带 no_save/turn_fragments 等临时标记的条目
+    才允许清理；用户历史和别的插件写进来的内容一律视为别人的，不碰。
+    """
+    if _is_temp_or_plugin_context(item):
+        return True
+    return "private_companion_" in _plain_request_text(item)
+
+
 def _sanitize_context_content(value: Any) -> tuple[Any, bool, bool]:
     if value is None:
         return value, False, False
@@ -401,17 +431,28 @@ def _sanitize_context_content(value: Any) -> tuple[Any, bool, bool]:
     return value, False, False
 
 
-def sanitize_request_history(req: Any, *, clean_proactive_guidance: bool = True) -> dict[str, int]:
+def sanitize_request_history(req: Any, *, clean_proactive_guidance: bool = False) -> dict[str, int]:
+    """只清理本插件自己注入到请求历史里的临时片段。
+
+    以前默认开启时，这里会直接改写 req.contexts：删掉含 send_message_to_user 的
+    整行、把【内在约束】等标题块吞到空行——这些内容可能是用户历史或别的插件写
+    的，等于和宿主/其它插件抢上下文。现在只处理能证明是本插件生态写入的条目
+    （见 _is_own_proactive_fragment），其余原样保留；整个开关默认关闭。
+    """
+    zero = {"before": 0, "after": 0, "removed": 0, "cleaned": 0}
     if not clean_proactive_guidance:
-        return {"before": 0, "after": 0, "removed": 0, "cleaned": 0}
+        return zero
     contexts = getattr(req, "contexts", None)
     if not isinstance(contexts, list):
-        return {"before": 0, "after": 0, "removed": 0, "cleaned": 0}
+        return zero
 
     cleaned_contexts: list[Any] = []
     cleaned_count = 0
     removed = 0
     for item in contexts:
+        if not _is_own_proactive_fragment(item):
+            cleaned_contexts.append(item)
+            continue
         cleaned_item, changed, drop = _sanitize_context_content(item)
         if drop:
             removed += 1
@@ -461,44 +502,6 @@ def remove_temp_text(req: Any, header: str, footer: str) -> int:
         if len(kept) != len(contexts):
             req.contexts = kept
     return removed
-
-
-def manage_request_contexts(
-    req: Any,
-    mode: str = "trim",
-    keep_recent: int = 2,
-    *,
-    preserve_external_temp: bool = True,
-) -> dict[str, int | str]:
-    contexts = getattr(req, "contexts", None)
-    if not isinstance(contexts, list):
-        return {"mode": mode, "before": 0, "after": 0, "removed": 0, "preserved": 0}
-
-    before = len(contexts)
-    normalized_mode = mode if mode in {"keep", "trim", "clear"} else "trim"
-    if normalized_mode == "keep":
-        return {"mode": normalized_mode, "before": before, "after": before, "removed": 0, "preserved": 0}
-
-    preserve_indices: set[int] = set()
-    if preserve_external_temp:
-        preserve_indices = {index for index, item in enumerate(contexts) if _is_temp_or_plugin_context(item)}
-
-    if normalized_mode == "clear":
-        kept_indices = preserve_indices
-    else:
-        keep = max(0, int(keep_recent or 0))
-        ordinary_indices = [index for index in range(before) if index not in preserve_indices]
-        kept_indices = set(ordinary_indices[-keep:] if keep else [])
-        kept_indices.update(preserve_indices)
-    req.contexts = [item for index, item in enumerate(contexts) if index in kept_indices]
-    after = len(getattr(req, "contexts", []) or [])
-    return {
-        "mode": normalized_mode,
-        "before": before,
-        "after": after,
-        "removed": max(0, before - after),
-        "preserved": len(preserve_indices),
-    }
 
 
 def detect_private_companion_request(req: Any) -> dict[str, Any]:

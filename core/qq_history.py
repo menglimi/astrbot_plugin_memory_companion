@@ -6,13 +6,12 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
-from zoneinfo import ZoneInfo
 
 from .astrbot_compat import logger
+from .local_time import local_tz
 from .models import clean_text, stable_fingerprint
 
 
-LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 QQ_ID = re.compile(r"^[0-9]{5,20}$")
 
 
@@ -224,8 +223,8 @@ class QQHistoryReader:
         except ValueError as exc:
             raise ValueError(f"{label}格式无效") from exc
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=LOCAL_TZ)
-        return parsed.astimezone(LOCAL_TZ)
+            parsed = parsed.replace(tzinfo=local_tz())
+        return parsed.astimezone(local_tz())
 
     def _validated_range(self, start_at: Any, end_at: Any) -> tuple[datetime, datetime]:
         start = self._parse_local(start_at, "开始时间")
@@ -235,7 +234,7 @@ class QQHistoryReader:
         max_days = self.limits()["max_range_days"]
         if end - start > timedelta(days=max_days):
             raise ValueError(f"单次读取时间范围不能超过 {max_days} 天")
-        if end > datetime.now(LOCAL_TZ) + timedelta(minutes=5):
+        if end > datetime.now(local_tz()) + timedelta(minutes=5):
             raise ValueError("结束时间不能晚于当前时间")
         return start, end
 
@@ -315,7 +314,7 @@ class QQHistoryReader:
         try:
             parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
             if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=LOCAL_TZ)
+                parsed = parsed.replace(tzinfo=local_tz())
             return parsed.timestamp()
         except ValueError:
             return 0.0
@@ -532,7 +531,7 @@ class QQHistoryReader:
         timestamp_counts: dict[str, int] = {}
         for sequence, raw in enumerate(selected_raw, start=1):
             timestamp = self._timestamp(raw)
-            local = datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(LOCAL_TZ)
+            local = datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(local_tz())
             sender = raw.get("sender") if isinstance(raw.get("sender"), dict) else {}
             sender_id = clean_text(
                 sender.get("user_id") or raw.get("sender_id") or raw.get("user_id"), 40

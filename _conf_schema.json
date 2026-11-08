@@ -27,14 +27,15 @@
         "default": "月白"
       },
       "ui_style": {
-        "description": "拓展页 UI 样式",
-        "hint": "默认使用旧版管理面板；切换为新版后使用 Memory OS 三维终端界面。",
+        "description": "拓展页打开方式",
+        "hint": "默认「人物」：一打开就是她记得的人，点谁就能改称呼、纠正分量、让她忘掉某件事。「控制台」是旧版全部功能页；「三维终端」是彩蛋。",
         "type": "string",
         "options": [
-          "旧版",
-          "新版"
+          "人物",
+          "控制台",
+          "三维终端"
         ],
-        "default": "旧版"
+        "default": "人物"
       }
     }
   },
@@ -65,7 +66,14 @@
         "description": "最短记录字数",
         "hint": "短于该长度的普通文本不自动记录。命令、纯符号和空消息也会跳过。",
         "type": "int",
-        "default": 2
+        "default": 2,
+        "min": 0,
+        "max": 200,
+        "slider": {
+          "min": 0,
+          "max": 200,
+          "step": 10
+        }
       },
       "extract_stable_facts": {
         "description": "抽取稳定事实",
@@ -95,6 +103,12 @@
         "hint": "默认关闭（行为与旧版一致）。开启后，写入新记忆时把「Bot 自我时间线」「情绪较重」两类记忆的 mention_policy 从 tone_only 提为 soft_echo，使注入侧能给出这些记忆的内容而非纯语气提示。只影响之后新写入的记忆；存量记忆需回填或依赖注入侧放宽参数。",
         "type": "bool",
         "default": false
+      },
+      "reliable_sources_enabled": {
+        "description": "启用可靠来源捕获",
+        "hint": "记忆捕获与来源索引的总开关（默认开启）。关闭后不再记录用户消息、Bot 回复和来源片段，用于临时停用整个捕获链路；阶段总结、管理命令和手动写入不受影响。",
+        "type": "bool",
+        "default": true
       }
     }
   },
@@ -149,20 +163,41 @@
       "min_independent_evidence": {
         "description": "智能画像独立证据阈值",
         "type": "int",
-        "default": 3,
-        "hint": "同一人物、同一候选至少三条去重后的本人消息证据；不要求与 Bot 互动或跨会话。"
+        "default": 2,
+        "hint": "同一人物、同一候选至少三条去重后的本人消息证据；不要求与 Bot 互动或跨会话。",
+        "min": 0,
+        "max": 10,
+        "slider": {
+          "min": 0,
+          "max": 10,
+          "step": 1
+        }
       },
       "daily_success_limit_per_person": {
         "description": "单用户每日成功更新上限",
         "type": "int",
-        "default": 1,
-        "hint": "智能画像每天最多成功更新一次。"
+        "default": 3,
+        "hint": "智能画像每天最多成功更新一次。",
+        "min": 1,
+        "max": 20,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
       },
       "daily_attempt_limit_per_person": {
         "description": "单用户每日尝试上限",
         "type": "int",
-        "default": 2,
-        "hint": "允许一次失败退避重试；达到上限后当天不再生成。"
+        "default": 6,
+        "hint": "允许一次失败退避重试；达到上限后当天不再生成。",
+        "min": 1,
+        "max": 20,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
       },
       "daily_dispatch_enabled": {
         "description": "启用每日画像批处理",
@@ -174,25 +209,53 @@
         "description": "画像更新窗口开始小时",
         "type": "int",
         "default": 3,
-        "hint": "按 Asia/Shanghai 时区执行每日批处理。"
+        "hint": "按 Asia/Shanghai 时区执行每日批处理。",
+        "min": 0,
+        "max": 23,
+        "slider": {
+          "min": 0,
+          "max": 23,
+          "step": 1
+        }
       },
       "update_window_end_hour": {
         "description": "画像更新窗口结束小时",
         "type": "int",
         "default": 5,
-        "hint": "窗口外只收集哈希化证据，不整理智能画像。"
+        "hint": "窗口外只收集哈希化证据，不整理智能画像。",
+        "min": 0,
+        "max": 23,
+        "slider": {
+          "min": 0,
+          "max": 23,
+          "step": 1
+        }
       },
       "usage_min_confidence": {
         "description": "智能画像使用置信度",
         "type": "float",
         "default": 0.75,
-        "hint": "低于此值的智能推断不会进入表达适配。"
+        "hint": "低于此值的智能推断不会进入表达适配。",
+        "min": 0.0,
+        "max": 1.0,
+        "slider": {
+          "min": 0.0,
+          "max": 1.0,
+          "step": 0.01
+        }
       },
       "inferred_freshness_days": {
         "description": "智能推断新鲜期",
         "type": "int",
         "default": 90,
-        "hint": "超过期限的智能推断停止使用，等待新的独立证据。"
+        "hint": "超过期限的智能推断停止使用，等待新的独立证据。",
+        "min": 0,
+        "max": 500,
+        "slider": {
+          "min": 0,
+          "max": 500,
+          "step": 1
+        }
       }
     }
   },
@@ -211,7 +274,14 @@
         "description": "每批最多提炼断言数",
         "hint": "单批对话最多写入多少条断言。更多条目会显著增加输出 token 与耗时；只提炼真正长期成立的，宁少勿多。",
         "type": "int",
-        "default": 6
+        "default": 6,
+        "min": 1,
+        "max": 20,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
       }
     }
   },
@@ -272,97 +342,299 @@
         "description": "最少事件数",
         "hint": "未总结的时间线事件少于该数量时不会总结。",
         "type": "int",
-        "default": 20
+        "default": 8,
+        "min": 0,
+        "max": 25,
+        "slider": {
+          "min": 0,
+          "max": 25,
+          "step": 1
+        }
       },
       "trigger_event_count": {
         "description": "按条数触发",
         "hint": "未总结事件达到该数量时触发总结。建议 12-20。",
         "type": "int",
-        "default": 20
+        "default": 8,
+        "min": 1,
+        "max": 25,
+        "slider": {
+          "min": 1,
+          "max": 25,
+          "step": 1
+        }
       },
       "trigger_interval_minutes": {
         "description": "按时间触发",
         "hint": "最早未总结事件距今超过该分钟数且达到最少事件数时触发总结。0 表示只按条数触发。",
         "type": "int",
-        "default": 60
+        "default": 30,
+        "min": 0,
+        "max": 100,
+        "slider": {
+          "min": 0,
+          "max": 100,
+          "step": 1
+        }
       },
       "max_events_per_summary": {
         "description": "单次最多事件",
         "hint": "单次交给模型总结的时间线事件上限，避免输入过长。",
         "type": "int",
-        "default": 40
+        "default": 40,
+        "min": 1,
+        "max": 200,
+        "slider": {
+          "min": 1,
+          "max": 200,
+          "step": 1
+        }
       },
       "max_input_chars": {
         "description": "总结输入字数",
         "hint": "单次总结最多发送给模型的时间线消息字符数。",
         "type": "int",
-        "default": 6000
+        "default": 6000,
+        "min": 0,
+        "max": 20000,
+        "slider": {
+          "min": 0,
+          "max": 20000,
+          "step": 10
+        }
       },
       "max_summary_chars": {
         "description": "总结记忆字数",
         "hint": "生成的长期记忆内容最大字符数。",
         "type": "int",
-        "default": 1200
+        "default": 1200,
+        "min": 0,
+        "max": 5000,
+        "slider": {
+          "min": 0,
+          "max": 5000,
+          "step": 10
+        }
       },
       "provider_timeout_seconds": {
         "description": "总结模型超时秒数",
         "hint": "单次调用总结模型的最长等待时间。超时会尝试备用模型并保留未总结时间线。0 表示不限制。",
         "type": "int",
-        "default": 300
+        "default": 300,
+        "min": 0,
+        "max": 1000,
+        "slider": {
+          "min": 0,
+          "max": 1000,
+          "step": 1
+        }
+      },
+      "request_max_retries": {
+        "description": "总结调用重试次数",
+        "hint": "单次总结请求内部最多重试几次（默认 2）。以前写死 1 次，一次网络抖动就让这批摘要永久失败、进隔离区。",
+        "type": "int",
+        "default": 2,
+        "min": 1,
+        "max": 20,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
       },
       "evidence_events": {
         "description": "证据事件条数",
         "hint": "长期总结记忆中最多保留多少条原始时间线事件作为 evidence，便于排查总结来源。",
         "type": "int",
-        "default": 12
+        "default": 12,
+        "min": 0,
+        "max": 50,
+        "slider": {
+          "min": 0,
+          "max": 50,
+          "step": 1
+        }
       },
       "candidate_valid_days": {
         "description": "降级候选有效期天数",
         "hint": "总结正文没能通过引用校验、但模型确实写出了正文时，该批会存为待复核候选而不是被丢弃。这批候选的有效期由本项决定，到期后不再参与召回，记录本身仍保留、可人工复核。",
         "type": "int",
-        "default": 30
+        "default": 30,
+        "min": 0,
+        "max": 100,
+        "slider": {
+          "min": 0,
+          "max": 100,
+          "step": 1
+        }
       },
       "max_retries": {
         "description": "每批自动调用上限",
         "hint": "同一批次自动调用模型的总次数上限（含首次、备用模型及预算内纠正）。达到后隔离该批，后续消息继续；次数持久化，重启不重置。默认 5。",
         "type": "int",
-        "default": 5
+        "default": 5,
+        "min": 1,
+        "max": 20,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
       },
       "retry_backoff_seconds": {
         "description": "自动重试退避秒数",
         "hint": "首次自动重试前至少等待的秒数；连续失败会逐次延长，避免短暂断连时立即耗尽全部次数。0 表示不等待。",
         "type": "int",
-        "default": 60
+        "default": 60,
+        "min": 0,
+        "max": 200,
+        "slider": {
+          "min": 0,
+          "max": 200,
+          "step": 1
+        }
       },
       "transient_retry_cooldown_minutes": {
         "description": "连接错误冷却分钟",
         "hint": "连接、超时、限流错误的退避等待上限，也是迁移旧失败批次时的恢复等待时间。达到每批调用上限后挂起，手动总结可重新尝试。",
         "type": "int",
-        "default": 10
+        "default": 10,
+        "min": 0,
+        "max": 50,
+        "slider": {
+          "min": 0,
+          "max": 50,
+          "step": 1
+        }
       },
       "non_transient_retry_cooldown_minutes": {
         "description": "内容错误冷却分钟",
         "hint": "用于迁移旧版内容错误批次后的恢复等待时间。新版内容或引用错误会在每批调用预算内继续纠正，耗尽后隔离并继续处理后续消息。",
         "type": "int",
-        "default": 30
+        "default": 30,
+        "min": 0,
+        "max": 100,
+        "slider": {
+          "min": 0,
+          "max": 100,
+          "step": 1
+        }
+      },
+      "auto_drain_enabled": {
+        "description": "自动消化积压原文",
+        "hint": "后台定时扫描「从未总结过的原始对话」，把它们变成记忆。关闭后只有收到新消息的会话才会总结，老会话的原文会一直积压。",
+        "type": "bool",
+        "default": true
+      },
+      "auto_drain_interval_minutes": {
+        "description": "自动消化间隔分钟",
+        "hint": "两轮自动消化之间等待的分钟数。间隔越短消化越快，模型调用也越频繁。",
+        "type": "int",
+        "default": 2,
+        "min": 0,
+        "max": 10,
+        "slider": {
+          "min": 0,
+          "max": 10,
+          "step": 1
+        }
+      },
+      "auto_drain_sessions_per_round": {
+        "description": "每轮消化会话数",
+        "hint": "每轮最多挑几个积压会话做总结。配合间隔控制后台模型调用速度。",
+        "type": "int",
+        "default": 20,
+        "min": 0,
+        "max": 100,
+        "slider": {
+          "min": 0,
+          "max": 100,
+          "step": 1
+        }
       },
       "max_calls_per_session_hour": {
         "description": "每会话每小时自动调用上限",
         "hint": "实际调用次数预算，首次、备用模型和纠正共用；达到后暂停到后续触发，原文和待处理批次保留。重启不重置。默认 24，活跃会话可按需调整。",
         "type": "int",
-        "default": 24
+        "default": 24,
+        "min": 1,
+        "max": 100,
+        "slider": {
+          "min": 1,
+          "max": 100,
+          "step": 1
+        }
       },
       "max_concurrent_calls": {
         "description": "全局总结并发上限",
         "hint": "同一时刻最多允许多少个后台阶段性总结同时调用模型。多个群同时触发总结时会排队，避免一次性打爆模型网关导致全线超时。手动 /summary 命令不受此限制。",
         "type": "int",
-        "default": 1
+        "default": 1,
+        "min": 1,
+        "max": 20,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
       },
       "call_queue_timeout_seconds": {
         "description": "总结排队等待秒数",
         "hint": "后台总结等待全局并发槽位的最长时间；超时则本轮跳过，等新消息再次触发。0 表示无限等待。",
         "type": "int",
-        "default": 20
+        "default": 20,
+        "min": 0,
+        "max": 100,
+        "slider": {
+          "min": 0,
+          "max": 100,
+          "step": 1
+        }
+      },
+      "quarantine_auto_retry_days": {
+        "description": "隔离批次自动重排天数",
+        "hint": "被隔离（待修复）的总结批次闲置超过该天数后，维护任务会自动把它们重新排队，把事件交还给后续会话重新总结，避免隔离区只增不减。0 表示关闭自动重排，只由面板手动释放。",
+        "type": "int",
+        "default": 7,
+        "min": 0,
+        "max": 25,
+        "slider": {
+          "min": 0,
+          "max": 25,
+          "step": 1
+        }
+      },
+      "quarantine_auto_retry_limit": {
+        "description": "每次自动重排上限",
+        "hint": "每轮维护最多自动重排多少个隔离批次，避免一次性把大量旧批次推回队列。面板手动释放不受此限制。",
+        "type": "int",
+        "default": 50,
+        "min": 1,
+        "max": 200,
+        "slider": {
+          "min": 1,
+          "max": 200,
+          "step": 1
+        }
+      },
+      "self_experience_enabled": {
+        "type": "bool",
+        "description": "生成 Bot 自己的经历记忆",
+        "hint": "总结时额外产出一条 Bot 视角的脱敏经历（只写自己做了什么、感受到什么，不含对方隐私），跨会话可见。",
+        "default": true
+      },
+      "self_experience_max_chars": {
+        "type": "int",
+        "description": "自身经历字数上限",
+        "hint": "单条 Bot 经历记忆的最大字数。",
+        "default": 200,
+        "min": 0,
+        "max": 1000,
+        "slider": {
+          "min": 0,
+          "max": 1000,
+          "step": 10
+        }
       }
     }
   },
@@ -375,79 +647,170 @@
         "description": "片段失败重试次数",
         "hint": "单个历史会话片段连续失败达到该次数后暂停整个批次，保留已完成进度。",
         "type": "int",
-        "default": 3
+        "default": 3,
+        "min": 1,
+        "max": 20,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
       },
       "qq_max_range_days": {
         "description": "QQ 单次读取天数",
         "hint": "通过 NapCat/OneBot 直接读取好友历史时允许选择的最长时间范围，硬上限为 31 天。",
         "type": "int",
-        "default": 31
+        "default": 31,
+        "min": 0,
+        "max": 100,
+        "slider": {
+          "min": 0,
+          "max": 100,
+          "step": 1
+        }
       },
       "qq_max_messages": {
         "description": "QQ 单次消息上限",
         "hint": "一个读取预览最多暂存的好友消息数量，硬上限为 5000；超出时会在预览中明确标记截断。",
         "type": "int",
-        "default": 5000
+        "default": 5000,
+        "min": 1,
+        "max": 20000,
+        "slider": {
+          "min": 1,
+          "max": 20000,
+          "step": 1
+        }
       },
       "qq_page_size": {
         "description": "QQ 历史分页条数",
         "hint": "每次调用 get_friend_msg_history 请求的消息数量，最大为 100。",
         "type": "int",
-        "default": 100
+        "default": 100,
+        "min": 1,
+        "max": 500,
+        "slider": {
+          "min": 1,
+          "max": 500,
+          "step": 1
+        }
       },
       "qq_max_pages": {
         "description": "QQ 历史扫描页数",
         "hint": "从最新消息向前定位所选时段时最多扫描的页数，达到上限会停止并提示记录可能不完整。",
         "type": "int",
-        "default": 100
+        "default": 100,
+        "min": 1,
+        "max": 500,
+        "slider": {
+          "min": 1,
+          "max": 500,
+          "step": 1
+        }
       },
       "qq_request_timeout_seconds": {
         "description": "QQ 接口超时秒数",
         "hint": "单次 OneBot 能力检测或历史分页请求的等待时间。",
         "type": "int",
-        "default": 15
+        "default": 15,
+        "min": 0,
+        "max": 50,
+        "slider": {
+          "min": 0,
+          "max": 50,
+          "step": 1
+        }
       },
       "merge_seconds": {
         "description": "连续发言合并秒数",
         "hint": "同一说话人在该秒数内连续发送的消息会合并成一次逻辑发言；原始消息仍分别保存。",
         "type": "int",
-        "default": 120
+        "default": 120,
+        "min": 0,
+        "max": 500,
+        "slider": {
+          "min": 0,
+          "max": 500,
+          "step": 1
+        }
       },
       "hard_gap_minutes": {
         "description": "会话硬分段分钟",
         "hint": "相邻发言超过该间隔时一定开始新的会话片段。",
         "type": "int",
-        "default": 120
+        "default": 120,
+        "min": 0,
+        "max": 500,
+        "slider": {
+          "min": 0,
+          "max": 500,
+          "step": 1
+        }
       },
       "soft_gap_minutes": {
         "description": "会话软分段分钟",
         "hint": "超过该间隔且遇到跨日、晚安、离开或重新问候时开始新片段。",
         "type": "int",
-        "default": 30
+        "default": 30,
+        "min": 0,
+        "max": 100,
+        "slider": {
+          "min": 0,
+          "max": 100,
+          "step": 1
+        }
       },
       "max_turns": {
         "description": "单片段逻辑发言数",
         "hint": "限制一个会话片段最多包含多少次逻辑发言，避免提示过长。",
         "type": "int",
-        "default": 30
+        "default": 30,
+        "min": 1,
+        "max": 100,
+        "slider": {
+          "min": 1,
+          "max": 100,
+          "step": 1
+        }
       },
       "max_segment_chars": {
         "description": "单片段正文字数",
         "hint": "单个会话片段的正文上限；切分时尽量不拆开用户提问与 Bot 回答。",
         "type": "int",
-        "default": 4200
+        "default": 4200,
+        "min": 0,
+        "max": 20000,
+        "slider": {
+          "min": 0,
+          "max": 20000,
+          "step": 10
+        }
       },
       "package_chars": {
         "description": "单次总结打包字数",
         "hint": "允许把多个较短片段打包到一次模型请求中，但每个片段仍独立返回摘要和事件。",
         "type": "int",
-        "default": 4600
+        "default": 4600,
+        "min": 0,
+        "max": 20000,
+        "slider": {
+          "min": 0,
+          "max": 20000,
+          "step": 10
+        }
       },
       "detail_package_chars": {
         "description": "详细回忆补全打包字数",
         "hint": "旧批次升级为第三人称详细回忆时，单次发送给总结模型的片段与原文总量。数值越大调用更少，但更容易超时。",
         "type": "int",
-        "default": 9000
+        "default": 9000,
+        "min": 0,
+        "max": 50000,
+        "slider": {
+          "min": 0,
+          "max": 50000,
+          "step": 10
+        }
       }
     }
   },
@@ -458,9 +821,9 @@
     "items": {
       "embedding_enabled": {
         "description": "启用嵌入召回",
-        "hint": "开启后使用 Embedding Provider 为长期记忆建立向量索引，并额外召回语义相近候选；失败时自动回退本地检索。",
+        "hint": "默认开着：有嵌入模型就顺手建向量索引，召回时多找一层语义相近的话；没配嵌入模型也不会报错，自动退回全文检索。没有它，记忆只能靠字面相似找，等于还是消息记录库。",
         "type": "bool",
-        "default": false
+        "default": true
       },
       "embedding_provider_id": {
         "description": "嵌入模型 Provider",
@@ -489,13 +852,27 @@
         "description": "重排候选倍率",
         "hint": "实际注入 TopK 的多少倍进入二阶段重排。建议 3-5；过大会增加重排耗时。",
         "type": "int",
-        "default": 5
+        "default": 5,
+        "min": 0,
+        "max": 20,
+        "slider": {
+          "min": 0,
+          "max": 20,
+          "step": 1
+        }
       },
       "rerank_candidate_limit": {
         "description": "重排候选上限",
         "hint": "每轮最多送入重排模型的候选记忆数量。建议 24-40。",
         "type": "int",
-        "default": 32
+        "default": 32,
+        "min": 1,
+        "max": 100,
+        "slider": {
+          "min": 1,
+          "max": 100,
+          "step": 1
+        }
       },
       "embedding_index_pending": {
         "description": "待复核记忆也建向量索引",
@@ -510,59 +887,154 @@
     "hint": "向量比较批量、相似度阈值、超时和补索引等高级调优参数。日常使用可保持默认。",
     "type": "object",
     "items": {
+      "anchor_floor_enabled": {
+        "description": "人工锚定保底",
+        "hint": "开启后，被显式锚定的记忆会获得一条保底分数下限（旧行为）。2.6.1 起默认关闭：锚定只作为证据之一参与排序，不再强行抬进结果。",
+        "type": "bool",
+        "default": false
+      },
+      "scope_bonus_scale": {
+        "description": "同窗口加分缩放",
+        "hint": "同一个会话/同一个人/同一个群/机器人自身的记忆获得的轻微加分倍率。1.0 恢复 2.6.0 之前的硬偏置（+0.25/+0.15/+0.15/+0.08），默认 0.2 只做平手裁决。",
+        "type": "float",
+        "default": 0.2,
+        "min": 0.0,
+        "max": 1.0,
+        "slider": {
+          "min": 0.0,
+          "max": 1.0,
+          "step": 0.01
+        }
+      },
+      "mmr_redundancy_weight": {
+        "description": "多样性去冗余权重",
+        "hint": "MMR 重排里“与已选结果重复”的扣分权重。越大越倾向给不同的事，越小越倾向给最相关的同一件事。默认 0.35。",
+        "type": "float",
+        "default": 0.35,
+        "min": 0.0,
+        "max": 1.0,
+        "slider": {
+          "min": 0.0,
+          "max": 1.0,
+          "step": 0.01
+        }
+      },
       "recall_latency_budget_ms": {
         "description": "召回延迟预算（毫秒）",
         "hint": "每轮召回的时间预算。超预算后跳过可选的模型调用（精排），但候选数量不变——变慢的是排序质量，不是召回内容。想提速请用这一项，而不是调低注入条数：调低条数会直接删掉这个插件存在的意义。0 表示不限制。",
         "type": "int",
-        "default": 0
+        "default": 0,
+        "min": 0,
+        "max": 100,
+        "slider": {
+          "min": 0,
+          "max": 100,
+          "step": 10
+        }
       },
       "query_vector_cache_ttl_seconds": {
         "description": "问句向量缓存秒数",
         "hint": "开启向量检索时，每轮都要为当前问题算一次向量。同一句话重复追问是很常见的，这里按 TTL 缓存，避免重复的模型调用。0 表示关闭。",
         "type": "float",
-        "default": 0.0
+        "default": 0.0,
+        "min": 0.0,
+        "max": 10.0,
+        "slider": {
+          "min": 0.0,
+          "max": 10.0,
+          "step": 0.5
+        }
       },
       "embedding_candidate_limit": {
         "description": "向量比较批量",
         "hint": "每批处理的向量数，沿用原配置键。会分批比较全部当前允许读取且有效的已索引记忆；降低批量可减少临时内存，不再截掉较早的记忆。",
         "type": "int",
-        "default": 1200
+        "default": 1200,
+        "min": 1,
+        "max": 5000,
+        "slider": {
+          "min": 1,
+          "max": 5000,
+          "step": 1
+        }
       },
       "embedding_top_k": {
         "description": "向量合并数量",
         "hint": "当前授权集合内向量相似度最高的多少条会并入本地候选池，再重验来源、本地评分和可选重排。",
         "type": "int",
-        "default": 32
+        "default": 32,
+        "min": 1,
+        "max": 100,
+        "slider": {
+          "min": 1,
+          "max": 100,
+          "step": 1
+        }
       },
       "embedding_score_threshold": {
         "description": "向量相似度阈值",
         "hint": "低于该相似度的向量结果不会进入候选池。建议 0.30-0.42；过高会漏召回，过低会带来无关记忆。",
         "type": "float",
-        "default": 0.34
+        "default": 0.34,
+        "min": 0.0,
+        "max": 1.0,
+        "slider": {
+          "min": 0.0,
+          "max": 1.0,
+          "step": 0.01
+        }
       },
       "embedding_weight": {
         "description": "向量加权分",
         "hint": "向量相似度在最终本地评分中的软加分权重。建议 0.45-0.75；重排启用时不宜过高。",
         "type": "float",
-        "default": 0.55
+        "default": 0.55,
+        "min": 0.0,
+        "max": 1.0,
+        "slider": {
+          "min": 0.0,
+          "max": 1.0,
+          "step": 0.01
+        }
       },
       "embedding_timeout_ms": {
         "description": "嵌入超时毫秒",
         "hint": "生成查询向量或记忆向量超过该时间会回退/跳过。0 表示不限制；OpenAI 兼容公益站建议 4000-8000。",
         "type": "int",
-        "default": 5000
+        "default": 5000,
+        "min": 0,
+        "max": 20000,
+        "slider": {
+          "min": 0,
+          "max": 20000,
+          "step": 10
+        }
       },
       "rerank_timeout_ms": {
         "description": "重排超时毫秒",
         "hint": "重排模型超过该时间会回退本地检索。0 表示不限制；测试期建议 800-1500。",
         "type": "int",
-        "default": 1200
+        "default": 1200,
+        "min": 0,
+        "max": 5000,
+        "slider": {
+          "min": 0,
+          "max": 5000,
+          "step": 10
+        }
       },
       "embedding_max_text_chars": {
         "description": "嵌入文本上限",
         "hint": "送入 Embedding Provider 的单条记忆文本最大长度。会包含类型、范围、标签、内容、摘要字段和证据。",
         "type": "int",
-        "default": 1200
+        "default": 1200,
+        "min": 0,
+        "max": 5000,
+        "slider": {
+          "min": 0,
+          "max": 5000,
+          "step": 10
+        }
       },
       "embedding_backfill_enabled": {
         "description": "补齐旧记忆向量",
@@ -574,55 +1046,111 @@
         "description": "补向量批量",
         "hint": "每次后台最多补齐多少条旧记忆向量。值越大，首次开启后建索引越快，但会增加 Embedding Provider 调用量。",
         "type": "int",
-        "default": 50
+        "default": 50,
+        "min": 1,
+        "max": 200,
+        "slider": {
+          "min": 1,
+          "max": 200,
+          "step": 1
+        }
       },
       "embedding_backfill_interval_seconds": {
         "description": "补向量最短间隔",
         "hint": "同一 Embedding Provider 两次后台缺失扫描之间的最短秒数，避免每轮检索都重复扫描。0 表示不节流。",
         "type": "int",
-        "default": 300
+        "default": 300,
+        "min": 0,
+        "max": 1000,
+        "slider": {
+          "min": 0,
+          "max": 1000,
+          "step": 1
+        }
       },
       "embedding_background_concurrency": {
         "description": "向量后台并发",
         "hint": "后台新增记忆和批量补索引共用的最大并发数，建议 1-3。",
         "type": "int",
-        "default": 2
+        "default": 2,
+        "min": 0,
+        "max": 10,
+        "slider": {
+          "min": 0,
+          "max": 10,
+          "step": 1
+        }
       },
       "current_window_candidate_limit": {
         "description": "当前窗口候选保底",
         "hint": "无论全局记忆数量多少，额外读取当前私聊或群聊窗口的候选上限，防止高重要度全局记录挤掉当前上下文。",
         "type": "int",
-        "default": 600
+        "default": 600,
+        "min": 1,
+        "max": 2000,
+        "slider": {
+          "min": 1,
+          "max": 2000,
+          "step": 1
+        }
       },
       "keyword_fallback_min_fts_candidates": {
         "description": "宽泛关键词回退阈值",
         "hint": "FTS 候选少于该数量时才执行多列 LIKE 回退；设为 0 可完全关闭宽泛 LIKE 回退。",
         "type": "int",
-        "default": 80
+        "default": 80,
+        "min": 0,
+        "max": 250,
+        "slider": {
+          "min": 0,
+          "max": 250,
+          "step": 1
+        }
       },
       "relax_keyword_min_hits": {
-        "description": "放宽词法复核门槛",
+        "description": "弱关键词也允许召回：查询词只命中 1 个时仍进入注入候选（默认开；关闭后要求命中 2 个以上，短句更容易注入为空）",
         "hint": "默认关闭（行为与旧版一致）。开启后，语义候选的词法复核 min_hits 统一降到 1——语义相关但关键词不重叠的记忆更容易通过复核（配合调大向量合并数量效果明显），噪声由评分与注入条数兜底。",
         "type": "bool",
-        "default": false
+        "default": true
       },
       "proactive_message_score_penalty": {
         "description": "主动消息记忆降权",
         "hint": "proactive_message（主动消息原文）类记忆的评分乘数。1.0=不降权（默认，行为与旧版一致）；设为 0.3 表示评分乘 0.3、让位给有价值记忆；0=完全排除。该类记忆多为天气播报等低信息量原文，占用候选池。",
         "type": "float",
-        "default": 1.0
+        "default": 1.0,
+        "min": 0.0,
+        "max": 1.0,
+        "slider": {
+          "min": 0.0,
+          "max": 1.0,
+          "step": 0.01
+        }
       },
       "dedupe_content_ratio": {
         "description": "内容级去重阈值",
-        "hint": "检索结果中规范化文本相似度达到该比例（difflib ratio，0-1）的候选只保留评分最高的一条，避免同一事实的多条措辞变体占用注入名额。0=关闭（默认，行为与旧版一致）；建议 0.75-0.85。",
+        "hint": "内容相似度超过该比例的记忆只保留一条，避免同一件事反复注入。0 表示关闭去重，建议 0.85。",
         "type": "float",
-        "default": 0.0
+        "default": 0.85,
+        "min": 0.0,
+        "max": 1.0,
+        "slider": {
+          "min": 0.0,
+          "max": 1.0,
+          "step": 0.01
+        }
       },
       "non_conversation_budget": {
         "description": "非对话记忆预算",
         "hint": "普通问题中 Bot 自身时间线（生图、创作、直播、日程等）最多占用的召回名额，默认 2；明确询问这些内容时会自动放宽。",
         "type": "int",
-        "default": 2
+        "default": 2,
+        "min": 0,
+        "max": 10,
+        "slider": {
+          "min": 0,
+          "max": 10,
+          "step": 1
+        }
       }
     }
   },
@@ -653,7 +1181,14 @@
         "description": "向量维度",
         "hint": "填写所选 Embedding Provider 实际返回的维度；不匹配时本批不会提交。",
         "type": "int",
-        "default": 0
+        "default": 0,
+        "min": 0,
+        "max": 10,
+        "slider": {
+          "min": 0,
+          "max": 10,
+          "step": 1
+        }
       },
       "history_backfill_enabled": {
         "description": "回填当前会话历史",
@@ -665,31 +1200,92 @@
         "description": "每次维护来源数",
         "hint": "单次后台唤醒最多检查的来源数，取值会限制在 1-32。",
         "type": "int",
-        "default": 4
+        "default": 4,
+        "min": 0,
+        "max": 20,
+        "slider": {
+          "min": 0,
+          "max": 20,
+          "step": 1
+        }
       },
       "provider_calls_per_run": {
         "description": "每次 Provider 调用上限",
         "hint": "单次后台唤醒最多新增的 Embedding 请求数，取值会限制在 1-32。已就绪且内容未变的投影不重复调用。",
         "type": "int",
-        "default": 8
+        "default": 8,
+        "min": 0,
+        "max": 25,
+        "slider": {
+          "min": 0,
+          "max": 25,
+          "step": 1
+        }
       },
       "fragment_target_chars": {
         "description": "原文片段目标长度",
         "hint": "按 Unicode 码点切分的单片段目标长度。",
         "type": "int",
-        "default": 600
+        "default": 600,
+        "min": 0,
+        "max": 2000,
+        "slider": {
+          "min": 0,
+          "max": 2000,
+          "step": 10
+        }
       },
       "fragment_overlap_chars": {
         "description": "原文片段重叠长度",
         "hint": "相邻片段保留的重叠码点数，必须小于片段目标长度。",
         "type": "int",
-        "default": 80
+        "default": 80,
+        "min": 0,
+        "max": 250,
+        "slider": {
+          "min": 0,
+          "max": 250,
+          "step": 10
+        }
       },
       "window_max_chars": {
         "description": "邻近窗口最大长度",
         "hint": "单个片段与可用邻近消息拼接后的总码点上限。",
         "type": "int",
-        "default": 1800
+        "default": 1800,
+        "min": 0,
+        "max": 10000,
+        "slider": {
+          "min": 0,
+          "max": 10000,
+          "step": 10
+        }
+      },
+      "query_max_chars": {
+        "description": "语义检索查询长度上限",
+        "hint": "把检索问题拼成语义查询时最多保留的字符数，取值会限制在 1-2000。",
+        "type": "int",
+        "default": 1000,
+        "min": 0,
+        "max": 5000,
+        "slider": {
+          "min": 0,
+          "max": 5000,
+          "step": 10
+        }
+      },
+      "documents_per_query": {
+        "description": "单次语义扫描来源上限",
+        "hint": "一次语义检索最多扫描的来源条数，取值会限制在 64-20000；调大可提高召回但会变慢。",
+        "type": "int",
+        "default": 5000,
+        "min": 0,
+        "max": 20000,
+        "slider": {
+          "min": 0,
+          "max": 20000,
+          "step": 1
+        }
       },
       "processing_version": {
         "description": "原文投影修订",
@@ -712,27 +1308,55 @@
       },
       "top_k": {
         "description": "注入条数",
-        "hint": "每轮最多注入多少条记忆。默认 4 条，优先保留最相关内容；时间聚合问题可按需增加。",
+        "hint": "每轮对话最多注入几条记忆。太小会「记不住」，太大会挤占上下文；单人使用建议 6-10。",
         "type": "int",
-        "default": 4
+        "default": 8,
+        "min": 1,
+        "max": 25,
+        "slider": {
+          "min": 1,
+          "max": 25,
+          "step": 1
+        }
       },
       "max_chars": {
         "description": "最大注入字数",
         "hint": "限制单轮注入长度，避免拖慢主链和污染上下文。原默认 1800 会把注入压成精简模式，每条只剩两百多字。",
         "type": "int",
-        "default": 4000
+        "default": 4000,
+        "min": 0,
+        "max": 20000,
+        "slider": {
+          "min": 0,
+          "max": 20000,
+          "step": 10
+        }
       },
       "max_item_chars": {
         "description": "单条记忆内容上限",
         "hint": "每条注入记忆的内容最多保留多少字符（默认 320）。注入条数较少时可保留更完整的摘要片段，整包仍受「最大注入字数」限制。",
         "type": "int",
-        "default": 320
+        "default": 240,
+        "min": 0,
+        "max": 1000,
+        "slider": {
+          "min": 0,
+          "max": 1000,
+          "step": 10
+        }
       },
       "temporal_aggregate_max_chars": {
         "description": "时间聚合注入字数",
         "hint": "当用户问最近一周、最近几天、本周这类需要汇总多条记忆的问题时使用。默认更宽，且会用精简证据格式注入。",
         "type": "int",
-        "default": 3600
+        "default": 3600,
+        "min": 0,
+        "max": 20000,
+        "slider": {
+          "min": 0,
+          "max": 20000,
+          "step": 10
+        }
       },
       "include_raw_events": {
         "description": "允许注入原始事件",
@@ -762,7 +1386,14 @@
         "description": "注入调试日志字数",
         "hint": "单轮注入调试日志最多打印多少字符。调大可查看完整注入块，调小可避免日志过长。",
         "type": "int",
-        "default": 12000
+        "default": 12000,
+        "min": 0,
+        "max": 50000,
+        "slider": {
+          "min": 0,
+          "max": 50000,
+          "step": 10
+        }
       },
       "enable_tone_abstraction": {
         "description": "启用 tone 表达抽象",
@@ -770,17 +1401,95 @@
         "type": "bool",
         "default": true
       },
-      "injection_cache_ttl_seconds": {
-        "description": "注入结果缓存秒数",
-        "hint": "同一轮内多次请求复用注入结果的时长。0 = 不缓存。",
-        "type": "float",
-        "default": 0.0
-      },
       "hook_request_budget_seconds": {
         "description": "注入钩子超时预算（秒）",
         "hint": "正数时整个注入钩子被 wait_for 包裹，超时即降级放行（本轮不注入），绝不拖死全轮对话。0 = 关闭。",
         "type": "float",
-        "default": 0.0
+        "default": 0.0,
+        "min": 0.0,
+        "max": 10.0,
+        "slider": {
+          "min": 0.0,
+          "max": 10.0,
+          "step": 0.5
+        }
+      },
+      "empty_recall_notice": {
+        "description": "空召回时提示「没检索到记忆」",
+        "hint": "默认关：什么都没想起来的时候不写任何回执，模型不会开口就交代「我查了记忆库」。只有排查检索问题时才需要打开。",
+        "type": "bool",
+        "default": false
+      }
+    }
+  },
+  "memory_humanization": {
+    "description": "拟人化记忆表达",
+    "hint": "让记忆表达更像人：久不提起的事措辞变模糊、没把握的事以模糊印象出现、彻底想不起时坦然承认。只影响注入措辞层，不改写存储的记忆内容，也不改变检索与权限判定；关闭后与旧版本行为完全一致。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用拟人化表达",
+        "hint": "默认开：久不提起的事说得模糊一点、没把握的说成「好像」、真想不起来就承认。关掉会变成一板一眼的确定口吻。存储与检索正确性不受影响。",
+        "type": "bool",
+        "default": true
+      },
+      "vivid_full_days": {
+        "description": "细节清晰期（天）",
+        "hint": "记忆存在不超过该天数时按原文清晰引用；超过后注入措辞降级为「细节已模糊，只可提大意」。手动记住、固定、关系承诺、伤疤和高重要度记忆不受年龄分级影响。",
+        "type": "float",
+        "default": 180.0,
+        "min": 0.0,
+        "max": 1000.0,
+        "slider": {
+          "min": 0.0,
+          "max": 1000.0,
+          "step": 1.0
+        }
+      },
+      "vivid_fuzzy_days": {
+        "description": "轮廓印象期（天）",
+        "hint": "记忆存在超过该天数后只保留轮廓：措辞为「好像有这么回事」，不再给出日期、原话等具体细节。建议 365-730。",
+        "type": "float",
+        "default": 540.0,
+        "min": 0.0,
+        "max": 2000.0,
+        "slider": {
+          "min": 0.0,
+          "max": 2000.0,
+          "step": 1.0
+        }
+      },
+      "fuzzy_impression_max_items": {
+        "description": "模糊印象条数上限",
+        "hint": "每轮最多把多少条低置信/陈旧记忆以「模糊印象」注入（模型可用「是不是…来着」的求证口吻使用）。0 = 恢复旧行为，这类记忆整条不注入。",
+        "type": "int",
+        "default": 2,
+        "min": 1,
+        "max": 20,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
+      },
+      "fuzzy_item_max_chars": {
+        "description": "模糊印象单条字数",
+        "hint": "模糊印象条目只保留大意轮廓，限制单条最大字数。",
+        "type": "int",
+        "default": 160,
+        "min": 0,
+        "max": 500,
+        "slider": {
+          "min": 0,
+          "max": 500,
+          "step": 10
+        }
+      },
+      "no_recall_hint_enabled": {
+        "description": "想不起来时诚实提示",
+        "hint": "开启后，本轮完全没有召回任何记忆时，注入包附带一条：坦然承认「想不起来」而不是脑补细节。关闭拟人化总开关时本项无效。",
+        "type": "bool",
+        "default": true
       }
     }
   },
@@ -795,17 +1504,42 @@
         "type": "bool",
         "default": true
       },
-      "capture_group_messages": {
-        "description": "记录群聊普通发言",
-        "hint": "开启后，即使 Bot 没被唤醒，也会记录群聊中的普通文本发言，用于形成连续对话片段。",
+      "capture_private_messages": {
+        "description": "记录私聊消息",
+        "hint": "开启后记录与 Bot 的私聊消息，用于形成连续对话片段。私聊天然指向 Bot，不需要唤醒词。",
         "type": "bool",
         "default": true
+      },
+      "capture_group_messages": {
+        "description": "记录群聊普通发言",
+        "hint": "开启后群聊里 @ 机器人、回复机器人或命中关键词的发言会写入记忆，私聊时才能想起群里聊过的事；默认开启，群聊普通闲聊仍不记录。",
+        "type": "bool",
+        "default": true
+      },
+      "group_capture_engagement_only": {
+        "description": "群聊只记与 Bot 相关的话",
+        "hint": "开启时，群聊只有 @Bot、回复 Bot、唤醒前缀或关键词命中的发言会被记录；关闭则记录群里所有文本发言（仅在已开启「记录群聊普通发言」时生效）。",
+        "type": "bool",
+        "default": true
+      },
+      "group_capture_keywords": {
+        "description": "群聊采集关键词",
+        "hint": "除 @ 和回复之外，群聊里出现这些词时也视为在叫 Bot，会记录该条发言。多个词用逗号、分号或空格分隔；留空表示不额外匹配。",
+        "type": "string",
+        "default": ""
       },
       "idle_gap_minutes": {
         "description": "连续片段间隔",
         "hint": "群聊相邻消息超过该分钟数时，视为新的连续对话片段。当前主要用于标记和后续展示。",
         "type": "int",
-        "default": 20
+        "default": 20,
+        "min": 0,
+        "max": 100,
+        "slider": {
+          "min": 0,
+          "max": 100,
+          "step": 1
+        }
       }
     }
   },
@@ -818,13 +1552,27 @@
         "description": "追问补全事件数",
         "hint": "处理“还有的吧”“刚才那个”等连续追问时，最多读取多少条最近群聊事件来补全检索词。",
         "type": "int",
-        "default": 12
+        "default": 12,
+        "min": 0,
+        "max": 50,
+        "slider": {
+          "min": 0,
+          "max": 50,
+          "step": 1
+        }
       },
       "time_window_timeline_limit": {
         "description": "时间窗口时间线条数",
         "hint": "当用户问今天、昨天、最近一周、上个月等时间问题时，最多补充多少条该窗口内的原始时间线事件。",
         "type": "int",
-        "default": 12
+        "default": 12,
+        "min": 1,
+        "max": 50,
+        "slider": {
+          "min": 1,
+          "max": 50,
+          "step": 1
+        }
       },
       "recent_fact_guard_enabled": {
         "description": "近期事实防遗忘",
@@ -836,19 +1584,40 @@
         "description": "近期事实有效小时",
         "hint": "只参考该小时数内的私聊即时状态；更近的明确更新会覆盖较早状态。",
         "type": "int",
-        "default": 3
+        "default": 3,
+        "min": 1,
+        "max": 10,
+        "slider": {
+          "min": 1,
+          "max": 10,
+          "step": 1
+        }
       },
       "recent_fact_guard_event_limit": {
         "description": "近期事实扫描事件数",
         "hint": "每轮最多检查多少条同一私聊时间线事件，用于寻找即时状态和 Bot 已回应证据。",
         "type": "int",
-        "default": 24
+        "default": 24,
+        "min": 1,
+        "max": 100,
+        "slider": {
+          "min": 1,
+          "max": 100,
+          "step": 1
+        }
       },
       "recent_fact_guard_max_items": {
         "description": "近期事实最多条数",
         "hint": "每轮最多给模型多少条近期状态锚点；默认 4 条以控制提示长度和干扰。",
         "type": "int",
-        "default": 4
+        "default": 4,
+        "min": 1,
+        "max": 20,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
       },
       "low_information_guard_enabled": {
         "description": "低信息输入保护",
@@ -860,13 +1629,20 @@
         "description": "低信息过期分钟",
         "hint": "弱语义输入距离上一条同会话事件超过该分钟数时，会隔离旧话题。摸摸/贴贴类亲昵输入始终隔离旧话题。",
         "type": "int",
-        "default": 20
+        "default": 20,
+        "min": 0,
+        "max": 100,
+        "slider": {
+          "min": 0,
+          "max": 100,
+          "step": 1
+        }
       },
       "suppress_memory_on_low_information": {
-        "description": "弱语义禁用长期召回",
+        "description": "低信息量消息（嗯/好的/表情）也允许注入少量相关记忆。默认关掉抑制：真实聊天里短句占多数，抑制会让记忆长期不出现。",
         "hint": "开启后，弱语义输入不使用长期记忆和陪伴插件检索线索，只根据当前消息与必要的近期原始上下文回复。",
         "type": "bool",
-        "default": true
+        "default": false
       },
       "topic_shift_guard_enabled": {
         "description": "新话题隔离保护",
@@ -875,16 +1651,23 @@
         "default": true
       },
       "suppress_memory_on_topic_shift": {
-        "description": "新话题禁用长期召回",
+        "description": "话题切换时也允许注入相关记忆。默认关掉抑制：切话题不等于要失忆，检索仍会按相关度过滤。",
         "hint": "开启后，新话题隔离触发时也会跳过长期记忆召回；用户明确说记得、之前、上次、按我喜欢的等需要记忆时不会跳过。",
         "type": "bool",
-        "default": true
+        "default": false
       },
       "topic_shift_guard_recent_events": {
         "description": "新话题比较事件数",
         "hint": "判断新请求是否与最近历史重叠时，最多比较多少条同会话时间线事件。",
         "type": "int",
-        "default": 6
+        "default": 6,
+        "min": 0,
+        "max": 20,
+        "slider": {
+          "min": 0,
+          "max": 20,
+          "step": 1
+        }
       },
       "group_actor_relevance_guard_enabled": {
         "description": "群聊发言者相关性保护",
@@ -902,13 +1685,27 @@
         "description": "跨窗口衔接有效分钟",
         "hint": "只读取该分钟数内相反会话类型的近期消息，过期内容不会进入跨窗口上下文。",
         "type": "int",
-        "default": 30
+        "default": 120,
+        "min": 0,
+        "max": 500,
+        "slider": {
+          "min": 0,
+          "max": 500,
+          "step": 1
+        }
       },
       "cross_window_recent_event_limit": {
         "description": "跨窗口衔接片段数",
         "hint": "每轮最多提供多少条当前用户与同一 Bot 的近期往返片段。默认 6 条，避免把原始历史整段塞给模型。",
         "type": "int",
-        "default": 6
+        "default": 6,
+        "min": 1,
+        "max": 20,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
       },
       "cross_window_group_to_private_enabled": {
         "description": "群聊衔接到私聊",
@@ -945,19 +1742,72 @@
         "description": "每轮核心块上限",
         "hint": "按优先级选取当前作用域可见的核心块，建议保持在 4-12 条。",
         "type": "int",
-        "default": 8
+        "default": 12,
+        "min": 1,
+        "max": 50,
+        "slider": {
+          "min": 1,
+          "max": 50,
+          "step": 1
+        }
       },
       "max_chars": {
         "description": "核心记忆字数预算",
         "hint": "核心块在整份记忆注入包内的独立预算，超出时按优先级保留。",
         "type": "int",
-        "default": 800
+        "default": 1200,
+        "min": 0,
+        "max": 5000,
+        "slider": {
+          "min": 0,
+          "max": 5000,
+          "step": 10
+        }
       },
       "scan_limit": {
         "description": "核心块扫描上限",
         "hint": "单轮最多检查多少个核心块的作用域和可见性。一般无需调整。",
         "type": "int",
-        "default": 200
+        "default": 200,
+        "min": 1,
+        "max": 1000,
+        "slider": {
+          "min": 1,
+          "max": 1000,
+          "step": 1
+        }
+      },
+      "auto_distill_enabled": {
+        "type": "bool",
+        "description": "自动沉淀核心记忆",
+        "default": true,
+        "hint": "维护任务每轮从高重要度的长期记忆里挑事实，补成核心记忆块；只在块数少于上限时补，不会覆盖你手写的块。"
+      },
+      "auto_distill_max_blocks": {
+        "type": "int",
+        "description": "自动沉淀块数上限",
+        "default": 6,
+        "hint": "自动生成的核心块最多补到这么多块，剩下的额度留给你自己写。",
+        "min": 1,
+        "max": 20,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
+      },
+      "auto_distill_min_salience": {
+        "type": "float",
+        "description": "自动沉淀重要度门槛",
+        "default": 0.45,
+        "hint": "只沉淀重要度不低于该值的记忆（0~1），调低会沉淀更多但更杂。",
+        "min": 0.0,
+        "max": 1.0,
+        "slider": {
+          "min": 0.0,
+          "max": 1.0,
+          "step": 0.01
+        }
       }
     }
   },
@@ -983,6 +1833,12 @@
         ],
         "default": "current_message"
       },
+      "include_intent_diagnostics": {
+        "description": "注入里回显检索诊断",
+        "hint": "开启后在注入内容里回显“检索模式/检索关键词/Bot 心理能量”等遥测行（调试用）。默认关闭，避免把内部字段写进给模型的人话里。",
+        "type": "bool",
+        "default": false
+      },
       "include_intent_context": {
         "description": "注入检索意图",
         "hint": "在上下文包中加入本轮检索意图摘要，帮助模型理解这些记忆为什么被取出。",
@@ -1005,13 +1861,27 @@
         "description": "上下文扩展读取消息数",
         "hint": "最多读取当前请求上下文中的最近消息数。",
         "type": "int",
-        "default": 12
+        "default": 12,
+        "min": 0,
+        "max": 50,
+        "slider": {
+          "min": 0,
+          "max": 50,
+          "step": 1
+        }
       },
       "contextual_query_anchor_limit": {
         "description": "上下文查询锚点上限",
         "hint": "每轮最多提取多少个前文实体或主题锚点。",
         "type": "int",
-        "default": 8
+        "default": 8,
+        "min": 1,
+        "max": 25,
+        "slider": {
+          "min": 1,
+          "max": 25,
+          "step": 1
+        }
       }
     }
   },
@@ -1024,37 +1894,149 @@
         "description": "意图摘要字数",
         "hint": "限制检索意图摘要长度，避免陪伴插件线索过长。",
         "type": "int",
-        "default": 520
+        "default": 520,
+        "min": 0,
+        "max": 2000,
+        "slider": {
+          "min": 0,
+          "max": 2000,
+          "step": 10
+        }
       },
       "self_timeline_limit": {
         "description": "Bot 自我时间线槽",
         "hint": "每轮最多放入多少条 Bot 自己的日程、主动行为和陪伴笔记。",
         "type": "int",
-        "default": 2
+        "default": 4,
+        "min": 1,
+        "max": 20,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
       },
       "user_profile_limit": {
         "description": "用户画像槽",
         "hint": "每轮最多放入多少条当前用户偏好、身份、关系和明确记住事项。",
         "type": "int",
-        "default": 2
+        "default": 2,
+        "min": 1,
+        "max": 20,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
       },
       "current_window_limit": {
         "description": "当前窗口槽",
         "hint": "每轮最多放入多少条当前私聊或群聊窗口相关记忆。",
         "type": "int",
-        "default": 3
+        "default": 3,
+        "min": 1,
+        "max": 20,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
       },
       "conversation_summary_limit": {
         "description": "阶段总结槽",
         "hint": "每轮最多放入多少条阶段性对话总结，用于保持连续性。",
         "type": "int",
-        "default": 2
+        "default": 3,
+        "min": 1,
+        "max": 20,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
       },
       "stable_memory_limit": {
         "description": "稳定记忆槽",
         "hint": "每轮最多放入多少条其他可见稳定记忆；总数仍受记忆注入 top_k 限制。",
         "type": "int",
-        "default": 3
+        "default": 4,
+        "min": 1,
+        "max": 20,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
+      }
+    }
+  },
+  "persona_memory": {
+    "description": "记得这个人",
+    "hint": "每次开口前，先把「眼前这个人是谁」放回她眼前：名字、称呼、关系、分量，还有几件要紧的事。关掉就退回按相似度找记忆。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用「记得这个人」",
+        "hint": "默认开启。开启后每轮注入一小段人物卡，超字数会自动只留名字和关系。",
+        "type": "bool",
+        "default": true
+      },
+      "max_chars": {
+        "description": "人物卡字数上限",
+        "hint": "太小会只剩名字和关系，太大会挤掉对话本身。默认 420。",
+        "type": "int",
+        "default": 420,
+        "min": 0,
+        "max": 2000,
+        "slider": {
+          "min": 0,
+          "max": 2000,
+          "step": 10
+        }
+      },
+      "max_items": {
+        "description": "要紧的事条数",
+        "hint": "人物卡里最多列几件她记得的事。默认 4。",
+        "type": "int",
+        "default": 6,
+        "min": 1,
+        "max": 20,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
+      },
+      "max_item_chars": {
+        "description": "单条字数",
+        "hint": "人物卡里每件事最多写多少字。默认 90。",
+        "type": "int",
+        "default": 90,
+        "min": 0,
+        "max": 500,
+        "slider": {
+          "min": 0,
+          "max": 500,
+          "step": 10
+        }
+      },
+      "imprint_keep_forever": {
+        "description": "刻骨的永不归档",
+        "hint": "亲密、承诺、第一次、吵过又和好的原话，不受「原始事件保留天数」限制。默认开。",
+        "type": "bool",
+        "default": true
+      },
+      "weight_enabled": {
+        "description": "她心里有杆秤",
+        "hint": "按这个人留下多少、留下多深、认识多久、一起经历过什么，掂一个「分量」，决定想起多少、忘得多快。别人（人形化、关系插件）报了自己的好感度，就听别人的。默认开。",
+        "type": "bool",
+        "default": true
+      },
+      "absorb_enabled": {
+        "description": "顺手记住关系插件说的关系",
+        "hint": "关系插件（如 user_tag）会在请求里说明「她在这人面前是谁」。默认开：只把它记进这个人的档案，不写进记忆、不当事实讲出去；用户本人亲口说的关系更硬，不会被覆盖。",
+        "type": "bool",
+        "default": true
       }
     }
   },
@@ -1124,10 +2106,10 @@
         "default": true
       },
       "clean_proactive_history": {
-        "description": "清理主动消息历史提示与外部残留块",
-        "hint": "注入前清理 AstrBot 原始上下文中残留的主动消息生成提示、send_message_to_user 工具说明、主动承接占位和 TTS/定时控制标签，只保留用户可见的干净聊天内容。同时只保留真正带临时/不保存标记的外部片段，历史里遗留的 private_companion HTML 动态块会被清理，避免状态、引用链或工具提示写入会话历史后反复污染主链。",
+        "description": "清理自家残留的主动消息提示",
+        "hint": "默认关闭。开启后只清理本插件自己塞进请求的临时片段（主动消息生成提示、send_message_to_user 说明、主动承接占位、TTS/定时控制标签），绝不改动用户和宿主写入的历史。以前这项会顺手改写宿主传来的整段上下文，已收窄。",
         "type": "bool",
-        "default": true
+        "default": false
       },
       "suppress_self_timeline_when_companion_seen": {
         "description": "陪伴已注入时隐藏自我时间线槽",
@@ -1156,9 +2138,9 @@
       },
       "allow_group_public_in_private": {
         "description": "私聊可见群公共记忆",
-        "hint": "开启后私聊中可看到群公共记忆，便于跨窗口回话。如需严格隔离私聊与群聊可关闭。",
+        "hint": "开启后，私聊里也能想起这个人在群里公开说过的事（跨群、跨会话的「同一个人」记忆）。关掉则群聊记忆只在原群里可见。默认开启；涉及他人隐私时可关闭。",
         "type": "bool",
-        "default": false
+        "default": true
       },
       "enable_acl_rules": {
         "description": "启用卡片权限",
@@ -1203,6 +2185,12 @@
         "type": "bool",
         "default": true
       },
+      "enable_person_weight_tool": {
+        "description": "启用分量工具",
+        "hint": "开启后模型可查看、纠正自己心里对当前这个人的分量（memory_companion_person_weight）；只影响当前发言者，不写聊天记录。",
+        "type": "bool",
+        "default": true
+      },
       "enable_note_tools": {
         "description": "启用陪伴笔记工具",
         "hint": "开启后模型可创建、读取和删除当前 Bot 自己可见的 companion_note，用于日程、状态、创作草稿和陪伴线索整理。",
@@ -1218,6 +2206,12 @@
       "enable_source_query_v2": {
         "description": "启用原文范围批读",
         "hint": "默认关闭。完成工具能力绑定后可按消息时间正序批读，长消息连续分片；仍共用导航步数和全局版本校验，不代表事件查全。",
+        "type": "bool",
+        "default": false
+      },
+      "allow_group_remember": {
+        "description": "允许在群聊里写入记忆",
+        "hint": "默认关闭：群里谁都能说话，一条「记住这个」不该变成对全群可见的永久记忆。需要的话在这里打开；打开后群里写的记忆也不会被钉成永久，随时可以被忘掉。",
         "type": "bool",
         "default": false
       }
@@ -1238,43 +2232,92 @@
         "description": "单轮最多导航步数",
         "hint": "同一条消息最多允许多少次不同的导航调用。默认 3；这是资源上限，不要求模型用满。",
         "type": "int",
-        "default": 3
+        "default": 3,
+        "min": 1,
+        "max": 20,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
       },
       "per_step_limit": {
         "description": "每步证据条数",
         "hint": "每次导航最多返回多少条当前可见候选。默认 6，较小值可减少提示词体量。",
         "type": "int",
-        "default": 6
+        "default": 6,
+        "min": 1,
+        "max": 20,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
       },
       "candidate_scan_limit": {
         "description": "每步图候选扫描数",
         "hint": "每步最多扫描多少条关联路径，再按当前权限过滤并截取可见证据。默认 96。",
         "type": "int",
-        "default": 96
+        "default": 96,
+        "min": 1,
+        "max": 500,
+        "slider": {
+          "min": 1,
+          "max": 500,
+          "step": 1
+        }
       },
       "range_batch_max_bytes": {
         "description": "原文批读返回字节上限",
         "hint": "默认 12288 字节。按 source-query 完整 JSON 的 UTF-8 体积计量，含正文和引用；外层查询进度另计，不等于模型 Token 预算。",
         "type": "int",
-        "default": 12288
+        "default": 12288,
+        "min": 0,
+        "max": 50000,
+        "slider": {
+          "min": 0,
+          "max": 50000,
+          "step": 10
+        }
       },
       "range_batch_max_messages": {
         "description": "原文批读消息上限",
         "hint": "每批最多处理的授权消息数，默认 48；SQL 额外预取一条只判断续页，不计已展示。",
         "type": "int",
-        "default": 48
+        "default": 48,
+        "min": 1,
+        "max": 200,
+        "slider": {
+          "min": 1,
+          "max": 200,
+          "step": 1
+        }
       },
       "range_batch_max_fragments": {
         "description": "原文批读片段上限",
         "hint": "每批最多返回的片段数，默认 64；长消息可以连续返回多个片段。",
         "type": "int",
-        "default": 64
+        "default": 64,
+        "min": 1,
+        "max": 200,
+        "slider": {
+          "min": 1,
+          "max": 200,
+          "step": 1
+        }
       },
       "range_batch_excerpt_chars": {
         "description": "原文批读单片段字符上限",
         "hint": "默认 800 字符，最大 800；实际输出还受 UTF-8 字节预算限制，未返回正文保留游标偏移。",
         "type": "int",
-        "default": 800
+        "default": 800,
+        "min": 0,
+        "max": 2500,
+        "slider": {
+          "min": 0,
+          "max": 2500,
+          "step": 10
+        }
       }
     }
   },
@@ -1299,13 +2342,27 @@
         "description": "扩展词上限",
         "hint": "每次检索最多从图谱取多少个相关词。建议 6-12，过高会扩大召回范围。",
         "type": "int",
-        "default": 12
+        "default": 12,
+        "min": 1,
+        "max": 50,
+        "slider": {
+          "min": 1,
+          "max": 50,
+          "step": 1
+        }
       },
       "backfill_limit": {
         "description": "维护补建条数",
         "hint": "运行维护时，最多从多少条已有阶段性总结补建知识图谱。补建是幂等的，重复运行不会重复建边。",
         "type": "int",
-        "default": 300
+        "default": 300,
+        "min": 1,
+        "max": 1000,
+        "slider": {
+          "min": 1,
+          "max": 1000,
+          "step": 1
+        }
       }
     }
   },
@@ -1318,7 +2375,14 @@
         "description": "单次导入上限",
         "hint": "单次最多导入多少条 LivingMemory documents 完整记忆。0 表示不限制。",
         "type": "int",
-        "default": 5000
+        "default": 5000,
+        "min": 1,
+        "max": 20000,
+        "slider": {
+          "min": 1,
+          "max": 20000,
+          "step": 1
+        }
       },
       "livingmemory_db_path": {
         "description": "LivingMemory 数据库路径",
@@ -1359,43 +2423,92 @@
         "description": "原始事件保留天数",
         "hint": "原始流水事件超过该天数后可进入清理。0 表示暂不自动清理。",
         "type": "int",
-        "default": 30
+        "default": 30,
+        "min": 0,
+        "max": 100,
+        "slider": {
+          "min": 0,
+          "max": 100,
+          "step": 1
+        }
       },
       "retention_unsummarized_timeline_days": {
         "description": "未总结时间线保留天数",
-        "hint": "从未成功写入长期总结的原始消息，超过该天数后在睡眠维护时删除；仍被待处理批次占有的行会跳过。这些行多半来自总结失败或被隔离的批次，不设上限的话时间线只会一直增长。默认 0 表示不自动删除——删的是原始对话，不可逆，确认不再需要后再开启。",
+        "hint": "从未成功写入长期总结的原始消息，超过该天数后在睡眠维护时删除；仍被待处理批次占用的行会跳过。默认 365 天：一年的原话还总结不了，基本就是没用了，留着只会让时间线无限长。删的是原始流水，已总结出来的记忆不受影响；改成 0 就是不自动删。",
         "type": "int",
-        "default": 0
+        "default": 365,
+        "min": 0,
+        "max": 2000,
+        "slider": {
+          "min": 0,
+          "max": 2000,
+          "step": 1
+        }
       },
       "pending_review_max_age_days": {
         "description": "待复核候选最长保留天数",
         "hint": "一直停在待复核队列、既不被注入也不被衰减的候选记忆，超过该天数后转入可恢复冷区并关闭其复核条目，避免永远悬挂。0 表示不自动处理。",
         "type": "int",
-        "default": 30
+        "default": 30,
+        "min": 0,
+        "max": 100,
+        "slider": {
+          "min": 0,
+          "max": 100,
+          "step": 1
+        }
       },
       "retention_raw_event_limit": {
         "description": "原始事件单次归档上限",
         "hint": "每次睡眠维护最多归档多少条过期 raw_event 长期记录，避免一次维护写入过多。",
         "type": "int",
-        "default": 1000
+        "default": 1000,
+        "min": 1,
+        "max": 5000,
+        "slider": {
+          "min": 1,
+          "max": 5000,
+          "step": 1
+        }
       },
       "retention_summarized_timeline_days": {
         "description": "已总结时间线保留天数",
         "hint": "只清理已经成功写入长期总结的时间线；未总结和总结失败的原始消息不会被删除。0 表示不自动清理。",
         "type": "int",
-        "default": 30
+        "default": 30,
+        "min": 0,
+        "max": 100,
+        "slider": {
+          "min": 0,
+          "max": 100,
+          "step": 1
+        }
       },
       "retention_injection_log_days": {
         "description": "注入日志保留天数",
         "hint": "超过该天数的注入诊断日志会在睡眠维护时删除。0 表示不自动清理。",
         "type": "int",
-        "default": 14
+        "default": 14,
+        "min": 0,
+        "max": 50,
+        "slider": {
+          "min": 0,
+          "max": 50,
+          "step": 1
+        }
       },
       "retention_cleanup_limit": {
         "description": "保留清理单次上限",
         "hint": "每次维护分别最多删除多少条已总结时间线和注入日志，避免长事务。",
         "type": "int",
-        "default": 2000
+        "default": 2000,
+        "min": 1,
+        "max": 10000,
+        "slider": {
+          "min": 1,
+          "max": 10000,
+          "step": 1
+        }
       },
       "memory_decay_enabled": {
         "description": "启用自然衰减",
@@ -1413,13 +2526,27 @@
         "description": "自动维护启动延迟（秒）",
         "hint": "插件收到首条消息后等待一段时间再执行，避免启动和对话热路径争抢资源。",
         "type": "int",
-        "default": 120
+        "default": 120,
+        "min": 0,
+        "max": 500,
+        "slider": {
+          "min": 0,
+          "max": 500,
+          "step": 1
+        }
       },
       "auto_interval_hours": {
         "description": "自动维护间隔（小时）",
         "hint": "两次自然遗忘维护之间的最短间隔，最小 1 小时。",
         "type": "int",
-        "default": 24
+        "default": 24,
+        "min": 1,
+        "max": 100,
+        "slider": {
+          "min": 1,
+          "max": 100,
+          "step": 1
+        }
       },
       "wal_checkpoint_enabled": {
         "description": "自动 WAL 截断",
@@ -1431,13 +2558,27 @@
         "description": "WAL 截断间隔（秒）",
         "hint": "两次 WAL 截断检查之间的最短间隔，最小 60 秒。",
         "type": "int",
-        "default": 1800
+        "default": 1800,
+        "min": 0,
+        "max": 10000,
+        "slider": {
+          "min": 0,
+          "max": 10000,
+          "step": 1
+        }
       },
       "wal_checkpoint_min_bytes": {
         "description": "WAL 截断阈值（字节）",
         "hint": "仅当 -wal 文件超过该大小时才尝试 TRUNCATE，最小 1MB。",
         "type": "int",
-        "default": 8388608
+        "default": 8388608,
+        "min": 0,
+        "max": 50000000,
+        "slider": {
+          "min": 0,
+          "max": 50000000,
+          "step": 10
+        }
       },
       "memory_decay_archive_without_summary": {
         "description": "无模型时冷归档",
@@ -1449,7 +2590,14 @@
         "description": "自然衰减扫描上限",
         "hint": "每轮衰减最多扫描多少条候选；实际上限还会与 候选数×12 取大者。",
         "type": "int",
-        "default": 2000
+        "default": 2000,
+        "min": 1,
+        "max": 10000,
+        "slider": {
+          "min": 1,
+          "max": 10000,
+          "step": 1
+        }
       },
       "memory_decay_include_bot_self": {
         "description": "衰减包含 Bot 自我记录",
@@ -1474,25 +2622,53 @@
         "description": "单次候选上限",
         "hint": "每次预览最多检查多少条带原始事件引用的会话摘要。",
         "type": "int",
-        "default": 20
+        "default": 20,
+        "min": 1,
+        "max": 100,
+        "slider": {
+          "min": 1,
+          "max": 100,
+          "step": 1
+        }
       },
       "max_items_per_preview": {
         "description": "单次建议上限",
         "hint": "一次预览最多保留多少条通过本地证据校验的修改建议。",
         "type": "int",
-        "default": 8
+        "default": 8,
+        "min": 1,
+        "max": 25,
+        "slider": {
+          "min": 1,
+          "max": 25,
+          "step": 1
+        }
       },
       "provider_timeout_seconds": {
         "description": "审计模型超时秒数",
         "hint": "审计复用记忆总结模型，并按该时间限制单次请求。",
         "type": "int",
-        "default": 60
+        "default": 60,
+        "min": 0,
+        "max": 200,
+        "slider": {
+          "min": 0,
+          "max": 200,
+          "step": 1
+        }
       },
       "preview_expire_hours": {
         "description": "预览有效小时数",
         "hint": "超过有效期必须重新生成，避免应用已经过时的建议。",
         "type": "int",
-        "default": 24
+        "default": 24,
+        "min": 1,
+        "max": 100,
+        "slider": {
+          "min": 1,
+          "max": 100,
+          "step": 1
+        }
       }
     }
   },
@@ -1503,69 +2679,191 @@
     "items": {
       "memory_decay_after_days": {
         "description": "衰减年龄天数",
-        "hint": "稳定记忆存在超过该天数后才可能进入衰减候选。明确记住、画像、偏好、关系、手动记忆会被保护。",
+        "hint": "稳定记忆存在超过该天数后才可能进入衰减候选。明确记住、画像、偏好、关系、手动记忆会被保护。原版默认 180；拟人向调低到 90，让久不提起的日常记忆更早真正变淡。",
         "type": "int",
-        "default": 180
+        "default": 90,
+        "min": 0,
+        "max": 500,
+        "slider": {
+          "min": 0,
+          "max": 500,
+          "step": 1
+        }
       },
       "memory_decay_idle_days": {
         "description": "未访问天数",
-        "hint": "记忆距离上次被召回超过该天数后才可能衰减；被频繁召回的记忆会自然加固。",
+        "hint": "记忆距离上次被召回超过该天数后才可能衰减；被频繁召回的记忆会自然加固。原版默认 90；拟人向调低到 45，约一个半月没人提起的事就开始变淡。",
         "type": "int",
-        "default": 90
+        "default": 45,
+        "min": 0,
+        "max": 200,
+        "slider": {
+          "min": 0,
+          "max": 200,
+          "step": 1
+        }
       },
       "memory_decay_max_importance_percent": {
         "description": "重要记忆慢忘阈值",
         "hint": "重要度高于该百分比后会延长遗忘周期，但不会形成永久保护；只有明确固定或手工保护的记忆永不自动衰减。建议 65-80。",
         "type": "int",
-        "default": 74
+        "default": 74,
+        "min": 1,
+        "max": 250,
+        "slider": {
+          "min": 1,
+          "max": 250,
+          "step": 1
+        }
       },
       "memory_decay_score_threshold_percent": {
         "description": "衰减分阈值",
         "hint": "年龄、未访问时间、重要度和置信度共同计算的衰减分达到该百分比后才进入压缩。",
         "type": "int",
-        "default": 75
+        "default": 65,
+        "min": 0,
+        "max": 200,
+        "slider": {
+          "min": 0,
+          "max": 200,
+          "step": 1
+        }
+      },
+      "memory_decay_gradual_enabled": {
+        "description": "先淡再忘",
+        "hint": "打开后，老记忆先一档一档褪色（召回分数越来越低），褪到很淡才归档；不会某天突然整条消失。关掉就退回「到点直接归档」的老做法。",
+        "type": "bool",
+        "default": true
+      },
+      "memory_decay_fade_floor_percent": {
+        "description": "淡到什么程度才归档",
+        "hint": "记忆的「清晰度」低于该百分比才允许归档。默认 25：只剩两成多印象时，她才真的想不起来了。",
+        "type": "int",
+        "default": 25,
+        "min": 0,
+        "max": 100,
+        "slider": {
+          "min": 0,
+          "max": 100,
+          "step": 1
+        }
+      },
+      "memory_decay_fade_ratio_percent": {
+        "description": "每次褪色比例",
+        "hint": "每褪一次，清晰度变成原来的百分之多少。默认 70，褪两三次就到了「模糊」那档。",
+        "type": "int",
+        "default": 70,
+        "min": 0,
+        "max": 250,
+        "slider": {
+          "min": 0,
+          "max": 250,
+          "step": 1
+        }
+      },
+      "memory_decay_fade_interval_days": {
+        "description": "褪色间隔天数",
+        "hint": "同一条记忆两次褪色之间至少隔多少天，避免维护一跑就一路褪到底。",
+        "type": "int",
+        "default": 1,
+        "min": 0,
+        "max": 7,
+        "slider": {
+          "min": 0,
+          "max": 7,
+          "step": 1
+        }
       },
       "memory_decay_max_candidates": {
         "description": "单次候选上限",
         "hint": "每次睡眠维护最多处理多少条衰减候选。",
         "type": "int",
-        "default": 120
+        "default": 120,
+        "min": 1,
+        "max": 500,
+        "slider": {
+          "min": 1,
+          "max": 500,
+          "step": 1
+        }
       },
       "memory_decay_max_groups": {
         "description": "单次窗口组上限",
         "hint": "每次睡眠维护最多压缩多少个私聊/群聊窗口，确保不同窗口的隐私边界不混合。",
         "type": "int",
-        "default": 8
+        "default": 8,
+        "min": 1,
+        "max": 25,
+        "slider": {
+          "min": 1,
+          "max": 25,
+          "step": 1
+        }
       },
       "memory_decay_min_items_per_summary": {
         "description": "摘要最少碎片",
         "hint": "同一窗口至少累积多少条衰减候选才生成压缩摘要并归档原碎片。",
         "type": "int",
-        "default": 4
+        "default": 4,
+        "min": 0,
+        "max": 20,
+        "slider": {
+          "min": 0,
+          "max": 20,
+          "step": 1
+        }
       },
       "memory_decay_max_items_per_summary": {
         "description": "单摘要碎片上限",
         "hint": "单条衰减摘要最多合并多少条旧记忆碎片。",
         "type": "int",
-        "default": 24
+        "default": 24,
+        "min": 1,
+        "max": 100,
+        "slider": {
+          "min": 1,
+          "max": 100,
+          "step": 1
+        }
       },
       "memory_decay_summary_input_chars": {
         "description": "衰减摘要输入字数",
         "hint": "单次衰减压缩最多发送给模型的旧记忆字符数。",
         "type": "int",
-        "default": 6000
+        "default": 6000,
+        "min": 0,
+        "max": 20000,
+        "slider": {
+          "min": 0,
+          "max": 20000,
+          "step": 10
+        }
       },
       "memory_decay_summary_chars": {
         "description": "衰减摘要字数",
         "hint": "衰减压缩生成的新长期摘要最大字数。",
         "type": "int",
-        "default": 900
+        "default": 900,
+        "min": 0,
+        "max": 5000,
+        "slider": {
+          "min": 0,
+          "max": 5000,
+          "step": 10
+        }
       },
       "memory_decay_scan_limit": {
         "description": "衰减候选扫描池",
         "hint": "候选筛选前最多扫描的稳定记忆数；实际扫描至少为候选上限的 12 倍。",
         "type": "int",
-        "default": 2000
+        "default": 2000,
+        "min": 1,
+        "max": 10000,
+        "slider": {
+          "min": 1,
+          "max": 10000,
+          "step": 1
+        }
       },
       "memory_decay_include_bot_self": {
         "description": "允许衰减 Bot 自身记忆",
@@ -1590,7 +2888,14 @@
         "description": "后台任务启动宽限期（秒）",
         "hint": "插件启动后的这段时间内不创建后台任务。",
         "type": "int",
-        "default": 60
+        "default": 60,
+        "min": 0,
+        "max": 200,
+        "slider": {
+          "min": 0,
+          "max": 200,
+          "step": 1
+        }
       }
     }
   }

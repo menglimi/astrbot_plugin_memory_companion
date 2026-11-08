@@ -23,6 +23,7 @@ PROFILE = 'memory.source-capture.v1'
 MAX_BODY_BYTES = 256 * 1024
 MAX_PENDING_BYTES = 16 * 1024 * 1024
 CHUNK_CHARS = 4096
+DEFAULT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 IDENTITY_FIELDS = ('installation', 'platform', 'bot', 'persona', 'scope', 'session',
                    'speaker', 'audience', 'direction', 'message')
 
@@ -53,6 +54,7 @@ def initialize(db):
         CREATE TABLE IF NOT EXISTS capture_chunks (
             source_key TEXT NOT NULL, seq INTEGER NOT NULL, char_offset INTEGER NOT NULL,
             byte_offset INTEGER NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL,
+            created_at REAL NOT NULL DEFAULT 0, expires_at REAL NOT NULL DEFAULT 0,
             PRIMARY KEY(source_key,seq));
         CREATE TABLE IF NOT EXISTS capture_operations (
             operation TEXT PRIMARY KEY, source_key TEXT NOT NULL, payload_digest TEXT NOT NULL,
@@ -81,18 +83,50 @@ def initialize(db):
             UPDATE capture_sources SET state='changed',manifest='{}' WHERE timeline_id=NEW.id;
         END;
     ''')
+    # Idempotent upgrade for databases created before chunk retention existed.
+    columns = {row[1] for row in db.execute('PRAGMA table_info(capture_chunks)').fetchall()}
+    if 'created_at' not in columns:
+        db.execute('ALTER TABLE capture_chunks ADD COLUMN created_at REAL NOT NULL DEFAULT 0')
+    if 'expires_at' not in columns:
+        db.execute('ALTER TABLE capture_chunks ADD COLUMN expires_at REAL NOT NULL DEFAULT 0')
     db.execute("INSERT OR IGNORE INTO capture_runtime VALUES ('installation',?)", (secrets.token_hex(24),))
     db.execute("INSERT OR IGNORE INTO capture_runtime VALUES ('digest_key',?)", (secrets.token_hex(32),))
     db.commit()
 
 
 class SourceCapture:
-    def __init__(self, store):
+    def __init__(self, store, *, default_enabled=True, retention_seconds=DEFAULT_RETENTION_SECONDS):
         self.store = store
         self.db = store._conn
+        self.default_enabled = bool(default_enabled)
+        self.retention_seconds = max(0, int(retention_seconds))
         with store._lock:
             self.installation = self.db.execute("SELECT value FROM capture_runtime WHERE key='installation'").fetchone()[0]
             self._digest_key = bytes.fromhex(self.db.execute("SELECT value FROM capture_runtime WHERE key='digest_key'").fetchone()[0])
+
+    def source_capture_enabled(self):
+        """Read the effective switch: config default unless an explicit override was written."""
+        with self.store._lock:
+            row = self.db.execute("SELECT value FROM capture_runtime WHERE key='source_capture_enabled'").fetchone()
+        if row is None:
+            return self.default_enabled
+        return str(row[0]).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+    def set_source_capture_enabled(self, enabled, *, actor=''):
+        """Persist an explicit on/off override so the switch is writable at runtime."""
+        value = '1' if enabled else '0'
+        stamp = utc_now()
+        with self.store._lock, self.store._transaction_sync():
+            self.db.execute("INSERT OR REPLACE INTO capture_runtime VALUES ('source_capture_enabled',?)", (value,))
+            self.db.execute("INSERT OR REPLACE INTO capture_runtime VALUES ('source_capture_enabled_by',?)", (str(actor or '')[:120],))
+            self.db.execute("INSERT OR REPLACE INTO capture_runtime VALUES ('source_capture_enabled_at',?)", (stamp,))
+        return {'enabled': bool(enabled), 'actor': str(actor or '')[:120], 'updated_at': stamp}
+
+    def source_capture_switch(self):
+        with self.store._lock:
+            rows = dict(self.db.execute("SELECT key,value FROM capture_runtime WHERE key IN ('source_capture_enabled','source_capture_enabled_by','source_capture_enabled_at')").fetchall())
+        return {'enabled': self.source_capture_enabled(), 'explicit': 'source_capture_enabled' in rows,
+                'actor': rows.get('source_capture_enabled_by', ''), 'updated_at': rows.get('source_capture_enabled_at', '')}
 
     def activate(self, generation):
         with self.store._lock, self.store._transaction_sync():
@@ -171,6 +205,39 @@ class SourceCapture:
             return {**receipt, 'operation': operation, 'status': row['state'], 'payload_digest': row['payload_digest'],
                     'source_state': 'revoked' if self._revoked(row['source_key']) else current_state}
 
+    def read_body(self, source_key, *, authorize=lambda: True):
+        """Read back the retained original body assembled from chunk rows."""
+        with self.store._lock:
+            if not authorize():
+                return {'ok': False, 'status': 'unavailable', 'source_key': source_key}
+            if self._revoked(source_key):
+                return {'ok': False, 'status': 'revoked', 'source_key': source_key}
+            source = self.db.execute('SELECT * FROM capture_sources WHERE source_key=?', (source_key,)).fetchone()
+            if not source:
+                return {'ok': False, 'status': 'missing', 'source_key': source_key}
+            rows = self.db.execute('SELECT seq,char_offset,byte_offset,body,digest,created_at,expires_at '
+                                   'FROM capture_chunks WHERE source_key=? ORDER BY seq', (source_key,)).fetchall()
+            if not rows:
+                return {'ok': False, 'status': 'expired' if source['state'] == 'current' else source['state'],
+                        'source_key': source_key, 'timeline_id': source['timeline_id'], 'revision': source['revision']}
+            body = ''.join(row['body'] for row in rows)
+            expires = [row['expires_at'] for row in rows if row['expires_at']]
+            return {'ok': True, 'status': 'available', 'source_key': source_key, 'timeline_id': source['timeline_id'],
+                    'revision': source['revision'], 'state': source['state'], 'body': body, 'chars': len(body),
+                    'bytes': sum(len(row['body'].encode('utf-8')) for row in rows), 'chunks': len(rows),
+                    'created_at': rows[0]['created_at'], 'expires_at': min(expires) if expires else 0.0}
+
+    def purge_expired(self, now=None):
+        """Delete retained bodies past their expiry; timeline projections stay untouched."""
+        deadline = time.time() if now is None else float(now)
+        with self.store._lock, self.store._transaction_sync():
+            rows = self.db.execute('SELECT source_key,count(*) AS n FROM capture_chunks '
+                                   'WHERE expires_at>0 AND expires_at<=? GROUP BY source_key', (deadline,)).fetchall()
+            deleted = sum(int(row['n']) for row in rows)
+            if deleted:
+                self.db.execute('DELETE FROM capture_chunks WHERE expires_at>0 AND expires_at<=?', (deadline,))
+        return {'deleted_chunks': deleted, 'sources': len(rows), 'at': deadline}
+
     def stage(self, prepared, *, generation, authorize=lambda: True, expires=None):
         operation, key, ph = (prepared[k] for k in ('operation', 'source_key', 'payload_digest'))
         payload = prepared['payload']
@@ -238,12 +305,15 @@ class SourceCapture:
             if not actual:
                 raise ValueError('capture_timeline_not_committed')
             self.db.execute('DELETE FROM capture_chunks WHERE source_key=?', (key,))
-            chunks=[]; byte_offset=0
+            chunks=[]; byte_offset=0; chunk_created=time.time()
+            chunk_expires=(chunk_created+self.retention_seconds) if self.retention_seconds>0 else 0.0
             for seq, offset in enumerate(range(0,len(payload['body']),CHUNK_CHARS)):
                 chunk=payload['body'][offset:offset+CHUNK_CHARS]; blob=chunk.encode('utf-8')
                 sha=hashlib.sha256(blob).hexdigest()
-                self.db.execute('INSERT INTO capture_chunks VALUES (?,?,?,?,?,?)', (key,seq,offset,byte_offset,chunk,sha))
-                chunks.append(dict(seq=seq,char_offset=offset,byte_offset=byte_offset,chars=len(chunk),bytes=len(blob),digest=sha))
+                self.db.execute('INSERT INTO capture_chunks (source_key,seq,char_offset,byte_offset,body,digest,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?)',
+                                (key,seq,offset,byte_offset,chunk,sha,chunk_created,chunk_expires))
+                chunks.append(dict(seq=seq,char_offset=offset,byte_offset=byte_offset,chars=len(chunk),bytes=len(blob),digest=sha,
+                                   created_at=chunk_created,expires_at=chunk_expires))
                 byte_offset+=len(blob)
             manifest=dict(chunks=chunks,chars=len(payload['body']),bytes=byte_offset,
                           body_digest=hashlib.sha256(payload['body'].encode('utf-8')).hexdigest(),processing=payload['processing'])
@@ -290,8 +360,11 @@ class SourceCapture:
 
     def status(self):
         with self.store._lock:
+            chunk_rows = self.db.execute('SELECT count(*) AS n,min(expires_at) AS expires FROM capture_chunks WHERE expires_at>0').fetchone()
             return dict(profile=PROFILE,operations=dict(self.db.execute('SELECT state,count(*) FROM capture_operations GROUP BY state').fetchall()),
                         journal_mode=self.db.execute('PRAGMA journal_mode').fetchone()[0],
                         synchronous=self.db.execute('PRAGMA synchronous').fetchone()[0],
                         body_byte_limit=MAX_BODY_BYTES, pending_byte_limit=MAX_PENDING_BYTES,
+                        retention_seconds=self.retention_seconds, retained_chunks=chunk_rows['n'],
+                        next_expiry=chunk_rows['expires'] or 0.0, source_capture=self.source_capture_switch(),
                         inventory_coverage='observed_hooks_only')

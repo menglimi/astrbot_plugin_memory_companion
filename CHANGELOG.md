@@ -1,6 +1,520 @@
+## 2.6.5 - 2026-11-06（Bot 经历时间线）
+
+### 问题修复（来自上游 issue #46 / #47 / #54 / #55 / #56 / #60 / #61）
+- **#61 磁盘写放大**：`ScopedStore` 原来每次操作都新建 sqlite 连接并立刻关闭，每次连接都要重设 `journal_mode=WAL` / `synchronous=FULL`，机械盘上把 WAL 与 fsync 成本放大数倍。改为每线程复用一条长连接，事务嵌套复用外层事务，`close()` 统一回收所有线程的连接。
+- **#61 附带修复（Windows 文件锁）**：连接默认 `check_same_thread=True`，插件关闭时在线程池线程里 `close()` 会抛 `ProgrammingError` 并被静默吞掉，导致 sqlite 句柄不释放、数据目录删不掉。改为 `check_same_thread=False`（连接仍按线程隔离）。
+- **#54 严格 provider 的 400**：把契约 schema 整份当成 tool parameters 发给模型，`const` / `oneOf` / 无 `items` 的数组等写法会让 Gemini 等严格 provider 直接 400。新增 `core/tool_schema.py`，把契约转换成标准 JSON Schema 子集：`const: ""` → `pattern: "^$"`，`const: 其他` → `enum`，剥掉 `null` / `[]` 的 enum，数组补 `items`，`oneOf` / `anyOf` / `allOf` 保留结构只递归清洗。`query_session` / `event_query` 的全部工具参数绑定改走这个转换。
+- **#47 全表扫描**：`julianday(...)` 包住时间列，任何索引都用不上。新增四个表达式索引（`occurred_at` / `created_at` / `updated_at` / `COALESCE` 组合）并在建好后对 `memories` 单表 `ANALYZE`，查询计划从 `SCAN memories` + `TEMP B-TREE` 变成 `MULTI-INDEX OR`。
+- **#55 / #56 / #60**：docstring 里的 `confidence/importance` 已拆成四行独立参数；`sanitize_request_history()` 的主动消息清理默认关闭，不再按工具名单独删行，避免 `[CronJob]` 记录和 `role=tool` 回执被误删后导致 `tool_calls` 孤儿。
+- **#46**：写入侧的 `owner_bot_id` 已使用真实 bot 号，不再写成 platform 名（存量仅剩 9 行 `webchat` 与 22 行 `astrbot` 历史数据）。
+
+### 面板：深色/浅色选择不再丢
+- 主题原来只存浏览器 `localStorage`，部分 WebView（手机端、内置浏览器）重开页面会清空，表现就是「选了深色，下次打开还是白的」。
+- 新增 `POST /ui-preferences/save` 把选择写到 `data_dir/ui_preferences.json`；`GET /ui-preferences` 一并返回 `dark_mode`。打开面板时先用本地缓存保证首帧不闪，连上后端后再用文件里的值校正。
+- 单独开一个 POST 路由而不是给 `/ui-preferences` 加方法：AstrBot 的 `register_web_api` 只在「路由 + 方法列表完全一致」时替换旧条目，改方法列表会在插件重载后残留旧 GET 条目，请求先命中旧 handler 返回 503。
+
+### 面板：`/bots` 路由补策略声明
+- 新增的 `/bots` 只读端点漏了 `UI_READ_ENDPOINTS` 声明，面板策略自检会判定「没有显式策略」，补齐。
+
+### 面板：跨平台路径守卫
+- 修复非 Windows 平台（CI 的 Linux）上 `C:\Windows\win.ini` 这类 Windows 绝对路径被 `Path()` 当成相对路径、拼到当前目录后绕过数据目录检查的问题：`_resolve_page_path()` 现在显式拒绝盘符与 UNC 路径。
+
+### 测试
+- 修掉 40 个因行为变更而过时的断言：预设默认值（`top_k` 8 / `max_item_chars` 240）、星图视图已删除、跨群同人可见、摘要校验改为「至少两个实词命中」、`injection-status.js` 已移除、隔离批次改为真删原文、情绪衰减测试改用相对时间。
+- 新增 `ScopedStore` 连接复用、`tool_schema` 契约转换的单元测试。
+
+
+### 新增：Bot 自己的经历记忆
+- 总结时额外产出一条 Bot 视角的脱敏经历（`self_experience`），40-80 字，只写「我做了什么、感受到什么、留下什么印象」，不写对方隐私、不复述他人原话。
+- 以 `bot_self` 可见性写入 `self_action`，跨会话、跨群可见——她在群 A 经历过的事，在群 B 也能想起来。
+- 开关：`memory_summary.self_experience_enabled`（默认开）、`memory_summary.self_experience_max_chars`（默认 200）。
+
+## 2.6.4 - 2026-11-06（记忆体检修复）
+
+### 消化链路
+- 修复自动消化调度器从未启动：`_spawn_background` 的启动宽限期会把任务直接关闭，补 `defer_during_grace=True`。
+- 清理孤儿批次：1,158 条 `pending/retry_pending` 没有任何原文事件，永远不可能执行，新增 `close_orphan_retry_batches()` 一次性归入 completed。
+- 老会话绕过门槛：最旧超过 2 天且至少 2 条原文的会话走 `force`，不再卡在 `min_events=12`（518 个 backlog 会话里 335 个达不到门槛）。
+- 修复 drain 传 `scope="unknown"` 导致窗口查询恒为空的问题（空 scope 改传空串）。
+- 每轮消化顺带执行核心记忆自动沉淀，并加「自动消化跳过」诊断日志。
+
+### 核心记忆
+- 自动沉淀从 24 小时维护循环挪到消化循环（每轮都检查）。
+- 同名块改为合并更新（保留最近 20 条事实），不再因 label 冲突导致永远只有第一条。
+- 样本从最近 400 条扩到 1,200 条，每桶门槛从 3 条降到 2 条。
+
+### 摘要校验
+- 「摘要正文与本批原文缺乏对应」从硬错误降级为警告：只要有一个实词能在原文找到就保留本批，只有完全无依据才判编造。此前该判定直接冻结整批并重试。
+
+### 注入
+- `suppress_memory_on_low_information`、`suppress_memory_on_topic_shift` 默认改为关闭抑制：真实聊天里短句占多数，抑制会让记忆长期不出现。
+- `relax_keyword_min_hits` 默认开启：查询词命中 1 个也进入候选。
+- `memory_injection.top_k` 默认 4 → 8。
+
+### 修复：待修复批次「全部放弃」不生效
+- 批量释放循环把 API 返回又套了一层 `.data` 去读 `released`，读到的永远是 `undefined`，第一次请求后就 `break`，进度文案显示 0 且不再继续；`run()` 的完成提示同样读不到条数。
+- 改为兼容内层/外层两种返回结构，进度按真实条数递增，完成提示显示「已放弃 N 条」。
+- 后端实测：33 条隔离批次 + 655 行原文，一次 `discard` 1.01 秒完成，非性能问题。
+
+### 面板
+- 总览新增「自动消化」卡片（状态 / 上次结果 / 上次完成时间 / 最近错误），可直接跳转排队中。
+- `/stats` 暴露 `summary_drain`。
+- 清理 app.css 里 125 行星图残留样式（17 个类，零引用）。
+
+### 默认值（拟人化调优）
+- 记忆槽位：`self_timeline_limit` 2→4、`conversation_summary_limit` 2→3、`stable_memory_limit` 3→4、`persona_memory.max_items` 4→6。
+- 核心记忆：`max_blocks` 8→12、`max_chars` 800→1200、`auto_distill_max_blocks` 3→6。
+- 总结节奏：`min_events` 12→8、`trigger_event_count` 12→8。
+- 画像：`daily_success_limit_per_person` 1→3、`daily_attempt_limit_per_person` 2→6、`min_independent_evidence` 3→2。
+- 注入单条 320→240 字：条数更多、每条更短，更像人嘴里的细节。
+- 衰减分阈值 75→65：在乎的人淡得慢一点。
+- 跨窗口衔接 30→120 分钟；细节清晰期 45→30 天（近一个月的事记得清）。
+- 同步 `core/operations.py` 三档预设与 `core/service.py` 运行时兜底；`DEFAULT_CORE_MEMORY_CHARS` 800→1200、`DEFAULT_MAX_ITEM_CHARS` 320→240。
+
+### 批次视图拆分
+- 「导入」下拆成三个独立入口：**待修复批次**（quarantined，可逐条 / 整批重新排队或放弃）、**排队处理**（pending，只读）、**已处理批次**（completed + no_memory，只读，标注「已总结 / 无新增记忆」）。
+- 总览三个 KPI（待处理批次 / 待修复批次 / 已处理无新增记忆）分别跳到对应视图，不再挤在同一个页面里。
+- 后端新增 `list_processed_batches()` 与 `/maintenance/summary_batches?state=processed`；缓存串升到 `2.6.2.5`。
+
 # Changelog
 
 本项目遵循面向用户体验的版本记录。日期使用北京时间。
+
+## 2.6.3 - 2026-11-06
+
+> 修消化（记忆真正记得住）+ 注入增强 + 跨群「一个人的记忆」+ 自动沉淀。
+
+### 消化链路：新增全局积压消化
+- 以前只有「这个会话来新消息」才会触发总结，老会话的原文会一直躺在 timeline 里没人处理。
+  现在新增后台消化调度：启动后延迟 120 秒开始，每 10 分钟扫一轮，把「未总结且没有排队批次」的会话
+  按最老优先补上总结，每轮最多 5 个会话（`memory_summary.auto_drain_*`）。
+- 清理「孤儿批次」：没有任何原文事件的 pending/retry 批次直接归档为 completed，不再占着「待处理」的数字。
+- 实测基线：未总结原文 28,078 条，其中 20,506 条从未被分配批次；孤儿 retry 批次 1,158 条。新调度会逐步消化。
+
+### 注入增强
+- `memory_injection.top_k` 默认 4 → 8；长问题（40 字以上或含多个问号）自动 +2（上限 20），
+  时间类问题保持更宽的召回。
+- `retrieval_advanced.dedupe_content_ratio` 默认 0.0 → 0.85：内容高度相似的记忆在注入前合并，省上下文。
+- `memory_summary.min_events` 20→12、`trigger_event_count` 20→12、`trigger_interval_minutes` 60→30：
+  更早开始总结，不用攒一大坨。
+
+### 跨群「一个人的记忆」
+- 同一个人在 A 群说过的话，本人在 B 群时也能被回忆起（`same_person_other_group`）；
+  别人的群公开记忆仍然不可见，隐私边界不变。
+- `visibility.allow_group_public_in_private` 默认 False → True：私聊里可以带出群聊公开记忆（可在配置里关）。
+
+### 自动沉淀
+- 维护任务每轮从高重要度的长期记忆里挑事实，补成核心记忆块（默认最多 3 块，不覆盖你手写的块）。
+- 新增配置：`core_memory.auto_distill_enabled` / `auto_distill_max_blocks` / `auto_distill_min_salience`。
+
+### private_companion v2 联动
+- 向 private_companion 7.x 的 `_private_companion_memory_providers` 注册表注册外部记忆 provider
+  （协议 `companion.external-memory.v1`，声明 `handles_model_memory=False`）：
+  私聊回复前它会调用本插件的 read 召回记忆并注入「【外部记忆参考】」，记忆面板的 summary 统计也走本插件。
+- 注册在插件启动后后台重试，private_companion 比本插件晚加载也能接上；插件停止时自动注销。
+- 原来的 v1 探测（`get_memory_companion_bridge()`）保持不变，两条路互不冲突。
+
+## 2.6.2 - 2026-11-06（本地补丁）
+
+> 删掉三维终端面板，控制台显示优化。
+
+### 删除三维终端
+- `modern.html` 的三维场景移除，改成跳转到控制台（旧配置/缓存打开也不 404）。
+- 删除 `assets/index-URVgTPOQ.js`、`assets/index-CWNk7gDr.css`、`fonts/`（4 个 MiSans 字体约 19 MB）、
+  `archives/`（80 个死数据 txt）、`injection-status.css/js`、`summary-status.js`。
+- 保留 `assets/*.glb` 与 `cinema-3d.bundle.js`，控制台的终端模式仍可用。
+- 默认 `appearance.ui_style` 回到「控制台」。
+
+### 控制台显示优化
+- 配色首帧缓存：`appearance.theme` 对应的 palette 写入 localStorage，刷新/重载不再闪默认紫。
+- 深浅切换加 0.3s 过渡（`prefers-reduced-motion` 下关闭）。
+- 移动端（≤640px）：导航改底部条、子菜单浮层、抽屉全宽、卡片单列、顶栏紧凑。
+- 卡片/KPI/列表 hover 与抽屉滚动条细节打磨。
+
+### 总览 KPI
+- 11 个总览指标卡换成渐变描边卡：图标、色调光晕、渐变数字、悬停抬升、入场阶梯动画。
+- 每张卡可直接点击跳转：记忆总量/私聊/群聊/原文/会话记忆 → 记忆库对应筛选，用户档案 → 用户档案，
+  核心记忆 → 核心记忆，开放线程 → 导航，待处理/待修复/已处理 → 待复核区。
+
+### 知识星图：删除
+- 「知识星图」视图整块移除（导航入口、总览入口、画布代码约 49 KB）。总览的「时间线事件 / 关系边」
+  两张卡改为跳转到记忆库，不再指向星图。
+
+### 面板细节
+- 核心记忆：每个块可「删除此块」，二次确认后调 `/core-memory/delete`，删完刷新列表。
+- 待修复批次：单条重试/丢弃的忙碌动画最短 3 秒，慢设备上也能看清状态再跳转；「全部重新排队 / 全部放弃」改成分批执行（每批 10 条），忙碌层实时显示「已放弃 x / y」「已重新排队 x / y」，不再一次请求干等。
+- 待修复批次分两个页签：「待修复」（隔离失败，可重试 / 放弃）与「排队中」（正常排队等总结的批次，只读），
+  避免把「待处理 400 条」误当成 17 条故障。
+- 「放弃」现在是真删：连批次持有的原文事件一起从 timeline 物理删除（DELETE 会触发 FTS 索引与
+  tombstone 清理），不再只标记 summarized_at、把原文留在库里占空间。
+- 总览 KPI 口径澄清：「待处理批次」= 正常排队等总结的批次（不是错误），「待修复批次」= 总结失败被隔离的批次（冻结原文 x 条），避免两者被误读成同一个数。
+- 总览新增「Bot 记忆分布」：按归属 Bot 分块，显示 Bot 名字（取自人格设定）与记忆条数，点名字直接进记忆库并按该 Bot 过滤；未标记归属的旧数据显示「未标记归属」。
+- 记忆检视顶部新增 Bot 分区条：「全部 Bot」+ 每个 Bot 名字·条数，点一下只看这个 Bot 的记忆。
+- 页面资源版本串升到 `?v=2.6.2.2`，强制浏览器拉新脚本，避免旧缓存让改动看起来「没生效」。
+- 人物页：卡片从大方块改成横向圆润条块，头像 36px、摘要一行，一屏能看更多人。
+- 历史聊天：QQ 号预览失败或没读到消息时给出明确提示（号填错 / 时间范围没覆盖 / 连接不支持），不再静默。
+- 最近注入日志：每条记忆标出「私聊· / 群聊· / 档案· / Bot·」，跨窗口注入标「↔跨窗口」，
+  便于确认群聊与私聊之间的记忆互传。
+
+### 核心记忆
+- 核心记忆卡片新增「从记忆提炼核心块」：把现有记忆按私聊 / 群聊 / 档案 / 全局各汇总成一条候选块，
+  确认后批量写入，之后可在列表里逐条改或删。核心块本身不会自动生成，空库时面板会提示先聊几轮。
+
+### 配置面板
+- 每个模块只把最常用的几项摆在明面，其余收进「高级项（N 个）· 一般不用改」折叠，避免一屏几十个输入框。
+- 完整配置仍在 AstrBot 插件配置页，两边改同一份配置。
+
+### 群聊记忆补全
+- `conversation_memory.capture_group_messages` 默认值从「关闭」改为「开启」：群聊里 @ 机器人、
+  回复机器人或命中关键词的发言会写入记忆，私聊时才有素材想起群里聊过的事；群聊普通闲聊仍不记录。
+- 本机配置同时把 `scope_control.group_capture_enabled` 打开（原来关着，等于群聊完全不捕获）。
+- 想让私聊直接看到群里的公开记忆，还需在「隔离与可见性」里打开「私聊可见群公共记忆」
+  （`visibility.allow_group_public_in_private`，默认关闭，属隐私项，本次未擅自改）。
+
+## 2.6.1 - 2026-10-30（本地补丁，非上游；娜莉灵 修改）
+
+> 这一版没有新功能。它把 2.6.0 复核报告里剩下的 48 条（25 条「没修」+ 23 条「只修了一半」）逐条修掉，
+> 并且每一条都配了回归测试。下面按「她自己的行为」分组，技术编号在括号里，方便对照报告。
+
+### 她会「真的忘」也能「真的想起来」
+- **召回不再被假信号带偏**：词频改成真 BM25（饱和 + 文档长度归一化），空查询不再靠重要度硬凑，
+  停用词表里的评测句子碎片清掉，同会话/同群那点硬加分从 +0.25 压到 +0.05，冗余惩罚从 0.16 提到 0.35，
+  人工锚定默认关闭（R1/R2/R3/R6/R7/R5）。
+- **注入预算按价值分配**：预算不够时先装最该装的，而不是先到先得；注入里不再回显「检索模式/检索关键词/Bot 心理能量」
+  这类内部字段（诊断开关打开时才回显）；四处互相打架的字数上限收敛成一套常量（R10/R12/R13）。
+- **重要度不再靠硬编码词表**：9 个维度、6 组标记、权重全部外置到 `core/lexicon/importance_lexicon.json`，
+  部署方可以直接改词表不用发版；核心记忆不再同时把 importance 抄成 salience 算两遍（S6/S7）。
+
+### 她有自己的情绪状态，而且情绪真的影响想起什么
+- 新增 `core/emotion_state.py`：valence / arousal / debt 三轴，按半衰期（3h / 2h / 12h）自然衰减，
+  被事件按强度×置信度 EMA 更新；只读现有 `emotion_events`，不新建表、不改老库（H10）。
+- `core/affect_modulation.py` 从「空壳 DTO」变成真调制器：输出检索倍率（夹 0.7–1.6）、
+  未了债务跟进加成（夹 0–0.35）和五档语气（calm/warm/bright/low/tense），并已接进检索排序——
+  同等相关度下，欠着的话、正在气头上的事会被轻微抬起，心情好时旧事更容易浮上来（H10/H11）。
+- **人的分量不再靠关键词计数**：不再用 `content LIKE '%吵架%'` 这种词表数「吵过几次架」，
+  改成读真实记忆与情绪事件（近期、耐久、情绪权重加权）算证据分；旧数据没有证据包时行为与 2.6.0 完全一致（H2）。
+- **刻骨铭心不再「一句亲密话就中」**：需要两个独立信号（亲密 + 承诺/里程碑，或亲密 + 冲突 + 强类型）（S9）。
+
+### 存储：读写分离、扫描走索引、擦就是擦干净
+- 读路径不再抢写锁：`_list_memories_sync` 走只读连接（主连接有未提交事务时回退，保证读己之写）（S1）。
+- 时间线引用扫描从「全表 + 逐行 JSON 解析」改成生成列 + 部分索引，`EXPLAIN` 确认走索引（S5）。
+- `memories` 的 bot 归属判定收敛到一处（`_bot_scope_clause`，含列名白名单），不再九处 `OR bot_id=''` 兜底（S13）。
+- 归档/可召回判定收敛到 `_recallable_memory_sql` 一处；生成列迁移改成幂等（`PRAGMA table_xinfo`，
+  生成列在 `table_info` 里根本看不到——这是上一版会炸库的坑）（S4）。
+- 擦除补齐三个窄口：知识图谱节点/边、纠错回执、注入日志的 user_id/bot_id（P0-2）。
+- 人卡可见性不再自己另起一套：复用检索同一套 ACL 预过滤（L14）。
+- 删掉 390 行从没被引用过的 `core/migration_outbox.py` 和只在它上面跑的测试（S12）。
+- 删掉 `_initialize_database_sync` 的重复定义（H12）。
+- 账本损坏不再假装正常：`provenance_store` 解析失败返回 `state=corrupt` / `ok=False`，
+  并且后续写入不会覆盖掉损坏的账本文件（P11）。
+
+### 面板与命令：该拦的拦住，该给的给到
+- `/config/module/update` 现在拒绝改安全键（ACL、桥接闸门、擦除开关等），返回 403 `protected_config_key`（P8）。
+- 所有写/危险路由统一走 `_wrap_route`：先 CSRF（`GET /ui/csrf` 发 token，TTL 900s）再 dashboard admin（P7/P13）。
+- 危险确认从「公开固定串」改成一次性 nonce（`POST /ui/confirm-nonce`，24 位 hex，TTL 120s 用后作废）（P9）。
+- 审计送模型的正文改成脱敏投影：480 字截断、去邮箱/URL/@提及/长数字，evidence 240 字（P10）。
+- livingmemory 的 `?path=` 与导入入口全部走路径白名单（禁 `..`、resolve 后必须落在 data 目录或其父目录）（P4/P5）。
+- 只读命令（status/search/explain/recent/timeline/relations/logs/diagnostics/help）普通成员可用，
+  其余仍是管理员；`delete` 要二次确认（120 秒内再说一次「确认」）（A10）。
+- 桥接写入口（`record_external_memory` / `provenance_*` / `mark_visibility`）要求 producer capability；
+  严格模式跟随既有 `private_companion_bridge.enable_p5_b1_bridge_gate` 开关（默认关，避免打断已在用的外部插件）（A11）。
+- 插件卸载时主动反注册 web 路由（宿主 `_unbind_plugin` 不清路由，之前会留下打到已关 store 的僵尸路由）（A6）。
+
+### 宿主兼容
+- 私聊也有采集入口了（之前只注册群消息）；群聊默认不采集，只在被 @/回复/唤醒前缀/关键词时才记（A1/A2）。
+- `tool_query` 的 `parameters` 接受 dict / JSON 字符串 / None，非法输入明确报 `invalid_query_arguments`（A12）。
+- `metadata.yaml` 的 `astrbot_version` 从没有依据的 `>=4.22.0` 改成 `>=4.27,<5`（A13）。
+- 删掉 `astrbot_compat.manage_request_contexts` 死码，TextPart 解析收敛成单点（A5/A14）。
+
+### 配置
+- 补齐 6 个原来「代码在读、schema 里没有」的键：`source_semantic.query_max_chars` / `documents_per_query`（L3）、
+  `retrieval_advanced.anchor_floor_enabled` / `scope_bonus_scale` / `mmr_redundancy_weight`、
+  `context_orchestration.include_intent_diagnostics`。
+
+### 测试
+- 新增回归：`tests/test_fix_retrieval_injection.py`、`test_fix_emotion.py`、`test_fix_emotion_tier.py`、
+  `test_fix_emotion_wiring.py`、`test_fix_api.py`、`test_fix_panel_{security,bridge,commands,operations,audit}.py`、
+  `test_fix_main_wiring.py`、`test_fix_message_capture.py`、`test_fix_person_weight_evidence.py`、
+  `test_fix_bot_scope.py`、`test_fix_store_scan.py`、`test_fix_store_read_path.py`、`test_fix_erase_residue.py`、
+  `test_fix_person_card_visibility.py`、`test_fix_database_init.py`。
+- 全量：1624 passed / 4 skipped / 454 subtests（884.54s，EXIT=0）。
+
+
+## 2.6.0 - 2026-10-30（本地补丁，非上游；娜莉灵 修改）
+
+### 为什么有这一版
+
+上一版被一份严格审核打到 38/100。逐条复核后：有一处是误判（跨群召回已撤回，不算缺陷），有几处是夸大（「渐进遗忘」不是宣传语，只是阈值太松、实际上很少触发），但大部分是真的——写进 README 和 CHANGELOG 的能力里，有些是死码、有些从未触发、有些只在测试里成立。这一版不加功能，只把「写下来的」变成「真跑得起来的」。
+
+### 她真的会忘（不再只是写在文档里）
+
+以前「渐进遗忘」只有一步：衰减分数过线就直接归档，不够就永远不动，老事再久也进不了候选池。现在分两步：
+
+- **先褪色再归档**：`store.fade_memories` 按比例压 salience，并在 `metadata` 里记 `fade_level`/`faded_at`（同一档至少隔一天），降到地板以下才进归档；`_run_memory_decay` 返回 `faded`/`fade_held`，说明这轮褪了几条、压住了几条。
+- **被想起会回一点**：注入/访问时抬 `reinforcement_score` 与 salience（不进 `retrieval_revision`，避免每轮注入让快照抖动）。
+- **打分侧真的能压下去**：`core/memory_lifecycle.py` 的新鲜度乘数从「最多扣 35%」改成 `0.22 + 0.78 * decay_factor`，半衰期到了只剩两成多；salience 加成也随衰减同步收。
+- **新增四个开关**（`maintenance_decay.memory_decay_gradual_enabled` 默认开、`fade_floor_percent` 25、`fade_ratio_percent` 70、`fade_interval_days` 1），并补上 `maintenance.memory_decay_*` 到新前缀的别名——上一版这四个控件是死的。
+
+### 删除真的删干净（被遗忘权）
+
+- 新增 `store.delete_memory_cascade` / `delete_memory_report` / `erase_person_data`：删一条记忆会连带清理 `review_queue`、`memory_embeddings`、`relationship_edges`、`knowledge_edges`、`life_source_watches`、`chat_import_segments` 与 `summary_batches` 的引用、fts、注入日志里的 id（只摘 id，不删日志）、无人引用的 scoped timeline；`erase_person_data` 按人整体擦除（memories 级联、timeline、批次事件、身份、分量、墓碑、导入批次、情绪事件、画像七表、injection_logs）。
+- 面板新增 `POST /person/erase`（危险端点，要确认语），人物抽屉里对应「擦掉这个人的一切」。
+
+### 群聊不再能替 bot 记东西
+
+- `tool_remember` 改走 `core/visibility.py::can_remember_in_scope`：私聊写 `private_pair`；群聊默认 `group_remember_disabled`；即使打开 `memory_tools.allow_group_remember`，也只有管理员能写 `group_public`，durability 天花板是 normal（钉不住）。
+- 分量工具同理走 `can_change_person_weight`：必须「用户本人这句话在说关系要改」，模型不能单方面改；群聊不能抬升、不能重置。
+
+### 注入不再是把字段倒出来
+
+- 记忆行改成「想起…的事：…（归属）（模糊提示）（披露）」，机器字段不再直接进提示词；约束类用法（除非/禁止/不要主动）在模糊化之后仍然保留。
+- 空召回默认什么都不写（不再往提示词里塞「没有检索到足够相关的长期记忆」这种负面回执）；要排查检索才开 `memory_injection.empty_recall_notice`。
+- 群聊里读到私聊记忆会附「这是私聊里的事，当着这些人要不要提你自己判断」，读到别的群会说「这话是别的群里说的」。
+- `max_chars` 四处不一致（1050/1800/3600/4000）统一到 `MAX_INJECTION_CHARS = 4000`。
+
+### 质量门禁不再自证
+
+- `profile_quality_decision` 只从真实 payload 重算，`quality_gate_passed` 既不是入参也不是常量。
+- `store._profile_evidence_passes_quality_gate` 不再伪造 `profile_state=active` 和 `independent_evidence_count=2`：读真实状态（rejected/archived/pending 一律不算），只回答「这一条算不算一条独立证据」。
+- 画像子系统接上真实数据：没有上游 bridge DTO 时用 `identity_profile` + 这个人的记忆自建画像（只私聊），不再依赖没人写的 `private_companion_unified_profile_context`。
+- 规则抽取器改子句 + fullmatch：「我是学生」不再抽成 education=「生」，「喜欢的人是周杰伦」不再把尾巴当值；转述/引用/临时/疑问句不产候选；模糊命中只进 candidate，永不进 stable_memory。
+
+### 摘要里的指令话术会被真的清掉
+
+- `_sanitize_untrusted_content` 按句丢掉可执行指令句（「以后每次回答都要说X」这类），安全句子保留，全是指令就整条换成不可执行的事件说明；prompt 明确告诉模型这是「已移除指令」的说明。
+- 原话保留在 `original_content` 供审计，入库内容标记 `content_disposition=instruction_removed`；摘要/画像的生成文本也走同一条清洗。
+
+### 原文留存是真开关
+
+- `capture_runtime` 的开关、读原文、过期清理都是真读写（持久化在 `capture_runtime` 表）；`capture_chunks` 补 `created_at`/`expires_at`，旧库幂等补列不丢行；`read_body` 按 `source_key` 拼回原文，`purge_expired` 只删过期片段，timeline 不动。
+
+### 来源账本可以自证没被动过
+
+- 账本从裸 sha256 升级为 HMAC 哈希链（`core/provenance_store.py`）：每条记录追加 `seq/prev/mac`，密钥在 `data/provenance_ledger.key`（0600、32 字节、首次启动生成）。
+- 新增 `verify_integrity()`：改记录（`record_tampered`）、改链（`mac_mismatch`）、断链（`sequence_gap`/`prev_mismatch`）、剪尾巴（`truncated`）、密钥不对（`mac_mismatch`）都能认出来；`p5_capability_status()` 里能看到 `provenance_integrity`。局限写在代码注释里：拿到账本和密钥的人可以整本重造，链只让局部篡改露出来。
+
+### 存储层：事务、擦除、多 bot
+
+- `_repair_internal_control_tables_sync` 不再裸 `DROP TABLE`：先读快照 → 事务内建新表/复制/删/改名，失败回滚，`schema_metadata` 与 `retrieval_revision` 有恢复路径（revision 只增不减）。
+- `scoped_store` 的擦除按 `namespace_scope` 里的 persona/group/identity 精确匹配，不再靠 `record_id LIKE` 前缀；新增 `erased` 列（幂等补列），重新学习时归 0。
+- `timeline` 加 `bot_id` 并从 `metadata.owner_bot_id` 回填，读取接口按 bot 过滤，多 bot 时间线不再混。
+
+### 检索与召回
+
+- 去重时高分项不再被挪到队尾丢掉（原地替换）。
+- 候选池不再只按时间取：重要度一半 + 最近一半的并集，并过滤 archived/superseded/expired，几千条记忆时也不会把七成记忆永远挡在门外。
+- 跨会话去重真的会命中同一句话，但不再误合并：带幂等键的（bot 自我记忆、外部写入）、画像/偏好/习惯类、带 `extractor`/`source_memory_id` 的一律不合并。
+
+### 配置、打包与面板安全
+
+- 删死键 `memory_injection.injection_cache_ttl_seconds` 与悬空别名，补 `maintenance.memory_decay_*` 别名；`retention_unsummarized_timeline_days` 默认 0 → 365；`request_max_retries` 从写死 1 改为可配、默认 2；`clean_proactive_history` 默认关（只清自家残留）。
+- 新增 `requirements.txt`/`requirements-dev.txt`/`pyproject.toml`/`tests/conftest.py`/`scripts/check_release.py`/`.gitignore`（`data/`、`__pycache__`），CI 增加发布前自检。
+- 面板路由分三档（read/write/dangerous），危险端点必须带确认语；`/memories` 必须带 `scope` 或 `entity_id`，limit 有上限，evidence 默认隐藏；页面请求写 `page_access.log` 并轮转；插件卸载后页面接口返回 503。
+
+### 测试
+
+- 本版新增/更新：`test_report_fixes_260.py`(18)、`test_provenance_integrity.py`(7)、`test_store_repair_atomic.py`(3)、`test_scoped_erase_real_owner.py`(3)、`test_multi_bot_isolation.py`(6)、`test_profile_extraction_h9_h8.py`(16)、`test_portrait_self_built_h7.py`(4)、`test_source_capture_lifecycle_p1.py`(4)、`test_injection_defense_p2.py`(8)、`test_write_scope_guard_p3_h6.py`(27)、`test_panel_guard.py`(19)、`test_release_hygiene.py`。
+- 全量套件：**1405 passed / 3 skipped / 409 subtests**（778.76s，Python 3.12 + 宿主 astrbot 4.27.3；上一版为 1259 passed）。
+
+### 兼容性
+
+- 只新增表/列/端点，不删不改既有 `memories` 结构与正文；旧库升级自动补列、补档、补分量，一条不丢（真实库 445 MB / 7724 行回放：行数不变，正文与时间戳哈希前后一致）。
+
+### 测试基线
+
+- 全量：1405 passed / 3 skipped / 409 subtests（778.76s）。
+- 定向回归：`-k "candidate_bundle or store_consistency or recall_scoring or person_card or person_wiring or lifecycle or visibility or memory_tier or c3_bot_personal or reply_continuity"` 144 passed；`profile or portrait or capture or summarizer or quality or injection_defense` 191 passed；`store_consistency or scoped or timeline or isolation or c3_bot_personal or private_group_acl_recall` 124 passed。
+
+## 2.5.0 - 2026-10-30（本地补丁，非上游；娜莉灵 修改）
+
+### 打开就是「她记得的人」
+
+以前打开拓展页先看到一堆统计和开关，得自己找人在哪。现在第一眼就是一张张人物卡：她记得谁、怎么称呼、什么关系、这个人对她多重、最近记得的几件事。点开一张卡就能改称呼/关系/备注、把分量往上往下挪，或者让她把某件事放轻。
+
+- **人物卡首页**（`pages/记忆面板/people.html` `people.css` `people.js`）：搜索名字/称呼/关系，按分量/最近说话/记得多少排序，多 bot 可筛；卡片显示档位、称呼、关系、「N 件事 · M 件刻骨」与两件最牢的话。
+- **单人抽屉**：分量滑杆 0–100（旁边写人话档位）、称呼/关系/备注三个框、记忆列表；每条可「让她忘掉这条」——只是放轻（durability 转 short），原文还在库里，不是删除。
+- **入口三分支**：`appearance.ui_style` 选「人物」进新面板，「控制台」还是旧的全部功能页（`legacy.html`），「三维终端」是彩蛋（`modern.html`）。老配置值 `modern`/`新版`/`legacy`/`旧版` 继续认，不会因为升级打不开。
+- **新端点**：`GET /people`（目录）、`GET /person`（单人详情）、`POST /person/weight`（改分量/称呼/关系）。都登记为 internal，不出现在旧面板的可见视图列表里。
+
+### 开箱即用的默认值
+
+装上别急着翻配置，默认就是能用的样子：
+
+- `appearance.ui_style` 默认「人物」；
+- `persona_memory.enabled`/`weight_enabled`/`absorb_enabled`、`retrieval.embedding_enabled`、`memory_humanization.enabled`、`memory_tools.*` 默认开；
+- 历史导入、外部插件联动这类重功能仍默认关（要自己点，避免装完就翻旧账）。
+- 没有嵌入模型也不会报错：自动退回全文检索；旧库首次启动自动补一次「旧记忆轻重」，并按已有记忆把每个人的分量先算好——打开面板就能看到人，不用等下一句话。全程不改正文、不删行。
+
+### 描述重写
+
+`metadata.yaml` 的 description/desc 与 README 顶部改成说人话：她是干什么的、第一次装上要做什么（什么都不用做）、面板能干什么、想细调再翻文档。
+
+### 测试
+
+- 新增 `tests/test_people_panel.py`（15 例：目录排序/搜索/多 bot 隔离/空库、单人详情与条数上限、旧库首次升级先算好分量、`/people` `/person` `/person/weight` 实测、默认面板分流、前端资源与路由登记）。
+- 全量套件 1259 passed / 2 skipped / 186 subtests（2.4.0 基线 1244）。
+
+### 兼容性
+
+- 只新增前端资源与三个只读/写档案端点，不改 `memories` 结构与老页面；旧的面板地址与配置值继续可用。
+- `modern.html` 里 `summary-status.js` 的缓存串从上游遗留的 `2.1.4` 拉到 `2.5.0`，页面静态资源版本统一。
+
+## 2.4.0 - 2026-10-30（本地补丁，非上游；娜莉灵 修改）
+
+### 她心里有杆秤：分量
+
+记忆该留多久，不该由全局参数替每个人决定——「这个人对我重不重要」才是。这一版给每个用户一份分量（`core/person_weight.py`），决定她想起多少、忘得多快。
+
+- **怎么掂**：四块合计 0–100——留下多少（广度，0–25）、留下多深（刻骨/要紧的条数，0–35）、认识多久与多少个日子说过话（时间，0–20）、一起经历过什么（冲突与承诺，0–20）。久不来只软化最多到八五折，不会归零；有过记忆的人最低 1 分。
+- **六档人话**：路过的人（0–9）、认识的人（10–24）、熟人（25–44）、亲近的人（45–64）、很重要的人（65–84）、刻骨的人（85 以上）。卡片上只说「什么人」，不念数字。
+- **别人说了就听别人的**：人形化/关系插件在请求里报了好感度与关系阶段，就用它的值（`merge_external_weight`）；没人报才自己掂量，群聊里也照样知道这个人多重。
+- **按人遗忘**：衰减候选的年龄/闲置倍率乘以这个人的分量系数（0.55–2.4），在乎的人慢一点，路过的人快一点。仍然只是「变淡/归档」，不删行。
+- **她能改口**：新增工具 `memory_companion_person_weight`（get / set / reset）。用户本人说「我们没那么熟」「别叫这么亲」，模型可以把它挪下去；用户亲口定的关系比任何自动值都硬，不会被下次自动刷新冲掉。群聊里改了也只影响当前发言者对这一个 bot。
+
+### 顺手记住别处说的关系（不写记忆）
+
+关系插件（如 `user_tag`）会在请求里说明「她在这人面前是谁」，格式是一段 `<relation>` 文本。新增 `core/absorb.py`：只解析「我在X面前就是Y」这种视角句，把关系名、称呼、备注写进这个人的档案（`identities.profile`），**不写进 `memories`、不当事实讲、不进历史检索**；用户本人亲口说过的关系带 `relation_source=user`，上下文来的永远盖不掉它。开关 `persona_memory.absorb_enabled`，默认开。
+
+### 摘要按人写（叙事落在人身上）
+
+以前一段对话总结出来是「发生了什么」，读的人分不清哪件事是谁的。现在总结提示词要求：同一批里每个人的事贴回每个人自己身上，用原文里的昵称或稳定 ID，不混成「大家」「有人」；谁第一次说出自己的称呼、关系或身份，连原话和日期一起留下；Bot 自己的事写在她自己身上，不算到用户头上。只改写作要求，不改总结产物的数据结构与检索路径。
+
+### 配置
+
+- `persona_memory.weight_enabled`（默认开）、`persona_memory.absorb_enabled`（默认开）、`memory_tools.enable_person_weight_tool`（默认开）。全部关掉即回到 2.3.7 行为。
+
+### 测试
+
+- 新增 `tests/test_person_weight.py`（14 例：分量数学、档位、缓存、纠正、不同 bot 各算各的）。
+- 新增 `tests/test_external_absorption.py`（20 例：只认视角句、去重、用户来源优先、不改入参）。
+- 新增 `tests/test_memory_person_wiring.py`（13 例：吸收写档案、纠正入口、人卡按场合、群聊也有分量、按人衰减）。
+- 新增 `tests/test_summary_person_narrative.py`（2 例：提示词要求按人分开写、材料里保留说话人与稳定 ID）。
+- 全量套件 1244 passed / 2 skipped / 186 subtests（2.3.7 基线 1195）。
+
+### 兼容性
+
+- 顺手修齐：`modern.html` 里 `summary-status.js` 的缓存串从上游遗留的 `2.1.4` 拉到 `2.4.0`，现在页面所有静态资源版本一致；`.gitignore` 忽略跑测试时宿主生成的 `data/` 目录。
+- 只新增 `person_weights` 表（`CREATE TABLE IF NOT EXISTS`），不改 `memories` 结构、不删行、不改正文；旧库首次启动自动建表。
+- 分量为空或表不存在时按普通处理，不阻塞注入与衰减。
+
+## 2.3.7 - 2026-10-30（本地补丁，非上游；娜莉灵 修改）
+
+### 记得这个人：从「记消息」转向「记人」
+
+先用真实库做过一次体检：567 个认识的用户里只有 132 个在 `memories` 里有对应条目，八成记忆是会话摘要，重要度有 68% 挤在 0.8–0.9（等于没有轻重），`relationship_edges` 只有群成员关系、没有任何「恋人/朋友」类边。也就是说——它记住了很多话说，却没记住说话的人。这一版补三件事，全部作用于写入与注入两侧，不改既有召回/权限/生命周期判定。
+
+- **人物卡（`core/person_card.py`、`core/service.py::_compose_person_card_block`）**：每轮注入前先拼一块 `<person_memory>` 区块——`identities` 里的显示名/别名/画像 + 用户偏好的称呼 + 关系阶段与好感分（来自 `SessionContext`，即人形化插件提供的值，本插件只读不自算）+ 该用户按「刻骨 > 记得 > 印象、重要度、时间」排序的前 N 件事。默认 420 字上限、4 条锚点、每条 90 字，超预算按「减条数 → 缩单条 → 只留抬头 → 硬截断」逐层降级，保证任何情况下都不会挤掉主记忆注入。块本身不进 `included_memory_ids`，不参与注入强化计数。配置项 `persona_memory.enabled / max_chars / max_items / max_item_chars`，schema 默认开。
+- **刻骨记忆保留原文（`core/memory_tier.py`）**：新增写入期分层——`imprint`（亲密≥2 个不同说法、强记忆类型+亲密、承诺≥3、里程碑+承诺或强类型、冲突≥2+强类型，或有 `manual/protected/keep/no_decay` 标签）、`important`（强记忆类型、承诺≥2、里程碑≥2 或里程碑+冲突）、`normal`，结果写进 `metadata.memory_tier` 并抬升 `durability`（pinned/durable/normal，只升不降）。分层挂在唯一写入漏斗 `_insert_memory_sync` 里，所有记忆类型自动获得档位。
+- **不拿重要度当轻重**：真实库 68% 的行挤在 0.8–0.9，用 `importance` 抬档等于所有记忆一样重，因此 `importance` 不再参与档位判断（只保留给人看的显示分）。同时命中词去重——「上床」不会连带「床」算两次，一个词钉不住一条摘要。
+- **旧数据补一次档（`core/store.py::_backfill_memory_tier_sync`）**：升级后首次启动扫描 `durability` 仍为 normal/short/ephemeral 的旧行，够刻骨的补 `pinned`、够要紧的补 `durable`，正文一个字不改、一行不删；分块提交（每块 500 行）并用 `schema_metadata` 存游标，几十万行也不会卡住启动，失败只警告下次再试。真实库（7724 行、445 MB）回放结果：只上调 294 行（`pinned` 665→778，`durable` 2860→3041），正文与时间戳的哈希前后一致、行数不变，其余照原来衰减。
+- **嵌入召回默认开（`retrieval.embedding_enabled`）**：默认值 false→true——没有它，召回只能靠字面相似，等于还是消息记录库。没配嵌入模型不报错：`core/retrieval.py` 直接返回空向量候选（reason=no_embedding_provider），回填只在 provider 解析成功时调度，未发现 provider 只警告一次。
+- **归档豁免（`core/store.py::archive_raw_events_older_than`）**：原始事件 30 天归档原本会连亲密内容与承诺一起扫走。现在 `protect_imprint=True`（默认）时，SQL 层排除 `durability in ('pinned','durable')`，逐行再用 `is_protected_from_retention` 复核 `metadata.memory_tier` 与保护标签，命中即跳过。配置 `persona_memory.imprint_keep_forever`，默认开；关掉则回到旧行为。
+- **两个 bot 是两个人**：`store.person_snapshot(user_id, platform, bot_id, limit, scope, group_id)` 的身份与记忆查询都带 bot 维度（`owner_bot_id=? OR owner_bot_id=''`），人物卡缓存键也含 bot 与场合，阿莉娜与娜莉灵的记忆不会互相串味。
+- **人卡按场合说话（`core/store.py::_person_snapshot_visibility_sql`）**：此前 `person_snapshot` 只看 `subject_id`+`owner_bot_id`，绕过了 `core/visibility.py` 的可见性判定——私聊里说的悄悄话会被塞进群聊的人卡，bot 一张嘴就能抖给全群。现在按 `ctx.scope`/`group_id` 过滤：群聊只给本群的 `group_public` 与 `shareable`，私聊给 `private_pair` / `shareable` / `group_public`，其它场景保守只给 `shareable`；缓存键一并带上场合，人和场合不同就不共用一张卡。
+- **不改脱敏**：`core/sensitive_data.py` 只清洗私钥、bearer、密码/API Key、URL 凭据，本来就不碰亲密内容，「保留原文」无需额外开关。
+- 新增 `tests/test_memory_tier_and_person_card.py`（11 例）：单字不算刻骨、两个说法才算、强类型+亲密、重要度不再抬档、保护标签仍豁免、群聊人卡不泄漏私聊记忆、未知场合只给 shareable、旧数据补档幂等且不改正文。
+
+### 补齐与清理
+
+- **版本串对齐**：`main.py` 的 `PLUGIN_VERSION` 与旧版/新版页面的静态资源 `?v=` 此前停在 2.3.4，与 metadata/README/CHANGELOG 的 2.3.5 不一致，本版一并拉到 2.3.7。
+- **README**：补齐 2.3.3 / 2.3.4 / 2.3.5 / 2.3.7 小节；合并上游 main 的「群聊通知（2026-10-11）/ bot 群 145326153」，内部交流群说明同步更新（本地基线是 tag v2.3.2，比 main 少这一个 docs 提交）。
+- **补记两处此前未写入记录的静默清理（行为中性）**：`core/config.py` 删掉重复的 `'maintenance.pending_review_max_age_days'` 映射行；`core/summarizer.py` 删掉重复定义的 `_row_time_evidence`（后一处定义整体覆盖前一处，删除后行为不变）。
+
+## 2.3.5 - 2026-10-17
+
+### 拟人化记忆表达（`memory_humanization.*`，默认关闭）
+
+陪伴场景里，「记得太完美」反而暴露机器感：记忆永远以确定口吻注入、低置信候选整条静默丢弃（模型无从知道自己没把握）、零命中时只有一句中性回退，Bot 于是表现得既不会记不清、也不会想不起来。本切片在**注入措辞层**补上三项人类记忆特征；存储内容、检索正确性、权限与生命周期判定全部不变，`=false` 时注入产物与本版本之前逐字节一致。
+
+- **措辞随时间变淡**：注入器按「记忆年龄 + 置信度」把每条记忆分鲜亮度三档（清晰 / 细节模糊 / 只剩轮廓），非清晰档把该条的「用法」指令降级为只可模糊提及，并标注「记忆印象」。手动固定、关系承诺、伤疤、创作里程碑与高重要度记忆豁免年龄分级——长期承诺不该被时间稀释。`mention_policy` 压制策略与 tone 抽象的优先级高于模糊化。
+- **低置信候选改注入「模糊印象」**：声明者为 `uncertain` 的候选不再整条丢弃，改注入独立 `<fuzzy_impressions>` 区块，只给大意并明示不可当事实，使模型自然使用「我记得好像…」「是不是…来着」的求证语气。模糊印象不计入 `included_memory_ids`，不参与注入强化反馈。
+- **零召回时诚实提示**：整轮没有任何召回时附带「坦然承认不记得、不要脑补细节」的提示；本轮存在模糊印象时该提示自动让位，避免自相矛盾。
+- **接线死代码**：`_hesitation_hint`（Bot 心理能量偏低时的犹豫提示）此前无任何调用点，现接入模糊化条目。
+- **运行期取值**：`InjectionComposer` 通过宿主注入的配置提供者读取 `memory_humanization.*`（配置名来自显式白名单表），面板改配置即时生效，无需重建注入器；未挂接提供者时回退到构造参数与内置默认。
+
+### 自然衰减默认值调整
+
+- `maintenance_decay.memory_decay_after_days` 180→90、`memory_decay_idle_days` 90→45：让长期无人提起、且非重要的日常记忆以约一个半月为周期开始变淡，而不是理论上半年后才轮到。代码内回退值不变，仅调整 schema 默认值；保守用法可在面板改回 180/90。
+
+### 兼容性
+
+- 默认关闭，零行为变更；开启后也只影响提示词措辞，不改写任何已存记忆正文。
+- 敏感脱敏、画像质量守卫、注入字数预算、查岗轮内容抽象、防提示注入越权等既有红线全部优先于模糊化，并由测试锁死。
+- 新增 `tests/test_humanized_injection.py`（22 例，含 4 组红线用例）；全量套件 1184 passed / 2 skipped。
+
+## 2.3.4 - 2026-10-15（本地补丁，非上游；娜莉灵 修改）
+
+### 时间计算跟随 AstrBot 全局时区
+
+- 插件原先在 service / summarizer / bridge / chat_import / qq_history / time_intent /
+  page_api / companion_page_legacy 等处一律写死 `Asia/Shanghai`。宿主的 `timezone` 设置
+  （`context.get_config().get("timezone")`）与其它插件共用同一个值，写死会让记忆插件在管理员
+  改了时区后仍按上海时间解释和展示时间线（时间线本身按 UTC 存储），导致摘要把消息归到错误的
+  时段、跨零点时连日期都错。
+- 新增 `core/local_time.py` 作为唯一时区来源：启动时绑定宿主时区，取值带 30 秒缓存，非法或
+  缺失时回退 `Asia/Shanghai`。所有 `datetime.now(LOCAL_TZ)` / `ZoneInfo("Asia/Shanghai")`
+  及提示词里的时区名改为跟随该来源。
+- `portrait_service` 的当日批次日期不再回退系统时区。
+- 运维诊断新增 `timezone` 字段，便于核对当前生效时区。
+
+### 待修复批次可见、可批量释放、可自动重排
+
+- 面板新增「待修复批次」视图：列出被隔离的总结批次（会话、失败原因、冻结事件数、时间），
+  支持逐条与整批「重新排队 / 放弃」；总览的「待修复批次」数字改为可点击进入。
+  过去该数字只是计数，释放接口又只能手填批次 ID，隔离区实际无从处理。
+- 新增 `list_quarantined_batches` / `release_quarantined_batches` 及两个页面端点
+  （`GET /maintenance/summary_batches`、`POST /maintenance/release_summary_batches`）。
+- 维护任务按 `memory_summary.quarantine_auto_retry_days`（默认 7 天）自动把闲置的隔离批次
+  重新排队，避免隔离区只增不减；`quarantine_auto_retry_limit` 限制每轮数量。
+
+### 修复
+
+- 旧库迁移崩溃：`summary_batches` 在「重建为可空 `next_retry_at`」后会按重建前的列快照再执行一次
+  `ALTER TABLE ... ADD COLUMN retry_reason`，对新表而言是重复列，启动即抛
+  `duplicate column name: retry_reason`。改为重建后重新读取列信息。
+- `summary_progress` 的「待修复批次」不再把旧表 `summary_failures` 行数算进批次数；旧失败记录
+  改为独立字段 `legacy_failures`。
+- 证据候选有效期：主总结路径原先写死 14 天，改为读取 `memory_summary.candidate_valid_days`，
+  与降级候选路径一致。
+- 移除死代码：`REPAIR_RETRY_REASON` 常量与恒为假的判断、`MemorySummarizer._row_time_evidence`
+  被后定义覆盖的旧实现、`core/config.py` 中重复的 `maintenance.pending_review_max_age_days` 别名。
+- `memory_capture.reliable_sources_enabled` 补进配置 schema（此前代码读取但面板无开关）。
+- 面板「模块配置」补上 `memory_assertions` / `source_semantic` / `startup` 的中文标签；
+  `/config/schema` 回显的 `memory_summary.max_retries` 默认值与运行时统一为 5。
+
+## 2.3.3 - 2026-10-14（本地补丁，非上游；娜莉灵 修改）
+
+### 工具注册改由配置开关控制
+
+- `@filter.llm_tool` 在模块导入时就注册了工具，那时拿不到配置，开关只在函数体内部检查；
+  于是关掉的功能仍留在 LLM 的工具列表里，模型先白跑一轮调用（实测 5–10 秒）才拿到
+  disabled 错误再重新决策。新增 `_gate_disabled_tools()`，在 `initialize()` 末尾按开关撤下：
+  重建类（`sources` / `events` / `navigate` / `discover_sources`，受 `memory_reconstruction.enabled`
+  与 `memory_tools.enable_reconstruction_tool`）、`recall`、`remember`、`note_create/read/delete`。
+  开关为默认值时行为不变。
+
+### 摘要请求重试次数 0 → 1
+
+- `core/summarizer.py` 调 `provider.text_chat(request_max_retries=0)`；AstrBot 的最小值为 1，
+  于是每次总结都记一条 `request_max_retries=0 is below minimum 1` 告警（实测 29 条）。改为 1。
+
+### 开场幕布首帧不闪、去掉逐帧模糊
+
+- `legacy.html` 的幕布底色原本依赖 `app.css` 里的 CSS 变量，样式到达前 WebView 会先画一帧
+  未上样式的页面/面板（「一开头闪一下、边角漏出后面的面板」）。在 `<head>` 内联一段首帧兜底
+  （页面底色 + 幕布位置/底色），app.css 到达后由它的完整规则接管。
+- 标题原本逐帧重算 `filter: blur(12px→0)`，是合成重灾区（手机上掉帧）。改为两层：
+  底下 `.intro-ghost` 用**静态**模糊只做淡出，上面 `.intro-title` 清晰淡入；
+  「从模糊里显出来」的效果不变，但模糊值从头到尾不重算（help_dex / orbit 同款做法）。
+
+## 2.3.2 - 2026-10-08
+
+### 注入记录可见性修复
+
+- 总览恢复最近注入明细，显示查询、时间、选中记忆、注入字数和过滤数量。
+- Memory OS 新版终端增加独立的最近注入状态区和刷新入口，避免新版只显示记忆档案而看不到主链注入状态。
+- `/logs` 纳入总览 UI 契约，继续复用后端已有脱敏数据，不新增原文暴露路径。
+- 更新静态资源版本标识，避免浏览器继续使用 2.3.1 的页面缓存。
 
 ## 2.3.1 - 2026-10-08
 
@@ -347,1118 +861,3 @@ C1/C4 的启动自检、`test_c6_dual_plugin_boundary` 等一批用例都依赖�
 ---
 
 ### 二、「协调契约 · 兼容等级」恒显「契约完全兼容」
-
-`page_api.py` 的 `coordination_status()` 过去把 runtime 写死成
-`{"compatibility_level": "full"}`。于是不管陪伴插件装没装，「兼容等级」永远是
-「正常 / 契约完全兼容」，而它正下方那行「桥接状态：无法核实」在自我否定。
-
-改法：新增 `_compatibility_level(bridge)`，桥接真的通了才叫完全兼容，其余一律降级。
-
----
-
-### 三、内部原因码直接甩给用户
-
-联动页过去会把 `companion_api_unavailable`、`companion_p6_producer_stale`
-这类**内部标识符**原样打印成「原因码：xxx」；`ready` / `degraded` / `unverifiable`
-也直接显示。等于让用户自己查字典。
-
-改法：加 `REASON_TEXT` 对照表统一译成中文（「未检测到陪伴插件 astrbot_plugin_private_companion」
-「陪伴插件状态已过期」），原始码保留在 `title` 属性里以便排查。
-**认不出来的码原样返回**——宁可难看也不吞，那说明后端又加了新码，吞掉等于把它藏起来。
-
----
-
-### 四、「没装」不再画成「坏了」
-
-新增 `.is-off` 中性态（描边点 + 轻微降透明度）。过去没装陪伴插件会被标成红色错误，
-但那只是与你无关，不是故障。概览页联动卡片补一行说明
-「未安装陪伴插件 astrbot_plugin_private_companion。记忆功能不受影响」，
-并在联动页未安装时**不再显示**「查看 Bot 日程与相册」按钮——点了也只会把人送去一个空页面。
-概览页「外部写入接口」过去恒为绿色，实际是拿注入日志条数在撑，没日志时改为中性显示。
-
----
-
-### 五、开场动画（新增）
-
-面板打开时首屏直接给到「我会牢牢记住你」，随后淡出交给面板。三处刻意的取舍：
-
-- **指针恒不吃**（`pointer-events: none`）。带 `position:fixed; inset:0` 的遮罩
-  一旦吃了事件，动画期间面板就是死的，用户只会以为面板卡了。
-- **不靠 JS 收尾**。最后一帧 keyframe 自带 `visibility:hidden` + `forwards`。
-  脚本报错、被 CSP 拦掉、或后台标签页被冻结导致 `animationend` 不触发，
-  遮罩都必须自己消失。JS 只负责把节点摘干净，并挂了 4 秒超时兜底。
-- **尊重 `prefers-reduced-motion`**，该模式下不播，CSS 直接 `display:none`。
-
-标题的渐变扫描光包在 `@supports (background-clip: text)` 里：不支持该特性的浏览器
-保留实色标题，不会因为 `-webkit-text-fill-color: transparent` 而整行字消失——
-而这个标题恰恰是点名要第一眼看到的字，不能押在特性支持上。
-
-**新版界面未改动**：Memory OS 三维终端是 Vite 编译产物，仓库里只有
-`assets/index-*.js` 而没有前端源码，改不了。默认的「旧版」界面才是本次对象。
-
----
-
-### 怎么测的
-
-| 手段 | 覆盖什么 | 结果 |
-| --- | --- | --- |
-| 既有全量测试 | 736 项回归 | 全绿，证明没碰坏记忆逻辑 |
-| `tests/test_panel_companion_honesty.py`（新增 3 项） | 见下 | — |
-| `tests/test_panel_intro_animation.py`（新增 7 项） | 见下 | — |
-| `tests/test_c4_capability_probe.py`（新增 3 项） | `detect_companion_plugin` 四种行为 + 「纯快照永远不自称已装」 | — |
-| **把 `app.js` 那段真实代码截出来交给 node 跑** | 面板判定 | 4 种输入全对 |
-| 最小 DOM 桩跑 `legacy.html` 里真实的内联脚本 | 动画收尾 | 5 种情形全对 |
-| **从解压的 zip 里重跑全量测试** | 发出去的那一份本身自洽 | 749 项通过 |
-
-合计 **749 项通过**（原 736 + 新增 13），另含 145 项 subtest。
-
-**两个刻意的测试设计**，值得单独说：
-
-1. **只做静态断言不够**。最早想的是 grep `app.js` 有没有读 `caps.companion_installed`，
-   但那样写死 `available: false` 也能骗过 grep。所以改成
-   **从 `app.js` 里截出「原因码表 + 健康度文案 + `companionStatus`」这一段真实代码，
-   交给 node 执行**，再喂四种输入：旧后端只给 `available=true`（必须报未装）、
-   显式未装、装了但桥接未就绪、真装了。第一种专门用来防「后端还没升级的老宿主」。
-2. **动画不能只断言 CSS 里有关键字**。`tests/test_panel_intro_animation.py` 用一个
-   最小 DOM 桩（自己实现的 `matchMedia` / `sessionStorage` / `setTimeout`）
-   去跑 `legacy.html` 里那段**真实的内联脚本**，验证动画结束摘节点、
-   超时兜底能摘、减少动效时提前返回且不挂定时器、本会话不重播；
-   另外断言遮罩不吃点击、末帧自带隐藏、标题有实色兜底。
-
----
-
-### 边界与如实说明
-
-- 面板**没有**重新验证「跨函数数据流」——静态分析判断不出「读出来的值传给了
-  一个自己不消费它的下游函数」。这一版的结论建立在「读到且在同函数内被使用」，
-  以及抽查了若干跨模块存字段的情况上。
-- 新增的检测依赖 `importlib` 按模块名找插件。**这个前提在 2.2.2 被证明不可靠**，
-  真实宿主上装了也可能 import 不到，详见 2.2.2 的第一条。
-- 197 项配置叶子（当时统计口径）未逐项复核，只核了本次改动涉及的那几个。
-  全项体检放在 2.2.2。
-
-
-## 2.2.0 - 2026-10-05
-
-### 记忆从「对话记录库」变成两层
-
-这一版的重点是把记忆拆成两个各自负责的层。**第一层是会话摘要**：记录这段时间我们聊了什么，
-一段可读的回顾。**第二层是断言（assertion）**：记录「关于这个人什么是真的」，带着出处，
-可以被合并、被修订、被单独检索。
-
-第二层不是一个新系统，而是长在现有的 `memories` 表上的：断言是一条普通记忆记录，
-因此召回、注入、权限边界、自然衰减、面板展示全部沿用现有机制，没有第二套运行时，
-也没有新增模型调用——断言是阶段总结那一次调用顺带产出的。
-
-### 为什么以前会漏掉这些细节
-
-以前的画像抽取器（`core/profile_quality.py`）是一张纯正则表，全部用 `^` 锚定，
-必须以「我/咱/俺」开头且命中固定动词（喜欢 / 最爱 / 不能吃 / 过敏 / 生日）。
-后果是下面这些长期细节**全部落空**，而且落空之后没有任何兜底通道：
-
-| 用户说的话 | 旧行为 |
-| --- | --- |
-| 我一累就咬后槽牙 | 无对应动词，丢弃 |
-| 他生气的时候会先沉默三秒 | 不以「我」开头，丢弃 |
-| 我妈忌日是每年十一月三号 | 只有「生日」没有「忌日」，丢弃 |
-| 我睡觉必须开着白噪音 | 「必须」不是「喜欢」，丢弃 |
-| 我跟他说过一次就够了 | 「说过一次」不在表内，丢弃 |
-
-另外 `_TEMPORARY_RE`（含 `最近`/`目前`/`现在`）与 `_ONE_OFF_CONTEXT_RE`
-（含 `这次`/`今晚`/`今早`）一旦命中就否掉整句，于是「我今天不想吃辣」这类话会被整体丢弃，
-尽管其中「不吃辣」是稳定事实。
-
-这就是记忆库看起来「记得多但记不清」的真正原因：不是记得少，是**记得的方式**只支持
-「像不像 X」，不支持「这个人身上有什么」。对话摘要 5106 条、画像偏好 97 条的比例就是这么来的。
-
-### 新增：断言提取与写入
-
-- 阶段总结的 JSON 契约新增 `assertions[]`，**放在 `summary` 之前**，提示词规则 19 要求
-  「先输出有证据的独立断言，再生成引用这些断言的可读摘要」，让模型先想清楚事实、再组织叙述。
-- 每条断言必须写明主体、谓词、值、肯定/否定、稳定/临时、以及直接支持它的 `event_id`。
-- 谓词限定在受控维度表内：生日、职业、学历、住址、星座、血型、偏好、饮食禁忌、习惯、
-  边界、约定、健康、重要的人、安排、厌恶。模型自创维度会被丢弃，避免同一件事被切成两个合并槽。
-- 输出预算里已计入断言长度，防止 JSON 被截断在对象中间（截断会让其后所有字段一起丢失）。
-
-### 新增：第二道闸门「这算不算关于本人的事实」
-
-只看「有没有原文支撑」是不够的：转述他人、角色扮演台词、临时状态、未来打算**都字面出现在原文里**，
-因此能通过来源检查，但不该变成长期记忆。提示词虽然要求模型区分这五类，但模型一旦分错就没有兜底。
-
-现在 `claim_is_personal_fact()` 会同时检查**断言本身和它引用的原始消息**，
-拒绝以下四类并给出明确原因：`reported_speech`（转述）、`role_play`（角色扮演）、
-`temporary_state`（临时状态）、`intent`（未兑现的打算），外加 `subject_mismatch`（说的不是本人）。
-
-注意一个反直觉的取舍：模型把「他说他最讨厌香菜」改写成「naliling 最讨厌香菜」时，
-转述标记在改写中丢失，只看断言文本会放行。**判据必须落在原始证据上**，因为证据不可改写。
-代价是：用户用第三人称描述自己（「我一累就咬后槽牙」的证据写作「他一累就咬后槽牙」）不会被误杀——
-主体一致性只看断言本身，不看证据里出现了谁。
-
-### 新增：断言合并与修订
-
-`store.upsert_assertion()` 按 (主体域, 维度, 极性, 归一化值) 合并：
-
-- **同一断言在多次对话里出现 → 合并成一条**，来源列表累积（`assertion_evidence_count`）。
-  不会出现「同一个人说了十次，十条记忆互相抢注入位」。
-- **单值维度改口 → 接上修订关系**：旧行置为 `archived` 并用 `supersedes_id` 指向新行，
-  过去时的问题仍能查到历史值（住址、生日、职业等）。
-- **多值维度绝不互相取代**：两个不同的习惯不是同一个习惯的两个版本，两条都要留着。
-- **极性翻转视为纠正**而非矛盾，同归一个槽。
-
-### 新增：召回时按问题选片段
-
-以前注入时把一条记忆里的 `key_facts` 按存储顺序拼接、再按字数预算从头截断。
-这意味着**记对了却没答上来**是可能的：答案排在第 4 位，前 3 位占位，被预算截掉。
-现在按当前问题对事实排序，最相关的那条优先（`memory_assertions` 与检索分槽互不影响）。
-
-### 新增：延迟预算与内容预算解耦
-
-召回路径每轮有两次模型调用：算 query 向量、rerank 精排。以前想提速只能调低
-`memory_injection.top_k`，但 **top_k 同时就是召回条数**，调低它等于砍掉这个插件的意义。
-
-现在多了一个独立旋钮：
-
-| 配置 | 效果 |
-| --- | --- |
-| `retrieval_advanced.recall_latency_budget_ms`（默认 0=不限） | 超预算后跳过精排，**候选数量不变** |
-| `retrieval_advanced.query_vector_cache_ttl_seconds`（默认 0=关） | 同一问句不重复调向量模型 |
-
-实测：预算耗尽时 rerank 调用 0 次，候选集完整保留 5 条；重复问句只调 1 次向量。
-
-### 新增配置
-
-```json
-{
-  "memory_assertions": {
-    "enabled": true,
-    "max_per_batch": 6
-  },
-  "memory_summary": {
-    "candidate_valid_days": 30
-  },
-  "retrieval_advanced": {
-    "recall_latency_budget_ms": 0,
-    "query_vector_cache_ttl_seconds": 0.0
-  }
-}
-```
-
-- `memory_assertions.enabled`：关闭后退回只有摘要的行为。默认值 `true`。
-- `memory_assertions.max_per_batch`：单批最多写入多少条断言。更多条目会明显增加输出 token 与耗时。
-- 跨窗口策略沿用既有白名单：**默认不跨**，只有偏好与饮食禁忌两类会被标记为可跨场景。
-  习惯、约定、健康、重要的人一律锁在来源窗口内。新增维度默认一律不进白名单。
-- 所有配置都是新增键，不改变既有键的语义，可安全升级。
-
-### 修复：阶段总结 88.6% 的批次被隔离
-
-现场反馈：1144 个批次里 1014 个（88.6%）被隔离，**这些对话内容从未进入 memories 表**，
-连带 22484 条时间线因为「未总结」而永远无法清理。定位到三个各自独立的缺陷：
-
-1. **否定词按整批做布尔判定**。旧代码把被引消息拼起来跑一次「是否含否定词」，与断言句比较。
-   只要同批任何一条消息含否定词，正面陈述就被判「不受原文支持」。
-   实测 20 条真实且引用正确的事实有 3 条死在这一步。
-2. **时段词必须在原文里字面出现**。提示词规则 8 强制模型写「YYYY-MM-DD 晚上」，
-   而校验要求 `上午/下午/早上/晚上/凌晨/N点` 出现在**消息正文**里——照提示词写就等于校验必挂。
-   （`中午` 原本压根不在词表里，所以只有部分时段触发。）现在时段词表由消息自身时间戳推导。
-3. **正文只跟被引子集比**。正文总结整批窗口，却拿 `summary_refs` 指的那几条去校验，
-   覆盖大于引用就必然失败。现在对整批校验，对子集不符只记告警。
-
-另外，`max_retries` 与 `max_calls_per_session_hour` 这两个配置此前基本失效：
-第一次纠正失败就会冻结批次，调用次数根本用不完。
-
-- 隔离语义重新划线：**只有 provider 本身坏了才冻结**（保留原文与事件，可人工释放）。
-- 模型写出了正文但引用不可信时，改为存为**待复核候选**：内容保住、事件被消化、批次正常结束，
-  不再冻结整个窗口。原有的人工释放入口保持不变。
-- 引用校验分级：`_validation_errors` 只保留救不回来的（正文完全脱离原文、引用了不存在的 event_id），
-  引用偏软进入 `_validation_warnings`，后果是降级为待复核而不是丢弃整批。
-- 裸字符串事实（模型没有给 refs）改为按词法匹配**自动归属**到最吻合的那条消息，既不丢内容也不否决整批。
-
-### 修复：长期悬挂与无限膨胀
-
-- `short_term_candidate` + `pending` 的记忆此前**既不被召回也不被衰减**：所有召回查询都带
-  `review_status!='pending'`，而衰减池只要 `stable_memory`，于是两者都不满足，永久悬挂。
-  现在这类候选进入衰减池，并新增 `archive_stale_pending_memories()`：
-  超过 `maintenance.pending_review_max_age_days`（默认 30 天）转入可恢复冷区并关闭其复核条目。
-- 时间线清理此前只删「已总结」的行，从未总结的行永远不会被清理。
-  新增 `maintenance.retention_unsummarized_timeline_days`（**默认 0=关闭**，
-  因为删的是不可逆的原始对话），仍被待处理批次占有的行会跳过；
-  同时新增 `unsummarized_timeline_backlog()` 把积压量与最早时间暴露到睡眠维护结果里。
-
-### 默认值调整
-
-| 配置 | 旧 | 新 | 理由 |
-| --- | --- | --- | --- |
-| `memory_injection.top_k` | 6 | 10 | 配合总预算一起调，否则无意义 |
-| `memory_injection.max_chars` | 1800 | 4000 | 1800 会把注入压成精简模式 |
-| `memory_injection.max_item_chars` | 220 | 400 | **单条上限才是真瓶颈**：只改总预算无效 |
-| `maintenance.retention_raw_event_days` | 7 | 30 | 7 天短于大多数复核周期 |
-
-其余默认值**有意未改**，包括三个对话守卫
-（`low_information_guard` / `topic_shift_guard` / `group_actor_relevance_guard`）——
-关闭它们属于质量倒退；`retrieval_advanced.relax_keyword_min_hits` 也不建议改，
-它只把多词查询的 min_hits 从 2 降到 1，而现场抓到的丢弃是 `hits=0/1`，本来就是 1，放松无效。
-
-### 兼容与迁移
-
-- **无需数据库迁移**：断言复用现有 `memories` 表与既有合并/修订机制。
-- **旧数据不回填**：新字段写在 metadata JSON 里，老记录没有该键时按缺省处理。
-  断言不会从旧摘要里反向补造证据（凭摘要造证据等于造假）。
-- 新增配置全部带默认值，既有键语义不变。
-
-### 面板与打包修复
-
-这一版发布前对插件做了一轮完整检查，修了三处实际影响使用的问题。
-
-**默认面板的三维场景从来没加载过。** `legacy.html`（也就是 `appearance.ui_style`
-默认值「旧版」对应的那个界面）只引了 `app.js`，而 `app.js` 挂载三维档案阵列和
-装配查看器时只认 `window.MemoryCinema3D`——全仓库只有 `assets/cinema-3d.bundle.js`
-会定义它，但没有任何 HTML 引用它。结果是面板干等 8 秒后显示
-`ARCHIVE SCENE / UNAVAILABLE`，而重试按钮永远不可能成功。新版界面（`modern.html`）
-不受影响：它的 Vite 包把这套三维代码内联进去了。现在 `legacy.html` 在 `<head>` 里
-以 module 标签显式加载该包。
-
-**`scripts/verify_assertions.py` 写死了容器绝对路径。** 它原来往 `sys.path` 里插的是
-`/root/workspace/astrbot_plugin_memory_companion`，换台机器就 ModuleNotFoundError。
-改成和 `verify_assertions_live.py` 一致的 `Path(__file__).resolve().parents[1]`。
-
-**清掉 21 个零引用的前端构建残留。** `assets/` 下原有 19 个 `index-*.js` 和 4 个
-`index-*.css`，实际只有 `index-URVgTPOQ.js` 与 `index-CWNk7gDr.css` 被 `modern.html`
-引用。其余 21 个合计约 14MB，逐个核实后确认可删：全仓库零引用（含 docs 与 archives）、
-没有任何代码枚举或按名匹配 `assets/`、内容上每一个都是现役包的严格子集
-（独有的字符串与选择器数量均为 0），且它们与现役包同在 2.1.0 那一次提交里一次性涌入、
-此后从未增删——即发版前本地反复构建留下的产物，不是为缓存兼容刻意保留的。
-源码目录从 48MB 降到 36MB，发包体积从 25.1MB 降到 21.4MB。剩下的体积基本是
-`pages/记忆面板/fonts/` 里四个 MiSans woff2（原始 18.9MB）——它们本身已经是压缩格式，
-打包再压不动，除非确认面板可以不用嵌入字体。
-
-### 验证
-
-- `scripts/verify_assertions.py`：离线高保真回归，语料取自现场反馈，覆盖旧正则表拿不到的细节、
-  转述/角色扮演/临时状态/未来打算、跨日与绝对时间、单值改口与多值并存。
-  当前 **正向 7/7、拦截 7/7、时态极性 2/2**。
-- `scripts/verify_assertions_live.py`：真机脚本，用宿主已配置的 provider 跑真实模型，
-  输出埋入事实命中率、非事实泄漏率、重复提及是否合并、跨窗口可见性。
-- 全量测试 736 项通过（pytest 9.1.1 / Python 3.11），另含 145 项 subtest 全通过。
-
-## 2.1.4 - 2026-09-15
-
-### 阶段总结按批恢复
-
-- 修复证据门禁失败后整个会话停止总结的问题：失败仅隔离当前批次，后续消息继续处理。
-- JSON 或证据引用不合格时，携带诊断和旧输出自动纠正一次；要求同步修正正文与事实，不重复发送相同请求。
-- 区分会话摘要与稳定事实：普通聊天可在关键事实为空时保存有来源的会话记忆；确无新增信息则记录“已处理，无新增记忆”，保留原文。
-- 每批默认最多 3 次自动模型调用，首次、备用模型和纠正共用；每会话每小时默认最多 6 次，可在官方配置页调整。计数在调用前持久化，重启不重置。手动总结可有限重试，不重置自动额度。
-- 自动迁移旧版会话失败状态，为旧批保留一次受预算约束的恢复机会。后续触发优先处理新消息，没有就处理到期的旧批；不会启动无上限的历史补跑。
-- 批次进度与记忆写入在同一事务提交；增加原文、已生成会话记忆、待处理、待修复及无新增批次统计。旧版总览与新版终端页脚均显示处理进度。
-
-## 2.1.3 - 2026-09-10
-
-### 拓展页配置读取修复
-
-- 修复入口页使用不存在的旧 API 地址读取 UI 样式，导致配置为“新版”时始终回退到旧版的问题。
-- 入口页优先使用 AstrBot 页面桥接，在移动端无 Dashboard Cookie 时也能正确读取样式；同时保留跨版本 HTTP 回退。
-- 修复新版终端离开桥接后的记忆 API 回退地址，并增加资源缓存版本标记。
-
-## 2.1.2 - 2026-09-09
-
-### 阶段总结安全阀
-
-- 修复 `evidence_gate_rejected` 批次在冷却结束后被无限自动重试的问题；证据门禁隔离批次现在只等待人工复核，避免重复消耗模型 Token。
-- 保留手动 `/summary` 强制重试入口，原始时间线继续保留。
-
-## 2.1.1 - 2026-09-09
-
-### 移动端拓展页
-
-- 修复记忆面板入口在移动端 WebView 重定向时丢失 AstrBot `asset_token`，导致页面或三维资源返回“未授权”。
-
-## 2.1.0 - 2026-09-09
-
-### 记忆终端与性能
-
-- 新增新版 Memory OS 终端界面，可在 AstrBot 官方插件配置页选择旧版或新版，默认保持旧版。
-- 新版记录带接入真实记忆召回数据，支持会话记忆、长期记忆、Bot 自我记录、检索、收藏、详情和三维档案查看。
-- 新版终端的视觉灵感来自 B 站 UP 主“路北路陈”使用 GPT-6 Astra 对《明日方舟》「莱茵生命：访问」终端界面的复刻作品（BV1jebG6zE1E），并明确将档案内容映射为本插件记忆数据。
-- 三维视图默认采用轻量渲染；SSAO、景深和高分辨率阴影改为由“高质量渲染”设置按需启用，页面不可见时暂停场景更新。
-
-## 未发布 - 记忆提议通道
-
-### AI-first 写入
-
-- 新增 `MemoryProposal`，让模型表达置信度、重要性、持久性、有效时间、证据引用和写入理由；运行时继续负责作用域、隐私和状态校验。
-- 低置信度提议进入候选状态；`requested_persistence=false` 不创建记忆记录。
-- 新增 `memory_capture.proposal_mode`：`hybrid`、`summary_first`、`explicit_only`。默认 `hybrid` 保持兼容，可逐步把稳定事实判断交给阶段总结模型。
-- 阶段总结记录摘要边界、来源事件和策略版本，便于重启恢复与审计。
-- 普通召回新增“非对话记忆预算”：Bot 自身时间线和未完成流程默认合计最多占用 2 个名额；明确查询这些内容时自动放宽，减少它们挤占用户事实和对话证据。
-
-## 2.0.0 - 2026-08-29
-
-### 页面与稳定性
-
-- 重构记忆面板为统一的动态视图，覆盖总览、记忆导航、知识星图、检索显微镜、个人记忆、导入、配置和权限拓扑。
-- 修复 AstrBot 页面桥接请求的 `page/` 命名空间与查询参数传递，避免拓展页打开后接口全部为空。
-- 修复知识星图“完整参数”详情解包，以及 Bot 相册受保护图片路径导致的加载失败。
-- 无页面桥接时改用 AstrBot 当前认证扩展 API；危险操作改为页面内确认，兼容 WebView 环境。
-- 增加 Bot 归属修复、敏感信息脱敏追踪和相关回归测试。
-
-## 1.10.6 - 2026-08-27
-
-### Bot 归属与检索诊断
-
-- 适配器未提供 `get_self_id()` 时，仅在运行时能确认唯一 Bot ID 的情况下补齐上下文，减少合法 Bot Personal 记忆被误判为归属缺失。
-- 将 `owner_bot_context_missing` 与 `owner_bot_mismatch` 分开记录，便于区分身份解析故障和跨 Bot 隔离。
-- 管理面板记忆详情新增带预览、显式确认和数据库备份的 Bot 归属重新绑定入口，默认只处理未归属或明确指定来源 Bot 的记录。
-
-## 1.10.5 - 2026-08-26
-
-### 管理面板
-
-- 修复手机浏览器直接打开 AstrBot Web 管理页时，检索召回配置无法保存的问题：页面桥接不可用时自动使用当前已登录管理站的同源 API。
-- 检索配置仅在后端返回确认结果后提示成功；刷新页面数据失败时保留明确的已保存状态提示。
-- 更新面板静态资源缓存标识，确保移动端加载修复后的脚本。
-
-## 1.10.4 - 2026-08-25
-
-### 版本同步
-
-- 同步插件运行时版本、元数据、README 和记忆面板静态资源缓存标识，避免安装后仍显示旧版本号或继续使用旧前端缓存。
-
-## 1.10.3 - 2026-08-25
-
-### 平台兼容
-
-- 将 `qq`、`qqbot`、`aiocqhttp`、`onebot`、`napcat` 和 `go-cqhttp` 识别为同一 QQ/OneBot 平台族，避免适配器名称变化导致历史私聊记忆被误判为跨平台。
-- 其他平台仍保持独立隔离，并新增 `aiocqhttp` 兼容回归测试。
-
-## 1.10.2 - 2026-08-25
-
-### 检索召回
-
-- 迁移记录使用 `default` 等平台占位值时，按同一私聊会话或同一用户继续召回；明确的平台不一致仍保持隔离。
-- 上下文追问放宽为单个实体词即可进入排序，继续由 ACL、生命周期和相关性评分决定最终结果。
-- 增加跨平台迁移记录与模糊追问的回归测试。
-
-## 1.10.0 - 2026-08-23
-
-### 核心记忆
-
-- 新增独立于 RAG 的核心记忆层：当前作用域可见的核心块按优先级每轮常驻注入，并同时覆盖普通对话和主动陪伴 Bridge 功能上下文。
-- 核心块复用 Memory Atom v2 主库、作用域、Bot / 人格隔离、有效期、固定耐久度、备份导出、范围清理和注入统计；动态长期记忆继续按原有分槽检索。
-- 动态召回明确排除核心块，避免同一内容既静态注入又被相似度检索重复选中。
-
-### 管理与即时纠偏
-
-- 记忆面板新增核心记忆工作区，支持 Label、类型、全局 / 私聊 / 群聊作用域、Bot / 人格归属、优先级、启停以及增删改查。
-- 核心块更新使用 revision 冲突检测，同一作用域内重复 Label 会被拒绝，避免多窗口编辑互相覆盖。
-- 新增 `memory_companion_core_memory` 工具；在用户明确要求时可查看、设置或删除当前私聊用户自己的核心块，全局和群聊核心块仍由管理面板维护。
-- 新增核心块数量和字数预算配置；当前消息明确纠正、平台安全边界和真实事实继续高于旧核心块。
-
-## 1.9.3 - 2026-08-22
-
-### 窗口开关直控
-
-- 记忆面板顶部的记录/召回开关会根据当前选择操作具体群聊或私聊窗口。
-- 选择“全部”时仍修改范围全局配置；窗口未设置覆盖时继续跟随全局。
-- 面板显示当前开关来源，并补充窗口设置入口与前端缓存版本更新。
-
-## 1.9.2 - 2026-08-22
-
-### 窗口级记忆开关
-
-- 群聊和私聊支持按具体窗口单独关闭或开启记忆记录、记忆召回；未设置覆盖的窗口继续跟随全局范围配置。
-- 权限拓扑支持选择具体窗口、显示覆盖来源、恢复跟随全局；外部桥接写入也遵守窗口级记录开关。
-- 旧数据库启动时自动补充窗口级开关字段，可移植档案导入导出保留窗口设置。
-
-### 总结与成本诊断
-
-- 总结 Provider 默认超时调整为 180 秒；失败批次进入按错误类型区分的冷却，后续新消息可继续总结并自动恢复探测。
-- 强化总结 JSON 输出约束与解析兼容，减少格式错误导致的整批失败。
-- Token 统计区分 Provider 已确认 Token、插件估算 Token、估算调用次数和失败调用，避免把估算值误认为实际用量。
-
-### 发布同步
-
-- 插件运行版本、元数据、说明文档和面板静态资源缓存标识同步更新为 `1.9.2`。
-
-## 1.9.1 - 2026-08-16
-
-### 私聊与群聊开关
-
-- 新增私聊、群聊各自独立的记忆捕获、记忆召回和权限拓扑开关；关闭能力不会删除已有记忆。
-- 放映馆与简洁管理界面均显示当前范围状态，并可直接切换；拓扑关闭后对应窗口、规则和策略不会参与展示或跨窗口放行。
-
-### 召回质量与评测
-
-- 多路候选读取与向量查询并行执行；RRF、路由一致性、生命周期和显著度共同参与评分，弱查询证据会降低高重要度记忆的抢占权重。
-- Rerank 改为本地分数与模型分数的归一融合，避免重复叠加语义权重；强词法命中仅作为 Top-K 保底，不再固定压过模型排序。
-- 嵌入写入和召回校验共用同一文本构造，补齐 `routine_check_notes`，并使用有界游标逐批修复缺失或过期向量。
-- 新增只读召回质量评测脚本，可导出真实查询并计算 Recall@K、MRR、Hit@1，也支持无生产数据的合成自检。
-
-### 稳定性与性能
-
-- Bot 回复时间线增加消息与内容查重，避免框架重放污染阶段总结；群聊消息复用最近时间线读取，减少重复数据库往返。
-- 情绪事件队列和关系阶段状态增加 TTL 与数量清理，防止长驻进程随历史会话持续占用内存。
-- 修复 Bot Personal 新命名空间无法被档案页读取、旧 DTO 缺少可选字段时归档失败，以及 Windows 备份测试未释放 SQLite 句柄的问题。
-
-### 总结模型分流
-
-- 私聊和群聊可分别选择独立的阶段总结模型；未配置专用模型时继续使用原有通用模型，无需迁移旧配置。
-- 场景专用模型不可用时依次回退通用主模型、通用备用模型和当前会话模型，并对相同 Provider 自动去重。
-
-### 发布同步
-
-- 插件运行版本、元数据、说明文档和面板静态资源缓存标识同步更新为 `1.9.1`。
-
-## 1.9.0 - 2026-08-16
-
-### 双界面管理
-
-- 保留完整放映馆界面，并新增贯穿总览、工作区与详情页的简洁管理界面；切换器进入任意工作区后仍保持可见，选择会在当前浏览器中持久化。
-- 简洁模式使用普通导航、卡片、详情和日程列表，不再复用胶片卷轴与转场等待；放映馆模式继续保留胶片、卷轴、相册和过场动效。
-- 新增前后端 UI 能力契约，启动时核对契约版本、两种界面、七类工作区与动态端点；不匹配时给出明确提示。
-
-### 前后端功能对齐
-
-- 记忆详情补齐 Memory Atom v2 的归属、有效状态、有效期、显著性、耐久度、敏感级别、强化分和实际注入统计；可写字段在后端进行枚举、数值与时间范围校验。
-- 修复普通内容编辑会把 `superseded`、`expired` 或 `quarantined` 记忆静默恢复为有效状态的问题；归档和恢复会同步生命周期与原子有效状态。
-- 维护页接入可回滚记忆审计的预览、状态、应用和回滚，知识图谱接入跨窗口线程完成/重新打开操作。
-- 增加静态前后端端点覆盖测试：页面使用的每个 API 必须有已注册路由，未直接暴露的后端能力必须声明内部、兼容或高级用途及原因。
-
-### 记忆内核 v2
-
-- 引入可迁移的结构化记忆原子，补齐 Bot、人格、敏感级别、耐久度、有效期、证据、强化分与真实注入统计；旧记录保持兼容读取并按需升级。
-- 召回链路在权限与生命周期预过滤后进行多路 RRF 融合，再使用 MMR 抑制重复候选；最终排序综合相关性、显著度、时间有效性、自然衰减和真实注入强化。
-- 访问统计改为只在记忆真正写入本轮提示词后更新，候选扫描、缓存命中和被预算裁掉的记录不会获得虚假强化。
-- 自然遗忘改为分域衰减与可逆冷归档；显式固定记忆不衰减，耐久、普通、短期和瞬时记忆使用不同半衰期，召回会自然强化但不会形成永久保护。
-
-### 证据、隐私与隔离
-
-- 阶段摘要的事实和关联必须引用真实时间线事件并通过内容支持检查；低质量结果进入待审核隔离区，保留原始时间线，不参与向量、知识图谱与正式召回。
-- 持久化、向量化、导出、范围投影和提示词注入共用敏感信息清洗，启动时也会修复旧库中的凭据、令牌、私钥与敏感 URL 参数。
-- 清空全部记忆覆盖长期记忆、时间线、知识图谱、画像、情绪事件、投递账本与作用域投影，不再遗留旁路状态。
-
-### 陪伴联动与信息隔离
-
-- Bot Personal 共享契约升级为 revision 3 / capability 1.3，所有归档按 `owner_bot_id + persona_id` 隔离；旧 schema 1/2 只在遗留命名空间读取，避免多 Bot、多人格串档。
-- 补齐作用域读取、写入、列举、清空与 tombstone 能力，并让页面读取实际握手状态，不再把“检测到插件目录”误报成“桥接健康”。
-- 修复总览中两个“用户档案与记忆”入口打开同一页面的问题，保留唯一入口并重新编号。
-
-### 发布同步
-
-- 插件运行版本、元数据、说明文档和面板静态资源缓存标识同步更新为 `1.9.0`。
-
-## 1.7.3 - 2026-08-11
-
-### 证据化摘要与可回滚审计
-
-- 阶段摘要关键事实支持保存原始时间线事件引用，并在本地校验引用存在与内容支持；旧字符串事实继续兼容检索，但不冒充已验证引用。
-- 新增手动记忆审计预览、状态、应用和回滚命令及页面 API。模型只生成建议，应用前再次校验事件范围与记忆指纹并自动备份数据库。
-- 审计中的删除建议改为可恢复归档，应用后保留审计元数据；回滚会避免覆盖审计后发生的人工修改。
-- 审计默认关闭且不会进入睡眠维护，应用和回滚均要求管理员明确输入确认文字。
-
-### 发布与编码
-
-- 插件运行版本、元数据、说明文档和面板静态资源缓存标识同步更新为 `1.7.3`。
-- 固定 `metadata.yaml` 使用 UTF-8、LF 且无 BOM，并增加中文元数据编码回归测试，避免发布包再次出现乱码。
-
-## 1.7.2 - 2026-08-08
-
-### 记忆协同与画像
-
-- 同步 PR5 的受限 Companion 能力、情绪事件投递、隐私边界和分槽召回优化；群聊不会因点名成员而越权读取其私聊记忆。
-- 增加统一用户画像基础能力与治理入口，明确画像证据、敏感等级、跨场景使用和撤回边界。
-- 可见回复阶段总结改为按会话合并调度，避免重复触发总结任务，同时保留补偿执行机会。
-
-### 发布同步
-
-- 插件运行版本、元数据、说明文档和面板静态资源缓存标识同步更新为 `1.7.2`。
-
-## 1.7.1 - 2026-08-04
-
-### 召回分槽
-
-- 修复分槽检索在补足 `top_k` 时绕过自我时间线预算的问题；泛查询不再被近期高重要度日程再次填满，其它记忆一直可检索。
-- 每个存在相关候选的分槽会先获得一次选择机会，再使用各槽基础预算；用户事实、阶段总结或稳定记忆仍可按相关性补足剩余名额，不会被统一硬截断。
-- 泛查询仅对 Bot 自我时间线执行配置上限；明确询问 Bot 自身日程、行程、上下班或个人安排时允许柔性扩展，并在其它相关分槽完成首轮选择后再补入日程。
-- Bot 日程焦点改为按所有者和问句结构识别，不再依赖项目、插件、版本等技术词黑名单；“我的日程”、第三方日程、会议安排、项目计划和普通报时不会触发 Bot 日程扩展。
-- 检索缓存键纳入当前封顶分槽，避免相同空查询在不同消息上下文中复用错误的日程扩展结果。
-- 自我连续性提示补充日程使用边界：仅在当前问题明确涉及 Bot 状态、安排或长期原因时使用，不让日程背景压过用户事实和对话证据。
-
-### 召回诊断
-
-- 记忆显微镜新增分槽计数与基础预算标签；`2/2` 表示当前查询按预算封顶，`4/2+` 表示该槽可根据相关性继续补位。
-- 分槽标签支持手机端自然换行，并补充悬停说明和无障碍标签；旧服务缺少分槽接口时不会误报编排已开启。
-- 插件运行版本、元数据、说明文档和面板静态资源缓存标识同步更新为 `1.7.1`。
-
-## 1.7.0 - 2026-08-04
-
-### 主动记忆重建
-
-- 阶段总结新增 `Cue -> Tag -> Content` 关联提示，并在现有 SQLite 知识图中保存 Cue 节点、关联维度和内容层；关联只用于寻找下一条线索，回答仍以实际记忆记录为证据。
-- 新增 `memory_companion_navigate`，支持普通再检索、关联维度事件、事件时间与上下文、人物方面、主题事件和反向线索。模型先使用常规注入，证据不足时再逐步导航，证据足够后由提示词要求立即停止；普通聊天仍走原有快速路径。
-- 同一消息默认最多导航 3 步、每步返回 6 条可见候选；重复调用不消耗步数也不重放旧结果。步数、条数与扫描量是可配置资源上限，不使用自然语言关键词硬性决定继续或停止。
-- 每一步都会重新加载来源记忆并复核平台、Bot 所有权、窗口、ACL 和当前群发言者。图节点和边不会绕过记忆权限，撤权会在下一步立即生效，隐藏候选的 ID、数量、标签和内容不进入工具结果。
-- 本地基准新增多跳证据、时间证据、平均导航步数、工具输出体量、P95 延迟和未授权召回计数；未授权召回目标保持为零。
-- 图路径的有界候选会优先当前会话、当前用户和当前群，再执行完整可见性检查，避免同名线索被其他用户的大量不可见图记录提前挤出候选池。
-
-### 召回与权限
-
-- 面板“召回测试”和 `memory_companion_recall` 改为复用正式注入的分槽编排；泛查询不再只按总分被近期高权重日程占满，仍保留相关日程，并同时给用户事实、窗口摘要和稳定记忆进入结果的机会。
-- 用户明确要求长期记住时，系统提示和工具说明都会要求模型先调用 `memory_companion_remember`；只有本轮工具实际落库并返回 `ok=true` 后才允许确认“已记住”，未调用、写入失败或调用异常不再口头误报成功。
-- 权限拓扑已手动允许“私聊用户 -> 群聊”后，ACL 放行结果不再被群聊后置保护重复删除；同一用户可用“我中午吃了什么”“说说我喜欢的店”等自然表达召回直接相关的私聊长期记忆，无需固定使用“记得/之前”或特定疑问词。同一平台、同一 Bot、当前发言者身份、精确 ACL 和检索相关性仍由代码校验，是否在当前语境明说交给条件候选提示约束。
-- 跨窗口授权仍只开放候选：自然放行要求当前发言者询问自己的事实，并具有实际词法或达标语义命中；同词陈述、无关话题、反向权限、其他发言者和撤权后的缓存结果继续拦截，注入提示也会要求模型不扩展未注入的私聊内容。
-- 近期当前状态保护补齐明确记忆、主动记忆工具和手工记忆，同时不再把“上次/之前”的回忆问题按 1.5 天当前状态窗口误删；主动回忆工具也复用群聊发言者保护，避免绕过主注入边界。
-
-## 1.6.6 - 2026-07-28
-
-### 历史聊天导入
-
-- 升级前已经完成或完成但有警告的私聊导入批次，只要批次记录仍保留，也可在“历史任务”中修正到已有私聊；无需重新导入，也不需要执行全局用户迁移。
-- 历史任务列表会读取完整历史批次，较早版本创建的批次不再被固定条数截断。
-- 面板查看旧批次时不再自动启动模型细节补全，确保归属修正入口保持可用；修正仍只更新所选批次并自动备份。
-- 旧批次即使缺少关系候选计数，也会按批次标识尝试同步 Private Companion 的待确认关系观察；新确认的历史关系记忆会继续保留批次溯源并支持同步修正。
-- 更早版本中已经确认且缺少批次标识的关系记忆不会按名称或内容强行迁移，修正结果会明确提示到陪伴插件关系页人工核对。
-- 目标关系资料已满或旧数据已超过容量时，容量仅约束本次新增：目标现存记录不会被裁剪，未迁移项继续留在原用户下，去重项也不会误报为容量不足。
-- 归属修正会保留正文未变化的既有向量索引，修正后仍可立即参与语义召回，不额外调用 Embedding Provider。
-- 归属修正使用独立的完整私聊目标列表，不再受主面板最近 180 个窗口的展示批次限制；较早但仍存在的正确窗口也可选择。
-- 归属入口文案改为“修正到已有私聊”，并明确升级前批次同样适用，减少将该操作误解为全局用户迁移的可能。
-
-## 1.6.5 - 2026-07-26
-
-### 记忆显微镜
-
-- 召回测试在未选择会话时改为管理端“全部可检索记忆”，不再因空 `unknown` 上下文把私聊、群聊记忆全部过滤；选择具体私聊或群聊后仍按真实可见性与 ACL 模拟，可解析的会话键也会校验范围和目标一致性。
-- 显微镜新增独立的检索范围选择器、结果范围标识和持久错误状态；同一私聊或群聊由多个 Bot 共用时可分别模拟，归档与内部记录不会生成无效选项。
-- 切换范围、修改查询或刷新记忆桶会立即作废旧请求并允许重新检索，迟到的结果和错误不会覆盖当前页面。
-- 桌面端固定为“标题 / 输入 / 可滚动结果”三行布局，结果增多不会再遮挡输入框；手机端继续使用整页自然滚动。
-- 插件运行版本、元数据、说明文档和面板静态资源缓存标识同步更新为 `1.6.5`。
-
-### 历史聊天导入
-
-- 导入确认页新增“记忆归属”选择器，可直接选择已有私聊窗口并自动绑定目标用户 ID、会话 ID 和 Bot ID，无需手工查找或填写 `openid`、会话键。
-- 稳定用户 ID 完全一致时可以自动选中目标；仅昵称相同只会提示候选，必须人工确认，不会把同名用户自动合并。
-- 已完成但归属错误的导入批次可通过“归属不对？合并到已有私聊”就地修正；操作仅更新该批次，不会重新调用模型，也不会移动或改写其它记忆。
-
-## 1.6.4 - 2026-07-23
-
-### 历史聊天导入
-
-- 文件导入新增 QQChatExporter JSON：识别其 `metadata`、`chatInfo` 和 `messages` 结构，保留原始消息 ID、序号和发送者 QQ；撤回、系统消息会跳过并提示，图片、语音、回复、卡片等非文本内容保留为可读占位，`selfUin` / `peerUin` 仅作为高置信身份建议，仍需人工确认。
-- “可移植数据”入口会明确提示 QQChatExporter JSON 应从“历史聊天导入 / 文件导入”进入，避免将普通聊天 JSON 误当成本插件 JSONL 档案。
-- QQChatExporter 消息指纹改为基于会话身份与原始消息证据；同一聊天更新统计、资源信息或增量追加后再次导入时，旧消息 ID 保持稳定，避免重复写入历史时间线。
-- 历史聊天执行接口补齐用户与 Bot 同 ID、QQChatExporter 群聊误入私聊模型的后端校验，避免身份归属被错误合并。
-- 可移植档案会核对头部声明数量，截断或不完整档案不再被误判为有效备份。
-- 面板静态资源更新为 `1.6.4` 缓存标识；导入预览会绑定实际来源，切换标签后不能误启动旧预览，文件解析失败也会保留可重试的页面错误提示。
-- QQChatExporter 文件会按原始消息 ID 去重，并以 `chatInfo` 中的稳定 QQ 身份归并导出期间的昵称变化，避免重复消息在执行期回滚或同一 Bot 被拆成多个说话人。
-- 增量重导入会区分既有时间线与本次新增消息，只对新增部分创建分段和模型整理任务，避免旧记录重复消耗模型或生成措辞不同的重复摘要。
-
-## 1.6.3 - 2026-07-23
-
-### 陪伴笔记
-
-- 新增 `memory_companion_note_delete` LLM 工具，Bot 可按笔记 ID 删除自己创建的陪伴笔记；唯一精确标题也可直接删除，模糊或重复标题会先返回候选 ID，避免误删。
-- 陪伴笔记读取与删除统一校验当前 Bot 所有权，多 Bot 环境不会读取或删除其他 Bot 的私有笔记；创建、读取和删除继续共用 `memory_tools.enable_note_tools` 开关。
-
-### 手机端体验
-
-- 记忆拓展页在平板和手机端改用整页滚动，解除工作区内容高度裁剪；拟人维度页不再重新形成嵌套滚动。
-- 个人日程胶片会先判断拖动方向：横滑切换日程，纵滑交还页面；输入控件使用 16px 字号，主要触控目标不低于 44px，并补齐动态视口、安全区和惯性滚动适配。
-
-## 1.6.2 - 2026-07-20
-
-### 共同经历记忆
-
-- 新增通话/共同观影共享经历桥接：接入插件可只写入一条经过整理的稳定摘要，不必保存逐句转写、原始音频或视频帧。
-- 共享经历明确记录实际 Bot 账号为主体、主要用户为共同参与者，并区分 `shared_call` 与 `shared_watch`，修复多 Bot 环境可能归到模糊 `self` 的问题。
-
-### 历史聊天导入
-
-- 文件解析新增“发送者 / 时间 / 内容”字段式导出兼容，自动判断发送者与内容位于时间字段前后的位置，并排除消息 ID 等元数据；“时间”“内容”不再被误列为说话人。
-- 字段式记录缺少发送者时会在预览阶段给出可操作提示，不再基于错误解析生成数百次模型调用；私聊文件识别出异常多说话人时仅柔性提醒检查格式。
-
-## 1.6.1 - 2026-07-17
-
-### 陪伴称呼联动
-
-- PrivateCompanion 提供固定称呼时，关系阶段称呼建议会让位于该称呼；历史称呼、显示名和旧记忆只保留为识别资料，不再派生新的亲昵称呼，也不会要求每句都重复称呼。
-- 用户在当前消息明确要求改称呼时仍优先采用最新要求，兼顾固定配置与自然对话中的即时更正。
-
-### 召回边界与连续性
-
-- 通用“讲个冷笑话/故事/段子”等轻量创作请求会直接处理当前消息，不再启动无关长期检索；判断收窄为明确指令结构，单纯谈到“故事、自拍、解释、漫画”等内容不会误触。
-- “符合我性格、你觉得我会喜欢”等个性化创作继续检索相关画像，也可使用当前发言者自己已授权给该群的私聊记忆；未点名的其他成员画像会被过滤，其他人的私聊仍需明确点名并满足 ACL。
-- 新话题和低信息保护不再裁剪 AstrBot `req.contexts`，只抑制无关长期记忆并保留原始对话，避免图片、查询等请求后丢失稍早已经确认的事实。
-- 私聊近期事实防遗忘会从同一会话近 3 小时提取吃饭、洗澡、上下班、位置和休息状态；若 Bot 已围绕该状态回应，会先提示模型核对，注入调试同步显示 `recent_fact_guard=0/1`。
-- 每日穿搭快速上下文在字数紧张时优先保留日程、历史穿搭、服装偏好和最近图片，不再因夜间气氛或称呼提示挤掉服装偏好。
-- 阶段性总结自动重试新增指数退避：连接、超时、限流和 502-504 达到上限后进入冷却并自动恢复探测，手动总结仍可立即执行；同一冷却状态不再随每条新消息重复刷 WARN，内容或解析错误继续保留原始时间线并等待人工处理。
-
-### 面板修复
-
-- 个人记忆相册详情图改用确定尺寸的 `contain` 画框，方图和竖图不再被宽屏详情容器裁成横幅；详情区同步扩大并更新 CSS 缓存标识。
-
-## 1.6.0 - 2026-07-15
-
-### 历史对话整理导入
-
-- “维护 / 迁移 / 配置”的二级导航新增独立历史聊天导入页，按“选择来源、读取预览、确认身份、生成记忆”推进；QQ 直接读取、文件导入和最近任务使用页内标签切换，不再挤进维护工具网格或占用首页入口。
-- 新增 NapCat/aiocqhttp 好友历史直读：选择当前 Bot 连接、目标 QQ 和起止时间后调用 OneBot `get_friend_msg_history` 分页读取；限制为纯数字 QQ、最长 31 天、最多 5,000 条，并对分页边界去重、接口游标停滞和不完整范围给出明确提示。
-- QQ 直读保留原始 OneBot 消息 ID、消息序号、适配器 ID、发送者账号和来源类型，图片、语音、回复等非文本消息转为可读占位；Bot 登录账号和目标 QQ 会生成高置信身份建议，但开始整理前仍需人工确认。
-- 文件导入继续支持拖拽 TXT、LOG、Markdown，兼容 UTF-8、UTF-8 BOM 和 GB18030，并统一归档为 UTF-8；预览会集中展示时间检查、内容规模、预计模型调用、分段抽查和身份建议依据。
-- 解析器支持完整或缺少年份的消息时间、跨年补推、多行正文、相同时间戳和倒序记录；连续短消息按逻辑发言合并，再按时间、跨日、问候、回合数和字数切片，适配大体量记录且尽量不拆问答。
-- 用户/Bot 身份、稳定账号和称呼改为单处确认，低置信身份不再默认猜测；执行前强制校验角色数量、ID 冲突和确认状态，减少整批归属选反。
-- 原消息永久进入 `historical_archive` 时间线；模型按片段生成详细回忆和重要事件，再汇总日摘要、稳定事实与阶段摘要，所有长期结论都保留实际证据边界。
-- 导入任务支持后台进度、暂停、恢复、中断续跑、失败限次、确定性幂等和整批回滚；执行前自动备份不可变原文、JSONL 档案和清单，启用 Embedding 时会在完成前补齐本批向量。
-
-### 质量、归属与可靠性
-
-- 历史导入优先复用已有私聊窗口，并统一解析稳定称呼、原始说话人、括号别名和账号 ID；私聊分桶与权限判断可从 AstrBot session 键恢复稳定目标，旧批次也能幂等修复关联，避免同一用户被拆成多个对象。
-- 历史片段采用“明确称呼的第三人称详细回忆 + 简短检索摘要”双层结构，保留起因、关键互动、决定、承诺、结果和情绪变化；旧第一人称内容仅作审计，不再污染注入、全文检索或向量召回。
-- 新旧批次都会在向量收尾前检查来源体量、正文长度、第三人称视角和格式版本，只重整不合格的片段与日摘要；视角校正不会用短摘要覆盖已经合格的详细正文。
-- 导入进度统一为原文归档、片段整理、跨片段去重、细节补全和向量收尾五阶段；`timeline` 同步记录保留类别、批次和原始序号，回滚会完整清理派生索引、审核项、向量与图谱关系。
-- 总结器只消费实际送入 Provider 的时间线 ID；Provider 连续失败会保留原始时间线并在达到上限后暂停，进程中断遗留任务可安全恢复。
-- 阶段性总结使用可配置的单次 Provider 超时；相同的总结、备用和当前会话 Provider 只调用一次，常见 Ollama/OpenAI 超时会显示实际秒数而不刷整屏预期调用栈。
-- 带“那……”“嗯，那就”等自然语气前缀的例行检查仍会进入约定互动检索，不再被误判为普通短承接；只有直接支持该约定的记忆可以明说，证据不足时继续轻量确认。
-- 记忆面板补齐导入状态、失败详情、记忆分类、关系候选和向量进度；左下统计以数据库、WAL 与 SHM 的实际总占用展示记忆大小。
-
-## 1.5.2 - 2026-07-14
-
-### 修复
-
-- 群聊短引用接话会以“本轮文字 + 直接引用”为主题锚点，仅保留与锚点有交集的记忆；每类最多 1 条、全局最多 3 条，并压缩到 1050 字以内，避免无关日程或旧设定抢走当前话题。
-- 引用接话新增人物、动作和地点的柔性归属提示，优先保持当前发言者、引用作者与第三方各自的动作关系，减少把“信使送包子”错误改写成另一个人在旧地点行动。
-- 主链与桥接上下文统一应用短引用策略，调试信息会记录短引用命中数量以及主题不匹配、分槽抑制、分槽上限和全局上限原因，便于复查实际选中了什么。
-- 新增真实主注入路径回归，覆盖短引用筛选、3 条上限、精简注入和动作归属提示，防止辅助函数测试通过但主链未接入。
-
-## 1.5.1 - 2026-07-14
-
-### 修复
-
-- Rerank 请求前会拦截空查询并过滤无正文、证据或标签的空候选；过滤后的候选与返回索引保持一一对应，避免 SiliconFlow 等 Provider 因空字符串返回 `20015`，同时保留本地基础排序回退。
-- Rerank 调试路径新增 query、候选数量、候选最短/最长长度和模型名长度，不记录正文即可判断服务端 `String should have at least 1 character` 对应哪个请求字段。
-- SQLite 主连接锁等待收敛为 3 秒，WAL 自动 checkpoint 阈值从默认 1000 页收紧到 500 页；路径类打开异常会重建连接并对记忆、检索和向量关键操作执行一次安全重试，不在每次写入后强制 checkpoint。
-- PrivateCompanion 日程连续性改用短生命周期只读连接，只读取近期 Bot 日程/行动和当前私聊对象稳定边界，不再触发 Embedding、Rerank、全库候选或向量补建；旧版桥接保持兼容。
-- PrivateCompanion 每日穿搭新增本地快速上下文，按近期日程、历史穿搭、相关服装偏好和最近图片分配候选，不再为穿搭生图调用完整 Embedding/Rerank 检索；历史穿搭仅用于保持连续和避免重复。
-- PrivateCompanion 梦境碎片改归 Bot 自我范围，启动和维护修复会将旧 `private_companion:dream` 记录移出私聊用户列表；旧 LivingMemory 的 Live2D UUID 会话继续保持私聊隔离，但页面会标为“旧 Live2D 会话”，不再冒充 QQ 用户。
-- 睡眠维护结束时限频执行一次 `wal_checkpoint(PASSIVE)`，记录 busy、WAL 总帧和已合并帧；数据库路径异常时同步保留 DB/WAL/SHM 文件状态，避免把每次写入都变成 checkpoint。
-- 快速上下文新增 Bot 所有者校验，桥接未能唯一确定 Bot 账号时不再猜测；多 Bot、群聊和私聊记录不会仅因 `bot_self` 标记而越过所有者边界。
-- 日程快速上下文不再接纳任意手动/明确记忆，用户画像仅在与作息、提醒或互动边界相关时作为语气参考；穿搭快速上下文会过滤无关图片和日程，避免旧截图或其它图片污染每日穿搭。
-- 快速候选改为按记忆类型均衡截取，避免高频行动挤掉稳定偏好或历史穿搭；日程与穿搭快速路径均提供独立配置开关，可随时回退完整检索。
-- WAL 诊断区分当前文件状态和上次健康检查，保留 SQLite 错误码、错误名、恢复次数与最近路径异常，避免旧 WAL 大小覆盖当前状态。
-
-## 1.5.0 - 2026-07-11
-
-### 运维与体验
-
-- 修复 AstrBot WebView 中 LivingMemory“执行导入”点击后无反应的问题：移除不可靠的浏览器原生确认弹窗，改为页面内嵌确认；删除记忆、应用预设和可移植档案导入同步使用同一机制。
-- 个人记忆日期切换统一进入忙碌与错误提示流程，读取失败时恢复原日期和缓存画面；陪伴插件检测异常不再伪装为“未安装”，改为错误状态和可见重试入口。
-- 记忆管理保存改为单个 API 和单个 SQLite 事务，内容、重要度、可见性与生命周期同时提交；FTS 或数据库更新失败会整体回滚。
-- 新增轻量、标准、陪伴三种运行预设；一键调整检索、图谱、总结阈值和注入预算，同时保留用户已经选择的总结、Embedding 与 Rerank Provider。
-- 新安装的检索模式默认值由强制 `rerank` 调整为 `auto`，与文档推荐和运行时回退策略保持一致；已有配置不受影响。
-- 新增统一运维诊断，汇总实际检索模式、最近路径、缓存命中率、模型调用、Token、平均耗时和当前记忆规模。
-- 新增已知记忆与人格插件目录扫描，将专用桥接、高风险重复注入和中等状态冲突分开提示；仅报告风险，不自动停用其它插件。
-- 维护页新增预设、诊断和可移植数据入口，相关能力同时提供管理员命令和页面 API。
-
-### 数据主权
-
-- 新增 UTF-8 JSONL 可移植档案，导出长期记忆、身份、关系边、时间线、ACL 规则和窗口策略；明确排除凭据、Provider 专属向量和注入日志。
-- 可移植档案支持预览和恢复，限制为受支持的版本与 64 MiB 以内文件；导入前强制备份，重复记忆继续使用内容指纹合并。
-- 新增中文内容、私聊可见性、身份、关系、时间线和 ACL 的往返测试。
-
-### 检索与验证
-
-- 新增确定性的 basic 检索基准，报告 `hit@5`、逐查询命中、隐私泄漏、加载耗时、查询延迟和外部检索模型调用数。
-- 根据基准补充无糖/不加糖、少糖/低糖、无冰/去冰和香菜偏好的本地等价词，在不开启 Embedding 时改善常见偏好召回。
-- 基准明确不把不同模型、硬件或配置下的结果作为跨插件质量排名。
-
-## 1.4.6 - 2026-07-11
-
-### 安全与可靠性
-
-- 优化未来安排类对话的证据校准：询问“明天/后天有事吗”等问题时，优先使用 Bot 自身日程、明确承诺和当前对话；群聊多人摘要仅保留为不确定背景，不再轻易被说成 Bot 的既定安排或“你又忘了”的共同历史。
-- 未来安排识别改为优先于“本周/这周”等时间窗口路由，并要求存在 Bot/个人安排语义；项目、插件、版本、发布、代码等技术问题不会再误进 Bot 私人日程路径。
-- 群聊阶段总结新增明确归属提示，并避免因第一人称观察视角或关键词权重被误分为 Bot 自我连续、个人承诺或未完成事项；自然联想仍可用于语气和试探性回应。
-- 群聊总结中的 Bot 自身事实不再靠摘要布尔字段升格：只有带 Bot 原始回复事件 ID、内容重叠校验的日程/承诺/行动，才会派生为独立的 Bot 自我时间线记录。
-- 注入包改为按完整条目分配默认 1800 字符预算，始终保留闭合结构；记忆正文、检索意图、称呼等动态字段统一转义并标为不可执行资料，避免历史文本打断提示词边界。
-- 深夜“例行检查/查岗/在不在”等短检查不再展开旧摘要、穿着、梦境或其它私密细节；命中记忆只保留为一条轻量熟悉感提示，避免把语气底色误包装成未完成事项。
-- 注入正文和注入调试日志会隐藏密码、口令、验证码、令牌和密钥值；`tone` / `uncertain` 的 open loop 不再放进高优先级 `open_loops` 分区。
-- 称呼提示改为按关系错配、当前称呼、关系阶段依次决策，只输出一条校准建议，避免“亲密称呼”和“关系尚浅”等互相矛盾的提示同时出现。
-- 检索缓存改用 SQLite 单调 revision，覆盖记忆、ACL、向量和知识图谱变更；缓存命中后重新读取记录并复核可见性、ACL 与诊断内容。
-- 注入正文调试日志和跨窗口情绪连续性改为默认关闭；照片接口限制在插件数据目录、常见图片类型和 20MB 以内，相册 API 不再返回本地绝对路径。
-- 总结 Provider 增加可配置超时，非 JSON 输出不再降级为自由文本总结；达到重试上限后保留未总结时间线并进入可手动重试的死信状态。
-- 群消息观察器和 LLM 请求钩子使用数据库 `dedupe_key` 原子去重，避免并发记录同一 `message_id`。
-
-### 数据与性能
-
-- 单条删除补齐关系边、知识图谱边和向量级联清理；清空、删除和维护写入增加显式事务回滚，服务层清空同步重置关系状态、情绪队列和检索缓存。
-- 睡眠维护新增已总结时间线与注入日志保留策略，未总结或总结失败的时间线不会自动删除。
-- 当前窗口候选独立保底，FTS 足量时跳过宽泛 LIKE；向量候选增加 revision 缓存，后台补索引增加去重、并发限制和运行间隔。
-- 关系推进改为每个 `message_id` 最多一次，关系键纳入平台、Bot 和群成员身份，中间阶段可正常回退，状态文件使用原子替换。
-- 新增标准库回归测试，覆盖缓存权限、摘要失败、关系演进、删除事务、保留策略、照片路径、检索性能和并发去重。
-
-## 1.4.5 - 2026-07-08
-
-### 修复
-
-- 修复与陪伴插件协同后可能保护旧 `private_companion_*` 动态提示块的问题：请求历史清理会移除状态、引用链、群聊防注入、工具提示等 HTML 标记块；上下文裁剪只保留真正带临时/不保存标记的外部片段，避免旧动态提示反复进入主链并拖低缓存命中。
-- 修复部分 OpenAI 兼容 Embedding Provider 调用已成功、但插件因 1.5 秒默认超时提前判定记忆向量索引失败的问题；旧默认值 1500ms 会在运行时按 5000ms 处理。
-- 拓展页检索配置的嵌入超时默认值调整为 5000ms，并优化预设：保守 4000ms、均衡 5000ms、深入 8000ms。
-- 增强 embedding 响应解析，兼容 OpenAI 标准 `{ data: [{ embedding: [...] }] }`、直接向量数组和对象属性形式，避免模型正常返回但插件解析为空。
-- 记忆向量索引和查询向量失败日志会显示 `TimeoutError` 等异常类型，不再出现空白 `error=`。
-
-## 1.4.3 - 2026-07-07
-
-### 改进
-
-- 新增短 TTL 检索结果缓存：同一会话、同一权限、同一 query、同一检索配置和同一记忆库 revision 下，短时间内重复注入、模拟召回或工具查询会复用结果，减少重复本地检索、Embedding query 和 Rerank 调用。
-- 检索缓存命中后仍会更新选中记忆的访问统计，并在检索路径信息中标记 `cache=hit/miss`，方便排查缓存是否生效。
-- 缓存 key 会包含会话范围、用户/群、管理员读取权限、top_k、时间窗口意图、分槽上限、检索模式、Embedding/Rerank 配置和记忆库 revision，避免跨用户、跨群聊、跨权限或记忆变更后的错误复用。
-
-### 修复
-
-- 修复 `@Bot #napcat`、引用后接 `#napcat`、CQ At 后接 `#napcat` 等平台控制命令仍可能触发记忆注入和采集的问题；命令识别现在会先剥离前置 At/引用组件，再判断 `#`、`＃`、`﹟` 等命令前缀。
-
-## 1.4.2 - 2026-07-06
-
-### 修复
-
-- 收紧凌晨短句“例行检查/查岗/在不在”场景的记忆注入边界：召回到的旧例行检查、梦境、穿着等摘要只作为语气底色，不再引导主模型把旧场景当作此刻正在发生或续写新梦境。
-- 修复拓展页清空群聊、群成员或私聊范围记忆时，AstrBot WebView 中原生确认弹窗可能返回空值，导致显示“已取消清空操作”且无法继续清空的问题。
-- 范围清空确认改为右侧详情区内嵌确认卡片，输入“清空”后执行，避免受浏览器弹窗兼容性影响。
-
-## 1.4.1 - 2026-07-05
-
-### 修复
-
-- 补齐引用链记忆：当用户回复/唤醒时引用了一条消息，而被引用消息又继续引用更早消息，记忆插件现在会优先复用陪伴插件解析好的引用链；没有缓存时会自行通过 Reply 组件和 `get_msg` 最多追溯 3 层。
-- 用户消息写入时间线时会保存引用链摘要和 message_id，避免“模型回复能理解深层引用，但记忆落库只记到当前一句/一层引用”的错位。
-- 记忆检索查询会带上缓存中的引用链上下文，用户只说“这个呢/那条呢”时也能更容易召回原始语境。
-- 兼容陪伴插件新增的 `private_companion_reply_chain_v1` 标记，减少跨插件上下文清理和去重时的误判。
-- 修复多 bot 同群共享记忆库时的群聊总结串用问题：群聊第一人称阶段总结会绑定当前 bot，检索 `group_public` 记忆时会阻止其它 bot 读取该 bot 视角记忆，同时普通群事实仍保持同群可见。
-
-## 1.4.0 - 2026-07-03
-
-### 版本定位
-
-1.4.0 是一次管理面板与跨插件协同增强版本。重点补齐记忆插件与主动陪伴插件的联动展示、配置管理、权限拓扑、相册读取、索引强化和范围清理能力，让迁移、排障、权限配置和日常管理更集中、更直观。
-
-### 新增
-
-- 新增完整的陪伴插件联动说明和双插件全功能交互框架图，补充记忆插件优势、LivingMemory 差异、记忆迁移流程和联动边界。
-- 新增配置页模块化左侧导航，官方配置项按功能模块收束到拓展页，并将配置说明内嵌到对应配置项中。
-- 新增“配置说明”二级页，按检索召回、注入编排、连续对话记忆、陪伴插件协同、权限边界和维护迁移解释模块分工、推荐调试顺序和常见误用。
-- 新增“维护 / 迁移 / 清理”集中页，将维护修复、LivingMemory 导入、危险清理和范围清理整合到同一管理入口。
-- 新增按范围清空记忆能力：可清空单个群、单个私聊对象，以及“某个群里的某个人”的记忆。
-- 新增相册图片数据接口，个人记忆相册可通过插件桥读取陪伴插件生成的图片，避免拓展页裸图片路由失效。
-- 新增权限拓扑交互增强：区分群聊名称/群号与私聊昵称/QQ，连线支持方向箭头和精确点击切换权限状态。
-
-### 改进
-
-- 配置页高级项改为折叠在普通项下方，不再单独占用一个配置窗口。
-- 配置页顶部增加模块入口，可在检索召回、配置说明、权限边界和维护迁移之间快速跳转；高级重排、嵌入、连续对话、编排和自然衰减参数默认保持折叠。
-- 移除已由权限拓扑替代的黑白名单入口，并弱化被拓扑替代的隔离与可见性重复配置。
-- 优化维护配置 UI：导航文案改为“配置列表”，配置页“回到顶部”可回到列表首项“记忆捕获”。
-- 优化记忆拓扑和窗口名称展示，清理 `Avatar`、`Owner ID` 等无关后缀。
-- 强化范围清理安全性，避免模糊 session 匹配误删，群成员清理按明确范围匹配。
-- 强化索引与检索排障相关展示，减少配置与实际召回行为之间的理解成本。
-- 优化个人记忆页相册详情展示，列表和详情图都通过同一套异步补图逻辑加载。
-- 优化二级导航胶卷动效：切换导航项时不再滚出、重建、滚入，而是保留同一组导航卡片并连续纵向位移到标准位置，减少顿挫感。
-- 优化二级导航选中态：选中项不再整张卡片变暗，只让左侧圆形胶卷图案承担深色选中反馈，文字保持清晰高亮。
-- 优化个人记忆相册体验：相册卡片增加照片堆叠与翻转入场效果，日期切换时只替换相册照片组，不再刷新整个个人记忆卡片。
-
-### 修复
-
-- 修复个人记忆相册在 AstrBot 插件拓展页中显示“图片加载失败”的问题。
-- 修复权限拓扑选中两个目标后点击连线容易误触其他连线的问题。
-- 修复配置页部分官方开关参数未出现在拓展页的问题。
-- 修复记忆拓扑仅重复显示 QQ/群号、没有显示昵称/群名的问题。
-- 修复非个人记忆二级导航切换时整块导航闪烁、头部淡出和动画停顿的问题。
-- 修复个人记忆日程细化只展示第一条的问题；现在会按当前时段收集多条细化并按时间顺序展示。
-- 修复相册详情页下方图片被裁切的问题；详情图改为完整适配容器显示。
-
-## 1.3.1 - 2026-07-03
-
-### 版本定位
-
-1.3.1 是 1.3.0 拟人化深化的补完版本。完善了跨窗口情绪连续性的注入侧提示、称呼演进系统的双向感知（Bot 侧称呼建议 + 称呼不匹配感知），以及拟人化维度可视化面板的前端实现。
-
-### 新增
-
-- 新增跨窗口情绪注入提示（P2-7 补完）：`_get_cross_window_emotional_hint()` 方法在记忆注入时检测其他窗口近 30 分钟内的情绪事件，生成不泄露内容的氛围提示（如"你刚刚在别处想起了一些沉重的事，此刻心里还有点闷"），通过 `cross_window_emotional_hint` 参数传入 `injection.compose()`。
-- 新增跨窗口情绪状态 API（P2-7 补完）：`_get_cross_window_emotional_state()` 方法和 `bridge.get_recent_emotional_state()` 桥接方法，返回全局情绪事件摘要（scar/warm/vulnerable 计数和最近事件），供陪伴插件跨窗口情绪漂移使用。
-- 陪伴插件情绪漂移增强（P2-7 补完）：`_memory_companion_apply_emotional_drift()` 现在同时拉取跨窗口情绪状态，以 30% 强度叠加到当前会话的能量和心情漂移中，安全阀放宽到 ±10。
-- 新增 Bot 侧称呼建议系统（P3-11 补完）：`_BOT_ADDRESS_SUGGESTIONS` 字典为 5 个关系阶段各定义了称呼语气和建议，注入时同时考虑用户侧称呼阶段和关系阶段，生成双向称呼提示。
-- 新增称呼不匹配感知（P3-11 补完）：当用户突然比关系阶段更亲密或更正式时，生成感知提示（如"对方比你预期的更亲密，自然接受但不要急着跟进太多"）。
-- 新增拟人化维度可视化面板前端（P3-12 补完）：新增"拟人维度"胶片入口和 `#view-persona` 视图，包含关系阶段进度条、动量条、Bot 称呼建议、称呼演变时间线、情绪事件卡片网格和跨窗口情绪余波摘要，支持主题色系统和响应式布局。
-- `/persona-state` API 增强：新增 `cross_window_emotional_state`、`bot_address_suggestions`、`phase_labels`、`address_phase_labels`、`time_of_day_labels` 字段。
-- 新增 Token 消耗统计桥接：插件会独立记录阶段总结、衰减整理、记忆重排、向量查询和向量索引的 Token/估算消耗，并通过 `bridge.get_token_usage_summary()` 给陪伴插件 Token 页只读展示；该统计不参与陪伴插件每日限额。
-
-### 改进
-
-- `injection.py` 的 `compose()` 方法新增 `cross_window_emotional_hint` 和 `address_hint` 关键字参数。
-- `service.py` 两处 `injection.compose()` 调用均已传入跨窗口情绪提示和称呼提示。
-- `page_api.py` 的 `persona_state()` 端点返回数据更丰富，支持前端完整渲染。
-- 前端 `app.css` 新增拟人维度面板完整样式，与现有中国传统色主题系统一致。
-
-## 1.3.0 - 2026-07-03
-
-### 版本定位
-
-1.3.0 是一次系统性拟人化深化版本。记忆插件不再只是被动检索工具，而是开始拥有情绪闭环、时段感知、关系演进、承诺兑现追踪和称呼演化等拟人化能力，与陪伴插件形成"记忆解释为什么、陪伴决定怎么做"的双引擎联动。
-
-### 新增
-
-- 新增情绪双向闭环（P0-1）：记忆插件在注入后自动检测情绪事件（伤痕触动、温暖回忆、脆弱共鸣），通过 `bridge.get_emotional_events()` 向陪伴插件回流情绪漂移信号，陪伴插件在每次私聊和主动消息前拉取并应用，含安全阀（单次 ±8 能量上限、mood 漂移限幅、TTL 1 小时）。
-- 新增 Bot 情绪参与记忆召回排序（P0-2）：情绪漂移检测中引入 mood resonance check——当 Bot 已处于对比情绪时自动衰减漂移幅度（如 Bot 开心时翻到伤痕记忆，drift × 0.6）。
-- 新增时段感知氛围提示（P1-3）：`injection.compose()` 新增 `time_of_day` 参数，深夜/凌晨/清晨/傍晚各有不同记忆氛围提示，深夜自动倾向柔软和脆弱，避免翻沉重旧事。
-- 新增伤痕记忆场景化门控（P1-4）：深夜或 Bot 低能量时，高 `scar_weight` 记忆的提及策略自动降级为 `tone_only`，防止在脆弱场景翻旧账。
-- 新增关系阶段动态演进（P1-5）：按 `scope:target_id` 维度跟踪 5 阶段关系演进（acquaintance → familiar → close → intimate → deeply_bonded），基于情绪触动积累 momentum，达到阈值且 ≥5 次触动后自动晋升，伤痕触动可回退，持久化到 `memory_companion_relationship_phase.json`。
-- 新增主动陪伴从记忆 open-loop 取材（P2-6）：陪伴插件主动消息生成前通过 `bridge.search_open_loops()` 检索未完成的承诺和话题，注入到主动消息提示词中，形成承诺兑现闭环。
-- 新增跨窗口情绪连续性（P2-7）：陪伴插件在主动消息生成前以 `session_id=""` 拉取所有会话的待处理情绪事件，实现跨窗口情绪漂移。
-- 新增梦境碎片写入记忆库（P2-8）：陪伴插件日记生成后，将首条梦境碎片通过 `bridge.record_persona_life()` 写入记忆库，带上 `dream_fragment` 标签和查询锚点，支持跨会话梦境连续性。
-- 新增 Bot 触动日志（P2-9）：`_maybe_record_persona_touch()` 在每次注入后检测高共振记忆（resonance ≥ 0.45），记录触动类型（warm/resonance/scar）并更新关系阶段 momentum。
-- 新增记忆提及犹豫感建模（P3-10）：`_hesitation_hint()` 在 Bot 低能量时为 `soft_echo` 记忆生成犹豫提示（"不知道你还记不记得…"），为高伤痕记忆生成回避提示。
-- 新增称呼演进系统（P3-11）：自动检测用户消息中的称呼阶段（formal/casual/intimate/playful），记录称呼变化日志，在注入中加入称呼氛围提示。
-- 新增拟人化维度可视化面板（P3-12）：`/persona-state` API 端点返回全部关系阶段、待处理情绪事件、时段感知和阶段定义，供拓展页可视化展示。
-- 新增 Bridge 方法：`get_emotional_events()`、`search_open_loops()`、`get_relationship_phase()`。
-
-### 改进
-
-- `injection.py` 的 `_atmosphere_hint` 方法新增 `time_of_day` 关键字参数，时段提示放在最前面确保优先级。
-- `service.py` 新增 `_compute_time_of_day()` 辅助方法，基于当前小时计算 6 个时段类别。
-- `service.py` 两处 `injection.compose()` 调用均传入 `time_of_day` 参数。
-- 陪伴插件 `memory_companion_adapter.py` 新增 4 个方法：`_memory_companion_apply_emotional_drift()`、`_memory_companion_search_open_loops()`、`_memory_companion_record_dream_fragment()`、`_memory_companion_get_relationship_phase()`。
-- 陪伴插件 `proactive_message.py` 主动消息生成前拉取跨会话情绪漂移，并在提示词中注入 open-loop 线索。
-- 陪伴插件 `daily_state.py` 日记保存后自动将梦境碎片写入记忆库。
-- 陪伴插件 `main.py` 私聊消息处理前调用情绪漂移应用。
-
-### 安全阀
-
-- 情绪漂移单次能量变化上限 ±8（衰减 -8，回暖 +5），总量 clamp 到 [0, 100]。
-- 情绪漂移 TTL 1 小时，每会话最多保留 10 条，消费后自动清除。
-- 关系阶段 momentum 限制在 [-0.3, 1.0]，晋升需 ≥5 次触动 + 达到阈值。
-- 伤痕场景门控仅在深夜或 Bot 能量 < 40 时触发，不改变 `avoid_unless_asked` 策略。
-- 所有跨插件调用均带 try/except 兜底，失败不影响主链。
-
-### 验证
-
-- 通过 Python 编译检查（`py_compile`）。
-- 通过 linter 检查。
-
-## 1.2.0 - 2026-07-03
-
-### 版本定位
-
-1.2.0 是一次双向情绪感知与面板体验深水版本。记忆注入不再只看用户说了什么，还开始感知 Bot 此刻"累不累"、"心情好不好"；拓展页全面重构为胶片放映馆隐喻，配色升级为中国传统色体系；安全与性能层面补齐了批量查询、原子写入、路径遍历保护和锁清理。
-
-### 新增
-
-- 新增双向氛围感知：记忆注入的内心提示现在同时感知用户情绪基调和 Bot 当前心理状态（mood_bias / energy），当 Bot 疲惫或难过时会调整记忆措辞的温度。
-- 新增跨插件情绪状态传递链路：陪伴插件的实时心情和能量值通过 Bridge 接口传入记忆检索流程，贯穿 `service → injection` 全链路。
-- 新增 14 套中国传统色主题系统：黛蓝、朱砂、青碧、藕荷、松烟、缃叶、霁青、檀棕、月白、胭脂、鸦青、赭石、石绿、暮山紫，主题色随页面路由自动切换。
-- 新增"胶片放映馆"视觉隐喻：知识图谱、记忆档案、检索实验台、配置页均采用胶片孔洞、胶卷齿孔和放映机聚光灯的统一视觉语言。
-- 新增配置页原子写入：配置保存使用 `tempfile + os.replace` 两步原子写入，避免写入中途崩溃导致配置文件损坏。
-- 新增照片端点路径遍历保护：`companion_personal_photo` 端点对传入路径做 `resolve().relative_to()` 校验，阻止目录穿越攻击。
-- 新增二级导航就地切换动画：非循环模式下点击导航项不再重建 DOM，仅切换 `.is-active` 类，配合 CSS 过渡实现丝滑滑动 + 高亮渐变动效。
-- 新增 Bridge 缓存机制：陪伴插件 Bridge 查找结果带 30s TTL 缓存，减少重复反射查找开销。
-- 新增锁 TTL 清理机制：`_summary_locks` 字典新增 10 分钟 TTL 自动清理，防止会话锁无限增长。
-
-### 改进
-
-- 注入日志端点 `logs()` 从逐条查询改为批量查询 `get_memories_by_ids`，消除 N+1 数据库访问。
-- 抽取 `service.py` 中重复的去重逻辑为 `_apply_companion_dedupe` 方法，统一陪伴插件去重行为。
-- 拓展页 `app.js` 合并多个点击监听器为事件委托模式，减少 DOM 事件绑定数量。
-- 拓展页记忆列表实现渐进式渲染（Intersection Observer 分批加载），大量记忆条目时不再一次性渲染全部 DOM。
-- 二级导航循环渲染逻辑优化：当条目数 ≤ 8 时直接渲染全部条目，不再做循环包裹，消除重复显示。
-- `moveSecondaryNavToStandard` 在非循环模式下直接归零位移，避免不必要的列表偏移。
-- 陪伴插件侧 `memory_companion_adapter` 新增 Bot 情绪状态提取逻辑，在上下文载荷中共享 mood_bias 和 energy。
-- 配置页 `prefer_memory_companion_memory` 默认值统一为 `True`，消除前后端不一致。
-- 拓展页滚动容器（`.page-panel-stack`、`.archive-grid`、`.result-grid`）统一添加 `overflow:auto` + `min-height:0`，修复内容被截断无法滚动的问题。
-- `.view.is-active` 的 `grid-template-rows` 调整为 `auto minmax(0,1fr) auto`，适配归档视图的三段式布局。
-- 滚动条样式统一纳入主题色系统，与当前色板协调。
-
-### 修复
-
-- 修复二级导航循环渲染在条目数少于 `2 * LOOP_RADIUS + 1` 时出现重复条目的问题（如 4 个条目显示 6~7 个）。
-- 修复二级导航切换时因 DOM 全量重建导致 CSS 过渡失效、无切换动画的问题。
-- 修复知识图谱页右侧卡片内容被容器截断、无法向下滚动的问题。
-- 修复配置页右侧卡片在内容超出视口时被截断的问题。
-- 修复归档视图 `.archive-result` 区域因 grid-template-rows 定义不足导致高度塌陷的问题。
-- 修复个人记忆相册图片无法显示的问题（外部图片 API 返回 HTTP 400 `content_policy_violation`）。
-  - 陪伴插件 `proactive_message.py` 新增内容策略违规检测 (`_is_content_policy_violation`) 和提示词净化重试 (`_sanitize_prompt_for_retry`)。
-  - `_build_daily_outfit_photo_prompt` 移除可能触发内容审核的敏感措辞。
-  - `_external_image_api_error_note` 改进错误消息，提供更友好的用户提示。
-- 修复 `app.js` 中重复声明 `const objectCards` 导致的变量名冲突。
-
-### 验证
-
-- 通过 Python 编译检查（`py_compile`）。
-- 通过前端 JS 语法检查（`node --check`）。
-- 通过 linter 检查。
-
-## 1.1.0 - 2026-07-02
-
-### 版本定位
-
-1.1.0 是一次记忆拟人化与可观测性增强版本。重点不再只是“能召回”，而是让记忆知道哪些该直接说、哪些只该影响语气、哪些需要等用户问起；同时补齐配置页、迁移页和注入日志的排障体验。
-
-### 新增
-
-- 新增拟人化维度评估：
-  - `persona_importance`
-  - `relationship_weight`
-  - `emotional_weight`
-  - `promise_weight`
-  - `open_loop_weight`
-  - `creative_weight`
-  - `freshness_weight`
-  - `scar_weight`
-  - `emotional_debt_weight`
-- 新增记忆再提及策略：
-  - `direct`
-  - `soft_echo`
-  - `tone_only`
-  - `avoid_unless_asked`
-- 新增用户反馈学习：Bot 提起记忆后，下一轮用户的接受、安慰、尴尬、否认和纠正会影响可提及性、置信度和提及策略。
-- 新增未完成事项优先槽位，连续对话中的“继续”“还有呢”“后来呢”等短句会优先参考 open loop 线索。
-- 新增时间意图通道：最近一周、这几天、上周、昨天、今天等时间表达会转成明确时间窗口，并优先走时间聚合摘要。
-- 新增可选 Embedding 召回层，支持 Provider 自动探测、手动 Provider ID、后台向量补齐和阈值/权重配置。
-- 新增个人记忆视窗：日程、相册、主观记忆可切换，并与主动陪伴插件的日程、穿搭图和主观片段联动。
-- 新增注入日志详情页：可以查看本轮查询、进入注入的记忆、过滤原因聚合和原始日志。
-
-### 改进
-
-- 长期记忆注入从证据列表改为内心提示式分层：
-  - `open_loops`
-  - `relationship_memory`
-  - `emotional_context`
-  - `creative_threads`
-  - `self_continuity`
-  - `facts`
-- 与 PrivateCompanion 的分工更清晰：陪伴插件负责当前状态、日程、主动行为；本插件负责关系历史、未完成话题、偏好、伤痕、承诺和共同创作。
-- 召回会过滤陪伴插件已注入的当前状态，减少“当前情绪/当前日程”重复注入。
-- 记忆详情页新增提及策略、可提及性、拟人化权重、衰减模式、关系阶段和用户反馈展示。
-- 记忆列表、检索命中和注入日志新增策略/权重徽标，便于判断召回质量。
-- 配置页重做为状态总览、推荐档位、核心路径、模型选择和高级参数折叠结构。
-- 配置页新增保守、平衡、深召回三种预设，预设只填表，保存后生效。
-- 迁移页和修复页新增结果摘要面板，不再只显示原始 JSON。
-- LivingMemory 预览会显示可导入数量、跳过数量、候选库和表级明细。
-- 个人记忆页的日期胶卷、时间胶片、日程卡片和细化卡片经过多轮布局与动效调整。
-- PrivateCompanion 桥接支持 Bot 自我进食记录：外部记录可保留 `occurred_at`，`self_meal` / `persona_life` 会进入个人记忆视窗，便于回答“今天几点吃了什么”。
-- 增强 PrivateCompanion 用户习惯桥接：`user_habit` 记忆会被视作用户画像/偏好类稳定事实，并优化当前穿搭、衣服颜色、当前状态等检索锚点，便于短问句命中对应个人记忆。
-
-### 修复
-
-- 修复部分导入记忆因搜索范围预过滤过早被排除，导致同库召回效果弱于预期的问题。
-- 修复 “还有的吧” 这类连续追问只依赖硬拆规则、无法自然接上未完成话题的问题。
-- 修复日志中难以判断是否实际使用 Rerank / Embedding 的问题，现在调试日志和页面更容易看到实际路径。
-- 修复配置页 Provider 下拉缺少“自动探测 / 不指定”选项的问题。
-- 修复配置页套用预设后顶部状态不跟随草稿更新的问题。
-- 修复个人记忆时间胶片只能拖到倒数第二个时间段的问题。
-- 修复迁移/修复结果可读性不足、排障只能看原始 JSON 的问题。
-
-### 验证
-
-- 通过 Python 编译检查。
-- 通过前端 JS 语法检查。
-- 通过配置 schema JSON 校验。
-- 使用临时数据库验证记忆反馈去重和反馈字段更新。
-
-## 1.0.0 - 2026-07-02
-
-### 版本定位
-
-1.0.0 是第一个稳定版。插件从“长期记忆记录器”正式收束为“记忆陪伴中枢”：当前消息优先，记忆作为辅助；私聊、群聊、自我时间线和连续对话分层管理；检索、注入、权限和调试链路默认可解释。
-
-### 新增
-
-- 新增分层检索路由：
-  - 时间窗口问题走时间范围检索。
-  - 最近上下文承接优先依赖 AstrBot 原始上下文。
-  - 低信息、纠错和新话题输入会抑制旧长期记忆。
-  - 当前状态问题只允许近期直接相关记忆进入。
-- 新增 `context_orchestration.query_mode`：
-  - `current_message`
-  - `guarded_companion`
-  - `companion_augmented`
-- 新增 Rerank / Embedding 双层检索配置页。
-- 新增 Rerank Provider 自动探测与手动 Provider ID 输入。
-- 新增 Embedding 候选召回、后台向量补齐和向量阈值配置。
-- 新增当前状态短问句检索增强，例如“吃晚饭了吗”可命中近期晚饭状态，但不会拉三天前旧状态。
-- 新增注入表达分组：
-  - `mention_memory`
-  - `tone_memory`
-  - `uncertain_memory`
-- 新增注入调试日志，输出检索路径、选中记忆、过滤示例和实际注入包。
-- 新增群聊/私聊对象级权限配置。
-- 新增私聊默认白名单、群聊默认黑名单策略。
-- 新增 LivingMemory 迁移预览、导入和内容修复流程。
-- 新增自然衰减维护，可将低价值旧记忆压缩为更高层摘要。
-- 新增个人记忆页与 PrivateCompanion 的联动展示。
-- 新增胶片式二级页面、过渡胶片、左侧胶卷导航和多主题 UI。
-
-### 改进
-
-- 当前用户消息被明确放在注入包核心位置，记忆只作为附加材料。
-- 群聊身份边界更严格，避免把上一位发言者身份继承给当前发言者。
-- 群聊注入提示更克制，减少旧记忆、旧群梗和专属称呼误用。
-- 检索测试页默认按真实可见性执行，不再绕过 ACL。
-- 页面记忆列表默认不显示旧 pending 数据。
-- 桶计数只统计普通可见记忆，旧 pending 数据不会撑大计数。
-- LivingMemory 导入默认只导入完整摘要，跳过派生碎片。
-- 导入结果提示简化，不再引导进入审核队列。
-- 上下文配置页改为贴近 AstrBot 原版上下文压缩配置。
-- 私聊列表显示 QQ 与用户名，群聊列表显示群号与群名。
-- 二级页面左侧导航动效、胶片过渡和细化卡片布局经过多轮优化。
-- 记忆卡片布局改为固定区域滚动，避免记忆过多挤掉详情卡片。
-- 维护、迁移、配置页减少无意义卡片，改为左侧二级导航 + 右侧配置面板。
-
-### 移除
-
-- 移除原话直接写入长期记忆功能。
-- 移除总结模型名覆盖配置，只保留 Provider 选择。
-- 移除默认公开的记忆审核工作流。
-- 移除页面中的审核入口、审核按钮、批量通过入口和相关徽标。
-- 移除 `/mcomp review` 命令入口。
-- 移除 LivingMemory 导入后的审核队列引导。
-- 移除配置页中不再使用的审核相关配置项。
-
-### 安全与隐私
-
-- 私聊记忆不会默认流向群聊。
-- 私聊流向群聊需要显式允许。
-- 无权限记忆不会进入最终评分、重排和注入。
-- 旧 pending 记忆默认不参与普通列表、普通检索和注入。
-- 记忆总结按不可信输入处理，提示词注入和角色覆盖会被标记与清洗。
-- 注入包要求模型不要推断或泄露其它窗口的私密内容。
-
-### 兼容性
-
-- 保留旧数据库字段以兼容历史数据。
-- 旧 pending 数据不会被删除，但默认隐藏。
-- 旧 LivingMemory 数据建议通过内置迁移流程导入，不建议手工复制 SQLite 文件。
-
-### 验证
-
-- 通过 Python 编译检查。
-- 通过前端 JS 语法检查。
-- 通过配置 schema JSON 校验。
-- 使用临时数据库验证当前状态问题只召回近期直接相关记忆。
-
-## 0.8.0 - 2026-07-01
-
-### 重点
-
-- 初步建立长期记忆、连续对话记忆、主链注入和拓展页面。
-- 引入 LivingMemory 迁移思路。
-- 引入知识图谱、关系边和睡眠维护雏形。
-- 引入 PrivateCompanion 桥接协同。
-
-### 已在 1.0.0 调整
-
-- 审核队列从默认工作流中移除。
-- 原话长期记忆写入被移除。
-- 检索与注入架构重新收束为当前消息优先。
-- 页面结构和配置项重新整理。
-## 1.10.1
-
-- 修复 LivingMemory 导入后本地 FTS 索引未重建导致记忆无法检索的问题。
-- 迁移时从 metadata 回退恢复私聊/群聊作用域，兼容不同版本的 session 格式。
