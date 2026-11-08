@@ -6115,6 +6115,32 @@ class MemoryCompanionService:
         except asyncio.TimeoutError:
             return False
 
+    @staticmethod
+    def _warn_summary_batch_quarantined(
+        ctx: SessionContext,
+        batch_id: str,
+        *,
+        event_count: Any,
+        reason: Any,
+        calls: Any,
+    ) -> None:
+        """Report every summary freeze with the same fields.
+
+        A transient provider failure that exhausts the call budget quarantines
+        the batch from inside the retry loop, so it returned before the shared
+        warning below ever ran and left no trace in the logs. Both freeze paths
+        now emit this single message.
+        """
+        logger.warning(
+            "[MemoryCompanion] 阶段总结批次已隔离，本批原始事件冻结等待复核释放: "
+            "session=%s batch=%s event_count=%s reason=%s calls=%s",
+            ctx.session_id,
+            batch_id,
+            int(event_count or 0),
+            clean_text(reason, 300),
+            int(calls or 0),
+        )
+
     async def maybe_summarize_session(self, ctx: SessionContext, *, force: bool = False) -> str:
         if not force and not self.config.bool("memory_summary.enabled", True):
             return ""
@@ -6222,6 +6248,12 @@ class MemoryCompanionService:
                                 delay=self._summary_retry_backoff_seconds(current["automatic_calls"]),
                             )
                             if exhausted:
+                                self._warn_summary_batch_quarantined(
+                                    ctx, batch_id,
+                                    event_count=total,
+                                    reason=feedback,
+                                    calls=current["automatic_calls"],
+                                )
                                 return ""
                             attempt_index += 1
                             continue
@@ -6263,9 +6295,11 @@ class MemoryCompanionService:
                 current = await self.store.get_summary_batch(batch_id)
                 state = str((current or {}).get("state") or "")
                 if state == "quarantined":
-                    logger.warning(
-                        "[MemoryCompanion] 阶段总结批次已隔离，本批原始事件冻结等待复核释放: session=%s batch=%s",
-                        ctx.session_id, batch_id,
+                    self._warn_summary_batch_quarantined(
+                        ctx, batch_id,
+                        event_count=total,
+                        reason=feedback or str((current or {}).get("last_error") or ""),
+                        calls=(current or {}).get("automatic_calls"),
                     )
                     return ""
                 if self.summarizer.compose_memory_content(payload or {}):

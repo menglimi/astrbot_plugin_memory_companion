@@ -139,6 +139,10 @@ class UiBackendContractTests(unittest.TestCase):
         self.assertIn('const response = await apiGet("/memory?id=" + encodeURIComponent(memoryId));', self.frontend_source)
         self.assertIn('const memory = response && response.memory ? response.memory : response;', self.frontend_source)
 
+    def test_summary_batch_release_hint_uses_the_real_batch_id_prefix(self) -> None:
+        self.assertIn('placeholder: "sb_... 批次 ID"', self.frontend_source)
+        self.assertNotIn("summary_batch_...", self.frontend_source)
+
     def test_memory_category_filters_expand_to_persisted_types(self) -> None:
         filters = literal(assignment(self.tree, "MEMORY_TYPE_FILTERS"))
         self.assertIn("user_profile", filters["profile"])

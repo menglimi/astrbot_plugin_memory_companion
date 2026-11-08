@@ -3242,7 +3242,7 @@ defineView("migrate", {
         title: "7. 汇总批次释放",
         desc: "被证据门禁隔离的批次会永远持有其时间线事件，那些原文不会再进入任何后续批次。填批次 ID 后由人工复核决定：重新排队（事件交还，可被新批次消费）或放弃（承认丢失，不再悬空）。",
         input: "releaseBatchId",
-        placeholder: "summary_batch_... 批次 ID",
+        placeholder: "sb_... 批次 ID",
         actions: [
           ["releaseRetryBtn", "重新排队"],
           ["releaseDiscardBtn", "放弃并关闭"],
