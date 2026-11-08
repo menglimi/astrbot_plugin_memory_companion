@@ -212,7 +212,7 @@ class CrossPlatformVisibilityTests(unittest.TestCase):
         )
         visible, reason = self.policy.is_visible(memory, ctx)
         self.assertFalse(visible)
-        self.assertEqual(reason, "private_pair_not_current_private")
+        self.assertEqual(reason, "other_platform")
 
 
 if __name__ == "__main__":
