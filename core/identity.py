@@ -1,11 +1,102 @@
 from __future__ import annotations
 
+import json
+import os
+
 import inspect
 import re
 from typing import Any, Callable
 
 from .models import EntityRef, SessionContext, clean_text
 
+
+
+_ALIAS_CACHE = {"mtime": None, "map": {}}
+
+
+def _identity_alias_path():
+    """插件数据目录下的身份映射表。"""
+    here = os.path.abspath(__file__)
+    plugin_dir = os.path.dirname(os.path.dirname(here))          # .../data/plugins/<name>
+    data_root = os.path.dirname(os.path.dirname(plugin_dir))     # .../data
+    name = os.path.basename(plugin_dir)
+    candidates = [
+        os.path.join(data_root, "plugin_data", name, "identity_alias.json"),
+        os.path.join(plugin_dir, "identity_alias.json"),
+    ]
+    try:
+        from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+        candidates.insert(0, os.path.join(str(get_astrbot_data_path()), "plugin_data",
+                                          name, "identity_alias.json"))
+    except Exception:
+        pass
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
+
+
+_CONFIG_CACHE = {"mtime": None, "enabled": False}
+
+
+def _identity_config_path():
+    """插件配置：data/config/astrbot_plugin_memory_companion_config.json。"""
+    here = os.path.abspath(__file__)
+    plugin_dir = os.path.dirname(os.path.dirname(here))
+    data_root = os.path.dirname(os.path.dirname(plugin_dir))
+    return os.path.join(data_root, "config", os.path.basename(plugin_dir) + "_config.json")
+
+
+def identity_merge_enabled():
+    """跨平台身份归一开关，默认关闭（不配置就不改变任何行为）。"""
+    try:
+        path = _identity_config_path()
+        mtime = os.path.getmtime(path) if os.path.exists(path) else None
+        if mtime != _CONFIG_CACHE["mtime"]:
+            enabled = False
+            if mtime is not None:
+                with open(path, encoding="utf-8-sig") as fh:
+                    cfg = json.load(fh)
+                if isinstance(cfg, dict):
+                    section = cfg.get("identity")
+                    if isinstance(section, dict):
+                        enabled = bool(section.get("merge_platform_accounts", False))
+                    if "merge_platform_accounts" in cfg:
+                        enabled = bool(cfg.get("merge_platform_accounts"))
+            _CONFIG_CACHE["mtime"] = mtime
+            _CONFIG_CACHE["enabled"] = enabled
+        return _CONFIG_CACHE["enabled"]
+    except Exception:
+        return False
+
+
+def canonical_user_id(user_id):
+    """把同一人在不同平台的账号归一到主 id（补丁）。
+
+    映射表放在插件数据目录：data/plugin_data/astrbot_plugin_memory_companion/identity_alias.json
+    形如 {"ou_xxx": "302578963"}；文件改动后下一条消息生效。
+    """
+    value = clean_text(user_id, 120)
+    if not value:
+        return value
+    if not identity_merge_enabled():
+        return value
+    try:
+        path = _identity_alias_path()
+        mtime = os.path.getmtime(path) if os.path.exists(path) else None
+        if mtime != _ALIAS_CACHE["mtime"]:
+            mapping = {}
+            if mtime is not None:
+                with open(path, "r", encoding="utf-8") as fh:
+                    raw = json.load(fh)
+                if isinstance(raw, dict):
+                    mapping = {str(k).strip(): str(v).strip() for k, v in raw.items()
+                               if str(k).strip() and str(v).strip()}
+            _ALIAS_CACHE["mtime"] = mtime
+            _ALIAS_CACHE["map"] = mapping
+        return _ALIAS_CACHE["map"].get(value, value)
+    except Exception:
+        return value
 
 async def maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
@@ -57,6 +148,9 @@ def normalize_session_context_fields(
         platform = clean_text(session_id.split(":", 1)[0], 80)
     if scope == "private" and not user_id and parsed_target:
         user_id = clean_text(parsed_target, 120)
+    # 补丁：页面/工具侧也会走这个函数，user_id 不归一的话跨平台看不到对方的记忆
+    if scope == "private":
+        user_id = canonical_user_id(user_id)
     if scope == "group" and not group_id and parsed_target:
         group_id = clean_text(parsed_target, 120)
     return {
@@ -76,11 +170,23 @@ def _tail_after_token(original: str, normalized: str, token: str) -> str:
 
 
 class IdentityResolver:
-    def __init__(self, bot_id_fallback: Callable[[Any], Any] | None = None):
-        # Some adapters/wrappers do not expose get_self_id().  The fallback is
+    def __init__(
+        self,
+        bot_id_fallback: Callable[[Any], Any] | None = None,
+        persona_id_fallback: Callable[[Any], Any] | None = None,
+    ):
+        # Some adapters/wrappers do not expose get_self_id().  The fallbacks are
         # deliberately supplied by the host service so identity.py stays
         # independent from AstrBot internals.
         self.bot_id_fallback = bot_id_fallback
+        # AstrBot's AstrMessageEvent has no ``persona_id`` attribute, and a
+        # single-persona companion install deliberately leaves
+        # ``private_companion_persona_id`` unset.  Reading only those two would
+        # leave the context without a persona, so persona-tagged memories would
+        # be rejected as ``persona_context_missing`` even though the host runs
+        # one.  The host service supplies the persona AstrBot applies, and keeps
+        # it empty when no persona applies.
+        self.persona_id_fallback = persona_id_fallback
 
     async def resolve_event_context(self, event: Any) -> SessionContext:
         session_id = clean_text(getattr(event, "unified_msg_origin", "") or "", 200)
@@ -127,6 +233,15 @@ class IdentityResolver:
             or getattr(event, "persona_id", ""),
             96,
         )
+        if not persona_id and callable(self.persona_id_fallback):
+            # See the __init__ note: mirror the persona the write path stamps so
+            # persona-tagged memories stay retrievable.
+            try:
+                persona_id = clean_text(
+                    await maybe_await(self.persona_id_fallback(event)), 96
+                )
+            except Exception:
+                persona_id = ""
         text = await self._message_text(event)
         message_id = self._message_id(event)
 
@@ -143,7 +258,7 @@ class IdentityResolver:
             session_id=session_id,
             scope=scope,
             platform=clean_text(platform, 80),
-            user_id=clean_text(user_id, 120),
+            user_id=canonical_user_id(user_id) if scope == "private" else clean_text(user_id, 120),
             user_name=clean_text(user_name, 80),
             group_id=clean_text(group_id, 120),
             group_name=clean_text(group_name, 80),

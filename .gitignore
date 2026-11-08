@@ -1,6 +1,17 @@
 __pycache__/
 *.py[cod]
+*.pyc
 *$py.class
 data/*.db
 data/*.db-*
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
 *.backup.*.db
+*.orig
+*.rej
+
+# 跑测试时宿主 AstrBot 会在当前目录生成运行时目录（不是插件内容）
+data/

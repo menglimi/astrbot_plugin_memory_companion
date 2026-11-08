@@ -201,8 +201,10 @@ class ProactiveMessagePenaltyTests(unittest.TestCase):
             bot_id="b1",
             message_text="hi",
         )
-        profile = engine._query_profile("hi", [])
-        score, _reason = engine._score(memory, [], ctx, profile, {})
+        profile = engine._query_profile("天气", ["天气"])
+        # R2：无查询词时不再用 importance 兜底打分（直接 0 分/空召回），
+        # 所以这条降权用例必须带真实查询词才有分可乘。
+        score, _reason = engine._score(memory, ["天气"], ctx, profile, {})
         return score
 
     def test_proactive_message_penalty_scales_score(self) -> None:

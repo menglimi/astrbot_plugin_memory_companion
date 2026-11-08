@@ -13,8 +13,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.12 与 AstrBot 4.27.3 宿主一致；3.14 覆盖当前开发机解释器。
-        python-version: ["3.12", "3.14"]
+        # 3.12 对齐 AstrBot 4.27+ 宿主运行环境；3.13 覆盖下一档解释器。
+        python-version: ["3.12", "3.13"]
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -25,8 +25,23 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       # 原生工具绑定与页面路由回归需要真实宿主 API；核心算法测试不调用外部模型。
-      - name: Install test runner
-        run: python -m pip install --upgrade pip pytest pytest-asyncio pytest-subtests jsonschema "astrbot==4.27.3"
+      # 用 astrbot>=4.27,<5 而不是钉死 4.27.3：用户实际跑的是 4.29.x，
+      # 固定小版本会让 CI 与真实环境长期脱节（审核报告 L9）。
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt "astrbot>=4.27,<5"
+
+      # L13：发布物里混进 __pycache__/.pyc/data/ 曾经没人拦。
+      # 这一步必须排在 compileall 之前：compileall 会生成 __pycache__，
+      # 反过来先编译再检查，CI 必然失败。
+      - name: Check release hygiene
+        run: python scripts/check_release.py --repo .
+
+      - name: Byte-compile every module
+        run: python -m compileall -q .
 
       - name: Run test suite
-        run: python -m pytest tests/ -q -p no:cacheprovider
+        # 显式带 --confcutdir=tests：与 pyproject 的 addopts 同值，避免有人删掉
+        # addopts 后 CI 又踩「根 __init__.py 被当顶层模块 import」。
+        run: python -m pytest tests/ -q -p no:cacheprovider --confcutdir=tests

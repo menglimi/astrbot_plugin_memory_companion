@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0f1218" />
+  <title>我会牢牢记住你 · 她记得的人</title>
+  <link rel="stylesheet" href="./people.css?v=2.6.5" />
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <span class="heart" aria-hidden="true"></span>
+      <div>
+        <h1>她记得的人</h1>
+        <p id="subtitle">正在想…</p>
+      </div>
+    </div>
+    <div class="tools">
+      <input id="search" type="search" placeholder="找一个人：名字、称呼、备注" autocomplete="off" />
+      <select id="botFilter" title="按 bot 筛选" hidden></select>
+      <select id="sort" title="排序">
+        <option value="weight">按分量</option>
+        <option value="recent">按最近</option>
+        <option value="memory">按记得多少</option>
+        <option value="name">按名字</option>
+      </select>
+      <button id="refresh" type="button">刷新</button>
+      <a class="ghost" href="./legacy.html">完整控制台</a>
+    </div>
+  </header>
+
+  <main>
+    <section id="summary" class="summary" hidden></section>
+    <section id="grid" class="grid"></section>
+    <section id="loading" class="loading">正在把她记得的人翻出来…</section>
+    <section id="empty" class="empty" hidden>
+      <h2>她还没记住谁</h2>
+      <p>等有人跟她多聊几次，人就会自己长出来。这里不用配置，她本来就在记。</p>
+      <p class="dim">想看她把每句话记成了什么？去 <a href="./legacy.html">完整控制台</a> 翻记忆库。</p>
+    </section>
+  </main>
+
+  <div id="scrim" class="scrim" hidden></div>
+  <aside id="drawer" class="drawer" hidden aria-label="一个人的档案">
+    <button id="close" class="close" type="button" aria-label="关闭">×</button>
+    <div id="drawerBody"></div>
+  </aside>
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="/api/plugin/page/bridge-sdk.js"></script>
+  <script src="./people.js?v=2.6.5"></script>
+</body>
+</html>

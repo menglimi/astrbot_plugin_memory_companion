@@ -63,7 +63,7 @@ class PageMemoryVisibilityTests(unittest.IsolatedAsyncioTestCase):
         store = SimpleNamespace(list_memories=AsyncMock(return_value=records))
         plugin = SimpleNamespace(service=SimpleNamespace(store=store))
         api = PluginPageApi(plugin)
-        request = SimpleNamespace(args={"limit": "50"})
+        request = SimpleNamespace(args={"scope": "private", "limit": "50"})
 
         with (
             patch.object(page_api_module, "request", request),

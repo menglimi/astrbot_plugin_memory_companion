@@ -12,14 +12,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from .astrbot_compat import logger
 from .identity import parse_scope_from_session
+from .local_time import local_tz, timezone_name
 from .models import EntityRef, MemoryRecord, SessionContext, clean_text, json_dumps, stable_fingerprint, utc_now
 
 
-LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 FULL_HEADER = re.compile(
     r"^(?P<speaker>[^\r\n:：]{1,80})\s*[:：]\s*"
     r"(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})\s+"
@@ -413,7 +412,7 @@ class HistoricalChatParser:
                 local = datetime.strptime(
                     f"{current_year:04d}-{month:02d}-{int(header['day']):02d} {header['clock']}",
                     "%Y-%m-%d %H:%M:%S",
-                ).replace(tzinfo=LOCAL_TZ)
+                ).replace(tzinfo=local_tz())
             except ValueError as exc:
                 raise ValueError(f"第 {header['line']} 行时间无效: {header['raw_time']}") from exc
             if previous_local is not None and local < previous_local:
@@ -912,7 +911,7 @@ class HistoricalChatImporter:
                 timestamp /= 1000.0
             if timestamp > 0:
                 moment = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-                return moment.astimezone(LOCAL_TZ), clean_text(raw.get("time"), 80) or str(raw_timestamp)
+                return moment.astimezone(local_tz()), clean_text(raw.get("time"), 80) or str(raw_timestamp)
         except (TypeError, ValueError, OverflowError, OSError):
             pass
         raw_time = clean_text(raw.get("time"), 80)
@@ -923,8 +922,8 @@ class HistoricalChatImporter:
         except ValueError:
             return None
         if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=LOCAL_TZ)
-        return moment.astimezone(LOCAL_TZ), raw_time
+            moment = moment.replace(tzinfo=local_tz())
+        return moment.astimezone(local_tz()), raw_time
 
     @staticmethod
     def _qq_chat_exporter_speaker(sender: dict[str, Any]) -> tuple[str, str]:
@@ -1578,7 +1577,7 @@ class HistoricalChatImporter:
                         "source_sender_id": clean_text(item.get("source_sender_id"), 120),
                         "original_local_time": item["local_time"],
                         "original_time_text": item["raw_time"],
-                        "timezone": "Asia/Shanghai",
+                        "timezone": timezone_name(),
                         "year_inferred": bool(item["inferred_year"]),
                         "retention_class": "historical_archive",
                         "preserve_raw": True,
@@ -2140,7 +2139,7 @@ class HistoricalChatImporter:
             "请逐段整理下面的历史私聊。每个 transcript_jsonl 都是独立会话片段；JSONL 中每行是一次逻辑发言。\n"
             "规则：\n"
             "1. 当前用户与 Bot 身份已经由人工确认，不得交换 user/bot 的动作。\n"
-            "2. 所有时间均为 Asia/Shanghai 绝对时间；不得用今天、昨天替代。\n"
+            f"2. 所有时间均为 {timezone_name()} 绝对时间；不得用今天、昨天替代。\n"
             "3. 普通寒暄可设 worth_long_term=false，但仍要给出一句 archive_note。\n"
             "4. 重要事件必须有 source_message_ids；状态仅限 planned|confirmed|ongoing|completed|cancelled|corrected。\n"
             "5. 称呼、关系变化和边界只输出为 relationship_observations，不直接认定为现实关系；角色扮演和玩笑降低置信度。\n"
@@ -2376,7 +2375,7 @@ class HistoricalChatImporter:
                 "detail_schema_version": self.DETAIL_SCHEMA_VERSION,
                 "start_at": segment["start_at"],
                 "end_at": segment["end_at"],
-                "timezone": "Asia/Shanghai",
+                "timezone": timezone_name(),
                 "source_message_ids": segment.get("message_ids") or [],
                 "summary_event_count": len(segment.get("message_ids") or []),
                 "segment_id": segment["id"],
@@ -3401,7 +3400,7 @@ class HistoricalChatImporter:
                 tags=["daily_digest", "historical_chat", date],
                 metadata={
                     "date": date,
-                    "timezone": "Asia/Shanghai",
+                    "timezone": timezone_name(),
                     "segment_ids": raw.get("segment_ids") or [],
                     "source_message_ids": raw.get("source_message_ids") or [],
                     "import_batch_id": batch["id"],
@@ -3488,7 +3487,7 @@ class HistoricalChatImporter:
                 "segment_ids": [item.get("segment_id") for item in summaries],
                 "import_batch_id": batch["id"],
                 "owner_bot_id": batch["bot_id"],
-                "timezone": "Asia/Shanghai",
+                "timezone": timezone_name(),
             },
             occurred_at=start_at or utc_now(),
             source_plugin="historical_chat_import",

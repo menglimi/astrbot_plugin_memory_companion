@@ -1,14 +1,19 @@
 """Memory-owned REQ-036 portrait capture, governance, and read boundary."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
 try:
-    from ..unified_profile_contract import build_person_ref, validate_profile_dto
+    from ..unified_profile_contract import build_person_ref, build_profile_dto, validate_profile_dto
 except ImportError:  # Existing standalone core.* test/import compatibility.
-    from unified_profile_contract import build_person_ref, validate_profile_dto  # type: ignore[no-redef]
-from .models import SessionContext, clean_text
+    from unified_profile_contract import (  # type: ignore[no-redef]
+        build_person_ref,
+        build_profile_dto,
+        validate_profile_dto,
+    )
+from .local_time import local_now
+from .models import EntityRef, SessionContext, clean_text
+from .person_context_contract import build_identity_key, person_id_for_identity
 from .portrait import (
     build_evidence,
     cross_scene_whitelisted_fact,
@@ -42,14 +47,127 @@ class PortraitService:
                 return True, getattr(source, "private_companion_namespace_context", None)
         return False, None
 
+    async def _self_built_memories(self, ctx: SessionContext, platform: str) -> list[dict[str, str]]:
+        """Read the person's existing memories as portrait seed material.
+
+        Only ids and contents are read here; the content is passed transiently
+        to the deterministic extractor and never copied into portrait tables.
+        """
+        if not hasattr(self.store, "person_snapshot"):
+            return []
+        try:
+            snapshot = await self.store.person_snapshot(
+                user_id=clean_text(ctx.user_id, 120),
+                platform=platform,
+                bot_id=clean_text(ctx.bot_id, 120),
+                limit=8,
+                scope="private",
+                group_id="",
+                hide_pending=True,
+                include_raw_events=False,
+            )
+        except Exception:
+            return []
+        rows = snapshot.get("memories") if isinstance(snapshot, dict) else None
+        if not isinstance(rows, list):
+            return []
+        result: list[dict[str, str]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            memory_id = clean_text(row.get("id"), 120)
+            content = clean_text(row.get("content"), 2000)
+            if memory_id and content:
+                result.append({"id": memory_id, "content": content})
+        return result
+
+    async def _self_built_profile_dto(self, ctx: SessionContext, *, legacy_scope: str) -> dict[str, Any] | None:
+        """Build the unified-profile DTO from data this plugin actually owns.
+
+        Production bridges do not populate private_companion_unified_profile_context
+        today, so the portrait subsystem reads the identity profile and existing
+        memories instead.  With no identity profile there is nothing trustworthy
+        to build from, and the caller skips gracefully instead of leaving dead code
+        behind a property nobody writes.
+        """
+        if ctx is None or ctx.scope != "private":
+            return None
+        platform = clean_text(ctx.platform, 40).lower()
+        user_id = clean_text(ctx.user_id, 120)
+        if not platform or not user_id:
+            return None
+        entity = EntityRef(kind="user", id=user_id, name=clean_text(ctx.user_name, 80))
+        try:
+            profile = await self.store.identity_profile(platform=platform, entity=entity)
+        except Exception:
+            return None
+        if not isinstance(profile, dict) or not profile:
+            return None
+        persona = clean_text(ctx.persona_id, 80)
+        subject_namespace = "private" if not persona else f"private:persona:{persona}"
+        identity = {
+            "companion_instance_id": f"memory-companion:{clean_text(ctx.bot_id, 80) or platform}",
+            "bot_account_id": clean_text(ctx.bot_id, 80) or "self",
+            "adapter_instance_id": platform,
+            "subject_namespace": subject_namespace,
+            "platform_subject_id": user_id,
+        }
+        try:
+            identity_key = build_identity_key(identity)
+            person_id = person_id_for_identity(identity)
+        except (KeyError, TypeError, ValueError):
+            return None
+        person_ref = {
+            "person_id": person_id,
+            "resolved_identity_key": identity_key,
+            "projection_revision": 1,
+            "identity_assurance": "observed",
+            "profile_status": "active",
+        }
+        memories = await self._self_built_memories(ctx, platform)
+        identity_summary = {
+            "display_name": clean_text(ctx.user_name, 80),
+            "relation_label": clean_text(profile.get("relation_label"), 80),
+            "relation_address": clean_text(profile.get("relation_address"), 80),
+            "relation_source": clean_text(profile.get("relation_source"), 40),
+            "profile_source": "identity_profile",
+        }
+        expression_summary = {
+            "memory_count": len(memories),
+            "scope": clean_text(legacy_scope, 40),
+            "source": "memory_self_built",
+        }
+        dto = build_profile_dto(
+            person_ref=person_ref,
+            identity_summary={key: value for key, value in identity_summary.items() if value},
+            expression_summary=expression_summary,
+            capability_summary={
+                "private_companion_enabled": True,
+                "proactive_private_enabled": False,
+                "portrait_mode": "learn_and_use",
+                "grant_source": "memory_self_built",
+            },
+            bridge_status={"mode": "memory_self_built", "namespace": subject_namespace},
+        )
+        if validate_profile_dto(dto):
+            return None
+        return {"dto": dto, "person_ref": build_person_ref(dto["person_ref"]), "memories": memories}
+
     async def sync_profile_context(
         self,
         *,
         event: Any = None,
         req: Any = None,
         legacy_scope: str = "private",
+        ctx: SessionContext | None = None,
     ) -> dict[str, Any]:
+        self_built: dict[str, Any] | None = None
         dto = self._profile_context(event, req)
+        if dto is None and ctx is not None:
+            self_built = await self._self_built_profile_dto(ctx, legacy_scope=legacy_scope)
+            if self_built is None:
+                return {"ok": False, "code": "portrait_profile_unavailable", "errors": [], "dto": None}
+            dto = self_built["dto"]
         errors = validate_profile_dto(dto)
         if errors:
             return {"ok": False, "code": "bridge_contract_mismatch", "errors": errors, "dto": None}
@@ -82,49 +200,34 @@ class PortraitService:
             "person_ref": person_ref,
             "source_scope": str(namespace.get("source_scope") or ""),
             "legacy_scope": str(namespace.get("legacy_scope") or ""),
+            "self_built": self_built is not None,
+            "seed_memories": list((self_built or {}).get("memories") or []),
         }
 
-    async def capture_user_message(self, ctx: SessionContext, *, event: Any = None, req: Any = None) -> dict[str, Any]:
-        """Capture only a sender's own message as portrait evidence.
-
-        The raw message is used transiently to derive a hash and deterministic
-        explicit candidate.  It is never copied to the portrait tables.
-        """
-        scope = self._scope_for_context(ctx)
-        if not scope:
-            return {"ok": False, "code": "bridge_person_mismatch", "facts": 0}
-        synced = await self.sync_profile_context(event=event, req=req, legacy_scope=scope)
-        if not synced.get("ok"):
-            return {"ok": False, "code": synced.get("code", "bridge_degraded"), "facts": 0}
-        person_ref = synced["person_ref"]
-        capabilities = synced["dto"].get("capability_summary", {})
-        if not bool(capabilities.get("portrait_learning_enabled")):
-            return {
-                "ok": False,
-                "code": "portrait_learning_disabled",
-                "facts": 0,
-                "person_id": person_ref["person_id"],
-            }
-        candidates = extract_explicit_candidates(ctx.message_text)
+    async def _record_candidates(
+        self,
+        *,
+        person_ref: dict[str, Any],
+        scope: str,
+        session_id: str,
+        message_id: str,
+        text: str,
+    ) -> tuple[int, dict[str, Any]]:
+        """Turn one piece of the person's own text into portrait facts."""
+        candidates = extract_explicit_candidates(text)
         if not candidates:
-            return {
-                "ok": True,
-                "code": "portrait_no_candidate",
-                "facts": 0,
-                "person_id": person_ref["person_id"],
-            }
-        scope = str(synced.get("source_scope") or "")
+            return 0, {}
         evidence = build_evidence(
             person_ref=person_ref,
             scope=scope,
-            session_id=ctx.session_id,
-            message_id=ctx.message_id,
+            session_id=session_id,
+            message_id=message_id,
             source_identity_key=person_ref["resolved_identity_key"],
-            text=ctx.message_text,
+            text=text,
         )
         evidence_result = await self.store.add_portrait_evidence(evidence)
         if not evidence_result.get("ok") or not evidence_result.get("created"):
-            return {"ok": bool(evidence_result.get("ok")), "code": evidence_result.get("code", "portrait_evidence_recorded"), "facts": 0}
+            return 0, evidence_result
         created = 0
         for candidate in candidates:
             fact = {
@@ -154,6 +257,68 @@ class PortraitService:
                     fact_id=result["fact_id"],
                     evidence_hash=evidence["evidence_hash"],
                 )
+        return created, {}
+
+    async def capture_user_message(self, ctx: SessionContext, *, event: Any = None, req: Any = None) -> dict[str, Any]:
+        """Capture only a sender's own message as portrait evidence.
+
+        The raw message is used transiently to derive a hash and deterministic
+        explicit candidate.  It is never copied to the portrait tables.
+        """
+        scope = self._scope_for_context(ctx)
+        if not scope:
+            return {"ok": False, "code": "bridge_person_mismatch", "facts": 0}
+        synced = await self.sync_profile_context(event=event, req=req, legacy_scope=scope, ctx=ctx)
+        if not synced.get("ok"):
+            return {"ok": False, "code": synced.get("code", "bridge_degraded"), "facts": 0}
+        person_ref = synced["person_ref"]
+        capabilities = synced["dto"].get("capability_summary", {})
+        if not bool(capabilities.get("portrait_learning_enabled")):
+            return {
+                "ok": False,
+                "code": "portrait_learning_disabled",
+                "facts": 0,
+                "person_id": person_ref["person_id"],
+            }
+        source_scope = str(synced.get("source_scope") or "")
+        seeds = list(synced.get("seed_memories") or [])
+        has_current = bool(extract_explicit_candidates(ctx.message_text))
+        if not has_current and not seeds:
+            return {
+                "ok": True,
+                "code": "portrait_no_candidate",
+                "facts": 0,
+                "person_id": person_ref["person_id"],
+            }
+        created, evidence_result = await self._record_candidates(
+            person_ref=person_ref,
+            scope=source_scope,
+            session_id=ctx.session_id,
+            message_id=ctx.message_id,
+            text=ctx.message_text,
+        )
+        for memory in seeds:
+            if not isinstance(memory, dict):
+                continue
+            memory_id = clean_text(memory.get("id"), 120)
+            content = clean_text(memory.get("content"), 2000)
+            if not memory_id or not content:
+                continue
+            more, _seed_result = await self._record_candidates(
+                person_ref=person_ref,
+                scope=source_scope,
+                session_id=ctx.session_id,
+                message_id=f"memory:{memory_id}",
+                text=content,
+            )
+            created += more
+        if created == 0 and evidence_result:
+            return {
+                "ok": bool(evidence_result.get("ok")),
+                "code": evidence_result.get("code", "portrait_evidence_recorded"),
+                "facts": 0,
+                "person_id": person_ref["person_id"],
+            }
         return {"ok": True, "code": "portrait_evidence_recorded", "facts": created, "person_id": person_ref["person_id"]}
 
     async def read_summary(self, request: dict[str, Any], *, limit: int = 8) -> dict[str, Any]:
@@ -210,7 +375,7 @@ class PortraitService:
     async def run_daily_batch(self, person_id: str, *, run_day: str = "") -> dict[str, Any]:
         day = clean_text(run_day, 16)
         if not day:
-            day = datetime.now(timezone.utc).astimezone().date().isoformat()
+            day = local_now().date().isoformat()
         return await self.store.run_portrait_daily_batch(
             person_id=person_id,
             run_day=day,
