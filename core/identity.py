@@ -76,11 +76,23 @@ def _tail_after_token(original: str, normalized: str, token: str) -> str:
 
 
 class IdentityResolver:
-    def __init__(self, bot_id_fallback: Callable[[Any], Any] | None = None):
-        # Some adapters/wrappers do not expose get_self_id().  The fallback is
+    def __init__(
+        self,
+        bot_id_fallback: Callable[[Any], Any] | None = None,
+        persona_id_fallback: Callable[[Any], Any] | None = None,
+    ):
+        # Some adapters/wrappers do not expose get_self_id().  The fallbacks are
         # deliberately supplied by the host service so identity.py stays
         # independent from AstrBot internals.
         self.bot_id_fallback = bot_id_fallback
+        # AstrBot's AstrMessageEvent has no ``persona_id`` attribute, and a
+        # single-persona companion install deliberately leaves
+        # ``private_companion_persona_id`` unset.  Reading only those two would
+        # leave the context without a persona, so persona-tagged memories would
+        # be rejected as ``persona_context_missing`` even though the host runs
+        # one.  The host service supplies the persona AstrBot applies, and keeps
+        # it empty when no persona applies.
+        self.persona_id_fallback = persona_id_fallback
 
     async def resolve_event_context(self, event: Any) -> SessionContext:
         session_id = clean_text(getattr(event, "unified_msg_origin", "") or "", 200)
@@ -127,6 +139,15 @@ class IdentityResolver:
             or getattr(event, "persona_id", ""),
             96,
         )
+        if not persona_id and callable(self.persona_id_fallback):
+            # See the __init__ note: mirror the persona the write path stamps so
+            # persona-tagged memories stay retrievable.
+            try:
+                persona_id = clean_text(
+                    await maybe_await(self.persona_id_fallback(event)), 96
+                )
+            except Exception:
+                persona_id = ""
         text = await self._message_text(event)
         message_id = self._message_id(event)
 
