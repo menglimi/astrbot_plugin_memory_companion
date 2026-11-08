@@ -550,6 +550,7 @@ def bind_query_tool_schema(manager: Any, module_path: str) -> bool:
     )
     source = manager.get_func("memory_companion_sources")
     if source is not None and source.handler_module_path == module_path:
+        source.parameters = tool_parameters_from_contract(source.parameters)
         source.parameters.get("properties", {}).pop("query_note", None)
         if "required" in source.parameters:
             source.parameters["required"] = [k for k in source.parameters["required"] if k != "query_note"]

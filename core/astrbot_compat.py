@@ -479,6 +479,17 @@ def sanitize_request_history(req: Any, *, clean_proactive_guidance: bool = False
     cleaned_count = 0
     removed = 0
     for item in contexts:
+        if isinstance(item, dict):
+            role = item.get("role")
+            tool_call_id = item.get("tool_call_id")
+            tool_calls = item.get("tool_calls")
+        else:
+            role = getattr(item, "role", None)
+            tool_call_id = getattr(item, "tool_call_id", None)
+            tool_calls = getattr(item, "tool_calls", None)
+        if role == "tool" or tool_call_id or tool_calls:
+            cleaned_contexts.append(item)
+            continue
         if not _is_own_proactive_fragment(item):
             cleaned_contexts.append(item)
             continue

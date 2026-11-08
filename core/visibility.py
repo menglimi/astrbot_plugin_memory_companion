@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .identity import session_target_id
+from .identity import canonical_user_id, session_target_id
 from .models import MemoryRecord, SessionContext
 
 
@@ -127,6 +127,15 @@ class VisibilityPolicy:
             # 记忆不该因为 platform 字段不同而互相不可见。
             ids = {memory.subject.id, memory.object.id}
             if ctx.user_id and ctx.user_id in ids:
+                if memory_platform and current_platform and memory_platform != current_platform:
+                    memory_user = session_target_id(memory.session_id, "private")
+                    current_user = session_target_id(ctx.session_id, "private")
+                    if not (
+                        memory_user and current_user and memory_user != current_user
+                        and canonical_user_id(memory_user) == ctx.user_id
+                        and canonical_user_id(current_user) == ctx.user_id
+                    ):
+                        return False, "other_platform"
                 if memory_platform and current_platform:
                     return True, "same_private_user"
                 return True, "same_private_user_legacy_platform"

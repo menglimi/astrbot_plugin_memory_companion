@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -93,6 +94,32 @@ def test_bound_sources_tool_parameters_are_provider_safe():
     source = next(tool for tool in tools.tools if tool.name == "memory_companion_sources")
 
     assert provider_problems(source.parameters) == []
+
+
+def test_v1_source_fallback_keeps_provider_safe_parameters():
+    from core.query_session import TOOL_NAME, bind_query_tool_schema, bind_source_query_v2_schema
+
+    query = SimpleNamespace(handler_module_path="test.module", parameters={})
+    source = SimpleNamespace(
+        handler_module_path="test.module",
+        parameters={
+            "type": "object",
+            "properties": {
+                "query_note": {"type": "string"},
+                "mode": {"const": ""},
+                "terms": {"type": "array"},
+            },
+            "required": ["query_note"],
+        },
+    )
+    tools = {TOOL_NAME: query, "memory_companion_sources": source}
+    manager = SimpleNamespace(get_func=tools.get)
+
+    assert bind_query_tool_schema(manager, "test.module")
+    assert not bind_source_query_v2_schema(manager, "test.module")
+    assert provider_problems(source.parameters) == []
+    assert "query_note" not in source.parameters["properties"]
+    assert source.parameters["required"] == []
 
 
 @pytest.mark.asyncio

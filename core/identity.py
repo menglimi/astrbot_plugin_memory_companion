@@ -149,7 +149,8 @@ def normalize_session_context_fields(
     if scope == "private" and not user_id and parsed_target:
         user_id = clean_text(parsed_target, 120)
     # 补丁：页面/工具侧也会走这个函数，user_id 不归一的话跨平台看不到对方的记忆
-    user_id = canonical_user_id(user_id)
+    if scope == "private":
+        user_id = canonical_user_id(user_id)
     if scope == "group" and not group_id and parsed_target:
         group_id = clean_text(parsed_target, 120)
     return {
@@ -257,7 +258,7 @@ class IdentityResolver:
             session_id=session_id,
             scope=scope,
             platform=clean_text(platform, 80),
-            user_id=canonical_user_id(user_id),
+            user_id=canonical_user_id(user_id) if scope == "private" else clean_text(user_id, 120),
             user_name=clean_text(user_name, 80),
             group_id=clean_text(group_id, 120),
             group_name=clean_text(group_name, 80),

@@ -147,7 +147,13 @@ def host_persona_manager(default_personality, personas=None):
                 if default_personality is None
                 else {"default_personality": default_personality}
             )
-            self.default_conf = {"provider_settings": settings}
+            self.default_conf = {
+                "provider_settings": settings,
+                "agent_runner": {
+                    "runner_type": "local",
+                    "config": {"persona": {"persona_id": default_personality or "[%None]"}},
+                },
+            }
 
         def get_conf(self, umo=None):
             return self.default_conf

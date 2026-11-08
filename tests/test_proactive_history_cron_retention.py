@@ -13,7 +13,9 @@
 """
 from __future__ import annotations
 
-from core.astrbot_compat import clean_private_companion_history_text
+from types import SimpleNamespace
+
+from core.astrbot_compat import clean_private_companion_history_text, sanitize_request_history
 
 
 def test_cron_job_record_is_preserved_verbatim():
@@ -77,3 +79,25 @@ def test_proactive_block_heading_text_is_still_dropped_whole():
 
     assert dropped is True
     assert cleaned == ""
+
+
+def test_tool_call_pair_is_preserved_during_history_cleanup():
+    assistant = {
+        "role": "assistant",
+        "content": "【主动消息回复上下文】",
+        "tool_calls": [{"id": "call_1"}],
+        "metadata": {"source": "private_companion"},
+    }
+    tool = {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": "send_message_to_user: 主动消息发送失败",
+        "metadata": {"source": "private_companion"},
+    }
+    guidance = {"role": "system", "content": "【主动消息回复上下文】", "metadata": {"source": "private_companion"}}
+    request = SimpleNamespace(contexts=[assistant, tool, guidance])
+
+    result = sanitize_request_history(request, clean_proactive_guidance=True)
+
+    assert request.contexts == [assistant, tool]
+    assert result == {"before": 3, "after": 2, "removed": 1, "cleaned": 0}
