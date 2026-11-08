@@ -119,17 +119,19 @@ class VisibilityPolicy:
             # do not let that placeholder hide an otherwise identical window.
             if memory.session_id and memory.session_id == ctx.session_id:
                 return True, "same_private_session"
-            memory_platform = _platform_family(memory.platform)
-            current_platform = _platform_family(ctx.platform)
-            if memory_platform and current_platform and memory_platform != current_platform:
-                return False, "other_platform"
             if ctx.scope != "private":
                 return False, "private_pair_not_current_private"
+            memory_platform = _platform_family(memory.platform)
+            current_platform = _platform_family(ctx.platform)
+            # 同一个人优先于平台判断：QQ 与飞书归一后，
+            # 记忆不该因为 platform 字段不同而互相不可见。
             ids = {memory.subject.id, memory.object.id}
             if ctx.user_id and ctx.user_id in ids:
                 if memory_platform and current_platform:
                     return True, "same_private_user"
                 return True, "same_private_user_legacy_platform"
+            if memory_platform and current_platform and memory_platform != current_platform:
+                return False, "other_platform"
             if ctx.user_id and session_target_id(memory.session_id, "private") == ctx.user_id:
                 return True, "same_private_session_target"
             return False, "other_private_pair"
