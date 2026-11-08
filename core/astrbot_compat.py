@@ -95,6 +95,27 @@ PRIVATE_COMPANION_PROACTIVE_BLOCK_HEADINGS = (
     "【内在约束】",
 )
 
+# AstrBot core 定时任务（active_agent cron）的执行汇报前缀，见
+# astrbot/core/cron/manager.py 的 summary_note 与 core/utils/history_saver.py。
+# 这类记录是用户可见的对话历史，不属于主动消息框架残留，不能被清理掉。
+CRON_JOB_HISTORY_PREFIXES = ("[CronJob]", "【CronJob】")
+
+# 只有当同一行还带有主动消息框架标记时，才把提到 send_message_to_user 的行当作
+# 框架残留删除。单独出现工具名的行可能是正常对话或定时任务汇报，不能仅凭工具名
+# 判定（否则会把 [CronJob] 记录整条删掉）。
+PRIVATE_COMPANION_TOOL_LINE_MARKERS = (
+    "privatecompanion",
+    "private companion",
+    "private_companion",
+    "工具调用限制",
+    "agent reached max steps",
+    "主动消息",
+    "主动陪伴",
+    "主动私聊",
+    "主动承接占位",
+    "候选主动消息",
+)
+
 
 def private_companion_proactive_text_is_internal(text: Any) -> bool:
     raw = str(text or "")
@@ -204,6 +225,11 @@ def clean_private_companion_history_text(text: Any) -> tuple[str, bool, bool]:
     raw = str(text or "")
     if not raw:
         return "", False, False
+    if raw.lstrip().startswith(CRON_JOB_HISTORY_PREFIXES):
+        # 定时任务汇报原样保留，只清无风险的 TTS 标签，绝不按行删除或整条丢弃。
+        cleaned = re.sub(r"\[\[TTSBLOCK:[^\]]*\]\]", "", raw)
+        cleaned = re.sub(r"\[\[PCTTS:[^\]]*\]\]", "", cleaned).strip()
+        return cleaned, cleaned != raw, False
     if private_companion_proactive_text_is_internal(raw):
         return "", True, True
 
@@ -233,7 +259,10 @@ def clean_private_companion_history_text(text: Any) -> tuple[str, bool, bool]:
             removed_line = True
             continue
         lowered = stripped.lower()
-        if "send_message_to_user" in lowered or "tool `send_message_to_user`" in lowered:
+        if "send_message_to_user" in lowered and any(
+            marker in lowered or marker in stripped
+            for marker in PRIVATE_COMPANION_TOOL_LINE_MARKERS
+        ):
             removed_line = True
             continue
         if any(stripped.startswith(heading) for heading in PRIVATE_COMPANION_PROACTIVE_BLOCK_HEADINGS):
