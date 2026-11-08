@@ -1593,5 +1593,17 @@
         "default": 60
       }
     }
+  },
+  "identity": {
+    "type": "object",
+    "description": "跨平台身份",
+    "items": {
+      "merge_platform_accounts": {
+        "type": "bool",
+        "description": "把同一人在不同平台的账号算作同一个人",
+        "default": false,
+        "hint": "开启后读取 plugin_data/<插件名>/identity_alias.json，形如 {\"ou_xxx\": \"302578963\"}。默认关闭，单平台用户不需要开"
+      }
+    }
   }
 }
