@@ -8131,19 +8131,38 @@ class MemoryStore(SummaryBatchStore):
         )
         identities = self._person_identity_cards_sync(user_ids)
         stats = self._person_memory_stats_sync(user_ids)
-        bots: dict[str, int] = {}
-        cards: list[dict[str, Any]] = []
+        groups: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             user_id = clean_text(row.get("user_id"), 120)
             if not user_id:
                 continue
+            groups.setdefault(user_id, []).append(row)
+        bots: dict[str, int] = {}
+        cards: list[dict[str, Any]] = []
+        for user_id, group in groups.items():
+            # 同一个人可能因为 bot / 平台不同被记成多行（空 bot_id、QQ、飞书、导入来源），
+            # 面板按人只给一张卡：取分量最高的那行当主卡，其余只用来合并平台。
+            row = max(group, key=lambda item: clamp_weight(item.get("weight")))
             row_bot = clean_text(row.get("bot_id"), 120)
-            bots[row_bot] = bots.get(row_bot, 0) + 1
+            platforms: list[str] = []
+            bot_ids: list[str] = []
+            group_bot_ids: list[str] = []
+            for item in group:
+                platform = clean_text(item.get("platform"), 40)
+                if platform and platform not in platforms:
+                    platforms.append(platform)
+                item_bot = clean_text(item.get("bot_id"), 120)
+                if item_bot not in group_bot_ids:
+                    group_bot_ids.append(item_bot)
+                if item_bot and item_bot not in bot_ids:
+                    bot_ids.append(item_bot)
+            for item_bot in group_bot_ids:
+                bots[item_bot] = bots.get(item_bot, 0) + 1
             identity = identities.get(user_id, {})
             profile = identity.get("profile")
             if not isinstance(profile, dict):
                 profile = {}
-            stat = stats.get((row_bot, user_id)) or stats.get(("", user_id)) or {}
+            stat = stats.get(("", user_id)) or stats.get((row_bot, user_id)) or {}
             display_name = clean_text(identity.get("display_name"), 80)
             address = clean_text(profile.get("relation_address"), 40)
             relation = clean_text(profile.get("relation_label"), 40)
@@ -8172,8 +8191,10 @@ class MemoryStore(SummaryBatchStore):
             cards.append(
                 {
                     "user_id": user_id,
-                    "platform": clean_text(row.get("platform"), 40),
+                    "platform": platforms[0] if platforms else clean_text(row.get("platform"), 40),
+                    "platforms": platforms,
                     "bot_id": row_bot,
+                    "bot_ids": bot_ids,
                     "display_name": display_name or address or user_id,
                     "address": address,
                     "relation_label": relation,
