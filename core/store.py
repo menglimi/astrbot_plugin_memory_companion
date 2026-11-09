@@ -7844,7 +7844,21 @@ class MemoryStore(SummaryBatchStore):
         bot_id = clean_text(bot_id, 120)
         if not user_id:
             return self._empty_person_weight("")
-        current = self._refresh_person_weight_sync(user_id, platform, bot_id)
+        with self._lock:
+            known_keys = {
+                (clean_text(row["bot_id"], 120), clean_text(row["platform"], 40))
+                for row in self._conn.execute(
+                    "SELECT bot_id, platform FROM person_weights WHERE user_id=?",
+                    (user_id,),
+                ).fetchall()
+            }
+        clicked_key = (bot_id, platform)
+        if clicked_key in known_keys or not known_keys:
+            current = self._refresh_person_weight_sync(user_id, platform, bot_id)
+        else:
+            # 什么都没指定就点开了这个人（合并卡打开的详情不带 bot/平台）：
+            # 不为空 key 凭空加一行，按现有各行直接改。
+            current = {"correction": 0, "components": {}}
         base = float(current.get("base") or 0.0)
         value = int(current.get("correction") or 0)
         target: int | None = None
@@ -7867,14 +7881,7 @@ class MemoryStore(SummaryBatchStore):
                     (user_id,),
                 ).fetchall()
             ]
-            if not any(
-                clean_text(row.get("bot_id"), 120) == bot_id
-                and clean_text(row.get("platform"), 40) == platform
-                for row in rows
-            ):
-                rows.append({"bot_id": bot_id, "platform": platform, "base": base})
-            clicked_final = 0
-            clicked_band = band_of(0)
+            applied: list[tuple[str, str, int, str]] = []
             for row in rows:
                 row_bot = clean_text(row.get("bot_id"), 120)
                 row_platform = clean_text(row.get("platform"), 40)
@@ -7887,9 +7894,7 @@ class MemoryStore(SummaryBatchStore):
                     row_base, row_correction, 1 if row_base > 0 else 0
                 )
                 row_band = band_of(row_weight)
-                if row_bot == bot_id and row_platform == platform:
-                    clicked_final = row_weight
-                    clicked_band = row_band
+                applied.append((row_bot, row_platform, row_weight, row_band))
                 self._conn.execute(
                     """
                     INSERT INTO person_weights (bot_id, platform, user_id, weight, base, correction,
@@ -7917,13 +7922,24 @@ class MemoryStore(SummaryBatchStore):
                     ),
                 )
             self._conn.commit()
+        # 点开的那一行可能不存在（合并卡的详情不带 bot/平台），这时按这个人
+        # 最高的那一行回报，和面板上看到的分量一致。
+        matched = [
+            item for item in applied if item[0] == bot_id and item[1] == platform
+        ]
+        if matched:
+            chosen = matched[0]
+        elif applied:
+            chosen = max(applied, key=lambda item: item[2])
+        else:
+            chosen = (bot_id, platform, 0, band_of(0))
         result = dict(current)
         result.update(
             {
-                "weight": clicked_final,
+                "weight": chosen[2],
                 "correction": value,
-                "band": clicked_band,
-                "band_label": BAND_LABELS.get(clicked_band, BAND_LABELS["stranger"]),
+                "band": chosen[3],
+                "band_label": BAND_LABELS.get(chosen[3], BAND_LABELS["stranger"]),
                 "source": "user" if value else "auto",
                 "updated_at": now,
             }
@@ -8362,6 +8378,14 @@ class MemoryStore(SummaryBatchStore):
                 weight_params.append(platform)
             weight_sql += " ORDER BY weight DESC LIMIT 1"
             weight_row = self._conn.execute(weight_sql, weight_params).fetchone()
+            if weight_row is None and (bot_id or platform):
+                # 这个人是在别的 bot / 平台下被记过的：详情仍然要给出分量，
+                # 否则合并卡点开会显示成 0。
+                weight_row = self._conn.execute(
+                    "SELECT * FROM person_weights WHERE user_id=?"
+                    " ORDER BY weight DESC LIMIT 1",
+                    (user_id,),
+                ).fetchone()
         identity = dict(identity_row) if identity_row is not None else {}
         profile = json_loads(identity.get("profile"), {}) if identity else {}
         if not isinstance(profile, dict):

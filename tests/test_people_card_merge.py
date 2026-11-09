@@ -197,6 +197,36 @@ class PeopleCardMergeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(0, row["correction"])
             self.assertNotEqual(1, row["weight"])
 
+    async def test_person_level_detail_covers_every_row(self) -> None:
+        await self.store.insert_memory(
+            _record("m1", "u1", "甲。", owner_bot_id="bot-a", platform="qq")
+        )
+        await self.store.insert_memory(
+            _record("m2", "u1", "乙。", owner_bot_id="bot-b", platform="lark")
+        )
+        await self.store.person_weight(user_id="u1", platform="qq", bot_id="bot-a")
+        await self.store.person_weight(user_id="u1", platform="lark", bot_id="bot-b")
+
+        card = (await self.store.list_person_cards())["items"][0]
+        self.assertEqual(2, card["memory_count"])
+
+        # 跨 bot 的人点开时不带 bot/平台：详情要看全，并且分量不能是 0。
+        detail = await self.store.person_panel_detail(user_id="u1")
+        self.assertEqual(card["memory_count"], detail["total"])
+        self.assertEqual(card["weight"], detail["weight"]["weight"])
+
+        # 这样点开再改分量，不该为空的 (bot, platform) 凭空加一行。
+        await self.store.set_person_weight(user_id="u1", weight=5)
+        with self.store._lock:  # noqa: SLF001 - 测试直接数行
+            keys = {
+                (row["bot_id"], row["platform"])
+                for row in self.store._conn.execute(
+                    "SELECT bot_id, platform FROM person_weights WHERE user_id='u1'"
+                ).fetchall()
+            }
+        self.assertEqual({("bot-a", "qq"), ("bot-b", "lark")}, keys)
+        self.assertEqual(5, (await self.store.list_person_cards())["items"][0]["weight"])
+
     async def test_detail_keeps_the_name_for_import_platforms(self) -> None:
         # 主行落在导入来源（livingmemory）上时，按平台查不到 identities，
         # 详情页不该把名字退化成 user_id。

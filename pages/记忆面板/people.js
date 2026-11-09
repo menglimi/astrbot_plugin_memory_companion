@@ -241,7 +241,14 @@ function renderGrid() {
     const chips = [`<span class="chip band ${bandClass(item.band)}">${esc(item.band_label)}</span>`];
     if (item.address) chips.push(`<span class="chip">叫她「${esc(item.address)}」</span>`);
     if (item.relation_label) chips.push(`<span class="chip">${esc(item.relation_label)}</span>`);
-    return `<button class="card" type="button" data-user="${esc(item.user_id)}" data-platform="${esc(item.platform)}" data-bot="${esc(item.bot_id)}">
+    // 一张卡代表一个人：这个人要是在多个 bot / 平台下都被记过，点开时
+    // 不能再按主行的 bot/平台过滤，不然详情只显示其中一份。
+    const spansRows =
+      (Array.isArray(item.platforms) ? item.platforms.length : 0) > 1 ||
+      (Array.isArray(item.bot_ids) ? item.bot_ids.length : 0) > 1;
+    const platform = spansRows ? "" : item.platform || "";
+    const botId = spansRows ? "" : item.bot_id || "";
+    return `<button class="card" type="button" data-user="${esc(item.user_id)}" data-platform="${esc(platform)}" data-bot="${esc(botId)}">
       <div class="card-head">
         <span class="avatar">${esc(initials(item.display_name))}</span>
         <div class="who"><div class="name">${esc(item.display_name)}</div><div class="sub">${esc(fmtDays(item.days_since_last))}</div></div>
