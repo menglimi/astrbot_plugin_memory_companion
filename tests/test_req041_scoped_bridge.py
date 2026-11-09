@@ -9,7 +9,7 @@ from core.bridge import MemoryCompanionBridge
 from core.namespace import NamespaceContext
 from core.namespace_capability import validate_namespace_capability
 from core.scoped_domain_contract import build_scoped_domain_payload
-from core.scoped_store import ScopedStore
+from core.scoped_store import ScopedStore, ScopedStoreError
 
 
 EPOCH = "req041-20260810-001"
@@ -65,7 +65,11 @@ class ScopedBridgeTests(unittest.TestCase):
             self.assertIs(first, second)
 
         self.store.close()
-        self.assertIsNone(self.store._conn)
+        self.assertEqual([], self.store._connections)
+        self.assertIsNone(self.store._local.connection)
+        with self.assertRaisesRegex(ScopedStoreError, "scoped_store_closed"):
+            with self.store._connection():
+                pass
 
     def _bind(self, **changes: str):
         values = {

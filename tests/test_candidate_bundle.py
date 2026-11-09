@@ -192,9 +192,9 @@ class CandidateBundleStoreTests(unittest.IsolatedAsyncioTestCase):
     def test_time_window_expression_indexes_support_each_date_predicate(self) -> None:
         store = self.make_store()
         expected = {
-            "occurred_at": "idx_memories_jd_occurred_at",
-            "created_at": "idx_memories_jd_created_at",
-            "updated_at": "idx_memories_jd_updated_at",
+            "occurred_at": "idx_memories_jd_occurred",
+            "created_at": "idx_memories_jd_created",
+            "updated_at": "idx_memories_jd_updated",
         }
 
         predicates = " OR ".join(

@@ -22,6 +22,7 @@ from astrbot_plugin_memory_companion.core.identity import (
     normalize_session_context_fields,
 )
 from astrbot_plugin_memory_companion.core.models import EntityRef, MemoryRecord, SessionContext
+from astrbot_plugin_memory_companion.core.retrieval import RetrievalEngine
 from astrbot_plugin_memory_companion.core.visibility import VisibilityPolicy
 
 LARK_ID = "ou_cec66"
@@ -172,6 +173,24 @@ class CrossPlatformVisibilityTests(unittest.TestCase):
         )
         visible, reason = self.policy.is_visible(memory, ctx)
         self.assertTrue(visible, reason)
+
+    def test_direct_candidates_use_the_same_explicit_alias_policy(self) -> None:
+        self.policy.enable_acl_rules = False
+        engine = RetrievalEngine(object(), self.policy)
+        memory = self._memory(MAIN_ID, "470488586", "lark", "lark:FriendMessage:" + LARK_ID)
+        memory.id = "linked-private-memory"
+        ctx = SessionContext(
+            session_id="qq:FriendMessage:" + MAIN_ID, scope="private", platform="qq", user_id=MAIN_ID
+        )
+
+        visible, blocked = asyncio.run(engine.filter_visible_candidates([memory], ctx))
+        self.assertEqual([memory.id], [item.memory.id for item in visible])
+        self.assertEqual([], blocked)
+
+        self._set_enabled(False)
+        visible, blocked = asyncio.run(engine.filter_visible_candidates([memory], ctx))
+        self.assertEqual([], visible)
+        self.assertEqual("other_platform", blocked[0]["reason"])
 
     def test_lark_context_can_read_qq_memory(self) -> None:
         memory = self._memory(MAIN_ID, "470488586", "qq", "qq:FriendMessage:" + MAIN_ID)

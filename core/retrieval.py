@@ -263,11 +263,17 @@ class RetrievalEngine:
                 and getattr(memory, "session_id", "") == getattr(ctx, "session_id", "")
             )
             explicit_person_link = self.policy.explicit_person_link_matches(memory, ctx)
+            linked_private_user = bool(
+                memory.visibility == "private_pair"
+                and ctx.scope == "private"
+                and self.policy.is_visible(memory, ctx)[0]
+            )
             if (
                 memory_platform and current_platform
                 and memory_platform != current_platform
                 and not same_session
                 and not explicit_person_link
+                and not linked_private_user
             ):
                 blocked.append({"id": memory_id, "reason": "other_platform", "content": ""})
                 continue

@@ -1,6 +1,6 @@
 [project]
 name = "astrbot_plugin_memory_companion"
-version = "2.6.5"
+version = "2.6.6"
 description = "AstrBot 记忆伴侣插件：跨会话记忆、画像与页面控制台"
 requires-python = ">=3.10"
 dependencies = ["astrbot>=4.27"]

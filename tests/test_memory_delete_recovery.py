@@ -81,12 +81,12 @@ class MemoryDeleteRecoveryTests(unittest.IsolatedAsyncioTestCase):
         original = store._delete_memory_sync
         attempts = 0
 
-        def fail_once(value: str) -> bool:
+        def fail_once(value: str, *, purge_sources: bool = False) -> bool:
             nonlocal attempts
             attempts += 1
             if attempts == 1:
                 raise sqlite3.OperationalError("unable to open database file")
-            return original(value)
+            return original(value, purge_sources=purge_sources)
 
         store._delete_memory_sync = fail_once
         self.assertTrue(await store.delete_memory(memory_id))
@@ -101,7 +101,7 @@ class MemoryDeleteRecoveryTests(unittest.IsolatedAsyncioTestCase):
         store = self.make_store()
         memory_id = await self._insert(store, "重连失败时原记忆必须保留")
 
-        def always_unopenable(value: str) -> bool:
+        def always_unopenable(value: str, *, purge_sources: bool = False) -> bool:
             raise sqlite3.OperationalError("unable to open database file")
 
         store._delete_memory_sync = always_unopenable
@@ -224,7 +224,7 @@ class MemoryDeleteRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         handler = MemoryCompanionCommandHandler(SimpleNamespace(store=_Store()), "test")
-        message = await handler.delete("mem-1")
+        message = await handler.delete("mem-1", confirm="确认")
 
         self.assertIn("删除失败", message)
         self.assertIn("仍然保留", message)
@@ -237,7 +237,7 @@ class MemoryDeleteRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         handler = MemoryCompanionCommandHandler(SimpleNamespace(store=_Store()), "test")
 
-        self.assertEqual("没有找到这条记忆。", await handler.delete("mem-404"))
+        self.assertEqual("没有找到这条记忆。", await handler.delete("mem-404", confirm="确认"))
 
 
 if __name__ == "__main__":

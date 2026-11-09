@@ -19,6 +19,7 @@ from astrbot_plugin_memory_companion.core.astrbot_compat import sanitize_request
 from astrbot_plugin_memory_companion.core.injection import InjectionComposer
 from astrbot_plugin_memory_companion.core.models import EntityRef, MemoryRecord, SearchResult, SessionContext
 from astrbot_plugin_memory_companion.core.service import MemoryCompanionService
+from astrbot_plugin_memory_companion.core.store import MemoryStore
 from astrbot_plugin_memory_companion.core.time_intent import parse_time_intent
 
 
@@ -66,7 +67,7 @@ class CurrentIssueRegressionTests(unittest.IsolatedAsyncioTestCase):
         ]
         request = SimpleNamespace(contexts=contexts)
 
-        result = sanitize_request_history(request)
+        result = sanitize_request_history(request, clean_proactive_guidance=True)
 
         self.assertEqual({"before": 2, "after": 2, "removed": 0, "cleaned": 0}, result)
         self.assertEqual(contexts, request.contexts)
@@ -196,6 +197,28 @@ class CurrentIssueRegressionTests(unittest.IsolatedAsyncioTestCase):
         [row] = await service.store.recent_injection_logs(limit=1)
         self.assertEqual(diagnostics, row["retrieval_info"])
         self.assertEqual("slot_capped:conversation_summary", row["blocked_reasons"][0]["reason"])
+
+    async def test_old_injection_log_table_upgrades_with_owner_and_diagnostics(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = MemoryStore(Path(directory.name) / "old-memory.db")
+        self.addCleanup(store.close)
+        store._conn.execute(
+            "CREATE TABLE injection_logs (id TEXT PRIMARY KEY, session_id TEXT, scope TEXT, "
+            "query TEXT, selected_memory_ids TEXT, blocked_reasons TEXT, "
+            "injection_chars INTEGER, created_at TEXT)"
+        )
+        store._conn.commit()
+        store.initialize()
+
+        await store.add_injection_log(
+            session_id="qq:FriendMessage:u1", scope="private", query="回顾",
+            selected_memory_ids=[], blocked_reasons=[], injection_chars=0,
+            user_id="u1", bot_id="b1", retrieval_info={"slot_counts": {}},
+        )
+        [row] = await store.recent_injection_logs(limit=1)
+        self.assertEqual(("u1", "b1"), (row["user_id"], row["bot_id"]))
+        self.assertEqual({"slot_counts": {}}, row["retrieval_info"])
 
 
 if __name__ == "__main__":

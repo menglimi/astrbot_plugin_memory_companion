@@ -7055,7 +7055,8 @@ class MemoryStore(SummaryBatchStore):
         subject_kind = clean_text(getattr(subject, "kind", ""), 40) or "user"
         return self._conn.execute(
             """
-            SELECT id, importance, confidence, merged_count, evidence, metadata
+            SELECT id, importance, confidence, merged_count, evidence, metadata,
+                   subject_person_id, identity_assurance
             FROM memories
             WHERE subject_kind=?
               AND subject_id=?
@@ -7066,6 +7067,7 @@ class MemoryStore(SummaryBatchStore):
                   ('archived', 'deleted', 'superseded', 'quarantined')
               AND content=?
               AND id<>?
+              AND subject_person_id IN ('', ?)
               AND COALESCE(
                   CASE WHEN json_valid(metadata)
                        THEN json_extract(metadata, '$.idempotency_key')
@@ -7081,6 +7083,7 @@ class MemoryStore(SummaryBatchStore):
                 clean_text(record.owner_bot_id, 120),
                 content,
                 record.id,
+                record.subject_person_id,
             ),
         ).fetchone()
 

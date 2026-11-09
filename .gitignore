@@ -15,3 +15,9 @@ data/*.db-*
 
 # 跑测试时宿主 AstrBot 会在当前目录生成运行时目录（不是插件内容）
 data/
+
+# 本地诊断、测试环境与工作记录不进入插件发布物。
+.tmp_diag/
+.tmp_pytest/
+.workbuddy/
+.pytest_cache/
