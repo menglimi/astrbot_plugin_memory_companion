@@ -1256,19 +1256,38 @@ defineView("overview", {
       .map((item) => {
         const selected = Array.isArray(item.selected_memories) ? item.selected_memories : [];
         const blocked = Array.isArray(item.blocked_reasons) ? item.blocked_reasons : [];
+        const retrieval = item.retrieval_info && typeof item.retrieval_info === "object" ? item.retrieval_info : {};
+        const slotCounts = retrieval.slot_counts && typeof retrieval.slot_counts === "object" ? retrieval.slot_counts : {};
+        const slotLimits = retrieval.slot_limits && typeof retrieval.slot_limits === "object" ? retrieval.slot_limits : {};
+        const slotSummary = Object.keys(slotCounts)
+          .map((slot) => slot + " " + Number(slotCounts[slot] || 0) + "/" +
+            (slotLimits[slot] == null ? "-" : Number(slotLimits[slot] || 0)))
+          .join(" · ");
+        const capped = Array.isArray(retrieval.capped_slots) ? retrieval.capped_slots : [];
+        const cappedCandidates = blocked
+          .filter((entry) => String(entry.reason || "").startsWith("slot_capped:"))
+          .map((entry) => String(entry.id || "") + (entry.score == null ? "" : " (" + entry.score + ")"))
+          .filter(Boolean)
+          .slice(0, 3);
         const query = compact(item.query) || "无检索词";
         const selectedText = selected.length
           ? selected.slice(0, 2).map((memory) => memoryTitle(memory)).join("；")
           : blocked.length
             ? "未注入记忆 · 过滤 " + blocked.length + " 项"
             : "未注入记忆";
+        const detailText = [
+          selectedText,
+          slotSummary ? "槽位 " + slotSummary : "",
+          capped.length ? "受限 " + capped.join(", ") : "",
+          cappedCandidates.length ? "限流候选 " + cappedCandidates.join(", ") : "",
+        ].filter(Boolean).join(" · ");
         return (
           '<div class="row" style="cursor:default;align-items:flex-start">' +
             '<div class="row-main" style="min-width:0">' +
               '<div class="row-title" title="' + esc(query) + '">' + esc(clip(query, 72)) + "</div>" +
               '<div class="row-sub">' + esc(fmtTime(item.created_at)) + " · " +
                 esc(selected.length + " 条记忆 · " + int(item.injection_chars) + " 字") + "</div>" +
-              '<div class="section-note" style="margin-top:5px;white-space:normal">' + esc(clip(selectedText, 180)) + "</div>" +
+              '<div class="section-note" style="margin-top:5px;white-space:normal">' + esc(clip(detailText, 280)) + "</div>" +
             "</div>" +
             '<div class="row-meta">' +
               badge(selected.length ? "已注入" : "未注入", selected.length ? "ok" : "warn") +
@@ -3266,6 +3285,7 @@ function speakerConfirmHtml(result) {
       '<label class="field"><span>目标 Bot ID</span><input id="impBotId" type="text" placeholder="多 Bot 时必填" value="' + esc(compact(botInfo.bot_id) || compact(botInfo.id)) + '" /></label>' +
       '<label class="field"><span>平台</span><input id="impPlatform" type="text" value="qq" /></label>' +
       '<label class="field"><span>会话 ID</span><input id="impSession" type="text" placeholder="留空自动推断" /></label>' +
+      '<label class="field"><span>关联人物 ID</span><input id="impPersonId" type="text" placeholder="person_...（可留空）" /></label>' +
     "</div>" +
     '<div class="pill-row" style="margin-top:12px">' +
       '<button class="btn is-primary" type="button" id="impStartBtn">开始生成记忆</button>' +
@@ -3492,6 +3512,7 @@ defineView("chatimport", {
           bot_name: "Bot",
           platform: $("#impPlatform", node).value.trim() || "qq",
           session_id: $("#impSession", node).value.trim(),
+          subject_person_id: $("#impPersonId", node).value.trim(),
         };
         if (!payload.user_id || !payload.bot_id) {
           toast("请填写目标用户 ID 与 Bot ID", "error");

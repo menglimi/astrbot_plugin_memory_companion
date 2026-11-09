@@ -676,7 +676,10 @@ class InjectionComposer:
             if slot:
                 diagnostic["slot"] = clean_text(slot, 60)
             self.last_omission_diagnostics.append(diagnostic)
-            self.last_omission_reasons.append(reason)
+            summary_reason = reason
+            if reason.startswith("injection_omitted:uncertain:"):
+                summary_reason = "injection_omitted:uncertain"
+            self.last_omission_reasons.append(summary_reason)
 
         def decision(item: SearchResult) -> tuple[bool, str, str]:
             key = item_key(item)
@@ -689,7 +692,11 @@ class InjectionComposer:
             if not allowed:
                 result = (False, f"injection_omitted:{reason}", expression)
             elif expression == "uncertain":
-                result = (False, "injection_omitted:uncertain", expression)
+                detail = str(getattr(item, "reason", "") or "").strip()[:240]
+                omission = "injection_omitted:uncertain"
+                if detail:
+                    omission = f"{omission}:{detail}"
+                result = (False, omission, expression)
             elif expression == "candidate" and self._is_rule_profile(memory):
                 result = (False, "injection_omitted:candidate", expression)
             else:

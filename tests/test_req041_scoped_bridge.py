@@ -35,6 +35,7 @@ class ScopedBridgeTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = Path(self.tmp.name) / "scoped.sqlite3"
         self.store = ScopedStore(self.path, clock=lambda: 100.0)
+        self.reopened_stores = []
         self.companion = object()
         self.context = SimpleNamespace(
             get_all_stars=lambda: [
@@ -52,7 +53,19 @@ class ScopedBridgeTests(unittest.TestCase):
         self.assertIsNotNone(self.capability)
 
     def tearDown(self) -> None:
+        for store in self.reopened_stores:
+            store.close()
+        self.store.close()
         self.tmp.cleanup()
+
+    def test_connection_is_reused_until_store_close(self) -> None:
+        with self.store._connection() as first:
+            pass
+        with self.store._connection() as second:
+            self.assertIs(first, second)
+
+        self.store.close()
+        self.assertIsNone(self.store._conn)
 
     def _bind(self, **changes: str):
         values = {
@@ -207,6 +220,7 @@ class ScopedBridgeTests(unittest.TestCase):
             payload={"value": "stable"}, event_id="write-1",
         )
         reopened_store = ScopedStore(self.path, clock=lambda: 200.0)
+        self.reopened_stores.append(reopened_store)
         reopened_service = SimpleNamespace(scoped_store=reopened_store, context=self.context)
         reopened_bridge = MemoryCompanionBridge(reopened_service)
         reopened_capability = reopened_bridge.register_private_companion(self.companion)

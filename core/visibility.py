@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .identity import session_target_id
-from .models import MemoryRecord, SessionContext
+from .models import MemoryRecord, SessionContext, normalize_explicit_person_binding
 
 
 def _clean_id(value: str | None) -> str:
@@ -60,6 +60,8 @@ class VisibilityPolicy:
         if memory.visibility == "shareable":
             return True, "shareable"
         if memory.visibility == "private_pair":
+            if self.explicit_person_link_matches(memory, ctx):
+                return True, "explicit_linked_person"
             owner_ok, owner_reason = self._bot_owner_visible(memory, ctx)
             if not owner_ok:
                 return False, owner_reason
@@ -68,6 +70,16 @@ class VisibilityPolicy:
             # do not let that placeholder hide an otherwise identical window.
             if memory.session_id and memory.session_id == ctx.session_id:
                 return True, "same_private_session"
+            memory_person_id, _memory_assurance = normalize_explicit_person_binding(
+                memory.subject_person_id,
+                memory.identity_assurance,
+            )
+            context_person_id, _context_assurance = normalize_explicit_person_binding(
+                ctx.subject_person_id,
+                ctx.identity_assurance,
+            )
+            if memory_person_id and context_person_id and memory_person_id != context_person_id:
+                return False, "other_person"
             memory_platform = _platform_family(memory.platform)
             current_platform = _platform_family(ctx.platform)
             if memory_platform and current_platform and memory_platform != current_platform:
@@ -95,6 +107,24 @@ class VisibilityPolicy:
                 return True, "group_public_allowed_in_private"
             return False, "other_group_public"
         return False, f"unknown_visibility:{memory.visibility}"
+
+    @staticmethod
+    def explicit_person_link_matches(memory: MemoryRecord, ctx: SessionContext) -> bool:
+        if memory.visibility != "private_pair" or memory.scope != "private" or ctx.scope != "private":
+            return False
+        memory_person_id, memory_assurance = normalize_explicit_person_binding(
+            memory.subject_person_id,
+            memory.identity_assurance,
+        )
+        context_person_id, context_assurance = normalize_explicit_person_binding(
+            ctx.subject_person_id,
+            ctx.identity_assurance,
+        )
+        return bool(
+            memory_person_id
+            and memory_person_id == context_person_id
+            and memory_assurance == context_assurance == "explicit_linked"
+        )
 
     def _bot_owner_visible(self, memory: MemoryRecord, ctx: SessionContext) -> tuple[bool, str]:
         """Keep bot-perspective group memories tied to the bot that produced them."""

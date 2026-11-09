@@ -35,6 +35,7 @@ from .models import (
     EntityRef,
     MemoryRecord,
     clean_text,
+    normalize_explicit_person_binding,
     is_memory_placeholder,
     json_dumps,
     json_loads,
@@ -1029,6 +1030,8 @@ class MemoryStore(SummaryBatchStore):
                     object_role TEXT NOT NULL DEFAULT '',
                     scope TEXT NOT NULL DEFAULT '',
                     session_id TEXT NOT NULL DEFAULT '',
+                    subject_person_id TEXT NOT NULL DEFAULT '',
+                    identity_assurance TEXT NOT NULL DEFAULT '',
                     platform TEXT NOT NULL DEFAULT '',
                     message_id TEXT NOT NULL DEFAULT '',
                     group_id TEXT NOT NULL DEFAULT '',
@@ -1272,6 +1275,7 @@ class MemoryStore(SummaryBatchStore):
                     query TEXT NOT NULL DEFAULT '',
                     selected_memory_ids TEXT NOT NULL DEFAULT '[]',
                     blocked_reasons TEXT NOT NULL DEFAULT '[]',
+                    retrieval_info TEXT NOT NULL DEFAULT '{}',
                     injection_chars INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT ''
                 );
@@ -1498,6 +1502,7 @@ class MemoryStore(SummaryBatchStore):
             )
             self._repair_internal_control_tables_sync()
             self._ensure_memory_columns_sync()
+            self._ensure_injection_log_columns_sync()
             self._ensure_timeline_columns_sync()
             self._ensure_acl_columns_sync()
             self._ensure_portrait_columns_sync()
@@ -1986,6 +1991,7 @@ class MemoryStore(SummaryBatchStore):
             AFTER UPDATE OF
                 memory_type, subject_kind, subject_id, subject_name, subject_role,
                 object_kind, object_id, object_name, object_role, scope, session_id,
+                subject_person_id, identity_assurance,
                 platform, message_id, group_id, visibility, sayability, reality_level,
                 lifecycle, content, evidence, confidence, importance, review_status,
                 tags, metadata, created_at, updated_at, occurred_at, source_plugin,
@@ -2322,7 +2328,7 @@ class MemoryStore(SummaryBatchStore):
             for row in self._conn.execute("PRAGMA table_info(memories)").fetchall()
         }
         salience_added = "salience" not in existing
-        columns_added = False
+        atom_columns_added = False
         additions = {
             "content_fingerprint": "TEXT NOT NULL DEFAULT ''",
             "merged_count": "INTEGER NOT NULL DEFAULT 1",
@@ -2353,17 +2359,25 @@ class MemoryStore(SummaryBatchStore):
             "injection_count": "INTEGER NOT NULL DEFAULT 0 CHECK(injection_count >= 0)",
             "last_injected_at": "TEXT NOT NULL DEFAULT ''",
             "canonical_key": "TEXT NOT NULL DEFAULT ''",
+            "subject_person_id": "TEXT NOT NULL DEFAULT ''",
+            "identity_assurance": "TEXT NOT NULL DEFAULT ''",
         }
         for name, ddl in additions.items():
             if name not in existing:
                 self._conn.execute(f"ALTER TABLE memories ADD COLUMN {name} {ddl}")
-                columns_added = True
+                if name not in {"subject_person_id", "identity_assurance"}:
+                    atom_columns_added = True
+
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_subject_person "
+            "ON memories(subject_person_id, identity_assurance, visibility, lifecycle)"
+        )
 
         marker = self._conn.execute(
             "SELECT value FROM schema_metadata WHERE key='memory_atom_v2_backfill_version'"
         ).fetchone()
         needs_backfill = (
-            columns_added
+            atom_columns_added
             or marker is None
             or clean_text(marker["value"], 40) != self.MEMORY_ATOM_BACKFILL_VERSION
         )
@@ -2379,6 +2393,15 @@ class MemoryStore(SummaryBatchStore):
             """,
             (self.MEMORY_ATOM_BACKFILL_VERSION, utc_now()),
         )
+
+    def _ensure_injection_log_columns_sync(self) -> None:
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(injection_logs)").fetchall()
+        }
+        if "retrieval_info" not in columns:
+            self._conn.execute(
+                "ALTER TABLE injection_logs ADD COLUMN retrieval_info TEXT NOT NULL DEFAULT '{}'"
+            )
 
     def _backfill_memory_atom_v2_sync(self, *, restore_legacy_salience: bool = False) -> int:
         """Populate v2 atom columns without rewriting legacy content or timestamps."""
@@ -6338,15 +6361,23 @@ class MemoryStore(SummaryBatchStore):
             if record.content_fingerprint:
                 duplicate = self._conn.execute(
                     """
-                    SELECT id, importance, confidence, merged_count, evidence, metadata
+                    SELECT id, importance, confidence, merged_count, evidence, metadata,
+                           subject_person_id, identity_assurance
                     FROM memories
                     WHERE content_fingerprint=? AND id<>? AND lifecycle!='archived'
+                      AND subject_person_id IN ('', ?)
                     ORDER BY merged_count DESC, updated_at DESC
                     LIMIT 1
                     """,
-                    (record.content_fingerprint, record.id),
+                    (record.content_fingerprint, record.id, record.subject_person_id),
                 ).fetchone()
             if duplicate:
+                duplicate_person_id, duplicate_assurance = normalize_explicit_person_binding(
+                    duplicate["subject_person_id"],
+                    duplicate["identity_assurance"],
+                )
+                merged_person_id = duplicate_person_id or record.subject_person_id
+                merged_assurance = duplicate_assurance or record.identity_assurance
                 merged_metadata = json_loads(duplicate["metadata"], {})
                 incoming_metadata = record.metadata if isinstance(record.metadata, dict) else {}
                 merged_metadata.setdefault("merged_from", [])
@@ -6413,7 +6444,8 @@ class MemoryStore(SummaryBatchStore):
                 self._conn.execute(
                     """
                     UPDATE memories
-                    SET importance=max(importance, ?),
+                    SET subject_person_id=?, identity_assurance=?,
+                        importance=max(importance, ?),
                         confidence=max(confidence, ?),
                         evidence=?,
                         metadata=?,
@@ -6422,6 +6454,8 @@ class MemoryStore(SummaryBatchStore):
                     WHERE id=?
                     """,
                     (
+                        merged_person_id,
+                        merged_assurance,
                         record.importance,
                         record.confidence,
                         evidence,
@@ -9578,6 +9612,7 @@ class MemoryStore(SummaryBatchStore):
         selected_memory_ids: list[str],
         blocked_reasons: list[dict[str, Any]],
         injection_chars: int,
+        retrieval_info: dict[str, Any] | None = None,
     ) -> str:
         return await asyncio.to_thread(
             self._add_injection_log_sync,
@@ -9587,6 +9622,7 @@ class MemoryStore(SummaryBatchStore):
             selected_memory_ids,
             blocked_reasons,
             injection_chars,
+            retrieval_info,
         )
 
     def _add_injection_log_sync(
@@ -9597,6 +9633,7 @@ class MemoryStore(SummaryBatchStore):
         selected_memory_ids: list[str],
         blocked_reasons: list[dict[str, Any]],
         injection_chars: int,
+        retrieval_info: dict[str, Any] | None = None,
     ) -> str:
         row_id = new_id("inj")
         with self._lock:
@@ -9604,9 +9641,9 @@ class MemoryStore(SummaryBatchStore):
                 """
                 INSERT INTO injection_logs(
                     id, session_id, scope, query, selected_memory_ids,
-                    blocked_reasons, injection_chars, created_at
+                    blocked_reasons, retrieval_info, injection_chars, created_at
                 )
-                VALUES(?,?,?,?,?,?,?,?)
+                VALUES(?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     row_id,
@@ -9615,6 +9652,7 @@ class MemoryStore(SummaryBatchStore):
                     clean_text(redact_sensitive_text(query), 1000),
                     json_dumps(selected_memory_ids),
                     json_dumps(redact_sensitive_value(blocked_reasons[:30])),
+                    json_dumps(redact_sensitive_value(retrieval_info or {})),
                     max(0, int(injection_chars or 0)),
                     utc_now(),
                 ),
@@ -9654,6 +9692,7 @@ class MemoryStore(SummaryBatchStore):
             item = dict(row)
             item["selected_memory_ids"] = json_loads(item.get("selected_memory_ids"), [])
             item["blocked_reasons"] = json_loads(item.get("blocked_reasons"), [])
+            item["retrieval_info"] = json_loads(item.get("retrieval_info"), {})
             result.append(item)
         return result
 
@@ -9947,6 +9986,8 @@ class MemoryStore(SummaryBatchStore):
         group_id: str = "",
         limit: int = 600,
         include_pending: bool = False,
+        subject_person_id: str = "",
+        identity_assurance: str = "",
     ) -> list[MemoryRecord]:
         return await self._run_recoverable_database_operation(
             self._list_current_window_candidate_memories_sync,
@@ -9956,6 +9997,8 @@ class MemoryStore(SummaryBatchStore):
             group_id,
             limit,
             include_pending,
+            subject_person_id,
+            identity_assurance,
         )
 
     def _list_current_window_candidate_memories_sync(
@@ -9966,10 +10009,13 @@ class MemoryStore(SummaryBatchStore):
         group_id: str,
         limit: int,
         include_pending: bool,
+        subject_person_id: str = "",
+        identity_assurance: str = "",
     ) -> list[MemoryRecord]:
         with self._lock:
             rows = self._current_window_candidate_rows(
-                self._conn, scope, session_id, user_id, group_id, limit, include_pending
+                self._conn, scope, session_id, user_id, group_id, limit, include_pending,
+                subject_person_id, identity_assurance,
             )
         return [MemoryRecord.from_row(row) for row in rows]
 
@@ -9982,11 +10028,17 @@ class MemoryStore(SummaryBatchStore):
         group_id: str,
         limit: int,
         include_pending: bool,
+        subject_person_id: str = "",
+        identity_assurance: str = "",
     ) -> list[Any]:
         scope = clean_text(scope, 40).lower()
         session_id = clean_text(session_id, 200)
         user_id = clean_text(user_id, 120)
         group_id = clean_text(group_id, 120)
+        subject_person_id, identity_assurance = normalize_explicit_person_binding(
+            subject_person_id,
+            identity_assurance,
+        )
         clauses: list[str] = []
         params: list[Any] = []
         if session_id:
@@ -9996,20 +10048,33 @@ class MemoryStore(SummaryBatchStore):
             clauses.append("(scope='group' AND group_id=?)")
             params.append(group_id)
         elif scope == "private" and user_id:
-            clauses.append("(scope='private' AND (subject_id=? OR object_id=?))")
+            private_subject_clause = "subject_id=? OR object_id=?"
             params.extend([user_id, user_id])
+            if subject_person_id:
+                private_subject_clause += (
+                    " OR (visibility='private_pair' AND subject_person_id=? "
+                    "AND identity_assurance='explicit_linked')"
+                )
+                params.append(subject_person_id)
+            clauses.append(f"(scope='private' AND ({private_subject_clause}))")
         if not clauses:
             return []
         where = f"lifecycle != 'archived' AND {self._recallable_memory_sql()} AND (" + " OR ".join(clauses) + ")"
         if not include_pending:
             where += " AND review_status != 'pending'"
+        order_by = "importance DESC, " + _memory_time_sql(include_updated=True) + " DESC"
+        if subject_person_id:
+            order_by = (
+                "CASE WHEN subject_person_id=? AND identity_assurance='explicit_linked' "
+                "THEN 0 ELSE 1 END, " + order_by
+            )
+            params.append(subject_person_id)
         return conn.execute(
             f"""
             SELECT *
             FROM memories
             WHERE {where}
-            ORDER BY importance DESC,
-                     {_memory_time_sql(include_updated=True)} DESC
+            ORDER BY {order_by}
             LIMIT ?
             """,
             params + [max(1, int(limit or 1))],
@@ -10137,6 +10202,8 @@ class MemoryStore(SummaryBatchStore):
                 clean_text(current_window.get("group_id", ""), 120),
                 int(current_window.get("limit", 0) or 0),
                 include_pending,
+                clean_text(current_window.get("subject_person_id", ""), 80),
+                clean_text(current_window.get("identity_assurance", ""), 40),
             )
             fts_rows = self._fts_candidate_rows(conn, fts_terms, fts_limit, include_pending)
             keyword_fallback_used = len(fts_rows) < max(0, int(keyword_fallback_min_fts or 0))

@@ -242,7 +242,9 @@ class RoleSourceSession:
         if kind == 'timeline':
             engine = self.service._retrieval_validation_engine()
             engine.policy.include_raw_events = True
-        return bool(engine.policy._bot_owner_visible(record, self.ctx)[0] and
+        explicit_person_link = engine.policy.explicit_person_link_matches(record, self.ctx)
+        owner_visible = engine.policy._bot_owner_visible(record, self.ctx)[0]
+        return bool((owner_visible or explicit_person_link) and
                     engine._search_visibility_reason(record, self.ctx, self.acl, include_core_memory=True)[0])
 
     def _capture(self, kind, source_id, version, *, mode):

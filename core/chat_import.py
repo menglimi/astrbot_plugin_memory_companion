@@ -16,7 +16,16 @@ from zoneinfo import ZoneInfo
 
 from .astrbot_compat import logger
 from .identity import parse_scope_from_session
-from .models import EntityRef, MemoryRecord, SessionContext, clean_text, json_dumps, stable_fingerprint, utc_now
+from .models import (
+    EntityRef,
+    MemoryRecord,
+    SessionContext,
+    clean_text,
+    is_valid_person_id,
+    json_dumps,
+    stable_fingerprint,
+    utc_now,
+)
 
 
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
@@ -1433,6 +1442,9 @@ class HistoricalChatImporter:
         user_name = clean_text(payload.get("user_name"), 80)
         bot_id = clean_text(payload.get("bot_id"), 120)
         bot_name = clean_text(payload.get("bot_name"), 80) or "Bot"
+        subject_person_id = clean_text(payload.get("subject_person_id"), 80)
+        if subject_person_id and not is_valid_person_id(subject_person_id):
+            raise ValueError("关联人物 ID 格式无效")
         if not user_id:
             raise ValueError("请填写目标用户 ID")
         if not bot_id:
@@ -1491,12 +1503,15 @@ class HistoricalChatImporter:
             }
             for speaker, mapping in sorted(speaker_map.items())
         }
-        fingerprint = stable_fingerprint(
+        fingerprint_parts = [
             manifest.get("parse_hash") or manifest.get("source_hash"),
             session_id,
             bot_id,
-            json.dumps(identity_fingerprint, ensure_ascii=False, sort_keys=True),
-        )
+        ]
+        if subject_person_id:
+            fingerprint_parts.append(subject_person_id)
+        fingerprint_parts.append(json.dumps(identity_fingerprint, ensure_ascii=False, sort_keys=True))
+        fingerprint = stable_fingerprint(*fingerprint_parts)
         batch_id = "chatimp_" + fingerprint[:24]
         existing = await self.store.get_chat_import_batch(batch_id)
         if existing and existing.get("state") not in {"rolled_back", "failed"}:
@@ -1530,6 +1545,7 @@ class HistoricalChatImporter:
                         "user_name": user_name,
                         "bot_id": bot_id,
                         "bot_name": bot_name,
+                        "subject_person_id": subject_person_id,
                     },
                 },
                 ensure_ascii=False,
@@ -1622,6 +1638,7 @@ class HistoricalChatImporter:
                     "reused_timeline_count": len(timeline_ids) - len(newly_inserted_ids),
                     "summarized_source_message_count": len(messages_to_summarize),
                     "segment_count": len(db_segments),
+                    "subject_person_id": subject_person_id,
                 }
             )
             await self.store.upsert_chat_import_batch(
@@ -2351,6 +2368,7 @@ class HistoricalChatImporter:
         narrative_summary = clean_text(result.get("summary"), 1200)
         canonical_summary = clean_text(result.get("canonical_summary"), 1600)
         neutral_content = self._neutral_detailed_summary(narrative_summary, canonical_summary)
+        subject_person_id, identity_assurance = self._batch_subject_person_binding(batch)
         return MemoryRecord(
             id="mem_" + stable_fingerprint(batch["id"], segment["id"], neutral_content)[:20],
             memory_type="conversation_summary",
@@ -2367,6 +2385,8 @@ class HistoricalChatImporter:
             evidence="\n".join(evidence_lines),
             confidence=result["confidence"],
             importance=result["importance"],
+            subject_person_id=subject_person_id,
+            identity_assurance=identity_assurance,
             review_status="auto",
             tags=["summary", "historical_chat", "long_term", *result["topics"][:5]],
             metadata={
@@ -2388,6 +2408,14 @@ class HistoricalChatImporter:
             source_plugin="historical_chat_import",
             import_batch_id=batch["id"],
         )
+
+    @staticmethod
+    def _batch_subject_person_binding(batch: dict[str, Any]) -> tuple[str, str]:
+        stats = batch.get("stats") if isinstance(batch.get("stats"), dict) else {}
+        person_id = clean_text(batch.get("subject_person_id") or stats.get("subject_person_id"), 80)
+        if not is_valid_person_id(person_id):
+            return "", ""
+        return person_id, "explicit_linked"
 
     def _entity_for_name(self, batch: dict[str, Any], name: str) -> EntityRef:
         query = clean_text(name, 80)
@@ -2605,6 +2633,7 @@ class HistoricalChatImporter:
         summary_memory_id: str,
     ) -> int:
         created = 0
+        subject_person_id, identity_assurance = self._batch_subject_person_binding(batch)
         for event in result["important_events"]:
             actor = self._entity_for_name(batch, event["actor"])
             object_ref = self._entity_for_name(batch, event["object"])
@@ -2624,6 +2653,8 @@ class HistoricalChatImporter:
                 evidence="；".join(event["source_message_ids"]),
                 confidence=event["confidence"],
                 importance=event["importance"],
+                subject_person_id=subject_person_id,
+                identity_assurance=identity_assurance,
                 review_status="auto" if event["confidence"] >= 0.7 else "pending",
                 tags=["important_event", "historical_chat", event["event_type"], event["status"]],
                 metadata={
@@ -3375,6 +3406,7 @@ class HistoricalChatImporter:
             return result
 
     async def _insert_reconciled_memories(self, batch: dict[str, Any], output: dict[str, Any]) -> None:
+        subject_person_id, identity_assurance = self._batch_subject_person_binding(batch)
         for raw in output.get("daily_digests") or []:
             if not isinstance(raw, dict):
                 continue
@@ -3398,6 +3430,8 @@ class HistoricalChatImporter:
                 evidence="；".join(raw.get("source_message_ids") or []),
                 confidence=0.72,
                 importance=max(0.0, min(1.0, float(raw.get("importance") or 0.58))),
+                subject_person_id=subject_person_id,
+                identity_assurance=identity_assurance,
                 tags=["daily_digest", "historical_chat", date],
                 metadata={
                     "date": date,
@@ -3440,6 +3474,8 @@ class HistoricalChatImporter:
                 evidence="；".join(raw.get("source_message_ids") or []),
                 confidence=confidence,
                 importance=0.7,
+                subject_person_id=subject_person_id,
+                identity_assurance=identity_assurance,
                 review_status="auto" if confidence >= 0.75 else "pending",
                 tags=["stable_fact", "historical_chat"],
                 metadata={
@@ -3466,6 +3502,7 @@ class HistoricalChatImporter:
             return
         start_at = clean_text(summaries[0].get("start_at"), 80)
         end_at = clean_text(summaries[-1].get("end_at"), 80)
+        subject_person_id, identity_assurance = self._batch_subject_person_binding(batch)
         record = MemoryRecord(
             id="mem_" + stable_fingerprint(batch["id"], "relationship_phase_summary", content)[:20],
             memory_type="relationship_phase_summary",
@@ -3481,6 +3518,8 @@ class HistoricalChatImporter:
             content=content,
             confidence=0.7,
             importance=0.72,
+            subject_person_id=subject_person_id,
+            identity_assurance=identity_assurance,
             tags=["relationship_phase", "historical_chat", "long_term"],
             metadata={
                 "start_at": start_at,

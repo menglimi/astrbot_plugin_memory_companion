@@ -237,11 +237,21 @@ class RetrievalEngine:
                 continue
             memory_platform = _platform_family(getattr(memory, "platform", ""))
             current_platform = _platform_family(getattr(ctx, "platform", ""))
-            if memory_platform and current_platform and memory_platform != current_platform:
+            same_session = bool(
+                getattr(memory, "session_id", "")
+                and getattr(memory, "session_id", "") == getattr(ctx, "session_id", "")
+            )
+            explicit_person_link = self.policy.explicit_person_link_matches(memory, ctx)
+            if (
+                memory_platform and current_platform
+                and memory_platform != current_platform
+                and not same_session
+                and not explicit_person_link
+            ):
                 blocked.append({"id": memory_id, "reason": "other_platform", "content": ""})
                 continue
             owner_visible, owner_reason = self.policy._bot_owner_visible(memory, ctx)
-            if not owner_visible:
+            if not owner_visible and not explicit_person_link:
                 blocked.append(
                     {
                         "id": memory_id,
@@ -313,7 +323,7 @@ class RetrievalEngine:
         total_limit: int = 6,
         time_intent: TimeIntent | None = None,
         capped_slots: set[str] | None = None,
-    ) -> tuple[list[SearchResult], list[dict[str, str]], dict[str, list[SearchResult]]]:
+    ) -> tuple[list[SearchResult], list[dict[str, Any]], dict[str, list[SearchResult]]]:
         self.start_latency_budget()
         ranked, blocked = await self._rank_candidates(query, ctx, time_intent=time_intent)
         total = max(1, int(total_limit or 1))
@@ -436,6 +446,31 @@ class RetrievalEngine:
         blocked.extend(mutable_blocked)
         selected, source_blocked, slot_map = self._collapse_redundant_source_slots(selected, slot_map)
         blocked.extend(source_blocked)
+        selected_ids = {item.memory.id for item in selected}
+        slot_capped: list[dict[str, Any]] = []
+        for slot in sorted(slot_limits):
+            limit = max(0, int(slot_limits.get(slot, 0) or 0))
+            if limit <= 0 or len(slot_map.get(slot, [])) < limit:
+                continue
+            omitted = 0
+            for candidate in ranked:
+                if candidate.memory.id in selected_ids:
+                    continue
+                if self._slot_for_memory(candidate.memory, ctx) != slot:
+                    continue
+                if not selectable_for_slot(candidate, slot):
+                    continue
+                slot_capped.append({
+                    "id": candidate.memory.id,
+                    "reason": f"slot_capped:{slot}",
+                    "slot": slot,
+                    "score": round(float(candidate.score), 4),
+                    "content": "",
+                })
+                omitted += 1
+                if omitted >= 3:
+                    break
+        blocked = slot_capped + blocked
         return selected, blocked, {slot: items for slot, items in slot_map.items() if items}
 
     def start_latency_budget(self) -> None:
@@ -1439,6 +1474,8 @@ class RetrievalEngine:
                         "session_id": ctx.session_id,
                         "user_id": ctx.user_id,
                         "group_id": ctx.group_id,
+                        "subject_person_id": ctx.subject_person_id,
+                        "identity_assurance": ctx.identity_assurance,
                         "limit": self.current_window_candidate_limit,
                     },
                     fts_terms=keyword_terms,
@@ -1499,6 +1536,8 @@ class RetrievalEngine:
                     group_id=ctx.group_id,
                     limit=self.current_window_candidate_limit,
                     include_pending=include_pending,
+                    subject_person_id=ctx.subject_person_id,
+                    identity_assurance=ctx.identity_assurance,
                 ),
                 self.store.list_fts_candidate_memories(
                     keyword_terms,
@@ -1746,7 +1785,8 @@ class RetrievalEngine:
         block_profile = self._query_blocks_profile_retrieval(query)
         authorization_key = (
             ctx.scope, ctx.session_id, ctx.platform, ctx.user_id, ctx.group_id,
-            ctx.bot_id, ctx.persona_id, ctx.strict_session_only,
+            ctx.bot_id, ctx.persona_id, ctx.subject_person_id,
+            ctx.identity_assurance, ctx.strict_session_only,
             self.policy.allow_self_timeline_everywhere, self.policy.allow_group_public_in_private,
             self.policy.hide_pending_review, self.policy.include_raw_events,
             self.policy.enable_acl_rules, self.policy.admin_read_all,

@@ -213,10 +213,6 @@ def clean_private_companion_history_text(text: Any) -> tuple[str, bool, bool]:
         if private_companion_proactive_text_is_internal(stripped):
             removed_line = True
             continue
-        lowered = stripped.lower()
-        if "send_message_to_user" in lowered or "tool `send_message_to_user`" in lowered:
-            removed_line = True
-            continue
         if any(stripped.startswith(heading) for heading in PRIVATE_COMPANION_PROACTIVE_BLOCK_HEADINGS):
             removed_line = True
             continue

@@ -15,6 +15,7 @@ from typing import Any
 
 from .models import json_dumps
 from . import query_notes
+from .tool_schema import project_tool_schema
 
 
 PROFILE = "memory.local-query-session.v1"
@@ -544,7 +545,7 @@ def bind_query_tool_schema(manager: Any, module_path: str) -> bool:
     tool = manager.get_func(TOOL_NAME)
     if tool is None or tool.handler_module_path != module_path:
         return False
-    tool.parameters = {k: deepcopy(v) for k, v in request_schema().items() if k not in {"$schema", "$id", "title"}}
+    tool.parameters = project_tool_schema(request_schema())
     source = manager.get_func("memory_companion_sources")
     if source is not None and source.handler_module_path == module_path:
         source.parameters.get("properties", {}).pop("query_note", None)
@@ -577,7 +578,7 @@ def bind_source_query_v2_schema(manager: Any, module_path: str) -> bool:
         schema = _legacy_source_schema()
     except (OSError, ValueError, KeyError, ImportError):
         return False
-    source.parameters = deepcopy(schema)
+    source.parameters = project_tool_schema(schema)
     function = inspect.unwrap(source.handler)
     setattr(function, "_memory_source_query_profile", SOURCE_QUERY_PROFILE_V2)
     setattr(function, "_memory_source_query_module", module_path)
@@ -637,9 +638,7 @@ def bind_query_tool_v3_schema(manager: Any, module_path: str) -> bool:
         request_validator_v3()
     except (OSError, ValueError, KeyError, ImportError):
         return False
-    wrapper.parameters = {
-        k: deepcopy(v) for k, v in schema.items() if k not in {"$schema", "$id", "title"}
-    }
+    wrapper.parameters = project_tool_schema(schema)
     # Mark the unwrapped callables so request-local projection can prove that
     # the tool was registered by this plugin, rather than trusting a same-name
     # tool supplied by another extension.
@@ -720,13 +719,15 @@ def offer_query_tool(service: Any, req: Any, ctx: Any, event: Any) -> None:
         if item.name == "memory_companion_sources" and _marked_source_v2_handler(item):
             from .source_query_v2 import request_schema as batch_schema
             item = copy(item)
-            item.parameters = deepcopy(_legacy_source_schema())
+            item.parameters = project_tool_schema(_legacy_source_schema())
             if (event is not None and service.config.bool("memory_tools.enable_source_query_v2", False)
                     and service._memory_reconstruction_enabled(ctx)):
                 legacy = deepcopy(item.parameters)
                 batch = {k: deepcopy(v) for k, v in batch_schema().items() if k not in {"$schema", "$id", "title"}}
-                item.parameters = {"type": "object", "additionalProperties": False,
-                                   "properties": deepcopy(legacy["properties"]), "anyOf": [legacy, batch]}
+                item.parameters = project_tool_schema({
+                    "type": "object", "additionalProperties": False,
+                    "properties": deepcopy(legacy["properties"]), "anyOf": [legacy, batch],
+                })
                 item.parameters["properties"]["action"]["enum"].append("range_batch")
                 item.description += (
                     " range_batch 按消息观察时间正序连续读取 [start_at,end_at)，使用服务配置的字节/消息/片段预算。"
@@ -771,10 +772,10 @@ def offer_query_tool(service: Any, req: Any, ctx: Any, event: Any) -> None:
         return
     projected = copy(wrapper)
     projected.description = "各记忆查询返回 result（本次资料）和 progress（短进度）。已有原文够用时可直接回答，进度不用写进回复。status 仅按需回看较早操作和有效续页，不检索、不总结。"
-    projected.parameters = {"type": "object", "additionalProperties": False, "properties": {
+    projected.parameters = project_tool_schema({"type": "object", "additionalProperties": False, "properties": {
         "operation": {"type": "string", "enum": ["status", "discover"] if discover_available else ["status"], "default": "status"},
         "parameters": {"type": "object", "additionalProperties": False, "properties": {}},
-    }}
+    }})
     if discover_available:
         projected.description += (
             " discover 用语义索引找历史来源候选；结果可能不完整，不代表已证明查全。"
@@ -797,10 +798,12 @@ def offer_query_tool(service: Any, req: Any, ctx: Any, event: Any) -> None:
                 note_source.parameters.setdefault("properties", {})["query_note"] = note_schema
                 for branch in note_source.parameters.get("anyOf", []):
                     branch.setdefault("properties", {})["query_note"] = deepcopy(note_schema)
+                note_source.parameters = project_tool_schema(note_source.parameters)
                 tools = [note_source if t is source else t for t in tools]
                 projected.parameters["properties"]["parameters"] = query_notes.status_parameters()
                 projected.description += " sources 可随查询附 query_note，保留此前已读材料的简短理解和引用；足够回答无需记事。status 可用 note_ids 回看，便笺是模型理解，日期和补充细节仍以原文为据。"
                 event._memory_query_notes = service._reconstruction_budget_key(event, ctx)
+    projected.parameters = project_tool_schema(projected.parameters)
     clone = copy(toolset)
     clone.tools = [projected if t is wrapper else t for t in tools]
     req.func_tool = clone

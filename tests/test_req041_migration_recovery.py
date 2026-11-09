@@ -37,10 +37,23 @@ class MigrationOutboxTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = Path(self.tmp.name) / "req041.sqlite3"
         self.outbox = MigrationOutbox(self.path, clock=lambda: 100.0)
+        self.reopened_outboxes = []
         self.outbox.begin_epoch(EPOCH, policy_version=POLICY)
 
     def tearDown(self) -> None:
+        for outbox in self.reopened_outboxes:
+            outbox.close()
+        self.outbox.close()
         self.tmp.cleanup()
+
+    def test_connection_is_reused_until_outbox_close(self) -> None:
+        with self.outbox._connection() as first:
+            pass
+        with self.outbox._connection() as second:
+            self.assertIs(first, second)
+
+        self.outbox.close()
+        self.assertIsNone(self.outbox._conn)
 
     def _enqueue(self, *, event: str = "event-1", revision: int = 1, payload=None) -> str:
         return self.outbox.enqueue(
@@ -56,6 +69,7 @@ class MigrationOutboxTests(unittest.TestCase):
         self.assertEqual("enqueued", self._enqueue())
         self.assertEqual("duplicate", self._enqueue())
         reopened = MigrationOutbox(self.path, clock=lambda: 101.0)
+        self.reopened_outboxes.append(reopened)
         pending = reopened.pending(EPOCH)
         self.assertEqual(1, len(pending))
         self.assertEqual("event-1", pending[0].event_id)
@@ -107,12 +121,14 @@ class MigrationOutboxTests(unittest.TestCase):
         with self.assertRaises(OutboxConflict):
             self.outbox.add_tombstone("identity:person-a", EPOCH, revision=3, reason_code="delete")
         reopened = MigrationOutbox(self.path)
+        self.reopened_outboxes.append(reopened)
         self.assertEqual(2, reopened.tombstone("identity:person-a", EPOCH)["revision"])
 
     def test_epoch_checkpoint_survives_restart(self) -> None:
         state = self.outbox.set_epoch_state(EPOCH, "replaying", checkpoint="identity:42")
         self.assertEqual("identity:42", state["checkpoint"])
         reopened = MigrationOutbox(self.path)
+        self.reopened_outboxes.append(reopened)
         self.assertEqual("replaying", reopened.epoch_status(EPOCH)["state"])
         self.assertEqual("identity:42", reopened.epoch_status(EPOCH)["checkpoint"])
 

@@ -86,6 +86,8 @@ class ScopedStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock if callable(clock) else time.time
         self._lock = threading.RLock()
+        self._conn: sqlite3.Connection | None = None
+        self._closed = False
         self._active_epoch = ""
         self._active_policy_version = ""
         self._epoch_revision = 0
@@ -94,7 +96,9 @@ class ScopedStore:
             self.initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.path), timeout=15.0, isolation_level=None)
+        conn = sqlite3.connect(
+            str(self.path), timeout=15.0, isolation_level=None, check_same_thread=False,
+        )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
@@ -107,16 +111,21 @@ class ScopedStore:
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        conn = self._connect()
-        try:
-            yield conn
-        finally:
-            conn.close()
+        with self._lock:
+            if self._closed:
+                raise ScopedStoreError("scoped_store_closed")
+            if self._conn is None:
+                self._conn = self._connect()
+            yield self._conn
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
-            conn = self._connect()
+            if self._closed:
+                raise ScopedStoreError("scoped_store_closed")
+            if self._conn is None:
+                self._conn = self._connect()
+            conn = self._conn
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 yield conn
@@ -126,7 +135,14 @@ class ScopedStore:
                 if conn.in_transaction:
                     conn.execute("ROLLBACK")
                 raise
-            finally:
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            conn, self._conn = self._conn, None
+            if conn is not None:
                 conn.close()
 
     def initialize(self) -> None:

@@ -39,6 +39,18 @@ def clean_text(value: Any, limit: int = 2000) -> str:
     return text
 
 
+def normalize_explicit_person_binding(person_id: Any, identity_assurance: Any) -> tuple[str, str]:
+    normalized_id = clean_text(person_id, 80)
+    assurance = clean_text(identity_assurance, 40)
+    if assurance != "explicit_linked" or re.fullmatch(r"person_[0-9a-f]{24}", normalized_id) is None:
+        return "", ""
+    return normalized_id, assurance
+
+
+def is_valid_person_id(person_id: Any) -> bool:
+    return re.fullmatch(r"person_[0-9a-f]{24}", clean_text(person_id, 80)) is not None
+
+
 def is_memory_placeholder(memory: Any) -> bool:
     """Return whether a record is an internal, non-recallable placeholder.
 
@@ -132,6 +144,8 @@ class SessionContext:
     companion_expression_self_disclosure: str = ""
     companion_expression_humor_mode: str = ""
     companion_expression_topic_initiative: str = ""
+    subject_person_id: str = ""
+    identity_assurance: str = ""
 
     @property
     def current_target_id(self) -> str:
@@ -190,6 +204,8 @@ class MemoryRecord:
     content_fingerprint: str = ""
     merged_count: int = 1
     supersedes_id: str = ""
+    subject_person_id: str = ""
+    identity_assurance: str = ""
 
     def ensure_defaults(self) -> "MemoryRecord":
         now = utc_now()
@@ -213,6 +229,14 @@ class MemoryRecord:
             self.owner_bot_id or metadata.get("owner_bot_id"),
             120,
         )
+        if self.scope == "private" and self.visibility == "private_pair":
+            self.subject_person_id, self.identity_assurance = normalize_explicit_person_binding(
+                self.subject_person_id,
+                self.identity_assurance,
+            )
+        else:
+            self.subject_person_id = ""
+            self.identity_assurance = ""
         validity_source = self.validity_status
         if validity_source == "active" and metadata.get("validity_status"):
             validity_source = metadata.get("validity_status")
@@ -310,6 +334,8 @@ class MemoryRecord:
             "confidence": self.confidence,
             "importance": self.importance,
             "owner_bot_id": self.owner_bot_id,
+            "subject_person_id": self.subject_person_id,
+            "identity_assurance": self.identity_assurance,
             "validity_status": self.validity_status,
             "valid_from": self.valid_from,
             "valid_to": self.valid_to,
@@ -369,6 +395,8 @@ class MemoryRecord:
             confidence=float(row_value(row, "confidence", 0.5) or 0.0),
             importance=float(row_value(row, "importance", 0.3) or 0.0),
             owner_bot_id=row_value(row, "owner_bot_id", ""),
+            subject_person_id=row_value(row, "subject_person_id", ""),
+            identity_assurance=row_value(row, "identity_assurance", ""),
             validity_status=row_value(row, "validity_status", "active"),
             valid_from=row_value(row, "valid_from", ""),
             valid_to=row_value(row, "valid_to", ""),

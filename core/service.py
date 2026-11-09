@@ -368,6 +368,7 @@ class MemoryCompanionService:
                 self._initialize_database_sync()
             except BaseException:
                 self.store.close()
+                self.scoped_store.close()
                 raise
         self.portraits = PortraitService(self.store, self.config)
 
@@ -501,6 +502,7 @@ class MemoryCompanionService:
                 self.store.initialize()
             except Exception as exc:
                 self.store.close()
+                self.scoped_store.close()
                 raise RuntimeError(
                     f"记忆主库初始化失败 [primary_store.initialize]: {type(exc).__name__}: {exc}"
                 ) from exc
@@ -508,6 +510,7 @@ class MemoryCompanionService:
                 self.scoped_store.initialize()
             except Exception as exc:
                 self.store.close()
+                self.scoped_store.close()
                 raise RuntimeError(
                     f"作用域记忆库初始化失败 [scoped_store.initialize]: {type(exc).__name__}: {exc}"
                 ) from exc
@@ -2160,6 +2163,8 @@ class MemoryCompanionService:
                 group_id=clean_text(group_id, 120),
                 bot_id=clean_text(event_metadata.get("bot_id"), 120),
                 persona_id=scope_ctx.persona_id,
+                subject_person_id=scope_ctx.subject_person_id,
+                identity_assurance=scope_ctx.identity_assurance,
                 message_id=clean_text(message_id, 120),
                 message_text=text,
             )
@@ -3638,6 +3643,8 @@ class MemoryCompanionService:
                 "group_id": clean_text(ctx.group_id, 120),
                 "bot_id": clean_text(ctx.bot_id, 120),
                 "persona_id": clean_text(ctx.persona_id, 96),
+                "subject_person_id": clean_text(ctx.subject_person_id, 80),
+                "identity_assurance": clean_text(ctx.identity_assurance, 40),
             },
             "time": time_payload,
             "slots": slot_limits or {},
@@ -3713,6 +3720,9 @@ class MemoryCompanionService:
                 "path": "skipped",
                 "reason": "scope_recall_disabled",
                 "scope": clean_text(ctx.scope, 40),
+                "slot_counts": {},
+                "slot_limits": {},
+                "capped_slots": [],
             }
             return []
         cache_key = await self._retrieval_cache_key(
@@ -3849,6 +3859,9 @@ class MemoryCompanionService:
             slot_map = {slot: items for slot, items in slot_map.items() if items}
             self._last_retrieval_path_info = dict(cached.get("path_info") or {})
             self._last_retrieval_path_info["cache"] = "hit"
+            self._last_retrieval_path_info["slot_counts"] = {
+                slot: len(items) for slot, items in slot_map.items()
+            }
             return results, blocked, slot_map
         engine = await self._retrieval_engine(ctx, admin_read_all=admin_read_all)
         if not self.config.bool("context_orchestration.enabled", True):
@@ -3856,6 +3869,11 @@ class MemoryCompanionService:
             self._last_retrieval_path_info = dict(engine.last_path_info or {})
             self._last_retrieval_path_info["cache"] = "miss"
             slot_map = {"stable_memory": results}
+            self._last_retrieval_path_info.update({
+                "slot_counts": {slot: len(items) for slot, items in slot_map.items()},
+                "slot_limits": {},
+                "capped_slots": [],
+            })
             self._set_retrieval_cache(
                 cache_key,
                 {
@@ -3876,6 +3894,17 @@ class MemoryCompanionService:
         )
         self._last_retrieval_path_info = dict(engine.last_path_info or {})
         self._last_retrieval_path_info["cache"] = "miss"
+        actual_capped_slots = set(capped_slots)
+        actual_capped_slots.update(
+            clean_text(item.get("slot"), 60)
+            for item in blocked
+            if str(item.get("reason", "")).startswith("slot_capped:")
+        )
+        self._last_retrieval_path_info.update({
+            "slot_counts": {slot: len(items) for slot, items in slot_map.items()},
+            "slot_limits": dict(slot_limits),
+            "capped_slots": sorted(slot for slot in actual_capped_slots if slot),
+        })
         self._set_retrieval_cache(
             cache_key,
             {
@@ -5439,6 +5468,8 @@ class MemoryCompanionService:
             group_id=record.group_id,
             bot_id=clean_text(record.owner_bot_id or metadata.get("owner_bot_id"), 120),
             persona_id=clean_text(metadata.get("persona_id"), 96),
+            subject_person_id=record.subject_person_id,
+            identity_assurance=record.identity_assurance,
             message_id=record.message_id,
         )
 
@@ -5453,6 +5484,8 @@ class MemoryCompanionService:
             group_name=ctx.group_name,
             bot_id=ctx.bot_id,
             persona_id=ctx.persona_id,
+            subject_person_id=ctx.subject_person_id,
+            identity_assurance=ctx.identity_assurance,
             message_id=ctx.message_id,
             message_text=ctx.message_text,
             strict_session_only=ctx.strict_session_only,
@@ -5913,6 +5946,8 @@ class MemoryCompanionService:
                 evidence=evidence,
                 confidence=0.72 if evidence_gate_passed else 0.42,
                 importance=float((payload or {}).get("importance", 0.68) or 0.68),
+                subject_person_id=ctx.subject_person_id,
+                identity_assurance=ctx.identity_assurance,
                 review_status="auto" if evidence_gate_passed else "pending",
                 tags=[
                     "summary",
@@ -6023,6 +6058,8 @@ class MemoryCompanionService:
             ),
             confidence=0.4,
             importance=0.3,
+            subject_person_id=ctx.subject_person_id,
+            identity_assurance=ctx.identity_assurance,
             review_status="pending",
             tags=["summary", "evidence_candidate", "summary_validation_failed", ctx.scope],
             owner_bot_id=self._bot_subject_id(ctx),
@@ -6216,6 +6253,8 @@ class MemoryCompanionService:
                 "long_term" if promotable else "evidence_candidate",
             ],
             owner_bot_id=self._bot_subject_id(ctx),
+            subject_person_id=ctx.subject_person_id,
+            identity_assurance=ctx.identity_assurance,
             durability="normal" if promotable else "short",
             sensitivity="internal",
             metadata={
@@ -6826,6 +6865,8 @@ class MemoryCompanionService:
             evidence=content,
             confidence=0.9,
             importance=0.75,
+            subject_person_id=ctx.subject_person_id,
+            identity_assurance=ctx.identity_assurance,
             review_status="auto",
             tags=["manual"],
             metadata={"owner_bot_id": self._bot_subject_id(ctx)},
@@ -7406,6 +7447,8 @@ class MemoryCompanionService:
                 evidence=ctx.message_text,
                 confidence=memory_proposal.confidence,
                 importance=memory_proposal.importance,
+                subject_person_id=ctx.subject_person_id,
+                identity_assurance=ctx.identity_assurance,
                 review_status="auto" if memory_proposal.confidence >= 0.55 else "pending",
                 tags=["llm_tool", note_type, ctx.scope],
                 valid_from=memory_proposal.valid_from,
@@ -9156,6 +9199,8 @@ class MemoryCompanionService:
             evidence=evidence,
             confidence=0.7,
             importance=max(0.45, min(0.78, max(record.importance for record in records) + 0.05)),
+            subject_person_id=sample.subject_person_id,
+            identity_assurance=sample.identity_assurance,
             review_status="auto",
             tags=["summary", "decay_summary", "sleep_maintenance", sample.scope],
             metadata={
@@ -9220,6 +9265,8 @@ class MemoryCompanionService:
             group_name=sample.object.name if sample.object.kind == "group" else "",
             bot_id=clean_text(sample.owner_bot_id or metadata.get("owner_bot_id"), 120),
             persona_id=clean_text(metadata.get("persona_id"), 96),
+            subject_person_id=sample.subject_person_id,
+            identity_assurance=sample.identity_assurance,
             message_text="",
         )
 
@@ -9969,6 +10016,9 @@ class MemoryCompanionService:
             companion_bot_energy=_bot_energy,
             time_of_day=scene_time_of_day,
         )
+        retrieval_path_info["slot_counts"] = {
+            slot: len(items) for slot, items in slot_map.items() if items
+        }
         results = self._flatten_slot_map(slot_map)
         injection_max_chars = self._injection_max_chars_for_query(ctx, retrieval_query, time_intent=time_intent)
         if short_reply_anchor:
@@ -10030,6 +10080,7 @@ class MemoryCompanionService:
             published = await self._publish_reply_memory_context(
                 ctx, req, event=event, injection=injection, slot_map=slot_map,
                 strategy_id="existing.search_context_slots",
+                retrieval_info=retrieval_path_info,
             )
         else:
             self._mark_memory_companion_injection_state(event, req, injected=False, conversation_memory=False, slot_map=slot_map)
@@ -10045,6 +10096,11 @@ class MemoryCompanionService:
                 selected_memory_ids=actual_injected_memory_ids if published else [],
                 blocked_reasons=blocked[:30],
                 injection_chars=len(injection) if published else 0,
+                retrieval_info={
+                    "slot_counts": retrieval_path_info.get("slot_counts", {}),
+                    "slot_limits": retrieval_path_info.get("slot_limits", {}),
+                    "capped_slots": retrieval_path_info.get("capped_slots", []),
+                },
             )
         if stage_timer:
             stage_timer.mark("compose_log")
@@ -10111,6 +10167,7 @@ class MemoryCompanionService:
     async def _publish_reply_memory_context(
         self, ctx: SessionContext, req: Any, *, event: Any, injection: str,
         slot_map: dict[str, list[Any]], strategy_id: str,
+        retrieval_info: dict[str, Any] | None = None,
     ) -> bool:
         remove_temp_text(req, MEMORY_COMPANION_INJECTION_HEADER, MEMORY_COMPANION_INJECTION_FOOTER)
         self._mark_memory_companion_injection_state(event, req, injected=False, conversation_memory=False, slot_map=slot_map)
@@ -10205,9 +10262,16 @@ class MemoryCompanionService:
             except Exception as exc:
                 logger.warning("[MemoryCompanion] Role input receipt unavailable: %s", type(exc).__name__)
         await self._mark_injected_memories([ref["id"] for ref in refs])
+        info = retrieval_info or {}
         logger.info(
-            "[MemoryCompanion] 已注入当前轮记忆: session=%s snapshot=%s count=%s chars=%s",
-            ctx.session_id, snapshot["snapshot_id"], len(refs), len(injection),
+            "[MemoryCompanion] 已注入当前轮记忆: session=%s snapshot=%s count=%s chars=%s slots=%s limits=%s capped=%s",
+            ctx.session_id,
+            snapshot["snapshot_id"],
+            len(refs),
+            len(injection),
+            json_dumps(info.get("slot_counts", {})),
+            json_dumps(info.get("slot_limits", {})),
+            json_dumps(info.get("capped_slots", [])),
         )
         return True
 
@@ -12542,7 +12606,9 @@ class MemoryCompanionService:
         if decision.layer == "current_state_chat":
             return "mention", "current_state_recent_context"
 
-        if confidence < 0.58 or (age_days is not None and age_days >= 45 and score < 1.15):
+        if confidence < 0.55 or (age_days is not None and age_days >= 45 and score < 1.15):
+            if confidence < 0.55:
+                return "uncertain", f"low_confidence:confidence={confidence:.2f}:threshold=0.55"
             return "uncertain", "low_confidence_or_old"
         if (
             ctx.scope == "group"
@@ -13200,6 +13266,8 @@ class MemoryCompanionService:
             group_name=ctx.group_name,
             bot_id=ctx.bot_id,
             persona_id=ctx.persona_id,
+            subject_person_id=ctx.subject_person_id,
+            identity_assurance=ctx.identity_assurance,
             message_id=ctx.message_id,
             message_text=ctx.message_text,
             strict_session_only=ctx.strict_session_only,
@@ -13687,7 +13755,10 @@ class MemoryCompanionService:
 
     def _close_store_sync(self) -> None:
         with self._database_init_lock:
-            self.store.close()
+            try:
+                self.store.close()
+            finally:
+                self.scoped_store.close()
 
     def shutdown_evidence(self) -> dict[str, Any]:
         """Return structured resource state for the shutdown completion log."""

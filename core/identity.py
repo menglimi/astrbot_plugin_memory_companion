@@ -4,7 +4,12 @@ import inspect
 import re
 from typing import Any, Callable
 
-from .models import EntityRef, SessionContext, clean_text
+try:
+    from ..unified_profile_contract import validate_profile_dto
+except ImportError:  # Existing standalone core.* test/import compatibility.
+    from unified_profile_contract import validate_profile_dto  # type: ignore[no-redef]
+
+from .models import EntityRef, SessionContext, clean_text, normalize_explicit_person_binding
 
 
 async def maybe_await(value: Any) -> Any:
@@ -139,6 +144,17 @@ class IdentityResolver:
         if scope == "unknown" and user_id:
             scope = "private"
 
+        subject_person_id = ""
+        identity_assurance = ""
+        profile_dto = getattr(event, "private_companion_unified_profile_context", None)
+        if scope == "private" and user_id and not validate_profile_dto(profile_dto):
+            person_ref = profile_dto.get("person_ref")
+            if isinstance(person_ref, dict) and person_ref.get("profile_status") == "active":
+                subject_person_id, identity_assurance = normalize_explicit_person_binding(
+                    person_ref.get("person_id"),
+                    person_ref.get("identity_assurance"),
+                )
+
         return SessionContext(
             session_id=session_id,
             scope=scope,
@@ -149,6 +165,8 @@ class IdentityResolver:
             group_name=clean_text(group_name, 80),
             bot_id=clean_text(bot_id, 120),
             persona_id=persona_id,
+            subject_person_id=subject_person_id,
+            identity_assurance=identity_assurance,
             message_id=clean_text(message_id, 120),
             message_text=clean_text(text, 2000),
         )
