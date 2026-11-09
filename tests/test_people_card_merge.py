@@ -25,6 +25,7 @@ def _record(
     *,
     owner_bot_id: str = "bot-a",
     platform: str = "qq",
+    durability: str = "normal",
 ):
     return MemoryRecord(
         id=doc_id,
@@ -36,7 +37,7 @@ def _record(
         visibility="private_pair",
         lifecycle="stable_memory",
         owner_bot_id=owner_bot_id,
-        durability="normal",
+        durability=durability,
         content=content,
         occurred_at="",
     )
@@ -122,6 +123,41 @@ class PeopleCardMergeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, scoped["memory_count"])
 
     async def test_card_follows_the_heaviest_row(self) -> None:
+        for index in range(6):
+            await self.store.insert_memory(
+                _record(
+                    f"a{index}",
+                    "u1",
+                    "甲。",
+                    owner_bot_id="bot-a",
+                    platform="qq",
+                    durability="pinned",
+                )
+            )
+        await self.store.insert_memory(
+            _record("b0", "u1", "乙。", owner_bot_id="", platform="lark")
+        )
+        await self.store.person_weight(user_id="u1", platform="qq", bot_id="bot-a")
+        await self.store.person_weight(user_id="u1", platform="lark", bot_id="")
+        weights: dict[tuple[str, str], int] = {}
+        for platform, bot in (("qq", "bot-a"), ("lark", "")):
+            row = await self.store.person_weight(
+                user_id="u1", platform=platform, bot_id=bot, max_age_seconds=3600
+            )
+            weights[(bot, platform)] = row["weight"]
+        heaviest = max(weights, key=lambda key: weights[key])
+        self.assertGreater(weights[heaviest], min(weights.values()))
+
+        card = (await self.store.list_person_cards())["items"][0]
+        self.assertEqual(heaviest[0], card["bot_id"])
+        self.assertEqual(heaviest[1], card["platform"])
+        self.assertEqual(weights[heaviest], card["weight"])
+        self.assertEqual({"qq", "lark"}, set(card["platforms"]))
+        self.assertEqual(["bot-a"], card["bot_ids"])
+
+    async def test_weight_edit_applies_to_every_row_of_the_person(self) -> None:
+        # 面板改分量是对「这个人」说的：所有行一起改，否则合并卡取最大值，
+        # 用户把卡调低会被另一行顶回去。
         await self.store.insert_memory(
             _record("m1", "u1", "甲。", owner_bot_id="bot-a", platform="qq")
         )
@@ -133,16 +169,33 @@ class PeopleCardMergeTests(unittest.IsolatedAsyncioTestCase):
         await self.store.set_person_weight(
             user_id="u1", weight=60, platform="qq", bot_id="bot-a"
         )
-        await self.store.set_person_weight(
-            user_id="u1", weight=20, platform="lark", bot_id=""
-        )
 
         card = (await self.store.list_person_cards())["items"][0]
-        self.assertEqual("bot-a", card["bot_id"])
-        self.assertEqual("qq", card["platform"])
         self.assertEqual(60, card["weight"])
-        self.assertEqual(["qq", "lark"], card["platforms"])
-        self.assertEqual(["bot-a"], card["bot_ids"])
+        await self.store.set_person_weight(
+            user_id=card["user_id"],
+            weight=1,
+            platform=card["platform"],
+            bot_id=card["bot_id"],
+        )
+
+        for platform, bot in (("qq", "bot-a"), ("lark", "")):
+            row = await self.store.person_weight(
+                user_id="u1", platform=platform, bot_id=bot, max_age_seconds=3600
+            )
+            self.assertEqual(1, row["weight"], f"{bot}/{platform} 没跟上这次改动")
+        self.assertEqual(1, (await self.store.list_person_cards())["items"][0]["weight"])
+
+        # 重置也是按人：所有行退回「她自己掂量的」，correction 清零。
+        await self.store.set_person_weight(
+            user_id="u1", correction=0, platform="qq", bot_id="bot-a"
+        )
+        for platform, bot in (("qq", "bot-a"), ("lark", "")):
+            row = await self.store.person_weight(
+                user_id="u1", platform=platform, bot_id=bot, max_age_seconds=0
+            )
+            self.assertEqual(0, row["correction"])
+            self.assertNotEqual(1, row["weight"])
 
     async def test_detail_keeps_the_name_for_import_platforms(self) -> None:
         # 主行落在导入来源（livingmemory）上时，按平台查不到 identities，

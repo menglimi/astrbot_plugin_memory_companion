@@ -7847,49 +7847,84 @@ class MemoryStore(SummaryBatchStore):
         current = self._refresh_person_weight_sync(user_id, platform, bot_id)
         base = float(current.get("base") or 0.0)
         value = int(current.get("correction") or 0)
+        target: int | None = None
         if weight is not None:
-            value = clamp_weight(weight) - int(round(base))
+            target = clamp_weight(weight)
+            value = target - int(round(base))
         elif correction is not None:
             value = int(correction)
         value = max(-100, min(100, int(round(value))))
         now = utc_now()
-        final = self._person_weight_total(base, value, 1 if base > 0 else 0)
-        band = band_of(final)
+        # 分量是对「这个人」说的，不是对某一行说的：同一个人因为 bot / 平台不同
+        # 会在 person_weights 里占好几行，而合并后的卡取各行里最大的那个分量。
+        # 只写一行的话，用户把卡调低会被另一行顶回去，看起来像没生效，
+        # 所以这里把同一个人的所有行写成同一个目标。
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO person_weights (bot_id, platform, user_id, weight, base, correction,
-                                            band, source, confidence, components, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'user', 1.0, ?, ?, ?)
-                ON CONFLICT(bot_id, platform, user_id) DO UPDATE SET
-                    weight=excluded.weight,
-                    correction=excluded.correction,
-                    band=excluded.band,
-                    source='user',
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    bot_id,
-                    platform,
-                    user_id,
-                    final,
-                    base,
-                    value,
-                    band,
-                    json_dumps(current.get("components", {})),
-                    now,
-                    now,
-                ),
-            )
+            rows = [
+                dict(row)
+                for row in self._conn.execute(
+                    "SELECT bot_id, platform, base FROM person_weights WHERE user_id=?",
+                    (user_id,),
+                ).fetchall()
+            ]
+            if not any(
+                clean_text(row.get("bot_id"), 120) == bot_id
+                and clean_text(row.get("platform"), 40) == platform
+                for row in rows
+            ):
+                rows.append({"bot_id": bot_id, "platform": platform, "base": base})
+            clicked_final = 0
+            clicked_band = band_of(0)
+            for row in rows:
+                row_bot = clean_text(row.get("bot_id"), 120)
+                row_platform = clean_text(row.get("platform"), 40)
+                row_base = float(row.get("base") or 0.0)
+                row_correction = (
+                    target - int(round(row_base)) if target is not None else value
+                )
+                row_correction = max(-100, min(100, int(round(row_correction))))
+                row_weight = self._person_weight_total(
+                    row_base, row_correction, 1 if row_base > 0 else 0
+                )
+                row_band = band_of(row_weight)
+                if row_bot == bot_id and row_platform == platform:
+                    clicked_final = row_weight
+                    clicked_band = row_band
+                self._conn.execute(
+                    """
+                    INSERT INTO person_weights (bot_id, platform, user_id, weight, base, correction,
+                                                band, source, confidence, components, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1.0, ?, ?, ?)
+                    ON CONFLICT(bot_id, platform, user_id) DO UPDATE SET
+                        weight=excluded.weight,
+                        correction=excluded.correction,
+                        band=excluded.band,
+                        source=excluded.source,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        row_bot,
+                        row_platform,
+                        user_id,
+                        row_weight,
+                        row_base,
+                        row_correction,
+                        row_band,
+                        "user" if row_correction else "auto",
+                        json_dumps(current.get("components", {})),
+                        now,
+                        now,
+                    ),
+                )
             self._conn.commit()
         result = dict(current)
         result.update(
             {
-                "weight": final,
+                "weight": clicked_final,
                 "correction": value,
-                "band": band,
-                "band_label": BAND_LABELS.get(band, BAND_LABELS["stranger"]),
-                "source": "user",
+                "band": clicked_band,
+                "band_label": BAND_LABELS.get(clicked_band, BAND_LABELS["stranger"]),
+                "source": "user" if value else "auto",
                 "updated_at": now,
             }
         )
