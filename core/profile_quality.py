@@ -69,6 +69,11 @@ _SECOND_PERSON_ONLY_RE = re.compile(
     r"(?:你们?|您们?|you)(?:自己|本人)?(?:呀|啊|呢|哦|嘛|啦|喔|咯|呗|哟|吧)*",
     re.IGNORECASE,
 )
+# A bare pronoun is a reference, not a stable profile value: "我喜欢的人是
+# 她" reads fine in chat but would store 她 as a durable preference.
+_THIRD_PERSON_ONLY_RE = re.compile(
+    r"(?:他们?|她们?|它们?)(?:自己|本人)?(?:呀|啊|呢|哦|嘛|啦|喔|咯|呗|哟|吧)*"
+)
 _ADDRESS_ACTION_RE = re.compile(r"(?:去|来|跟车|跟着|跟|上班|工作|做|让我)")
 _ADDRESS_REJECT_RE = re.compile(
     r"(?:不许|不准|不能|别|不要|禁止|怎么还|为何还|为什么还|老是|总是|"
@@ -101,6 +106,38 @@ _LIKE_RE = re.compile(
     r"(?:喜欢|最爱|超爱|特别喜欢|真的好爱|很爱|爱)(?P<value>.+)$",
     re.IGNORECASE,
 )
+# "我喜欢的人是周杰伦" must capture the person, not "的人是周杰伦".
+# Tried before the generic _LIKE_RE so the predicate tail is never treated as
+# the value.
+_LIKE_PERSON_RE = re.compile(
+    r"^(?:我|咱|俺)(?:真的好|真的|很|最|超|特别|超级)?"
+    r"(?:喜欢|爱)(?:的)?(?:那个人|人)(?:是|叫|就是|叫做|名叫|为)[：:\s]*(?P<value>.+)$",
+    re.IGNORECASE,
+)
+# "我最喜欢的是烤肉" / "我喜欢的就是周杰伦" -> explicit object clause.
+_LIKE_OBJECT_RE = re.compile(
+    r"^(?:我|咱|俺)(?:真的好|真的|很|最|超|特别|超级)?"
+    r"(?:喜欢|爱)(?:的)?(?:是|就是)[：:\s]*(?P<value>.+)$",
+    re.IGNORECASE,
+)
+# A leading action verb is stripped from a preference object; the result is
+# useful but inferred rather than a literal statement, so it is recorded as a
+# fuzzy candidate instead of an active stable fact.
+_LIKE_ACTION_PREFIXES = (
+    "吃",
+    "喝",
+    "玩",
+    "看",
+    "听",
+    "打",
+    "去",
+    "上",
+    "养",
+    "收集",
+    "收藏",
+    "追",
+)
+_LIKE_UNCLEAN_PREFIXES = ("不", "没", "别", "讨厌", "的人", "的是")
 _DISLIKE_RE = re.compile(
     r"^(?:我|咱|俺)(?:真的|很|最|超|特别|有点)?"
     r"(?:不太喜欢|不喜欢|不爱|讨厌)(?P<value>.+)$",
@@ -122,14 +159,62 @@ _OCCUPATION_PATTERNS = tuple(
         r"^(?:我|咱|俺)是(?:一名|一个)\s*(?P<value>.+)$",
     )
 )
-_EDUCATION_PATTERNS = tuple(
+# Education used to be "everything after 我是/我在学", so "我是学生"
+# produced education="生".  Degree words are now matched as whole words and the
+# generic tail pattern is gone; anything that does not form a clean value is
+# dropped rather than stored.
+_EDUCATION_DEGREE_TERMS = (
+    "博士后",
+    "博士研究生",
+    "博士生",
+    "博士",
+    "硕士研究生",
+    "硕士生",
+    "硕士",
+    "研究生",
+    "本科生",
+    "大学生",
+    "大专生",
+    "专科生",
+    "中专生",
+    "高中生",
+    "初中生",
+    "小学生",
+    "学生",
+)
+_EDUCATION_DEGREE_RE = re.compile(
+    r"^(?:我|咱|俺)(?:目前|现在)?"
+    r"(?:是一名|是一个|是个|是|在读的是|在读|正在读|正在上)?\s*"
+    r"(?P<value>"
+    + "|".join(_EDUCATION_DEGREE_TERMS)
+    + r")(?:一枚|一个|在读|在读中)?$"
+)
+_EDUCATION_ENROLLED_RE = re.compile(
+    r"^(?:我|咱|俺)(?:在|正在)(?:读|上)"
+    r"(?P<value>大学|研究生|硕士|博士|高中|初中|小学|本科|专科)(?:阶段|期间)?$"
+)
+_EDUCATION_ENROLLED_MAP = {
+    "大学": "大学生",
+    "研究生": "研究生",
+    "硕士": "硕士研究生",
+    "博士": "博士研究生",
+    "高中": "高中生",
+    "初中": "初中生",
+    "小学": "小学生",
+    "本科": "本科生",
+    "专科": "专科生",
+}
+_EDUCATION_MAJOR_PATTERNS = tuple(
     re.compile(pattern)
     for pattern in (
         r"^(?:我|咱|俺)(?:的)?专业(?:是|为|：|:)\s*(?P<value>.+)$",
-        r"^(?:我|咱|俺)(?:是|在)(?:学|读)(?:的是?)?\s*(?P<value>.+)$",
+        r"^(?:我|咱|俺)(?:是|在)(?:学|读)(?P<value>.+?)(?:专业|系)(?:的)?$",
         r"^(?:我|咱|俺)是(?P<value>.+?)专业(?:的)?$",
     )
 )
+# "我是学计算机的" keeps 计算机 but is an inference (the sentence names a field
+# of study, not a degree), so it is a fuzzy candidate.
+_EDUCATION_FIELD_RE = re.compile(r"^(?:我|咱|俺)是学(?P<value>.+?)的$")
 _ZODIAC_RE = re.compile(r"^(?:我|咱|俺)(?:的)?星座(?:是|为|：|:)?\s*(?P<value>.+)$")
 _BLOOD_TYPE_RE = re.compile(
     r"^(?:我|咱|俺)(?:的)?血型(?:是|为|：|:)?\s*(?P<value>.+)$", re.IGNORECASE
@@ -268,6 +353,8 @@ def _valid_general_value(value: str, *, maximum: int = 40) -> bool:
         return False
     if _SECOND_PERSON_ONLY_RE.fullmatch(value.strip()):
         return False
+    if _THIRD_PERSON_ONLY_RE.fullmatch(value.strip()):
+        return False
     if _QUESTION_WORD_RE.search(value):
         return False
     return not any(mark in value for mark in ("\n", "\r"))
@@ -283,6 +370,8 @@ def _candidate(
     claim_summary: str,
     score: float,
     importance: float,
+    quality: str = "explicit",
+    state: str = "",
 ) -> dict[str, Any]:
     normalized = normalize_profile_value(value)
     cardinality = (
@@ -298,7 +387,9 @@ def _candidate(
         }
         else "multi"
     )
-    return {
+    state = state or ("active" if quality == "explicit" else "candidate")
+    evidence_strength = "direct_statement"
+    payload: dict[str, Any] = {
         "memory_type": memory_type,
         "label": label,
         "kind": kind,
@@ -311,15 +402,26 @@ def _candidate(
         "profile_cardinality": cardinality,
         "claim_summary": _clean_text(claim_summary, 180),
         "extractor": RULE_EXTRACTOR,
-        "extraction_quality": "explicit",
+        "extraction_quality": quality,
         "extraction_quality_score": round(max(0.0, min(1.0, score)), 3),
-        "evidence_strength": "direct_statement",
-        "profile_state": "active",
-        "status": "active",
-        "quality_gate_passed": True,
+        "evidence_strength": evidence_strength,
+        "profile_state": state,
+        "status": state,
+        "quality_gate_passed": False,
         "confidence": round(max(0.0, min(1.0, score)), 3),
         "importance": round(max(0.0, min(1.0, importance)), 3),
     }
+    # The gate flag is derived from the payload itself, never hard-coded.  An
+    # active fact must clear the 0.75 activation threshold; a fuzzy candidate
+    # only has to clear the 0.5 candidate threshold and can therefore never be
+    # written as stable_memory (its state stays "candidate").
+    passed, _reason = profile_quality_decision(
+        payload,
+        require_active=state == "active",
+        minimum_score=0.75 if state == "active" else 0.5,
+    )
+    payload["quality_gate_passed"] = bool(passed)
+    return payload
 
 
 def _address_from_clause(clause: str) -> dict[str, Any] | None:
@@ -383,6 +485,163 @@ def _match_value(
     )
 
 
+def _clean_like_value(value: Any) -> str:
+    """Trim like-object politeness without eating a real noun's last character.
+
+    "我喜欢酒吧" ends with the noun 酒吧; the generic particle stripper used to
+    turn it into 酒.  Keep "吧" only for one-character remainders, still strip
+    it from real sentences such as "我喜欢烤肉吧".
+    """
+    particles = tuple(particle for particle in _TAIL_PARTICLES if particle != "吧")
+    text = _clean_value(
+        value, limit=40, strip_terminal_de=True, tail_particles=particles
+    )
+    if text.endswith("吧") and len(text) > 2:
+        text = _clean_value(
+            text[:-1], limit=40, strip_terminal_de=True, tail_particles=particles
+        )
+    return text
+
+
+def _like_candidates(clause: str) -> list[dict[str, Any]]:
+    for pattern in (_LIKE_PERSON_RE, _LIKE_OBJECT_RE):
+        match = pattern.fullmatch(clause)
+        if not match:
+            continue
+        value = _clean_like_value(match.group("value"))
+        if not _valid_general_value(value, maximum=30):
+            return []
+        return [
+            _candidate(
+                dimension="preference",
+                memory_type="user_preference",
+                label="喜欢",
+                kind="like",
+                value=value,
+                claim_summary=f"喜欢 {value}",
+                score=0.9,
+                importance=0.66,
+            )
+        ]
+    match = _LIKE_RE.fullmatch(clause)
+    if not match:
+        return []
+    value = _clean_like_value(match.group("value"))
+    if not value:
+        return []
+    # An unhandled "的人是…" tail is exactly the corruption this fix removes;
+    # drop it instead of storing "的人是周杰伦".
+    if any(value.startswith(prefix) for prefix in _LIKE_UNCLEAN_PREFIXES):
+        return []
+    if "的人" in value or "的是" in value:
+        return []
+    fuzzy = False
+    for prefix in _LIKE_ACTION_PREFIXES:
+        if value.startswith(prefix) and len(value) > len(prefix) + 1:
+            value = value[len(prefix) :].strip()
+            fuzzy = True
+            break
+    if not _valid_general_value(value, maximum=30):
+        return []
+    return [
+        _candidate(
+            dimension="preference",
+            memory_type="user_preference",
+            label="喜欢",
+            kind="like",
+            value=value,
+            claim_summary=f"喜欢 {value}",
+            score=0.6 if fuzzy else 0.9,
+            importance=0.6 if fuzzy else 0.66,
+            quality="inferred" if fuzzy else "explicit",
+        )
+    ]
+
+
+def _education_candidates(clause: str) -> list[dict[str, Any]]:
+    match = _EDUCATION_DEGREE_RE.fullmatch(clause)
+    if match:
+        value = _clean_value(match.group("value"), limit=20)
+        if _valid_general_value(value, maximum=20):
+            return [
+                _candidate(
+                    dimension="education",
+                    memory_type="user_profile",
+                    label="专业/学业",
+                    kind="education",
+                    value=value,
+                    claim_summary=f"学业身份是 {value}",
+                    score=0.9,
+                    importance=0.68,
+                )
+            ]
+        return []
+    match = _EDUCATION_ENROLLED_RE.fullmatch(clause)
+    if match:
+        value = _EDUCATION_ENROLLED_MAP.get(match.group("value"), "")
+        if _valid_general_value(value, maximum=20):
+            return [
+                _candidate(
+                    dimension="education",
+                    memory_type="user_profile",
+                    label="专业/学业",
+                    kind="education",
+                    value=value,
+                    claim_summary=f"学业身份是 {value}",
+                    score=0.9,
+                    importance=0.68,
+                )
+            ]
+        return []
+    for pattern in _EDUCATION_MAJOR_PATTERNS:
+        match = pattern.fullmatch(clause)
+        if not match:
+            continue
+        value = _clean_value(
+            match.group("value"),
+            limit=40,
+            strip_terminal_de=True,
+            tail_particles=_TAIL_PARTICLES,
+        )
+        if _valid_general_value(value, maximum=30) and not _TEMPORARY_RE.search(clause):
+            return [
+                _candidate(
+                    dimension="education",
+                    memory_type="user_profile",
+                    label="专业/学业",
+                    kind="education",
+                    value=value,
+                    claim_summary=f"专业/学业是 {value}",
+                    score=0.9,
+                    importance=0.68,
+                )
+            ]
+        return []
+    match = _EDUCATION_FIELD_RE.fullmatch(clause)
+    if match:
+        value = _clean_value(
+            match.group("value"),
+            limit=30,
+            strip_terminal_de=True,
+            tail_particles=_TAIL_PARTICLES,
+        )
+        if _valid_general_value(value, maximum=20):
+            return [
+                _candidate(
+                    dimension="education",
+                    memory_type="user_profile",
+                    label="专业/学业",
+                    kind="education",
+                    value=value,
+                    claim_summary=f"所学的领域是 {value}",
+                    score=0.6,
+                    importance=0.6,
+                    quality="inferred",
+                )
+            ]
+    return []
+
+
 def _non_address_candidates(clause: str) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     if _UNCERTAIN_RE.search(clause):
@@ -392,7 +651,12 @@ def _non_address_candidates(clause: str) -> list[dict[str, Any]]:
     )
 
     value = _match_value(_DISLIKE_RE, clause)
-    if _valid_general_value(value) and not transient_context:
+    if (
+        _valid_general_value(value)
+        and not transient_context
+        and "的人" not in value
+        and "的是" not in value
+    ):
         results.append(
             _candidate(
                 dimension="preference",
@@ -407,21 +671,10 @@ def _non_address_candidates(clause: str) -> list[dict[str, Any]]:
         )
         return results
 
-    value = _match_value(_LIKE_RE, clause)
-    if _valid_general_value(value) and not transient_context:
-        results.append(
-            _candidate(
-                dimension="preference",
-                memory_type="user_preference",
-                label="喜欢",
-                kind="like",
-                value=value,
-                claim_summary=f"喜欢 {value}",
-                score=0.93,
-                importance=0.66,
-            )
-        )
-        return results
+    if not transient_context:
+        results.extend(_like_candidates(clause))
+        if results:
+            return results
 
     value = _match_value(_ALLERGY_RE, clause) or _match_value(_CANNOT_EAT_RE, clause)
     if _valid_general_value(value, maximum=30) and not transient_context:
@@ -462,6 +715,13 @@ def _non_address_candidates(clause: str) -> list[dict[str, Any]]:
         )
         return results
 
+    # Education must run before the generic "我是一名X" occupation rule so
+    # "我是一名研究生" is not typed as an occupation.
+    if not _TEMPORARY_RE.search(clause):
+        results.extend(_education_candidates(clause))
+        if results:
+            return results
+
     for pattern in _OCCUPATION_PATTERNS:
         value = _match_value(pattern, clause, strip_terminal_de=True)
         if _valid_general_value(value) and not _TEMPORARY_RE.search(clause):
@@ -475,23 +735,6 @@ def _non_address_candidates(clause: str) -> list[dict[str, Any]]:
                     claim_summary=f"职业是 {value}",
                     score=0.92,
                     importance=0.7,
-                )
-            )
-            return results
-
-    for pattern in _EDUCATION_PATTERNS:
-        value = _match_value(pattern, clause, strip_terminal_de=True)
-        if _valid_general_value(value) and not _TEMPORARY_RE.search(clause):
-            results.append(
-                _candidate(
-                    dimension="education",
-                    memory_type="user_profile",
-                    label="专业/学业",
-                    kind="education",
-                    value=value,
-                    claim_summary=f"专业/学业是 {value}",
-                    score=0.91,
-                    importance=0.68,
                 )
             )
             return results
@@ -645,7 +888,8 @@ def profile_candidate_metadata(
     candidate: Any, *, source_memory_id: str = ""
 ) -> dict[str, Any]:
     payload = candidate if isinstance(candidate, dict) else {}
-    return {
+    state = _clean_text(payload.get("profile_state"), 40) or "candidate"
+    metadata: dict[str, Any] = {
         "extractor": RULE_EXTRACTOR,
         "profile_dimension": _clean_text(
             payload.get("profile_dimension") or payload.get("dimension"), 80
@@ -668,10 +912,23 @@ def profile_candidate_metadata(
         ),
         "evidence_strength": _clean_text(payload.get("evidence_strength"), 40)
         or "direct_statement",
-        "profile_state": _clean_text(payload.get("profile_state"), 40) or "candidate",
-        "quality_gate_passed": bool(payload.get("quality_gate_passed")),
+        "profile_state": state,
+        "quality_gate_passed": False,
         "source_memory_id": _clean_text(source_memory_id, 120),
     }
+    # Recompute the gate from the metadata itself instead of copying a caller
+    # supplied boolean.  This is what makes "quality_gate_passed" a result
+    # rather than a self-certification.
+    passed, _reason = profile_quality_decision(
+        {
+            "memory_type": payload.get("memory_type") or "user_profile",
+            "metadata": metadata,
+        },
+        require_active=state == "active",
+        minimum_score=0.75 if state == "active" else 0.5,
+    )
+    metadata["quality_gate_passed"] = bool(passed)
+    return metadata
 
 
 def _memory_and_metadata(value: Any) -> tuple[str, dict[str, Any]]:
@@ -686,10 +943,9 @@ def _memory_and_metadata(value: Any) -> tuple[str, dict[str, Any]]:
     ) else {}
 
 
-def profile_quality_decision(
-    memory_or_metadata: Any, *, require_active: bool = True
-) -> tuple[bool, str]:
-    """Validate rule-produced profile metadata while preserving manual records."""
+def _rule_profile_parts(
+    memory_or_metadata: Any,
+) -> tuple[str, dict[str, Any], bool]:
     memory_type, metadata = _memory_and_metadata(memory_or_metadata)
     extractor = _clean_text(metadata.get("extractor"), 80).lower()
     producer_kind = _clean_text(metadata.get("producer_kind"), 80).lower()
@@ -709,6 +965,88 @@ def profile_quality_decision(
     is_rule_profile = rule_source and (
         memory_type in PROFILE_MEMORY_TYPES or has_rule_metadata
     )
+    return memory_type, metadata, is_rule_profile
+
+
+def _has_profile_conflict(metadata: dict[str, Any]) -> bool:
+    if metadata.get("profile_conflict") or metadata.get("conflict_reason"):
+        return True
+    conflicts = metadata.get("conflicts_with")
+    if isinstance(conflicts, (list, tuple, set, frozenset)):
+        return bool(conflicts)
+    return bool(_clean_text(conflicts, 200))
+
+
+def _profile_payload_checks(
+    metadata: dict[str, Any],
+    *,
+    minimum_score: float,
+    require_inferred_evidence: bool,
+) -> tuple[bool, str]:
+    dimension = _clean_text(
+        metadata.get("profile_dimension") or metadata.get("dimension"), 80
+    )
+    value = _clean_text(metadata.get("profile_value") or metadata.get("value"), 80)
+    normalized = normalize_profile_value(metadata.get("normalized_value"))
+    if not dimension:
+        return False, "profile_dimension_missing"
+    if not value:
+        return False, "profile_value_missing"
+    if not normalized:
+        return False, "profile_normalized_value_missing"
+    if normalized != normalize_profile_value(value):
+        return False, "profile_normalized_value_mismatch"
+    if _has_profile_conflict(metadata):
+        return False, "profile_conflict"
+    try:
+        score = float(metadata.get("extraction_quality_score"))
+    except (TypeError, ValueError):
+        return False, "profile_quality_score_missing"
+    if not math.isfinite(score) or score < minimum_score or score > 1.0:
+        return False, "profile_quality_rejected"
+    quality = _clean_text(metadata.get("extraction_quality"), 40).lower()
+    if quality not in {"explicit", "confirmed", "corroborated", "inferred"}:
+        return False, "profile_extraction_quality_missing"
+    evidence = _clean_text(metadata.get("evidence_strength"), 60).lower()
+    if evidence not in {
+        "direct_statement",
+        "user_confirmed",
+        "multiple_independent_evidence",
+        "independent_evidence",
+    }:
+        return False, "profile_evidence_missing"
+    if require_inferred_evidence and quality == "inferred":
+        try:
+            evidence_count = int(
+                metadata.get("independent_evidence_count")
+                or metadata.get("evidence_count")
+                or 0
+            )
+        except (TypeError, ValueError):
+            evidence_count = 0
+        if evidence_count < 2 and evidence not in {
+            "user_confirmed",
+            "multiple_independent_evidence",
+        }:
+            return False, "profile_evidence_insufficient"
+    return True, "profile_quality_passed"
+
+
+def profile_quality_decision(
+    memory_or_metadata: Any,
+    *,
+    require_active: bool = True,
+    minimum_score: float = 0.75,
+) -> tuple[bool, str]:
+    """Validate rule-produced profile metadata while preserving manual records.
+
+    The verdict is always recomputed from the real payload.  A caller cannot
+    pass the gate by writing "quality_gate_passed": True, because that flag is
+    no longer an input.
+    """
+    _memory_type, metadata, is_rule_profile = _rule_profile_parts(
+        memory_or_metadata
+    )
     if not is_rule_profile:
         return True, "profile_quality_compatible"
 
@@ -726,53 +1064,58 @@ def profile_quality_decision(
     if require_active and state != "active":
         return False, f"profile_state_{state}"
 
-    dimension = _clean_text(
-        metadata.get("profile_dimension") or metadata.get("dimension"), 80
+    allowed, reason = _profile_payload_checks(
+        metadata,
+        minimum_score=minimum_score,
+        require_inferred_evidence=state == "active",
     )
-    value = _clean_text(metadata.get("profile_value") or metadata.get("value"), 80)
-    normalized = normalize_profile_value(metadata.get("normalized_value"))
-    if not dimension:
-        return False, "profile_dimension_missing"
-    if not value:
-        return False, "profile_value_missing"
-    if not normalized:
-        return False, "profile_normalized_value_missing"
-    if normalized != normalize_profile_value(value):
-        return False, "profile_normalized_value_mismatch"
-    try:
-        score = float(metadata.get("extraction_quality_score"))
-    except (TypeError, ValueError):
-        return False, "profile_quality_score_missing"
-    if not math.isfinite(score) or score < 0.75 or score > 1.0:
-        return False, "profile_quality_rejected"
-    quality = _clean_text(metadata.get("extraction_quality"), 40).lower()
-    if quality not in {"explicit", "confirmed", "corroborated", "inferred"}:
-        return False, "profile_extraction_quality_missing"
-    evidence = _clean_text(metadata.get("evidence_strength"), 60).lower()
-    if evidence not in {
-        "direct_statement",
-        "user_confirmed",
-        "multiple_independent_evidence",
-        "independent_evidence",
-    }:
-        return False, "profile_evidence_missing"
-    if quality == "inferred":
-        try:
-            evidence_count = int(
-                metadata.get("independent_evidence_count")
-                or metadata.get("evidence_count")
-                or 0
-            )
-        except (TypeError, ValueError):
-            evidence_count = 0
-        if evidence_count < 2 and evidence not in {
-            "user_confirmed",
-            "multiple_independent_evidence",
-        }:
-            return False, "profile_evidence_insufficient"
-    if not bool(metadata.get("quality_gate_passed", True)):
-        return False, "profile_quality_rejected"
+    if not allowed:
+        return False, reason
     return True, "profile_quality_passed"
+
+
+def profile_quality_activation_check(
+    memory_or_metadata: Any,
+) -> tuple[bool, str]:
+    """Check whether a rule candidate may be promoted to active.
+
+    This reads the real stored state instead of overwriting it with "active".
+    It is the function a store write gate should call before a promotion.
+    """
+    _memory_type, metadata, is_rule_profile = _rule_profile_parts(
+        memory_or_metadata
+    )
+    if not is_rule_profile:
+        return True, "profile_quality_compatible"
+    state = _clean_text(
+        metadata.get("profile_state") or metadata.get("status"), 40
+    ).lower()
+    if state not in {"candidate", "active"}:
+        if not state:
+            return False, "profile_state_missing"
+        if state in {"rejected", "superseded", "archived", "pending"}:
+            return False, f"profile_state_{state}"
+        return False, "profile_state_invalid"
+    return _profile_payload_checks(
+        metadata,
+        minimum_score=0.75,
+        require_inferred_evidence=True,
+    )
+
+
+def profile_quality_gate_passed(
+    memory_or_metadata: Any,
+    *,
+    require_active: bool = True,
+    minimum_score: float = 0.75,
+) -> bool:
+    """Convenience boolean wrapper around profile_quality_decision."""
+    passed, _reason = profile_quality_decision(
+        memory_or_metadata,
+        require_active=require_active,
+        minimum_score=minimum_score,
+    )
+    return bool(passed)
 
 
 __all__ = [
@@ -783,6 +1126,8 @@ __all__ = [
     "extract_profile_candidates",
     "normalize_profile_value",
     "profile_candidate_metadata",
+    "profile_quality_activation_check",
     "profile_quality_decision",
+    "profile_quality_gate_passed",
     "profile_rejection_reason",
 ]

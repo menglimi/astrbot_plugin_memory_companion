@@ -13,7 +13,11 @@ from .source_capture import SourceCapture, digest
 class CaptureRuntime:
     def __init__(self, service):
         self.service = service
-        self.store = SourceCapture(service.store)
+        config = getattr(service, 'config', None)
+        default_enabled = config.bool('memory_capture.source_capture_enabled', True) if config is not None else True
+        retention_days = config.int('memory_capture.source_retention_days', 7) if config is not None else 7
+        self.store = SourceCapture(service.store, default_enabled=default_enabled,
+                                   retention_seconds=max(0, retention_days) * 86400)
         self.generation = secrets.token_hex(16)
         self.store.activate(self.generation)
         self.wake = asyncio.Event()
@@ -23,6 +27,18 @@ class CaptureRuntime:
     def start(self):
         if self.task is None or self.task.done():
             self.task = self.service._spawn_background(self.loop(), label='source-capture', defer_during_grace=True)
+
+    def source_capture_enabled(self):
+        return self.store.source_capture_enabled()
+
+    def set_source_capture_enabled(self, enabled, *, actor=''):
+        return self.store.set_source_capture_enabled(enabled, actor=actor)
+
+    def read_original(self, source_key, *, authorize=lambda: True):
+        return self.store.read_body(source_key, authorize=authorize)
+
+    def purge_expired(self, now=None):
+        return self.store.purge_expired(now)
 
     def allowed(self, identity):
         s = self.service
@@ -46,7 +62,7 @@ class CaptureRuntime:
         if old is not None:
             return old
         s=self.service
-        if not getattr(event,'_s4_source_capture_enabled',False):
+        if not self.source_capture_enabled():
             return None
         if (not s.config.bool('memory_capture.reliable_sources_enabled',True)
                 or getattr(event,'private_companion_req036_denied',False)
@@ -114,6 +130,10 @@ class CaptureRuntime:
     async def loop(self):
         while not getattr(self.service,'_closing',False):
             self.wake.clear()
+            try:
+                self.store.purge_expired()
+            except Exception as exc:
+                self.last_error=type(exc).__name__
             rows=self.store.due()
             for row in rows:
                 try:

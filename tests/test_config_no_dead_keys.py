@@ -108,20 +108,39 @@ def _leaf_keys() -> list[tuple[str, str]]:
     return out
 
 
-def _code_corpus() -> str:
-    """所有非测试的 .py 与面板 .js/.html/.css 拼成一个大字符串。"""
-    parts: list[str] = []
+# 语料排除的顶层目录（相对仓库根的第一段）。
+# 旧实现用绝对路径的 path.parts 判断 rel[0] in {"tests", ...}：Windows 上 rel[0]
+# 是盘符（例如 "C:\\"），这个集合永远不命中，242 个文件连 tests/ 一起被拼成语料，
+# 死键守门测试被测试文件里的字面量喂饱，等于空转（审核报告 L4）。
+_CORPUS_EXCLUDE_DIRS = frozenset({"tests", "benchmarks", "scripts", "docs", "data"})
+
+
+def _code_corpus_paths() -> list[Path]:
+    """参与检查的文件清单；路径一律相对 ROOT 判断，在 CI/别的机器上行为一致。"""
+    paths: list[Path] = []
     for path in sorted(ROOT.rglob("*")):
         if not path.is_file():
             continue
-        rel = path.parts
-        if "__pycache__" in rel or ".git" in rel or rel[0] in {"tests", "benchmarks", "scripts", "docs"}:
+        try:
+            rel = path.relative_to(ROOT)
+        except ValueError:
+            continue
+        parts = rel.parts
+        if not parts or "__pycache__" in parts or parts[0] in _CORPUS_EXCLUDE_DIRS:
             continue
         if path.suffix in {".py", ".js", ".html", ".css"}:
-            try:
-                parts.append(path.read_text(encoding="utf-8"))
-            except UnicodeDecodeError:
-                continue
+            paths.append(path)
+    return paths
+
+
+def _code_corpus() -> str:
+    """所有非测试的 .py 与面板 .js/.html/.css 拼成一个大字符串。"""
+    parts: list[str] = []
+    for path in _code_corpus_paths():
+        try:
+            parts.append(path.read_text(encoding="utf-8"))
+        except UnicodeDecodeError:
+            continue
     return "\n".join(parts)
 
 
@@ -131,6 +150,25 @@ class NoDeadConfigKeysTests(unittest.TestCase):
         cls.leaves = _leaf_keys()
         cls.corpus = _code_corpus()
         dynamic = {key for names in DYNAMIC_FAMILIES.values() for key in names}
+
+    def test_corpus_excludes_test_code_and_includes_production(self) -> None:
+        """L4 自证：语料必须真的排掉 tests/，也必须真的含生产代码。
+
+        旧实现里 tests/ 全量进了语料，''假开关'' 在测试自己的字面量里就能命中，
+        死键断言永远不会红。这里两个方向都钉住：测试代码不得入语料，生产代码必须在。
+        """
+        paths = _code_corpus_paths()
+        rels = [path.relative_to(ROOT).as_posix() for path in paths]
+        self.assertTrue(rels, "语料为空，排除规则写错了")
+        self.assertEqual(
+            [],
+            [rel for rel in rels if rel.split("/")[0] == "tests"],
+            "语料混入 tests/，路径排除规则没有生效",
+        )
+        self.assertIn("page_api.py", rels, "语料缺少生产代码 page_api.py")
+        corpus = _code_corpus()
+        self.assertIn("class PluginPageApi", corpus)
+        self.assertNotIn("NoDeadConfigKeysTests", corpus, "语料混入本测试文件自身的字面量")
 
     def test_schema_leaf_count_is_sane(self) -> None:
         """防「清单本身写坏了」——比值不对会让下面所有判断失去意义。"""

@@ -22,7 +22,6 @@ def service(tmp_path):
     value = MemoryCompanionService(
         context=None, plugin_root=Path(__file__).parents[1], data_dir=tmp_path,
         config={
-            "injection_cache_ttl_seconds": 60,
             "memory_injection": {"max_chars": 3000, "enable_injection_logs": False},
             "retrieval": {"mode": "basic", "embedding_enabled": False},
             "conversation_memory_advanced": {

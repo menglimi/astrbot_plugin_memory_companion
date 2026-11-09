@@ -1,16 +1,56 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from typing import Any
 
 from .models import clean_text
 from .service import MemoryCompanionService
 
 
+# A10: read-only commands are safe for ordinary group members; everything that
+# mutates memory, config or diagnostics stays admin-only.  main.py consumes
+# command_permission() instead of hard-coding @permission_type on every entry.
+COMMAND_PERMISSION_MEMBER = "member"
+COMMAND_PERMISSION_ADMIN = "admin"
+READ_ONLY_COMMANDS = frozenset(
+    {
+        "status",
+        "search",
+        "explain",
+        "recent",
+        "timeline",
+        "relations",
+        "logs",
+        "diagnostics",
+        "help",
+    }
+)
+
+
+def command_permission(name: str) -> str:
+    """Return the minimum permission level for one mcomp sub-command."""
+    return (
+        COMMAND_PERMISSION_MEMBER
+        if clean_text(name, 40).strip().lower() in READ_ONLY_COMMANDS
+        else COMMAND_PERMISSION_ADMIN
+    )
+
+
+def read_only_commands() -> frozenset[str]:
+    """Expose the read-only command set for main.py and the release report."""
+    return READ_ONLY_COMMANDS
+
+
 class MemoryCompanionCommandHandler:
+    # A10: destructive commands need an explicit second step.
+    DELETE_CONFIRM_TTL_SECONDS = 120
+    DELETE_CONFIRM_WORDS = frozenset({"确认", "delete", "yes", "y"})
+
     def __init__(self, service: MemoryCompanionService, version: str):
         self.service = service
         self.version = version
+        self._pending_deletes: dict[str, float] = {}
 
     async def status(self) -> str:
         stats = await self.service.store.stats()
@@ -49,7 +89,8 @@ class MemoryCompanionCommandHandler:
             f"召回解释：选中 {len(selected)} 条，过滤 {len(blocked)} 条",
             f"检索来源：{intent.source}｜检索词：{clean_text(intent.query, 180)}",
         ]
-        intent_hint = intent.format_for_injection(320)
+        # R12：诊断入口显式要求遥测（检索模式/关键词/Bot 心理能量），注入路径不输出。
+        intent_hint = intent.format_for_injection(320, include_diagnostics=True)
         if intent_hint:
             lines.append("【检索意图】")
             lines.append(intent_hint)
@@ -92,9 +133,29 @@ class MemoryCompanionCommandHandler:
             return "本次未生成新记忆：可能无新增内容、模型暂不可用或批次仍待修复。原文已保留，可在面板总览查看处理进度。"
         return f"已生成阶段性长期记忆：{memory_id}"
 
-    async def delete(self, memory_id: str = "") -> str:
+    async def delete(self, memory_id: str = "", confirm: str = "") -> str:
+        """Delete one memory after an explicit second confirmation (A10).
+
+        The chat channel cannot render a modal, so the first call only arms a
+        short-lived pending confirmation for that id and repeats the command
+        text; sending the same command again inside the TTL (or passing
+        confirm="确认") performs the delete.  This mirrors the two-step
+        preview/清空 flow of clear_scope instead of deleting on first touch.
+        """
+        memory_id = clean_text(memory_id, 120)
         if not memory_id:
             return "用法：/mcomp delete <memory_id>"
+        explicit = clean_text(confirm, 20).casefold() in self.DELETE_CONFIRM_WORDS
+        if not explicit and not self._consume_delete_confirmation(memory_id):
+            self._pending_deletes[memory_id] = (
+                time.monotonic() + self.DELETE_CONFIRM_TTL_SECONDS
+            )
+            return (
+                f"将要删除记忆：{memory_id}（不可恢复）。\n"
+                f"请在 {self.DELETE_CONFIRM_TTL_SECONDS} 秒内再次执行同一条命令确认，"
+                "或使用 /mcomp delete <memory_id> 确认。"
+            )
+        self._pending_deletes.pop(memory_id, None)
         try:
             ok = await self.service.store.delete_memory(memory_id)
         except sqlite3.OperationalError as exc:
@@ -106,6 +167,13 @@ class MemoryCompanionCommandHandler:
                 "可在面板「运维诊断」查看库文件路径与最近一次连接重建失败详情。"
             )
         return "已删除。" if ok else "没有找到这条记忆。"
+
+    def _consume_delete_confirmation(self, memory_id: str) -> bool:
+        """Consume a still-valid pending delete confirmation for one id."""
+        expires_at = self._pending_deletes.pop(memory_id, None)
+        if expires_at is None:
+            return False
+        return expires_at >= time.monotonic()
 
     async def clear_scope(
         self,

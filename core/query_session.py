@@ -548,6 +548,7 @@ def bind_query_tool_schema(manager: Any, module_path: str) -> bool:
     tool.parameters = project_tool_schema(request_schema())
     source = manager.get_func("memory_companion_sources")
     if source is not None and source.handler_module_path == module_path:
+        source.parameters = tool_parameters_from_contract(source.parameters)
         source.parameters.get("properties", {}).pop("query_note", None)
         if "required" in source.parameters:
             source.parameters["required"] = [k for k in source.parameters["required"] if k != "query_note"]
@@ -589,7 +590,7 @@ def bind_source_query_v2_schema(manager: Any, module_path: str) -> bool:
 def _legacy_source_schema() -> dict[str, Any]:
     root = Path(__file__).resolve().parents[1] / "docs/contracts/source-query/v1"
     schema = json.loads((root / "schemas/request.schema.json").read_text(encoding="utf-8"))
-    return {k: v for k, v in schema.items() if k not in {"$schema", "$id", "title"}}
+    return tool_parameters_from_contract(schema)
 
 
 def _marked_source_v2_handler(tool: Any) -> bool:
@@ -794,7 +795,7 @@ def offer_query_tool(service: Any, req: Any, ctx: Any, event: Any) -> None:
                 note_schema = None
             if note_schema is not None:
                 note_source = copy(source)
-                note_source.parameters = deepcopy(source.parameters)
+                note_source.parameters = tool_parameters_from_contract(source.parameters)
                 note_source.parameters.setdefault("properties", {})["query_note"] = note_schema
                 for branch in note_source.parameters.get("anyOf", []):
                     branch.setdefault("properties", {})["query_note"] = deepcopy(note_schema)

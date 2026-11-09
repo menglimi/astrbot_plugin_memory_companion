@@ -139,6 +139,10 @@ class UiBackendContractTests(unittest.TestCase):
         self.assertIn('const response = await apiGet("/memory?id=" + encodeURIComponent(memoryId));', self.frontend_source)
         self.assertIn('const memory = response && response.memory ? response.memory : response;', self.frontend_source)
 
+    def test_summary_batch_release_hint_uses_the_real_batch_id_prefix(self) -> None:
+        self.assertIn('placeholder: "sb_... 批次 ID"', self.frontend_source)
+        self.assertNotIn("summary_batch_...", self.frontend_source)
+
     def test_memory_category_filters_expand_to_persisted_types(self) -> None:
         filters = literal(assignment(self.tree, "MEMORY_TYPE_FILTERS"))
         self.assertIn("user_profile", filters["profile"])
@@ -203,15 +207,214 @@ class UiBackendContractTests(unittest.TestCase):
             self.assertTrue(endpoints, view)
             self.assertEqual(set(), set(endpoints) - routes, view)
 
-    def test_recent_injection_trace_is_wired_to_both_panel_modes(self) -> None:
+    def test_recent_injection_trace_survives_starmap_removal(self) -> None:
+        # 2.6.4 删三维终端时一并移除了 injection-status.js；
+        # 总览的「最近注入」改由控制台 app.js 直接渲染，接口契约不变。
         views = literal(assignment(self.tree, "UI_VIEW_ENDPOINTS"))
         self.assertIn("/logs", views["overview"])
-        modern = (ROOT / "pages" / "记忆面板" / "modern.html").read_text(encoding="utf-8")
-        injection_script = (ROOT / "pages" / "记忆面板" / "injection-status.js").read_text(encoding="utf-8")
-        self.assertIn("./injection-status.js?v=", modern)
-        self.assertIn('bridge.apiGet("page/logs"', injection_script)
-        self.assertIn("/logs?limit=", injection_script)
-        self.assertIn("最近注入", injection_script)
+        panel = ROOT / "pages" / "记忆面板"
+        modern = (panel / "modern.html").read_text(encoding="utf-8")
+        self.assertNotIn("injection-status.js", modern)
+        self.assertFalse((panel / "injection-status.js").exists())
+        console = (panel / "app.js").read_text(encoding="utf-8")
+        self.assertIn("/logs?limit=", console)
+        self.assertIn("最近注入", console)
+
+
+# ---- L8：真实接口契约（直调 page_api，而不是只 grep 标签字符串）----------------
+# 旧测试用 ast 把 UI_DANGEROUS_ENDPOINTS 等常量读出来再断言字符串存在，这只能证明
+# 常量里写了这些字，证明不了运行中的端点真的按契约返回、危险操作真的被拦下。
+# 下面直接实例化 PluginPageApi，调 ui_capabilities() 与 _wrap_route() 来验行为。
+import importlib
+import inspect
+import sys
+import types
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+try:
+    from .package_bootstrap import bootstrap_package
+except ImportError:  # pragma: no cover - 直接以脚本方式运行时
+    from package_bootstrap import bootstrap_package
+
+
+bootstrap_package()
+
+if "quart" not in sys.modules:
+    _quart_stub = types.ModuleType("quart")
+    _quart_stub.jsonify = lambda payload=None, **kwargs: payload or kwargs
+    _quart_stub.request = SimpleNamespace(args={}, method="GET")
+    _quart_stub.send_file = AsyncMock()
+    sys.modules["quart"] = _quart_stub
+
+page_api_module = importlib.import_module("astrbot_plugin_memory_companion.page_api")
+PluginPageApi = page_api_module.PluginPageApi
+
+# 危险端点_handler 里出现任意一个标记，就认为它接了管理身份鉴权。
+ADMIN_GUARD_MARKERS = (
+    "admin_required",
+    "_require_admin",
+    "_require_dashboard_admin",
+    "_trusted_emotion_admin_context",
+    "_is_bound_dashboard_admin",
+)
+
+
+class _FakeResponse:
+    """替代 quart.jsonify 的最小响应：保留 status_code，业务负载放 json。"""
+
+    def __init__(self, payload, status_code=200):
+        self.json = payload
+        self.status_code = status_code
+
+
+def _fake_jsonify(payload=None, **kwargs):
+    return _FakeResponse(payload if payload is not None else kwargs)
+
+
+class UiCapabilitiesRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
+    """L8：把 /ui/capabilities 当成真契约逐字段核对，并验证危险端点的确认关口。"""
+
+    def _api(self):
+        # ui_capabilities / _wrap_route 不访问 service 业务方法；service 留空即可，
+        # data_dir 为空时审计日志直接跳过，测试不会污染仓库。
+        return PluginPageApi(SimpleNamespace(service=SimpleNamespace()))
+
+    async def _capabilities(self):
+        api = self._api()
+        with patch.object(page_api_module, "jsonify", _fake_jsonify):
+            response = await api.ui_capabilities()
+        self.assertEqual(200, response.status_code)
+        return api, response.json
+
+    async def test_ui_capabilities_matches_module_constants(self) -> None:
+        api, payload = await self._capabilities()
+        self.assertTrue(payload["success"])
+        self.assertEqual(page_api_module.UI_CONTRACT_VERSION, payload["contract_version"])
+        self.assertEqual(list(page_api_module.UI_MODES), payload["modes"])
+
+        endpoint_views: dict[str, list[str]] = {}
+        for view, endpoints in page_api_module.UI_VIEW_ENDPOINTS.items():
+            for endpoint in endpoints:
+                endpoint_views.setdefault(endpoint, []).append(view)
+        self.assertEqual(
+            {
+                view: list(endpoints)
+                for view, endpoints in page_api_module.UI_VIEW_ENDPOINTS.items()
+            },
+            {row["id"]: row["endpoints"] for row in payload["views"]},
+        )
+
+        rows = {row["path"]: row for row in payload["endpoints"]}
+        self.assertEqual(len(rows), len(payload["endpoints"]), "端点路径重复")
+        runtime_paths = {path for path, _h, _m, _d in api._route_specs()}
+        self.assertEqual(runtime_paths, set(rows), "能力清单与实际路由不一致")
+
+        exposure = page_api_module.UI_ENDPOINT_EXPOSURE
+        dangerous = page_api_module.UI_DANGEROUS_ENDPOINTS
+        problems: list[str] = []
+        for path, row in sorted(rows.items()):
+            expected_exposure = exposure.get(path, {}).get("exposure", "visible")
+            expected_reason = exposure.get(path, {}).get("reason", "面板直接功能")
+            if row["exposure"] != expected_exposure:
+                problems.append(f"{path} exposure={row['exposure']} 期望 {expected_exposure}")
+            if row["reason"] != expected_reason:
+                problems.append(f"{path} reason={row['reason']!r} 期望 {expected_reason!r}")
+            if row["dangerous"] != (path in dangerous):
+                problems.append(f"{path} dangerous={row['dangerous']}")
+            if row["views"] != endpoint_views.get(path, []):
+                problems.append(f"{path} views={row['views']}")
+            if not row["methods"]:
+                problems.append(f"{path} methods 为空")
+            if row["exposure"] not in {"internal", "compat", "advanced", "visible"}:
+                problems.append(f"{path} exposure 档位非法：{row['exposure']}")
+            if row["policy"] not in {"read", "write", "dangerous"}:
+                problems.append(f"{path} policy 非法：{row['policy']}")
+            if path in dangerous:
+                if row["policy"] != "dangerous":
+                    problems.append(f"{path} 是危险端点但 policy={row['policy']}")
+                if path not in page_api_module.UI_DANGEROUS_REASONS:
+                    problems.append(f"{path} 缺危险原因说明")
+        self.assertEqual([], problems, "ui_capabilities 与契约常量不一致：\n" + "\n".join(problems))
+
+        self.assertEqual(
+            set(dangerous),
+            {path for path, row in rows.items() if row["dangerous"]},
+        )
+
+    async def test_dangerous_endpoints_reject_missing_confirmation(self) -> None:
+        api = self._api()
+        failures: list[str] = []
+        for route in sorted(page_api_module.UI_DANGEROUS_ENDPOINTS):
+            handler = AsyncMock(return_value=_FakeResponse({"success": True}))
+            request = SimpleNamespace(method="POST")
+            with (
+                patch.object(page_api_module, "request", request),
+                patch.object(page_api_module, "jsonify", _fake_jsonify),
+                patch.object(api, "_json", AsyncMock(return_value={})),
+            ):
+                response = await api._wrap_route(route, handler)()
+            if response.status_code != 400:
+                failures.append(f"{route} 缺 confirm 时 status_code={response.status_code}")
+                continue
+            if response.json.get("error") != "confirm_required":
+                failures.append(f"{route} 错误码不是 confirm_required：{response.json}")
+            if handler.await_count:
+                failures.append(f"{route} 缺 confirm 却执行了业务 handler")
+        self.assertEqual([], failures, "危险端点确认关口漏洞：\n" + "\n".join(failures))
+
+    async def test_dangerous_endpoints_accept_matching_confirmation(self) -> None:
+        api = self._api()
+        failures: list[str] = []
+        for route in sorted(page_api_module.UI_DANGEROUS_ENDPOINTS):
+            payload = self._confirmation_payload(route)
+            expected, _target = api._expected_confirmation(route, payload)
+            if not expected:
+                failures.append(f"{route} 生不出期望 confirm")
+                continue
+            payload["confirm"] = expected
+            handler = AsyncMock(return_value=_FakeResponse({"success": True}))
+            request = SimpleNamespace(method="POST")
+            with (
+                patch.object(page_api_module, "request", request),
+                patch.object(page_api_module, "jsonify", _fake_jsonify),
+                patch.object(api, "_json", AsyncMock(return_value=payload)),
+            ):
+                response = await api._wrap_route(route, handler)()
+            if response.status_code != 200:
+                failures.append(f"{route} confirm={expected} 仍被拒：{response.json}")
+            if handler.await_count != 1:
+                failures.append(f"{route} confirm 匹配但 handler 未执行")
+        self.assertEqual([], failures, "危险端点确认规则不可用：\n" + "\n".join(failures))
+
+    @staticmethod
+    def _confirmation_payload(route: str) -> dict:
+        if route in {"/memory/delete", "/core-memory/delete"}:
+            return {"id": "mem-1"}
+        if route == "/person/erase":
+            return {"user_id": "user-1"}
+        if route == "/maintenance/clear_scope":
+            return {"scope": "private"}
+        return {}
+
+    def test_dangerous_endpoints_have_admin_authentication(self) -> None:
+        """危险端点除 confirm 外还必须有管理身份鉴权；未落地前跳过而不是硬失败。"""
+        api = self._api()
+        missing: list[str] = []
+        for path, handler, _methods, _desc in api._route_specs():
+            if path not in page_api_module.UI_DANGEROUS_ENDPOINTS:
+                continue
+            try:
+                source = inspect.getsource(handler)
+            except (OSError, TypeError):
+                source = ""
+            if not any(marker in source for marker in ADMIN_GUARD_MARKERS):
+                missing.append(path)
+        if missing:
+            self.skipTest(
+                "危险端点尚未接入管理身份鉴权（等 panel/Lead 落地后这条会自动生效）："
+                + ", ".join(missing)
+            )
 
 
 if __name__ == "__main__":

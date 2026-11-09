@@ -17,7 +17,6 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
-from zoneinfo import ZoneInfo
 
 from .astrbot_compat import (
     _plain_request_text,
@@ -39,6 +38,19 @@ from .assertions import (
     normalize_assertion,
 )
 from .audit import MemoryAuditManager
+from .absorb import (
+    RELATION_SOURCE_USER,
+    merge_relation_profile,
+    parse_relation_hints,
+)
+from .person_card import build_person_card, render_person_card
+from .person_weight import (
+    BAND_LABELS,
+    band_of,
+    clamp_weight,
+    decay_factor,
+    merge_external_weight,
+)
 from .bridge import (
     consume_authenticated_companion_projection,
     serialize_memory,
@@ -63,10 +75,18 @@ from .emotion_targeting import memory_emotion_refs
 from .identity import IdentityResolver, looks_like_command, maybe_await, normalize_session_context_fields, session_target_id
 from .importance import ImportanceEvaluator
 from .injection import (
+    DEFAULT_CORE_MEMORY_CHARS,
+    DEFAULT_INJECTION_CHARS,
+    DEFAULT_MAX_ITEM_CHARS,
+    MAX_INJECTION_CHARS,
     MEMORY_COMPANION_INJECTION_FOOTER,
     MEMORY_COMPANION_INJECTION_HEADER,
+    MIN_INJECTION_CHARS,
+    SHORT_REPLY_INJECTION_CHARS,
+    TEMPORAL_INJECTION_CHARS,
     InjectionComposer,
 )
+from .local_time import bind_timezone_provider, local_tz, timezone_name
 from .migration_livingmemory import LivingMemoryMigrator
 from .models import (
     EntityRef,
@@ -91,7 +111,7 @@ from .operations import (
     persist_runtime_config,
 )
 from .provenance import observed_from_companion_snapshot
-from .provenance_store import ProvenanceLedger
+from .provenance_store import ProvenanceLedger, load_or_create_integrity_key
 from .portrait_service import PortraitService
 from .qq_history import QQHistoryReader
 from .reply_chain import ReplyChainResolver
@@ -147,10 +167,11 @@ from .scoped_store import ScopedStore
 from .summarizer import MemorySummarizer
 from .time_intent import TimeIntent, parse_time_intent
 from .turn_signal import analyze_turn_signal, message_terms
-from .visibility import VisibilityPolicy
-
-
-LOCAL_TZ = ZoneInfo("Asia/Shanghai")
+from .visibility import (
+    VisibilityPolicy,
+    can_change_person_weight,
+    can_remember_in_scope,
+)
 
 USER_MEMORY_SUMMARY_VERSION = "memory.user_memory_summary.v1"
 _USER_MEMORY_PROFILE_TYPES = frozenset({"user_profile", "user_habit", "manual_memory"})
@@ -332,6 +353,29 @@ class MemoryCompanionService:
     # missed write-path update self-heals within one interval.
     _ACL_RECONCILE_INTERVAL_SECONDS = 60.0
 
+    def _host_timezone_name(self) -> str:
+        """Read AstrBot's global ``timezone`` for the plugin's wall clock.
+
+        AstrBot is the single owner of this setting and other plugins read the
+        same value, so mirroring it keeps memory summaries and time queries
+        aligned with the rest of the deployment.
+        """
+        context = getattr(self, "context", None)
+        getter = getattr(context, "get_config", None)
+        if not callable(getter):
+            return ""
+        try:
+            config = getter()
+        except Exception:
+            return ""
+        if config is None:
+            return ""
+        try:
+            value = config.get("timezone") if hasattr(config, "get") else getattr(config, "timezone", "")
+        except Exception:
+            return ""
+        return clean_text(value, 80)
+
     def __init__(
         self,
         *,
@@ -345,6 +389,9 @@ class MemoryCompanionService:
         self.config = ConfigView(config)
         self.plugin_root = Path(plugin_root)
         self.data_dir = Path(data_dir)
+        # The host owns the wall-clock timezone; bind it before any time-based
+        # work so summaries and queries use the same zone as AstrBot itself.
+        bind_timezone_provider(self._host_timezone_name)
 
         # 启动宽限期：插件加载后的前 N 秒内暂缓创建任何后台任务，
         # 避开 AstrBot 核心加载完插件后执行的 SQLAlchemy 连接池迁移窗口，
@@ -372,17 +419,27 @@ class MemoryCompanionService:
                 raise
         self.portraits = PortraitService(self.store, self.config)
 
-        self.identity = IdentityResolver(self._resolve_default_bot_id)
+        self.identity = IdentityResolver(
+            self._resolve_default_bot_id,
+            self._resolve_default_persona_id,
+        )
         self.reply_chain = ReplyChainResolver()
         self.intent_builder = RetrievalIntentBuilder()
         self.classifier = MemoryClassifier(
             capture_min_chars=self.config.int("memory_capture.capture_min_chars", 2)
         )
         self.injection = InjectionComposer()
+        # 拟人化注入（memory_humanization.*）走运行期配置提供者：
+        # 面板改配置即时生效，无需重建注入器。enabled=false 时注入器
+        # 所有 humanize 分支保持旧行为。
+        self.injection.set_humanize_config_provider(
+            lambda dotted, default: self.config.get(dotted, default)
+        )
         self.summarizer = MemorySummarizer(
             max_input_chars=self.config.int("memory_summary.max_input_chars", 6000),
             max_summary_chars=self.config.int("memory_summary.max_summary_chars", 1200),
             provider_timeout_seconds=self.config.int("memory_summary.provider_timeout_seconds", 300),
+            request_max_retries=self.config.int("memory_summary.request_max_retries", 2),
         )
         self.importance = ImportanceEvaluator(
             mention_policy_relax=self.config.bool("memory_capture.relax_mention_policy", False)
@@ -399,6 +456,13 @@ class MemoryCompanionService:
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._portrait_dispatch_task: asyncio.Task[Any] | None = None
         self._maintenance_dispatch_task: asyncio.Task[Any] | None = None
+        self._summary_drain_task: asyncio.Task[Any] | None = None
+        self._summary_drain_status: dict[str, Any] = {
+            "state": "idle",
+            "last_error": "",
+            "last_completed_at": "",
+            "last_result": "",
+        }
         self._maintenance_dispatch_status: dict[str, Any] = {
             "state": "idle",
             "last_error": "",
@@ -491,56 +555,16 @@ class MemoryCompanionService:
         self._RELATIONSHIP_PHASE_STATE_MAX = 4096
         self._relationship_phase_last_cleanup: float = 0.0
         self._load_relationship_phase_state()
-        self.provenance_ledger = ProvenanceLedger(self.data_dir / "provenance_ledger.json")
+        # P11：账本带密钥哈希链（密钥落在 data 目录、尽量 0600）。
+        # 取不到密钥也不报错：退化成空密钥链，仍能发现改/删/截断。
+        try:
+            _provenance_key = load_or_create_integrity_key(self.data_dir / "provenance_ledger.key")
+        except Exception:  # pragma: no cover - 极端只读环境
+            _provenance_key = b""
+        self.provenance_ledger = ProvenanceLedger(
+            self.data_dir / "provenance_ledger.json", integrity_key=_provenance_key
+        )
         self._last_p5_gate_status: dict[str, Any] = {"state": "disabled", "enabled": False}
-
-    def _initialize_database_sync(self) -> None:
-        with self._database_init_lock:
-            if self._database_initialized:
-                return
-            try:
-                self.store.initialize()
-            except Exception as exc:
-                self.store.close()
-                self.scoped_store.close()
-                raise RuntimeError(
-                    f"记忆主库初始化失败 [primary_store.initialize]: {type(exc).__name__}: {exc}"
-                ) from exc
-            try:
-                self.scoped_store.initialize()
-            except Exception as exc:
-                self.store.close()
-                self.scoped_store.close()
-                raise RuntimeError(
-                    f"作用域记忆库初始化失败 [scoped_store.initialize]: {type(exc).__name__}: {exc}"
-                ) from exc
-            try:
-                normalized = self.store.normalize_legacy_manual_visibility()
-                if normalized:
-                    logger.info(
-                        "[MemoryCompanion] 已收回早期过宽的手动记忆可见性: count=%s",
-                        normalized,
-                    )
-                internal_normalized = self.store.normalize_internal_bot_self_scopes()
-                if internal_normalized:
-                    logger.info(
-                        "[MemoryCompanion] 已将内部 Bot 梦境移出私聊用户范围: count=%s",
-                        internal_normalized,
-                    )
-            except Exception as exc:
-                self.store.close()
-                raise RuntimeError(
-                    f"旧记忆规范化失败 [legacy_memory.normalize]: {type(exc).__name__}: {exc}"
-                ) from exc
-            self._database_initialized = True
-
-    async def initialize_database(self) -> None:
-        """Initialize or upgrade plugin databases without blocking AstrBot's loop."""
-        if not self._database_initialized:
-            await asyncio.to_thread(self._initialize_database_sync)
-        if self.capture is None:
-            from .capture_runtime import CaptureRuntime
-            self.capture = CaptureRuntime(self)
 
     def _resolve_default_bot_id(self, _event: Any = None) -> str:
         """Return a Bot ID only when the runtime exposes one unambiguous value."""
@@ -586,6 +610,147 @@ class MemoryCompanionService:
                         add(star_config.get(key))
 
         return next(iter(ids)) if len(ids) == 1 else ""
+
+    async def _resolve_default_persona_id(self, event: Any = None) -> str:
+        """Return the persona AstrBot applies to this session, or ``""`` for none.
+
+        ``AstrMessageEvent`` carries no persona and a single-persona companion
+        leaves ``private_companion_persona_id`` unset, so the host persona has
+        to come from AstrBot's persona manager.  ``get_default_persona_v3`` is
+        not enough: it cannot report AstrBot's explicit "no persona" marker
+        (``[%None]``) and ignores session-level persona overrides.  Resolution
+        therefore uses ``resolve_selected_persona``, whose result is the persona
+        the runtime actually applies and the one the write path stamps.  When no
+        persona applies the id stays empty, so ``persona_context_missing``
+        remains an honest diagnostic instead of being replaced by a guess.
+        """
+        context = getattr(self, "context", None)
+        persona_manager = getattr(context, "persona_manager", None)
+        if persona_manager is None:
+            return ""
+        umo = clean_text(getattr(event, "unified_msg_origin", ""), 200)
+        provider_settings = self._persona_provider_settings(
+            context, persona_manager, umo
+        )
+        resolver = getattr(persona_manager, "resolve_selected_persona", None)
+        if callable(resolver) and umo:
+            try:
+                selected = await maybe_await(
+                    resolver(
+                        umo=umo,
+                        conversation_persona_id=await self._conversation_persona_id(
+                            event, umo
+                        ),
+                        platform_name=await self._event_platform_name(event),
+                        provider_settings=provider_settings,
+                    )
+                )
+            except Exception:
+                return ""
+            persona_id = selected[0] if isinstance(selected, tuple) else selected
+            persona_id = clean_text(persona_id, 96)
+            return "" if persona_id == "[%None]" else persona_id
+        return await self._fallback_persona_id(
+            persona_manager, provider_settings, umo
+        )
+
+    @staticmethod
+    def _persona_provider_settings(
+        context: Any, persona_manager: Any, umo: str
+    ) -> dict[str, Any]:
+        """Return AstrBot's ``provider_settings`` for one session, if exposed.
+
+        Args:
+            context: The AstrBot context the service was built with.
+            persona_manager: The host persona manager.
+            umo: Session origin used to select a per-session configuration.
+
+        Returns:
+            The provider settings mapping, or an empty mapping when the host
+            does not expose one.
+        """
+        acm = getattr(persona_manager, "acm", None)
+        for owner, name in ((context, "get_config"), (acm, "get_conf")):
+            getter = getattr(owner, name, None)
+            if not callable(getter):
+                continue
+            try:
+                config = getter(umo=umo) if umo else getter()
+            except TypeError:
+                try:
+                    config = getter(umo)
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            settings = config.get("provider_settings") if hasattr(config, "get") else None
+            if isinstance(settings, dict):
+                return settings
+        return {}
+
+    async def _conversation_persona_id(self, event: Any, umo: str) -> str | None:
+        """Return the persona pinned on the session's active conversation.
+
+        The built provider request already carries it during LLM hooks; other
+        entry points read it from the host conversation manager.
+        """
+        get_extra = getattr(event, "get_extra", None)
+        if callable(get_extra):
+            try:
+                request = get_extra("provider_request")
+            except Exception:
+                request = None
+            value = getattr(getattr(request, "conversation", None), "persona_id", None)
+            if value:
+                return clean_text(value, 96)
+        manager = getattr(getattr(self, "context", None), "conversation_manager", None)
+        get_id = getattr(manager, "get_curr_conversation_id", None)
+        get_conversation = getattr(manager, "get_conversation", None)
+        if not umo or not callable(get_id) or not callable(get_conversation):
+            return None
+        try:
+            conversation_id = await maybe_await(get_id(umo))
+            if not conversation_id:
+                return None
+            conversation = await maybe_await(get_conversation(umo, conversation_id))
+        except Exception:
+            return None
+        return clean_text(getattr(conversation, "persona_id", None), 96) or None
+
+    @staticmethod
+    async def _event_platform_name(event: Any) -> str:
+        getter = getattr(event, "get_platform_name", None)
+        if not callable(getter):
+            return ""
+        try:
+            return clean_text(await maybe_await(getter()), 80)
+        except Exception:
+            return ""
+
+    async def _fallback_persona_id(
+        self,
+        persona_manager: Any,
+        provider_settings: dict[str, Any],
+        umo: str,
+    ) -> str:
+        """Resolve the configured default persona on hosts without the richer API."""
+        configured = clean_text(provider_settings.get("default_personality"), 96)
+        if configured == "[%None]":
+            return ""
+        getter = getattr(persona_manager, "get_default_persona_v3", None)
+        if not callable(getter):
+            return ""
+        try:
+            persona = await maybe_await(getter(umo=umo) if umo else getter())
+        except Exception:
+            return ""
+        name = (
+            persona.get("name")
+            if isinstance(persona, dict)
+            else getattr(persona, "name", "")
+        )
+        name = clean_text(name, 96)
+        return "" if name == "[%None]" else name
 
     def _p5_gate_enabled(self, sink: str) -> bool:
         key = (
@@ -711,8 +876,15 @@ class MemoryCompanionService:
         snapshot = ledger.snapshot() if isinstance(ledger, ProvenanceLedger) else {
             "records": {}, "operation_count": 0, "observation_count": 0, "path_present": False,
         }
+        try:
+            integrity = ledger.verify_integrity() if isinstance(ledger, ProvenanceLedger) else {
+                "ok": False, "state": "unavailable", "reason": "ledger_unavailable",
+            }
+        except Exception as exc:
+            integrity = {"ok": False, "state": "error", "reason": type(exc).__name__}
         return {
             "schema_version": "ops.p5.provenance.v1",
+            "provenance_integrity": integrity,
             "recall_gate": self._p5_gate_enabled("memory_recall"),
             "bridge_gate": self._p5_gate_enabled("bridge_serialization"),
             "last_gate_state": str(getattr(self, "_last_p5_gate_status", {}).get("state") or "disabled"),
@@ -1056,6 +1228,14 @@ class MemoryCompanionService:
         self._sanitize_session_context_message_text(ctx)
         self._apply_companion_relationship_projection(ctx, event=event, req=req)
         self._apply_companion_expression_decision(ctx, event=event, req=req)
+        try:
+            await self._absorb_relation_hints(ctx, req=req)
+        except Exception as exc:  # 吸收失败绝不影响这一轮开口
+            logger.warning(
+                "[MemoryCompanion] 关系提示吸收失败（跳过本轮）: session=%s error=%s",
+                getattr(ctx, "session_id", ""),
+                exc,
+            )
         self._ensure_reconstruction_turn_token(event, ctx)
         self._apply_private_companion_preferred_address(ctx, req=req, event=event)
         if self._private_companion_internal_generation_event(event):
@@ -1430,6 +1610,16 @@ class MemoryCompanionService:
             )
 
     async def handle_group_message(self, event: Any) -> None:
+        """群聊/私聊共用的消息观察入口（A2）。
+
+        群聊默认**不**采集（conversation_memory.capture_group_messages 默认
+        False）；即使打开，也只采集「明确指向机器人」的消息（@ 机器人 / 唤醒前缀 /
+        回复机器人 / group_capture_keywords 关键词）。私聊天然指向机器人，另有
+        conversation_memory.capture_private_messages 开关可彻底关闭。
+
+        落库前统一用 message_id + 3 秒同文本去重（_timeline_already_has_message），
+        因此私聊不会被「观察入口」和 on_llm_request 采集链各写一条。
+        """
         self._ensure_lifecycle_maintenance_dispatcher()
         self._ensure_wal_checkpoint_loop()
         self._ensure_acl_projection_reconcile_loop()
@@ -1437,13 +1627,11 @@ class MemoryCompanionService:
             return
         if not self.config.bool("conversation_memory.enabled", True):
             return
-        if not self.config.bool("conversation_memory.capture_group_messages", True):
-            return
         if self._private_companion_internal_generation_event(event):
             return
         ctx = await self.identity.resolve_event_context(event)
         self._sanitize_session_context_message_text(ctx)
-        if ctx.scope != "group":
+        if not self._message_capture_allowed(ctx, event):
             return
         if not self._scope_feature_enabled(ctx, "capture"):
             return
@@ -1486,6 +1674,103 @@ class MemoryCompanionService:
         self._ensure_portrait_daily_dispatcher()
         self._schedule_session_summary(ctx, reason="group_conversation")
 
+    def _message_capture_allowed(self, ctx: SessionContext, event: Any) -> bool:
+        """A2：消息观察采集的统一门槛（群聊需指向机器人，私聊另有开关）。"""
+        scope = clean_text(ctx.scope, 40).lower()
+        if scope == "private":
+            return self.config.bool("conversation_memory.capture_private_messages", True)
+        if scope != "group":
+            return False
+        if not self.config.bool("conversation_memory.capture_group_messages", False):
+            return False
+        if not self.config.bool("conversation_memory.group_capture_engagement_only", True):
+            return True
+        return self._message_is_directed_at_bot(ctx, event)
+
+    def _message_is_directed_at_bot(self, ctx: SessionContext, event: Any) -> bool:
+        """A2：判断一条群消息是否「指向机器人」。
+
+        不能用 event.is_at_or_wake_command：宿主的 WakingCheckStage 在**任何**插件
+        handler 的 filter 通过时都会把它置 True，本插件这个 catch-all 观察 handler
+        会让每条群消息都变成「已唤醒」。所以这里直接看原始消息段：At 机器人 /
+        AtAll / 回复机器人消息，再看唤醒前缀与配置关键词。
+        """
+        self_id = ""
+        getter = getattr(event, "get_self_id", None)
+        if callable(getter):
+            try:
+                self_id = clean_text(getter() or "", 120)
+            except Exception:  # pragma: no cover - 平台适配器差异
+                self_id = ""
+        self_id = self_id or clean_text(ctx.bot_id, 120)
+        plain_parts: list[str] = []
+        components: list[Any] = []
+        get_messages = getattr(event, "get_messages", None)
+        if callable(get_messages):
+            try:
+                components = list(get_messages() or [])
+            except Exception:  # pragma: no cover - 平台适配器差异
+                components = []
+        for component in components:
+            name = type(component).__name__
+            if name == "At":
+                target = clean_text(getattr(component, "qq", ""), 120)
+                if target and self_id and target == self_id:
+                    return True
+            elif name == "AtAll":
+                return True
+            elif name == "Reply":
+                sender = clean_text(getattr(component, "sender_id", ""), 120)
+                if sender and self_id and sender == self_id:
+                    return True
+            elif name == "Plain":
+                plain_parts.append(str(getattr(component, "text", "") or ""))
+        raw_text = "".join(plain_parts).strip() or clean_text(ctx.message_text, 4000)
+        for prefix in self._wake_prefixes():
+            if prefix and raw_text.startswith(prefix):
+                return True
+        folded = raw_text.casefold()
+        for keyword in self._group_capture_keywords():
+            if keyword.casefold() in folded:
+                return True
+        return False
+
+    def _wake_prefixes(self) -> list[str]:
+        """读取宿主的唤醒前缀；上下文不可用时返回空列表，绝不抛错。"""
+        context = getattr(self, "context", None)
+        getter = getattr(context, "get_config", None)
+        if not callable(getter):
+            return []
+        try:
+            raw = getter()
+        except Exception:  # pragma: no cover - 宿主上下文不可用
+            return []
+        values = raw.get("wake_prefix") if hasattr(raw, "get") else None
+        if isinstance(values, str):
+            values = [values]
+        if not isinstance(values, (list, tuple)):
+            return []
+        prefixes: list[str] = []
+        for value in values:
+            prefix = clean_text(value, 20)
+            if prefix and prefix not in prefixes:
+                prefixes.append(prefix)
+        return prefixes
+
+    def _group_capture_keywords(self) -> list[str]:
+        """conversation_memory.group_capture_keywords：额外的「叫我」关键词。"""
+        raw = self.config.get("conversation_memory.group_capture_keywords", [])
+        if isinstance(raw, str):
+            raw = [item for item in re.split(r"[,，;；\s]+", raw)]
+        if not isinstance(raw, (list, tuple)):
+            return []
+        keywords: list[str] = []
+        for item in raw:
+            text = clean_text(item, 40)
+            if text and text not in keywords:
+                keywords.append(text)
+        return keywords
+
     async def read_unified_profile_portrait(self, request: dict[str, Any], *, limit: int = 8) -> dict[str, Any]:
         """Read a pre-authorized low-sensitivity summary through the Bridge."""
         return await self.portraits.read_summary(request, limit=limit)
@@ -1505,7 +1790,7 @@ class MemoryCompanionService:
         return start, end
 
     def _portrait_seconds_until_window(self, now: datetime | None = None) -> float:
-        local_now = (now or datetime.now(LOCAL_TZ)).astimezone(LOCAL_TZ)
+        local_now = (now or datetime.now(local_tz())).astimezone(local_tz())
         start, end = self._portrait_window_hours()
         if start <= local_now.hour < end:
             return 0.0
@@ -1650,6 +1935,117 @@ class MemoryCompanionService:
         if task is not None:
             self._maintenance_dispatch_status["state"] = "scheduled"
 
+    @staticmethod
+    def _core_distill_line(record: Any) -> str:
+        return clean_text(record.content, 120)
+
+    async def auto_distill_core_memory(self) -> dict[str, Any]:
+        """把长期积累的高价值记忆沉淀为核心记忆块（只补到上限，不覆盖已有块）。"""
+        if not self.config.bool("core_memory.enabled", True):
+            return {"ok": True, "code": "core_memory_disabled"}
+        if not self.config.bool("core_memory.auto_distill_enabled", True):
+            return {"ok": True, "code": "auto_distill_disabled"}
+        max_blocks = max(1, self.config.int("core_memory.auto_distill_max_blocks", 3))
+        existing = await self.list_core_memory_blocks()
+        if len(existing) >= max_blocks:
+            return {"ok": True, "code": "core_memory_full", "blocks": len(existing)}
+        min_salience = self.config.float("core_memory.auto_distill_min_salience", 0.45)
+        try:
+            memories = await self.store.list_memories(limit=1200, include_pending=False)
+        except Exception as exc:
+            return {"ok": False, "code": "list_failed", "error": self._describe_exception(exc)}
+        buckets: dict[str, list[Any]] = {"global": [], "private": [], "group": []}
+        for record in memories:
+            if record.memory_type == "core_memory":
+                continue
+            if record.lifecycle not in {"stable_memory", "working_memory", ""}:
+                continue
+            try:
+                score = float(record.salience or 0.0)
+            except (TypeError, ValueError):
+                score = 0.0
+            if score < min_salience:
+                continue
+            bucket = clean_text(record.scope, 24).lower() or "global"
+            if bucket not in buckets:
+                bucket = "global"
+            buckets[bucket].append(record)
+        created = 0
+        for bucket in ("global", "private", "group"):
+            if len(existing) + created >= max_blocks:
+                break
+            rows = sorted(buckets[bucket], key=lambda item: float(item.salience or 0.0), reverse=True)
+            if len(rows) < 2:
+                continue
+            facts: list[str] = []
+            seen: set[str] = set()
+            for record in rows:
+                text = self._core_distill_line(record)
+                if not text:
+                    continue
+                key = text.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                facts.append(text)
+                if len(facts) >= 6:
+                    break
+            if not facts:
+                continue
+            target_id = ""
+            bot_id = "self"
+            if bucket == "private":
+                subject_id = clean_text(getattr(rows[0].subject, "id", ""), 160)
+                if not subject_id or subject_id == "self":
+                    continue
+                target_id = subject_id
+                bot_id = clean_text(rows[0].owner_bot_id, 120) or "self"
+            elif bucket == "group":
+                group_id = clean_text(rows[0].group_id, 160)
+                if not group_id:
+                    continue
+                target_id = group_id
+                bot_id = clean_text(rows[0].owner_bot_id, 120) or "self"
+            label = "长期记忆·" + {"global": "整体", "private": "私聊", "group": "群聊"}[bucket]
+            payload = {
+                "label": label,
+                "content": "；".join(facts),
+                "scope": bucket,
+                "target_id": target_id,
+                "kind": "fact",
+                "priority": 60,
+                "bot_id": bot_id,
+            }
+            # 同名块已存在时合并更新（保留最近 20 条事实），否则每轮都会
+            # 因 label 冲突失败、核心记忆永远停在第一条。
+            for block in existing:
+                if not isinstance(block, dict):
+                    continue
+                if clean_text(block.get("label"), 80) != label:
+                    continue
+                if clean_text(block.get("scope"), 24) != bucket:
+                    continue
+                merged = [
+                    part.strip()
+                    for part in clean_text(block.get("content"), 4000).split("；")
+                    if part.strip()
+                ]
+                for fact in facts:
+                    if fact not in merged:
+                        merged.append(fact)
+                payload["content"] = "；".join(merged[-20:])
+                payload["id"] = clean_text(block.get("id"), 160)
+                break
+            result = await self.save_core_memory_block(payload)
+            if result.get("ok"):
+                created += 1
+                logger.info(
+                    "[MemoryCompanion] 自动沉淀核心记忆块: %s%s",
+                    label,
+                    "（合并更新）" if payload.get("id") else "",
+                )
+        return {"ok": True, "code": "distilled", "created": created, "blocks": len(existing) + created}
+
     async def _lifecycle_maintenance_dispatch_loop(self) -> None:
         startup_delay = max(
             5,
@@ -1668,6 +2064,16 @@ class MemoryCompanionService:
             try:
                 self._maintenance_dispatch_status["state"] = "running"
                 result = await self.sleep_maintenance(reason="scheduled_natural_forgetting")
+                try:
+                    await self.auto_distill_core_memory()
+                except Exception as exc:
+                    logger.warning("[MemoryCompanion] 核心记忆自动沉淀失败: %s", exc)
+                quarantine_days = self.config.int("memory_summary.quarantine_auto_retry_days", 7)
+                if quarantine_days > 0:
+                    await self.store.reap_stale_quarantined_batches(
+                        older_than_days=quarantine_days,
+                        limit=max(1, self.config.int("memory_summary.quarantine_auto_retry_limit", 50)),
+                    )
                 self._maintenance_dispatch_status.update(
                     {
                         "state": "scheduled",
@@ -1688,6 +2094,107 @@ class MemoryCompanionService:
                 logger.warning("[MemoryCompanion] 自动自然遗忘维护失败: %s", exc, exc_info=True)
             await asyncio.sleep(interval_hours * 3600)
 
+    def _ensure_summary_drain_dispatcher(self) -> None:
+        """Start the retained backlog drain: raw timeline -> memory, oldest first."""
+        if self._closing or self._closed or not self.config.bool("memory_summary.auto_drain_enabled", True):
+            return
+        if self._summary_drain_task is not None and not self._summary_drain_task.done():
+            return
+        task = self._spawn_background(
+            self._summary_drain_dispatch_loop(),
+            label="summary-drain",
+            defer_during_grace=True,
+        )
+        self._summary_drain_task = task
+        if task is not None:
+            self._summary_drain_status["state"] = "scheduled"
+
+    async def _summary_drain_dispatch_loop(self) -> None:
+        startup_delay = max(10, self.config.int("memory_summary.auto_drain_startup_delay_seconds", 120))
+        await asyncio.sleep(startup_delay)
+        orphan_cleaned = False
+        while not self._closing and not self._closed and self.config.bool("memory_summary.auto_drain_enabled", True):
+            try:
+                if not orphan_cleaned:
+                    try:
+                        retired = await self.store.close_orphan_retry_batches()
+                        if retired:
+                            logger.info("[MemoryCompanion] 清理无原文的排队批次: %s 条", retired)
+                    except Exception as exc:
+                        logger.warning("[MemoryCompanion] 清理无原文批次失败: %s", exc)
+                    orphan_cleaned = True
+                try:
+                    distilled = await self.auto_distill_core_memory()
+                    if distilled and distilled.get("created"):
+                        logger.info(
+                            "[MemoryCompanion] 核心记忆自动沉淀: %s 块", distilled.get("created")
+                        )
+                except Exception as exc:
+                    logger.warning("[MemoryCompanion] 核心记忆自动沉淀失败: %s", exc)
+                per_round = max(1, self.config.int("memory_summary.auto_drain_sessions_per_round", 5))
+                sessions = await self.store.list_summary_backlog_sessions(limit=per_round)
+                self._summary_drain_status.update(
+                    {"state": "running", "last_result": "backlog=%d" % len(sessions), "last_error": ""}
+                )
+                for item in sessions:
+                    if self._closing or self._closed:
+                        break
+                    session_id = clean_text(item.get("session_id"), 200)
+                    if not session_id:
+                        continue
+                    ctx = SessionContext(
+                        session_id=session_id,
+                        scope=clean_text(item.get("scope"), 40),
+                        bot_id=clean_text(item.get("bot_id"), 120),
+                    )
+                    oldest_raw = clean_text(item.get("oldest"), 60)
+                    pending_events = int(item.get("pending_events") or 0)
+                    force = False
+                    if oldest_raw and pending_events >= 2:
+                        try:
+                            oldest_at = datetime.fromisoformat(
+                                oldest_raw.replace("Z", "+00:00")
+                            )
+                            if oldest_at.tzinfo is None:
+                                oldest_at = oldest_at.replace(tzinfo=timezone.utc)
+                            force = (datetime.now(timezone.utc) - oldest_at).days >= 2
+                        except Exception:
+                            force = False
+                    try:
+                        memory_id = await self.maybe_summarize_session(ctx, force=force)
+                        if memory_id:
+                            logger.info(
+                                "[MemoryCompanion] 自动消化完成: session=%s memory=%s", session_id, memory_id
+                            )
+                        else:
+                            logger.info(
+                                "[MemoryCompanion] 自动消化跳过: session=%s force=%s",
+                                session_id,
+                                force,
+                            )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "[MemoryCompanion] 自动消化失败: session=%s error=%s",
+                            session_id,
+                            self._describe_exception(exc),
+                        )
+                    await asyncio.sleep(2)
+                self._summary_drain_status.update(
+                    {"state": "scheduled", "last_completed_at": utc_now()}
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._summary_drain_status.update(
+                    {"state": "degraded", "last_error": self._describe_exception(exc)}
+                )
+                logger.warning("[MemoryCompanion] 自动消化循环异常: %s", exc, exc_info=True)
+            await asyncio.sleep(
+                max(60, self.config.int("memory_summary.auto_drain_interval_minutes", 10) * 60)
+            )
+
     async def _portrait_daily_dispatch_loop(self) -> None:
         """Run only in the configured daily window, never on a message path."""
         while not self._closing and not self._closed and self.config.bool("portrait.daily_dispatch_enabled", True):
@@ -1706,10 +2213,10 @@ class MemoryCompanionService:
                 # Do not repeatedly re-enter the same window after the two
                 # bounded attempts.  The next pass begins on the next local
                 # calendar day.
-                next_start = (datetime.now(LOCAL_TZ) + timedelta(days=1)).replace(
+                next_start = (datetime.now(local_tz()) + timedelta(days=1)).replace(
                     hour=self._portrait_window_hours()[0], minute=0, second=0, microsecond=0
                 )
-                await asyncio.sleep(max(60.0, (next_start - datetime.now(LOCAL_TZ)).total_seconds()))
+                await asyncio.sleep(max(60.0, (next_start - datetime.now(local_tz())).total_seconds()))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1721,7 +2228,7 @@ class MemoryCompanionService:
                 await asyncio.sleep(15 * 60)
 
     async def run_due_portrait_batches(self, *, force_window: bool = False) -> dict[str, Any]:
-        now = datetime.now(LOCAL_TZ)
+        now = datetime.now(local_tz())
         if not force_window and self._portrait_seconds_until_window(now) > 0:
             return {"ok": True, "code": "portrait_window_closed", "processed": 0, "results": []}
         run_day = now.date().isoformat()
@@ -1957,6 +2464,83 @@ class MemoryCompanionService:
             getattr(req, "_private_companion_preferred_address_locked", False)
             or getattr(event, "_private_companion_preferred_address_locked", False)
         )
+
+    @staticmethod
+    def _request_text_blocks(req: Any) -> list[str]:
+        """把请求里可能夹着关系提示的文本都捞出来（系统提示 + 临时追加的文本段）。
+
+        关系插件（user_tag 之类）在 on_llm_request 阶段往请求上挂一段
+        `<relation>…</relation>`，位置不固定：可能并进 system_prompt，也可能
+        作为一条临时 TextPart 追加在用户内容后面。两种都读，读不到就算了。
+        """
+        texts: list[str] = []
+        system_prompt = getattr(req, "system_prompt", "")
+        if isinstance(system_prompt, str) and system_prompt.strip():
+            texts.append(system_prompt)
+        extra_parts = getattr(req, "extra_user_content_parts", None) or []
+        try:
+            iterator = list(extra_parts)
+        except TypeError:
+            iterator = []
+        for part in iterator:
+            text = part if isinstance(part, str) else getattr(part, "text", "")
+            if isinstance(text, str) and text.strip():
+                texts.append(text)
+        return texts
+
+    async def _absorb_relation_hints(self, ctx: SessionContext, *, req: Any = None) -> None:
+        """把别的插件顺手讲出来的「她在这人面前是谁」记下来。
+
+        只做一件事：从这一轮的请求文本里读关系提示，并进这个人自己的身份档案。
+        它不是记忆、不进召回，也不会被当成事实讲给别人听；用户亲口说过的关系
+        永远更硬（见 core/absorb.py 的 merge 规则）。读不到、没开、写失败都放行。
+        """
+        if not self.config.bool("persona_memory.absorb_enabled", True):
+            return
+        if req is None:
+            return
+        user_id = clean_text(getattr(ctx, "user_id", ""), 120)
+        if not user_id:
+            return
+        hints = parse_relation_hints(self._request_text_blocks(req))
+        if not hints:
+            return
+        platform = clean_text(getattr(ctx, "platform", ""), 40)
+        entity = EntityRef(
+            kind="user",
+            id=user_id,
+            name=clean_text(getattr(ctx, "user_name", ""), 80),
+        )
+        existing = await self.store.identity_profile(platform=platform, entity=entity)
+        for hint in hints:
+            merged = merge_relation_profile(existing, hint)
+            if not self._relation_profile_changed(existing, merged):
+                continue
+            await self.store.upsert_identity(
+                platform=platform,
+                entity=entity,
+                aliases=[],
+                profile=merged,
+                confidence=0.6,
+            )
+            existing = merged
+            if self.config.bool("memory_injection.debug_log_injection_enabled", False):
+                logger.info(
+                    "[MemoryCompanion] 吸收关系提示: user=%s relation=%s address=%s",
+                    user_id,
+                    clean_text(merged.get("relation_label"), 40),
+                    clean_text(merged.get("relation_address"), 40),
+                )
+
+    @staticmethod
+    def _relation_profile_changed(before: Any, after: Any) -> bool:
+        """只看真正有信息的三项；只是"又看到一次"不算变化，免得每条消息都写库。"""
+        old = before if isinstance(before, dict) else {}
+        new = after if isinstance(after, dict) else {}
+        for key in ("relation_label", "relation_address", "relation_note", "relation_source"):
+            if clean_text(old.get(key), 80) != clean_text(new.get(key), 80):
+                return True
+        return False
 
     @staticmethod
     def _apply_companion_relationship_projection(
@@ -2817,7 +3401,7 @@ class MemoryCompanionService:
                 "warnings": ["store_unavailable"],
             }
         if not clean_text(current_date, 20) or not clean_text(current_window, 40):
-            now = datetime.now(ZoneInfo("Asia/Shanghai"))
+            now = datetime.now(local_tz())
             current_date = current_date or now.strftime("%Y-%m-%d")
             current_window = current_window or self._bot_personal_window_for_datetime(now)
         return build_profile_result(
@@ -2893,7 +3477,7 @@ class MemoryCompanionService:
             ctx,
             explicit_query=query_text,
             top_k=top_k or self.config.int("memory_injection.top_k", 4),
-            max_chars=max_chars or self.config.int("memory_injection.max_chars", 1800),
+            max_chars=max_chars or self.config.int("memory_injection.max_chars", MAX_INJECTION_CHARS),
             note="bridge_injection",
             write_log=False,
             companion_bot_mood=companion_bot_mood,
@@ -2968,7 +3552,7 @@ class MemoryCompanionService:
         if not query_text:
             return ""
         core_memories = await self.core_memories_for_context(ctx)
-        core_memory_max_chars = self.config.int("core_memory.max_chars", 800)
+        core_memory_max_chars = self.config.int("core_memory.max_chars", DEFAULT_CORE_MEMORY_CHARS)
         limit = max(1, min(8, int(top_k or 6)))
         outfit_focus = clean_text(context_kind, 40).lower() == "outfit"
         fast_path = "outfit_fast_local" if outfit_focus else "schedule_fast_local"
@@ -2993,10 +3577,10 @@ class MemoryCompanionService:
             return self.injection.compose(
                 ctx,
                 [],
-                max_chars or self.config.int("memory_injection.max_chars", 4000),
+                max_chars or self.config.int("memory_injection.max_chars", MAX_INJECTION_CHARS),
                 core_memories=core_memories,
                 core_memory_max_chars=core_memory_max_chars,
-                max_item_chars=min(220, self.config.int("memory_injection.max_item_chars", 320)),
+                max_item_chars=min(220, self.config.int("memory_injection.max_item_chars", DEFAULT_MAX_ITEM_CHARS)),
             )
 
         schedule_types = {"schedule_fragment", "persona_life", "companion_note"}
@@ -3131,10 +3715,10 @@ class MemoryCompanionService:
             return self.injection.compose(
                 ctx,
                 [],
-                max_chars or self.config.int("memory_injection.max_chars", 4000),
+                max_chars or self.config.int("memory_injection.max_chars", MAX_INJECTION_CHARS),
                 core_memories=core_memories,
                 core_memory_max_chars=core_memory_max_chars,
-                max_item_chars=min(220, self.config.int("memory_injection.max_item_chars", 320)),
+                max_item_chars=min(220, self.config.int("memory_injection.max_item_chars", DEFAULT_MAX_ITEM_CHARS)),
             )
 
         slot_map: dict[str, list[SearchResult]] = {"self_timeline": [], "user_profile": []}
@@ -3172,7 +3756,7 @@ class MemoryCompanionService:
         injection = self.injection.compose(
             ctx,
             results,
-            max_chars or self.config.int("memory_injection.max_chars", 4000),
+            max_chars or self.config.int("memory_injection.max_chars", MAX_INJECTION_CHARS),
             intent_context=intent_context,
             slot_sections=self._slot_sections(slot_map),
             compact_memory=True,
@@ -3183,7 +3767,7 @@ class MemoryCompanionService:
             address_hint="" if outfit_focus else self._address_hint_for_injection(ctx),
             core_memories=core_memories,
             core_memory_max_chars=core_memory_max_chars,
-            max_item_chars=min(220, self.config.int("memory_injection.max_item_chars", 320)),
+            max_item_chars=min(220, self.config.int("memory_injection.max_item_chars", DEFAULT_MAX_ITEM_CHARS)),
         )
         logger.info(
             "[MemoryCompanion] %s快速上下文已生成: session=%s candidates=%s selected=%s chars=%s elapsed_ms=%s",
@@ -3983,6 +4567,17 @@ class MemoryCompanionService:
             non_conversation_budget=self.config.int(
                 "retrieval_advanced.non_conversation_budget", 2
             ),
+            # R5/R6/R7：人工锚定默认关闭、scope 加分整体缩放、MMR 去冗余权重。
+            # 三项都带安全默认值；老配置不写这些键时直接落到更克制的新默认。
+            anchor_floor_enabled=self.config.bool(
+                "retrieval_advanced.anchor_floor_enabled", False
+            ),
+            scope_bonus_scale=self.config.float(
+                "retrieval_advanced.scope_bonus_scale", 0.2
+            ),
+            mmr_redundancy_weight=self.config.float(
+                "retrieval_advanced.mmr_redundancy_weight", 0.35
+            ),
         )
 
     async def _resolve_rerank_provider(self, ctx: SessionContext, *, mode: str) -> tuple[Any, str]:
@@ -4352,7 +4947,7 @@ class MemoryCompanionService:
         error: str = "",
     ) -> None:
         usage = self._extract_token_usage(resp, prompt, completion)
-        now_dt = datetime.now(LOCAL_TZ)
+        now_dt = datetime.now(local_tz())
         now_ts = time.time()
         day = now_dt.strftime("%Y-%m-%d")
         hour = now_dt.strftime("%Y-%m-%dT%H:00")
@@ -5685,6 +6280,7 @@ class MemoryCompanionService:
             scope=ctx.scope,
             limit=self.config.int("memory_summary.max_events_per_summary", 40),
             after_timeline_id=clean_text(failure.get("end_timeline_id"), 160),
+            bot_id=ctx.bot_id,
         )
 
     async def _acquire_summary_call_slot(self, *, force: bool) -> bool:
@@ -5705,6 +6301,32 @@ class MemoryCompanionService:
             return True
         except asyncio.TimeoutError:
             return False
+
+    @staticmethod
+    def _warn_summary_batch_quarantined(
+        ctx: SessionContext,
+        batch_id: str,
+        *,
+        event_count: Any,
+        reason: Any,
+        calls: Any,
+    ) -> None:
+        """Report every summary freeze with the same fields.
+
+        A transient provider failure that exhausts the call budget quarantines
+        the batch from inside the retry loop, so it returned before the shared
+        warning below ever ran and left no trace in the logs. Both freeze paths
+        now emit this single message.
+        """
+        logger.warning(
+            "[MemoryCompanion] 阶段总结批次已隔离，本批原始事件冻结等待复核释放: "
+            "session=%s batch=%s event_count=%s reason=%s calls=%s",
+            ctx.session_id,
+            batch_id,
+            int(event_count or 0),
+            clean_text(reason, 300),
+            int(calls or 0),
+        )
 
     async def maybe_summarize_session(self, ctx: SessionContext, *, force: bool = False) -> str:
         if not force and not self.config.bool("memory_summary.enabled", True):
@@ -5737,6 +6359,8 @@ class MemoryCompanionService:
                 session_id=ctx.session_id, scope=ctx.scope,
                 limit=self.config.int("memory_summary.max_events_per_summary", 40),
                 exclude_assigned=True,
+                # S13：别的 bot 的流水不能总结进这个 bot 的记忆。
+                bot_id=ctx.bot_id,
             )
             # New messages take priority over bounded recovery of historical batches.
             if batch is None and self._summary_window_ready(window, force=force):
@@ -5811,6 +6435,12 @@ class MemoryCompanionService:
                                 delay=self._summary_retry_backoff_seconds(current["automatic_calls"]),
                             )
                             if exhausted:
+                                self._warn_summary_batch_quarantined(
+                                    ctx, batch_id,
+                                    event_count=total,
+                                    reason=feedback,
+                                    calls=current["automatic_calls"],
+                                )
                                 return ""
                             attempt_index += 1
                             continue
@@ -5852,9 +6482,11 @@ class MemoryCompanionService:
                 current = await self.store.get_summary_batch(batch_id)
                 state = str((current or {}).get("state") or "")
                 if state == "quarantined":
-                    logger.warning(
-                        "[MemoryCompanion] 阶段总结批次已隔离，本批原始事件冻结等待复核释放: session=%s batch=%s",
-                        ctx.session_id, batch_id,
+                    self._warn_summary_batch_quarantined(
+                        ctx, batch_id,
+                        event_count=total,
+                        reason=feedback or str((current or {}).get("last_error") or ""),
+                        calls=(current or {}).get("automatic_calls"),
                     )
                     return ""
                 if self.summarizer.compose_memory_content(payload or {}):
@@ -5876,8 +6508,7 @@ class MemoryCompanionService:
                         ),
                     )
                 spent = not force and int((current or {}).get("automatic_calls") or 0) >= max_calls
-                no_more_attempts = spent or str((current or {}).get("retry_reason") or "") == self.store.REPAIR_RETRY_REASON
-                if no_more_attempts:
+                if spent:
                     # Nothing usable came back and this batch is out of attempts,
                     # so freeze it instead of consuming events of unproven value.
                     logger.warning(
@@ -5924,8 +6555,9 @@ class MemoryCompanionService:
             )
             summary_quality = self.summarizer.summary_quality(payload or {})
             evidence_gate_passed = summary_quality == "normal"
+            candidate_valid_days = max(1, self.config.int("memory_summary.candidate_valid_days", 30))
             candidate_valid_to = (
-                (datetime.now(timezone.utc) + timedelta(days=14)).isoformat(timespec="seconds")
+                (datetime.now(timezone.utc) + timedelta(days=candidate_valid_days)).isoformat(timespec="seconds")
                 if not evidence_gate_passed
                 else ""
             )
@@ -5967,7 +6599,7 @@ class MemoryCompanionService:
                     "end_at": end_at,
                     "start_at_local": start_at_local,
                     "end_at_local": end_at_local,
-                    "timezone": "Asia/Shanghai",
+                    "timezone": timezone_name(),
                     "summarizer": "companion_memory_schema_v1",
                     "summary_schema_version": "companion_memory_v1",
                     "owner_bot_id": self._bot_subject_id(ctx),
@@ -6002,6 +6634,7 @@ class MemoryCompanionService:
             self._schedule_memory_embedding(memory_id, record)
             await self._persist_assertions(ctx, payload or {}, memory_id, rows)
             await self._record_verified_group_bot_self_facts(ctx, rows, payload or {}, memory_id)
+            await self._record_self_experience(ctx, rows, payload or {}, memory_id)
             await self._index_summary_knowledge_graph(ctx, record, payload or {}, memory_id)
             marked = len(rows)
             logger.info(
@@ -6274,6 +6907,77 @@ class MemoryCompanionService:
                 "policy_version": "memory_assertion_v1",
             },
         )
+
+
+    async def _record_self_experience(
+        self,
+        ctx: SessionContext,
+        rows: list[dict[str, Any]],
+        payload: dict[str, Any],
+        summary_memory_id: str,
+    ) -> int:
+        """把 Bot 视角的脱敏经历写成 bot_self 记忆，让她在别的会话里也能想起自己经历过什么。"""
+        if not self.config.bool("memory_summary.self_experience_enabled", True):
+            return 0
+        text = clean_text(
+            (payload or {}).get("self_experience"),
+            self.config.int("memory_summary.self_experience_max_chars", 200),
+        )
+        if len(text) < 8:
+            return 0
+        if self.summarizer._looks_like_prompt_injection(text):
+            return 0
+        current_bot_id = self._bot_subject_id(ctx)
+        occurred_at = ""
+        for row in reversed(rows or []):
+            occurred_at = clean_text(row.get("occurred_at") or row.get("created_at"), 80)
+            if occurred_at:
+                break
+        if ctx.scope == "group":
+            target = EntityRef(kind="group", id=ctx.group_id, name=ctx.group_name, role="group")
+        else:
+            target = EntityRef(kind="user", id=ctx.user_id, name=ctx.user_name, role="user")
+        record = MemoryRecord(
+            id=self.stable_id("self_experience", ctx.session_id, summary_memory_id, text),
+            memory_type="self_action",
+            subject=self._bot_entity(ctx),
+            object=target,
+            scope=ctx.scope or "private",
+            session_id=ctx.session_id,
+            platform=ctx.platform,
+            group_id=ctx.group_id,
+            visibility="bot_self",
+            sayability="indirect",
+            reality_level="bot_action",
+            lifecycle="stable_memory",
+            content=text,
+            evidence=text,
+            confidence=0.8,
+            importance=0.58,
+            review_status="auto",
+            tags=["self_experience", ctx.scope or "private"],
+            metadata={
+                "self_experience": True,
+                "source_summary_id": summary_memory_id,
+                "owner_bot_id": current_bot_id,
+                "persona_id": clean_text(ctx.persona_id, 96),
+                "origin_scope": ctx.scope,
+            },
+            occurred_at=occurred_at,
+            source_plugin="memory_companion",
+        )
+        try:
+            self.importance.calibrate(record, source="self_experience")
+            memory_id = await self.store.insert_memory(record)
+            self._schedule_memory_embedding(memory_id, record)
+            return 1
+        except Exception as exc:
+            logger.warning(
+                "[MemoryCompanion] 自身经历写入失败: session=%s error=%s",
+                ctx.session_id,
+                exc,
+            )
+            return 0
 
     async def _record_verified_group_bot_self_facts(
         self,
@@ -6888,7 +7592,7 @@ class MemoryCompanionService:
         ctx = self._normalized_session_context(ctx)
         result_limit = max(
             1,
-            int(limit) if limit is not None else self.config.int("core_memory.max_blocks", 8),
+            int(limit) if limit is not None else self.config.int("core_memory.max_blocks", 12),
         )
         candidates = await self.store.list_core_memories(
             limit=max(20, result_limit, self.config.int("core_memory.scan_limit", 200))
@@ -7019,7 +7723,10 @@ class MemoryCompanionService:
             importance=max(0.5, priority / 100.0),
             owner_bot_id=bot_id,
             validity_status="active",
-            salience=max(0.5, priority / 100.0),
+            # S7：不再把 priority 同时写进 salience（旧实现两个字段同源等值，
+            # 生命周期打分里 importance 与 salience 会各加一次，等于同一个信号
+            # 被双计）。salience 交给默认值/使用侧自然累积，priority 只由
+            # importance 承载。
             durability="pinned",
             sensitivity="private" if core_scope != "global" else "internal",
             review_status="manual",
@@ -7048,6 +7755,144 @@ class MemoryCompanionService:
         if record.memory_type != "core_memory":
             return {"ok": False, "code": "memory_type_conflict"}
         return {"ok": bool(await self.store.delete_memory(memory_id))}
+
+    @staticmethod
+    def _weight_public(info: dict[str, Any]) -> dict[str, Any]:
+        """把分量摊成给模型看的样子：数字 + 一句人话。"""
+        weight = clamp_weight((info or {}).get("weight"))
+        band = clean_text((info or {}).get("band"), 40) or band_of(weight)
+        return {
+            "weight": weight,
+            "band": band,
+            "band_label": clean_text((info or {}).get("band_label"), 40)
+            or BAND_LABELS.get(band, BAND_LABELS["stranger"]),
+            "source": clean_text((info or {}).get("source"), 40) or "auto",
+        }
+
+    async def tool_person_weight(
+        self,
+        event: Any,
+        *,
+        action: str = "get",
+        weight: int | float | None = None,
+        label: str = "",
+        address: str = "",
+        note: str = "",
+        rationale: str = "",
+    ) -> dict[str, Any]:
+        """她心里这个人有多重：查看，或者按用户本人的话纠正。
+
+        分量不是记忆、也不会被当成事实讲出来：它决定想起这个人多少、忘得多快。
+        只有用户本人亲口纠正（「我们没那么熟」「别叫这么亲」）才动它，
+        动了之后关系插件再怎么说也盖不回去。
+        """
+        if not self.config.bool("persona_memory.weight_enabled", True):
+            return {"ok": False, "code": "person_weight_disabled"}
+        ctx = self._normalized_session_context(
+            await self.identity.resolve_event_context(event)
+        )
+        user_id = clean_text(getattr(ctx, "user_id", ""), 120)
+        if not user_id:
+            return {"ok": False, "code": "user_required"}
+        platform = clean_text(getattr(ctx, "platform", ""), 40)
+        bot_id = clean_text(getattr(ctx, "bot_id", ""), 120)
+        # H6：分量是私下掂量的东西，不能靠群里一句话把自己抬成「刻骨的人」。
+        # 群里只允许往回收（「我们没那么熟」），抬升和重置必须回到私聊说。
+        in_group = clean_text(getattr(ctx, "scope", ""), 40) == "group"
+        normalized = clean_text(action, 24).lower() or "get"
+
+        if normalized in ("get", "check", "read", "查看"):
+            info = await self.store.person_weight(
+                user_id=user_id, platform=platform, bot_id=bot_id
+            )
+            return {"ok": True, "action": "get", **self._weight_public(info)}
+
+        if normalized not in ("set", "reset", "correct", "改", "纠正", "重置"):
+            return {"ok": False, "code": "unknown_action"}
+
+        # H6：改分量必须有「用户本人这句话」作为凭据，模型自己的判断不算。
+        # 群里不能抬升、不能重置，只能按用户原话往回收。
+        current = await self.store.person_weight(
+            user_id=user_id, platform=platform, bot_id=bot_id
+        )
+        try:
+            current_weight = int(current.get("weight") or 0)
+        except (TypeError, ValueError):
+            current_weight = 0
+        decision = can_change_person_weight(
+            ctx,
+            self.config,
+            action=normalized,
+            target_weight=weight,
+            current_weight=current_weight,
+        )
+        if not decision.allowed:
+            return {
+                "ok": False,
+                "code": decision.code,
+                "message": decision.reason,
+                "weight": current_weight,
+            }
+
+        if normalized in ("reset", "重置"):
+            # 抹掉她自己的判断，改回按记忆自动掂量。
+            await self.store.set_person_weight(
+                user_id=user_id, correction=0, platform=platform, bot_id=bot_id
+            )
+            info = await self.store.person_weight(
+                user_id=user_id, platform=platform, bot_id=bot_id, max_age_seconds=0
+            )
+        else:
+            if weight is None:
+                return {"ok": False, "code": "weight_required"}
+            try:
+                target = clamp_weight(weight)
+            except (TypeError, ValueError):
+                return {"ok": False, "code": "invalid_weight"}
+            if in_group and label:
+                # 群里不能给自己发关系名分；称呼可以记（她本来就会从对话里学）。
+                label = ""
+            info = await self.store.set_person_weight(
+                user_id=user_id, weight=target, platform=platform, bot_id=bot_id
+            )
+
+        profile_changed = False
+        if label or address or note:
+            entity = EntityRef(
+                kind="user",
+                id=user_id,
+                name=clean_text(getattr(ctx, "user_name", ""), 80),
+            )
+            existing = await self.store.identity_profile(platform=platform, entity=entity)
+            merged = merge_relation_profile(
+                existing,
+                {
+                    "relation": label,
+                    "address": address,
+                    "note": note,
+                    "source": RELATION_SOURCE_USER,
+                },
+            )
+            if self._relation_profile_changed(existing, merged):
+                await self.store.upsert_identity(
+                    platform=platform,
+                    entity=entity,
+                    aliases=[],
+                    profile=merged,
+                    confidence=0.9,
+                )
+                profile_changed = True
+
+        payload = {
+            "ok": True,
+            "action": normalized,
+            **self._weight_public(info),
+            "correction": int((info or {}).get("correction") or 0),
+            "profile_updated": profile_changed,
+        }
+        if clean_text(rationale, 200):
+            payload["rationale"] = clean_text(rationale, 200)
+        return payload
 
     async def tool_core_memory(
         self,
@@ -7425,11 +8270,23 @@ class MemoryCompanionService:
                     "error": "scope capture disabled",
                     "scope": clean_text(ctx.scope, 40),
                 }
-            visibility = "internal"
-            if ctx.scope == "private":
-                visibility = "private_pair"
-            elif ctx.scope == "group":
-                visibility = "group_public"
+            # P3：能不能在这个场合写记忆，统一交给 core/visibility 的判定函数：
+            # 私聊可写 private_pair；群里默认拒绝，开了 allow_group_remember 之后也
+            # 只允许管理员写 group_public；其它场景宁可不写。durability 有上限。
+            decision = can_remember_in_scope(ctx, self.config, event=event)
+            if not decision.allowed:
+                return {
+                    "ok": False,
+                    "code": decision.code,
+                    "message": decision.reason,
+                }
+            visibility = decision.visibility
+            durability_ceiling = {"ephemeral": 0, "short": 1, "normal": 2, "durable": 3, "pinned": 4}
+            requested_durability = memory_proposal.durability
+            if durability_ceiling.get(requested_durability, 2) > durability_ceiling.get(
+                decision.durability, 2
+            ):
+                requested_durability = decision.durability
             record = MemoryRecord(
                 id=self.stable_id("tool", note_type, ctx.session_id, content),
                 memory_type=memory_proposal.memory_type,
@@ -7453,7 +8310,7 @@ class MemoryCompanionService:
                 tags=["llm_tool", note_type, ctx.scope],
                 valid_from=memory_proposal.valid_from,
                 valid_to=memory_proposal.valid_to,
-                durability=memory_proposal.durability,
+                durability=requested_durability,
                 validity_status=memory_proposal.validity_status,
                 lifecycle="stable_memory" if memory_proposal.confidence >= 0.55 else "short_term_candidate",
                 metadata={
@@ -8334,7 +9191,7 @@ class MemoryCompanionService:
                 "end_at": clean_text(metadata.get("end_at"), 80),
                 "start_at_local": clean_text(metadata.get("start_at_local"), 80),
                 "end_at_local": clean_text(metadata.get("end_at_local"), 80),
-                "timezone": clean_text(metadata.get("timezone") or "Asia/Shanghai", 40),
+                "timezone": clean_text(metadata.get("timezone") or timezone_name(), 40),
             },
             "subject": {
                 "id": clean_text(memory.subject.id, 120),
@@ -8580,6 +9437,9 @@ class MemoryCompanionService:
     async def operational_report(self) -> dict[str, Any]:
         report = await build_operational_report(self)
         report["summary_progress"] = await self.store.summary_progress()
+        # Surface the wall-clock zone the plugin actually uses, so a host
+        # timezone mismatch is visible instead of silently skewing summaries.
+        report["timezone"] = timezone_name()
         return report
 
     async def export_portable_data(self) -> dict[str, Any]:
@@ -8814,6 +9674,7 @@ class MemoryCompanionService:
             archived = await self.store.archive_raw_events_older_than(
                 (now - timedelta(days=raw_days)).isoformat(timespec="seconds"),
                 limit=self.config.int("maintenance.retention_raw_event_limit", 1000),
+                protect_imprint=self.config.bool("persona_memory.imprint_keep_forever", True),
             )
         # A pending candidate is excluded from recall and, without this, from the
         # decay pool too, so it used to stay pending forever.
@@ -8867,23 +9728,48 @@ class MemoryCompanionService:
             max_candidates = max(1, self.config.int("maintenance.memory_decay_max_candidates", 120))
             scan_limit = max(max_candidates * 12, self.config.int("maintenance.memory_decay_scan_limit", 2000))
             pool = await self.store.list_decay_candidate_pool(limit=scan_limit)
+            weight_factors = await self._decay_person_factors(pool)
             candidates: list[dict[str, Any]] = []
             for record in pool:
-                item = self._decay_candidate(record)
+                subject = getattr(record, "subject", None)
+                factor = weight_factors.get(
+                    (
+                        clean_text(getattr(record, "owner_bot_id", ""), 120),
+                        clean_text(getattr(record, "platform", ""), 40),
+                        clean_text(getattr(subject, "id", "") if subject is not None else "", 120),
+                    ),
+                    1.0,
+                )
+                item = self._decay_candidate(record, person_factor=factor)
                 if not item:
                     continue
                 candidates.append(item)
                 if len(candidates) >= max_candidates:
                     break
 
+            # 先淡一层，再决定要不要归档：忘记是慢慢褪色的，不是某天突然删掉。
+            fade_updates, candidates, fade_held = self._split_decay_fade(candidates)
+            faded = 0
+            if fade_updates:
+                try:
+                    faded = await self.store.fade_memories(fade_updates)
+                except Exception as exc:
+                    logger.warning(
+                        "[MemoryCompanion] 记忆淡化失败（下次维护再试）: %s", exc
+                    )
+                    fade_held += len(fade_updates)
+                    fade_updates = []
+
             if not candidates:
                 return {
                     "enabled": True,
                     "scanned": len(pool),
                     "candidates": 0,
+                    "faded": faded,
+                    "fade_held": fade_held,
                     "archived": 0,
                     "summaries": 0,
-                    "reason": "no_eligible_memories",
+                    "reason": "faded_only" if faded else "no_eligible_memories",
                 }
 
             groups = self._decay_groups(candidates)
@@ -8945,6 +9831,8 @@ class MemoryCompanionService:
                 "enabled": True,
                 "scanned": len(pool),
                 "candidates": len(candidates),
+                "faded": faded,
+                "fade_held": fade_held,
                 "groups": len(groups),
                 "summaries": summaries,
                 "archived": archived,
@@ -8953,7 +9841,95 @@ class MemoryCompanionService:
                 "errors": errors[:5],
             }
 
-    def _decay_candidate(self, record: MemoryRecord) -> dict[str, Any] | None:
+    def _split_decay_fade(
+        self, candidates: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+        """把候选分两拨：这一轮先「淡一档」的，和已经淡到底、可以归档的。
+
+        默认每个候选先褪一次色（salience 打折、记下第几步），隔一天以上才会再褪；
+        褪到门槛以下才真正归档。关掉 maintenance.memory_decay_gradual_enabled 就回到
+        一次性归档的老路径。
+        """
+
+        if not self.config.bool("maintenance.memory_decay_gradual_enabled", True):
+            return [], list(candidates), 0
+        floor = max(0.0, min(0.9, self.config.int("maintenance.memory_decay_fade_floor_percent", 25) / 100.0))
+        ratio = max(0.1, min(0.95, self.config.int("maintenance.memory_decay_fade_ratio_percent", 70) / 100.0))
+        interval_days = max(0, self.config.int("maintenance.memory_decay_fade_interval_days", 1))
+        now = datetime.now(timezone.utc)
+        fade_updates: list[dict[str, Any]] = []
+        archive_items: list[dict[str, Any]] = []
+        held = 0
+        for item in candidates:
+            record = item.get("record")
+            if record is None:
+                continue
+            metadata = record.metadata if isinstance(record.metadata, dict) else {}
+            raw_salience = getattr(record, "salience", None)
+            if raw_salience in (None, "") or raw_salience is False:
+                raw_salience = record.importance
+            try:
+                salience = max(0.0, min(1.0, float(raw_salience or 0.0)))
+            except (TypeError, ValueError):
+                salience = 0.0
+            fade_level = max(0, int(metadata.get("fade_level") or 0))
+            if salience <= floor:
+                archive_items.append(item)
+                continue
+            faded_at = self._parse_iso(metadata.get("faded_at"))
+            if fade_level > 0 and faded_at is not None and interval_days:
+                if (now - faded_at).total_seconds() < interval_days * 86400:
+                    held += 1
+                    continue
+            fade_updates.append(
+                {
+                    "id": record.id,
+                    "salience": max(0.02, salience * ratio),
+                    "fade_level": fade_level + 1,
+                }
+            )
+        return fade_updates, archive_items, held
+
+    async def _decay_person_factors(
+        self, pool: list[MemoryRecord]
+    ) -> dict[tuple[str, str, str], float]:
+        """这批候选里，每个人在她心里多重 → 衰减快慢系数。
+
+        重的人门槛拉长、轻的人更快淡掉；算不出来就按 1.0（照常）。
+        """
+        if not self.config.bool("persona_memory.weight_enabled", True):
+            return {}
+        subjects: set[tuple[str, str, str]] = set()
+        for record in pool:
+            subject = getattr(record, "subject", None)
+            if subject is None or clean_text(getattr(subject, "kind", ""), 20) != "user":
+                continue
+            user_id = clean_text(getattr(subject, "id", ""), 120)
+            if not user_id:
+                continue
+            subjects.add(
+                (
+                    clean_text(getattr(record, "owner_bot_id", ""), 120),
+                    clean_text(getattr(record, "platform", ""), 40),
+                    user_id,
+                )
+            )
+            if len(subjects) >= 200:
+                break
+        factors: dict[tuple[str, str, str], float] = {}
+        for bot_id, platform, user_id in subjects:
+            try:
+                info = await self.store.person_weight(
+                    user_id=user_id, platform=platform, bot_id=bot_id
+                )
+            except Exception:
+                continue
+            factors[(bot_id, platform, user_id)] = decay_factor(info.get("weight"))
+        return factors
+
+    def _decay_candidate(
+        self, record: MemoryRecord, *, person_factor: float = 1.0
+    ) -> dict[str, Any] | None:
         memory_type = clean_text(record.memory_type, 80).lower()
         tags = {clean_text(tag, 80).lower() for tag in (record.tags or [])}
         protected_types = {
@@ -9032,6 +10008,13 @@ class MemoryCompanionService:
         if durable_weight:
             durability_age_multiplier *= 1.0 + durable_weight * 2.0
             durability_idle_multiplier *= 1.0 + durable_weight * 1.5
+        # 按人算，不按时间算：她心里重的人，忘得慢；只是照面的人，忘得快。
+        try:
+            factor = max(0.2, min(4.0, float(person_factor or 1.0)))
+        except (TypeError, ValueError):
+            factor = 1.0
+        durability_age_multiplier *= factor
+        durability_idle_multiplier *= factor
         min_age = max(
             1,
             int(self.config.int("maintenance.memory_decay_after_days", 180) * durability_age_multiplier),
@@ -9081,7 +10064,7 @@ class MemoryCompanionService:
             "reason": (
                 f"age={age_days:.1f}d idle={idle_days:.1f}d "
                 f"importance={record.importance:.2f} durability={durability} "
-                f"reinforcement={reinforcement:.2f}"
+                f"reinforcement={reinforcement:.2f} person={factor:.2f}"
             ),
         }
 
@@ -9451,6 +10434,138 @@ class MemoryCompanionService:
     async def _compose_memory_injection(
         self,
         ctx: SessionContext,
+        **kwargs: Any,
+    ) -> str:
+        """先摆上"这个人是谁"，再摆"想起了什么"。"""
+        body = await self._compose_memory_injection_core(ctx, **kwargs)
+        try:
+            card = await self._compose_person_card_block(ctx)
+        except Exception as exc:  # 人卡坏了不能把整条注入拖死
+            logger.warning("[MemoryCompanion] 人卡拼装失败: %s", exc)
+            card = ""
+        if not card:
+            return body
+        if not body:
+            return card
+        return f"{card}\n{body}"
+
+    async def _compose_person_card_block(
+        self,
+        ctx: SessionContext,
+        *,
+        max_chars: int | None = None,
+        max_items: int | None = None,
+    ) -> str:
+        if not self.config.bool("persona_memory.enabled", True):
+            return ""
+        user_id = clean_text(getattr(ctx, "user_id", ""), 120)
+        if not user_id:
+            return ""
+        bot_id = clean_text(getattr(ctx, "bot_id", ""), 120)
+        platform = clean_text(getattr(ctx, "platform", ""), 40)
+        address = clean_text(getattr(ctx, "preferred_address", ""), 60)
+        budget = int(
+            max_chars or self.config.int("persona_memory.max_chars", 420)
+        )
+        items = int(max_items or self.config.int("persona_memory.max_items", 6))
+
+        cache = getattr(self, "_person_card_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._person_card_cache = cache
+        scope = clean_text(getattr(ctx, "scope", ""), 40)
+        group_id = clean_text(getattr(ctx, "group_id", ""), 120)
+        # 缓存键必须带场合：同一个人在同一场合的和在群里的卡不是同一张。
+        cache_key = f"{bot_id}|{platform}|{user_id}|{address}|{scope}|{group_id}"
+        now = time.time()
+        cached = cache.get(cache_key)
+        if isinstance(cached, tuple) and len(cached) == 2 and now - cached[0] < 30.0:
+            return str(cached[1] or "")
+
+        snapshot = await self.store.person_snapshot(
+            user_id=user_id,
+            platform=platform,
+            bot_id=bot_id,
+            limit=16,
+            scope=scope,
+            group_id=group_id,
+            hide_pending=self.config.bool("visibility.hide_pending_review", True),
+            include_raw_events=self.config.bool("memory_injection.include_raw_events", False),
+            allow_group_public_in_private=self.config.bool(
+                "privacy_guard.allow_group_public_in_private", False
+            ),
+        )
+        identity_profile = (snapshot.get("identity") or {}).get("profile")
+        if isinstance(identity_profile, str):
+            identity_profile = json_loads(identity_profile, {})
+        if not isinstance(identity_profile, dict):
+            identity_profile = {}
+        # 分量：别人报了就用别人的（人形化/关系插件），没人报就自己按记忆掂量。
+        # 群聊也照样算——她心里这个人多重，不该因为换了个场合就不知道。
+        local_weight: dict[str, Any] = {}
+        if self.config.bool("persona_memory.weight_enabled", True):
+            try:
+                local_weight = await self.store.person_weight(
+                    user_id=user_id, platform=platform, bot_id=bot_id
+                )
+            except Exception as exc:  # 算不出来就按普通处理，别把注入拖死
+                logger.warning("[MemoryCompanion] 分量计算失败（先按普通处理）: %s", exc)
+        # ctx 上这个字段默认是 0（表示「没人报过」），不能当成外部报了 0 分。
+        external_score = getattr(ctx, "companion_relationship_score", None)
+        try:
+            external_score = int(external_score) if external_score else None
+        except (TypeError, ValueError):
+            external_score = None
+        if external_score is not None and external_score <= 0:
+            external_score = None
+        weight_info = merge_external_weight(
+            local_weight,
+            external_score,
+            external_phase=clean_text(
+                getattr(ctx, "companion_relationship_phase_key", ""), 40
+            ),
+        )
+        relation_label = clean_text(identity_profile.get("relation_label"), 40)
+        relation_address = clean_text(identity_profile.get("relation_address"), 60)
+        card = build_person_card(
+            user_id=user_id,
+            user_name=getattr(ctx, "user_name", ""),
+            platform=platform,
+            bot_id=bot_id,
+            identity=snapshot.get("identity") or {},
+            memories=snapshot.get("memories") or [],
+            preferred_address=address or relation_address,
+            relationship_label=(
+                clean_text(getattr(ctx, "companion_relationship_phase_label", ""), 40)
+                or relation_label
+                or clean_text(weight_info.get("band_label"), 40)
+            ),
+            # 只有别人真报了分数才把数字写进卡；自己掂量的只给一句「什么人」，
+            # 免得她张口就念「好感度 62」这种不像人说的话。
+            relationship_score=(
+                weight_info.get("weight")
+                if weight_info.get("source") == "companion"
+                else None
+            ),
+            relationship_phase=clean_text(weight_info.get("phase"), 40),
+            memory_total=int(snapshot.get("total") or 0),
+            max_anchors=max(items, 8),
+        )
+        block = render_person_card(
+            card,
+            max_chars=budget,
+            max_items=items,
+            max_item_chars=self.config.int("persona_memory.max_item_chars", 90),
+        )
+        cache[cache_key] = (now, block)
+        if len(cache) > 256:
+            for key in list(cache.keys())[:64]:
+                cache.pop(key, None)
+        return block
+
+    async def _compose_memory_injection_core(
+        self,
+        ctx: SessionContext,
         *,
         req: Any = None,
         event: Any = None,
@@ -9464,7 +10579,7 @@ class MemoryCompanionService:
     ) -> str:
         ctx = self._normalized_session_context(ctx)
         core_memories = await self.core_memories_for_context(ctx)
-        core_memory_max_chars = self.config.int("core_memory.max_chars", 800)
+        core_memory_max_chars = self.config.int("core_memory.max_chars", DEFAULT_CORE_MEMORY_CHARS)
         recent_fact_context = await self._recent_fact_guard_context(ctx)
         recent_cross_window_context = await self._recent_cross_window_context(ctx)
         turn_signal = analyze_turn_signal(explicit_query or ctx.message_text)
@@ -9491,7 +10606,7 @@ class MemoryCompanionService:
             return self.injection.compose(
                 ctx,
                 [],
-                max_chars or self.config.int("memory_injection.max_chars", 4000),
+                max_chars or self.config.int("memory_injection.max_chars", MAX_INJECTION_CHARS),
                 intent_context=intent_context,
                 emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"),
                 intimacy_level=getattr(turn_signal, "intimacy_level", 0.0),
@@ -9503,7 +10618,7 @@ class MemoryCompanionService:
                 core_memories=core_memories,
                 core_memory_max_chars=core_memory_max_chars,
                 included_memory_ids=static_included_memory_ids,
-                max_item_chars=self.config.int("memory_injection.max_item_chars", 320),
+                max_item_chars=self.config.int("memory_injection.max_item_chars", DEFAULT_MAX_ITEM_CHARS),
             )
 
         if decision.suppress_long_memory:
@@ -9541,6 +10656,8 @@ class MemoryCompanionService:
                     selected_memory_ids=static_included_memory_ids,
                     blocked_reasons=blocked,
                     injection_chars=len(injection),
+                    user_id=ctx.user_id,
+                    bot_id=ctx.bot_id,
                 )
             return injection
         if not retrieval_query and not (time_intent.active and time_intent.summary_like):
@@ -9577,6 +10694,8 @@ class MemoryCompanionService:
                     selected_memory_ids=static_included_memory_ids,
                     blocked_reasons=blocked,
                     injection_chars=len(injection),
+                    user_id=ctx.user_id,
+                    bot_id=ctx.bot_id,
                 )
             return injection
 
@@ -9648,7 +10767,8 @@ class MemoryCompanionService:
             time_intent=time_intent,
         )
         if short_reply_anchor:
-            injection_max_chars = min(injection_max_chars, 1050)
+            injection_max_chars = min(injection_max_chars, SHORT_REPLY_INJECTION_CHARS)
+        injection_max_chars = max(MIN_INJECTION_CHARS, min(injection_max_chars, MAX_INJECTION_CHARS))
         included_memory_ids: list[str] = []
         injection = self.injection.compose(
             ctx,
@@ -9670,7 +10790,7 @@ class MemoryCompanionService:
             included_memory_ids=included_memory_ids,
             core_memories=core_memories,
             core_memory_max_chars=core_memory_max_chars,
-            max_item_chars=self.config.int("memory_injection.max_item_chars", 320),
+            max_item_chars=self.config.int("memory_injection.max_item_chars", DEFAULT_MAX_ITEM_CHARS),
         )
         injection_omissions, _diagnostic_included_memory_ids = self.injection.diagnostic_snapshot()
         blocked.extend(injection_omissions)
@@ -9707,6 +10827,8 @@ class MemoryCompanionService:
                 selected_memory_ids=included_memory_ids,
                 blocked_reasons=blocked[:30],
                 injection_chars=len(injection),
+                user_id=ctx.user_id,
+                bot_id=ctx.bot_id,
             )
         return injection
 
@@ -9778,7 +10900,7 @@ class MemoryCompanionService:
                 recent_fact_context,
                 recent_cross_window_context,
             ) = await self._load_static_memory_context(ctx, stage_timer)
-        core_memory_max_chars = self.config.int("core_memory.max_chars", 800)
+        core_memory_max_chars = self.config.int("core_memory.max_chars", DEFAULT_CORE_MEMORY_CHARS)
         isolate_low_information = False
         isolate_topic_shift = False
         topic_shift_reason = ""
@@ -9859,7 +10981,7 @@ class MemoryCompanionService:
                 injection = self.injection.compose(
                     ctx,
                     [],
-                    self.config.int("memory_injection.max_chars", 4000),
+                    self.config.int("memory_injection.max_chars", MAX_INJECTION_CHARS),
                     intent_context=intent_context,
                     emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"),
                     intimacy_level=getattr(turn_signal, "intimacy_level", 0.0),
@@ -9871,7 +10993,7 @@ class MemoryCompanionService:
                     core_memories=core_memories,
                     core_memory_max_chars=core_memory_max_chars,
                     included_memory_ids=actual_injected_memory_ids,
-                    max_item_chars=self.config.int("memory_injection.max_item_chars", 320),
+                    max_item_chars=self.config.int("memory_injection.max_item_chars", DEFAULT_MAX_ITEM_CHARS),
                 )
             self._log_injection_debug(
                 ctx=ctx,
@@ -9902,6 +11024,8 @@ class MemoryCompanionService:
                     selected_memory_ids=actual_injected_memory_ids if published else [],
                     blocked_reasons=blocked,
                     injection_chars=len(injection) if published else 0,
+                    user_id=ctx.user_id,
+                    bot_id=ctx.bot_id,
                 )
             return
         blocked: list[dict[str, Any]] = []
@@ -10022,7 +11146,8 @@ class MemoryCompanionService:
         results = self._flatten_slot_map(slot_map)
         injection_max_chars = self._injection_max_chars_for_query(ctx, retrieval_query, time_intent=time_intent)
         if short_reply_anchor:
-            injection_max_chars = min(injection_max_chars, 1050)
+            injection_max_chars = min(injection_max_chars, SHORT_REPLY_INJECTION_CHARS)
+        injection_max_chars = max(MIN_INJECTION_CHARS, min(injection_max_chars, MAX_INJECTION_CHARS))
         actual_injected_memory_ids: list[str] = []
         injection = self.injection.compose(
             ctx,
@@ -10044,7 +11169,7 @@ class MemoryCompanionService:
             included_memory_ids=actual_injected_memory_ids,
             core_memories=core_memories,
             core_memory_max_chars=core_memory_max_chars,
-            max_item_chars=self.config.int("memory_injection.max_item_chars", 320),
+            max_item_chars=self.config.int("memory_injection.max_item_chars", DEFAULT_MAX_ITEM_CHARS),
         )
         injection_omissions, _diagnostic_included_memory_ids = self.injection.diagnostic_snapshot()
         blocked.extend(injection_omissions)
@@ -10101,6 +11226,8 @@ class MemoryCompanionService:
                     "slot_limits": retrieval_path_info.get("slot_limits", {}),
                     "capped_slots": retrieval_path_info.get("capped_slots", []),
                 },
+                user_id=ctx.user_id,
+                bot_id=ctx.bot_id,
             )
         if stage_timer:
             stage_timer.mark("compose_log")
@@ -10452,7 +11579,7 @@ class MemoryCompanionService:
             return text
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
+        return parsed.astimezone(local_tz()).strftime("%Y-%m-%d %H:%M:%S")
 
     @staticmethod
     def _recent_fact_categories(text: Any) -> set[str]:
@@ -10539,6 +11666,7 @@ class MemoryCompanionService:
             current_session_id=current_session_id,
             since_at=cutoff.isoformat(timespec="seconds"),
             limit=max(32, event_limit * 8),
+            bot_id=ctx.bot_id,
         )
         if not rows:
             return ""
@@ -10593,7 +11721,7 @@ class MemoryCompanionService:
             return ""
         lines = [f"方向：{direction}；有效窗口：近 {ttl_minutes} 分钟；仅含当前用户与同一 Bot 的片段。"]
         for item in reversed(selected):
-            local_time = item["occurred_at"].astimezone(ZoneInfo("Asia/Shanghai")).strftime("%H:%M")
+            local_time = item["occurred_at"].astimezone(local_tz()).strftime("%H:%M")
             lines.append(f"{local_time} {item['speaker']}：{item['text']}")
         return clean_text(" | ".join(lines), 1100)
 
@@ -10611,6 +11739,7 @@ class MemoryCompanionService:
             scope=ctx.scope,
             session_id=ctx.session_id,
             entity_id=ctx.user_id,
+            bot_id=ctx.bot_id,
         )
         if not rows:
             return ""
@@ -10670,7 +11799,7 @@ class MemoryCompanionService:
             f"以下是同一私聊近 {ttl_hours} 小时的原始事实锚点，不是长期摘要；有更新时以较新的明确说法为准："
         ]
         for fact in selected:
-            local_time = fact["occurred_at"].astimezone(ZoneInfo("Asia/Shanghai")).strftime("%H:%M")
+            local_time = fact["occurred_at"].astimezone(local_tz()).strftime("%H:%M")
             user_text = self.injection._redact_sensitive_text(fact["text"])
             line = f"- {local_time} 用户明确说：{user_text}"
             acknowledgements = [
@@ -10872,6 +12001,7 @@ class MemoryCompanionService:
         if not rows:
             rows = await self.store.recent_timeline(
                 limit=limit, scope=ctx.scope, session_id=ctx.session_id, entity_id=ctx.current_target_id,
+                bot_id=ctx.bot_id,
             )
             rows = [
                 {**row, "content": text}
@@ -12000,7 +13130,7 @@ class MemoryCompanionService:
     def _sanitize_request_history_for_companion(self, ctx: SessionContext, req: Any) -> None:
         sanitized = sanitize_request_history(
             req,
-            clean_proactive_guidance=self.config.bool("private_companion_bridge.clean_proactive_history", True),
+            clean_proactive_guidance=self.config.bool("private_companion_bridge.clean_proactive_history", False),
         )
         if int(sanitized.get("removed", 0) or 0) or int(sanitized.get("cleaned", 0) or 0):
             logger.info(
@@ -12030,7 +13160,7 @@ class MemoryCompanionService:
             "memory_injection_enabled": self.config.bool("memory_injection.enabled", True),
             "dedupe_prompt_context": self.config.bool("private_companion_bridge.dedupe_prompt_context", True),
             "prefer_memory_companion_memory": self.config.bool("private_companion_bridge.prefer_memory_companion_memory", True),
-            "clean_proactive_history": self.config.bool("private_companion_bridge.clean_proactive_history", True),
+            "clean_proactive_history": self.config.bool("private_companion_bridge.clean_proactive_history", False),
             "suppress_self_timeline_when_companion_seen": self.config.bool("private_companion_bridge.suppress_self_timeline_when_companion_seen", True),
             "suppress_user_context_when_companion_seen": self.config.bool("private_companion_bridge.suppress_user_context_when_companion_seen", True),
         }
@@ -12698,7 +13828,7 @@ class MemoryCompanionService:
         if not check_like:
             return False
         try:
-            hour = datetime.now(LOCAL_TZ).hour
+            hour = datetime.now(local_tz()).hour
         except Exception:
             return True
         return hour >= 23 or hour < 7
@@ -12827,22 +13957,39 @@ class MemoryCompanionService:
         return clean_text(query, 1400)
 
     def _retrieval_top_k_for_query(self, ctx: SessionContext, query: str, *, time_intent: TimeIntent | None = None) -> int:
-        base = self.config.int("memory_injection.top_k", 4)
+        base = self.config.int("memory_injection.top_k", 8)
         if (time_intent is not None and time_intent.active) or self._message_requests_temporal_aggregate(ctx.message_text or query):
             if time_intent is not None and time_intent.summary_like:
                 return max(base, 12)
             return max(base, 10)
+        # 信息量大的问句（长句、多问号）多给几条，短寒暄保持精简。
+        probe = clean_text(ctx.message_text or query, 600)
+        if len(probe) >= 40 or probe.count("？") + probe.count("?") >= 2:
+            return min(base + 2, 20)
         return base
 
     def _injection_max_chars_for_query(self, ctx: SessionContext, query: str, *, time_intent: TimeIntent | None = None) -> int:
-        base = self.config.int("memory_injection.max_chars", 4000)
+        # R13：不管配置写多大、走哪条分支，单轮注入都不超过 MAX_INJECTION_CHARS。
+        base = min(
+            self.config.int("memory_injection.max_chars", MAX_INJECTION_CHARS),
+            MAX_INJECTION_CHARS,
+        )
         if (time_intent is not None and time_intent.active) or self._message_requests_temporal_aggregate(ctx.message_text or query):
-            return max(base, self.config.int("memory_injection.temporal_aggregate_max_chars", 3600))
-        return base
+            return min(
+                max(
+                    base,
+                    self.config.int(
+                        "memory_injection.temporal_aggregate_max_chars",
+                        TEMPORAL_INJECTION_CHARS,
+                    ),
+                ),
+                MAX_INJECTION_CHARS,
+            )
+        return max(MIN_INJECTION_CHARS, base)
 
     def _slot_limits(self, top_k: int, *, query: str = "", time_intent: TimeIntent | None = None) -> dict[str, int]:
         total = max(1, int(top_k or 1))
-        conversation_limit = self.config.int("context_orchestration.conversation_summary_limit", 2)
+        conversation_limit = self.config.int("context_orchestration.conversation_summary_limit", 3)
         open_loop_limit = 1
         if self._message_is_vague_recent_followup(query):
             open_loop_limit = min(total, 3)
@@ -12851,11 +13998,11 @@ class MemoryCompanionService:
             open_loop_limit = max(open_loop_limit, min(total, 2))
         return {
             "open_loop": min(total, open_loop_limit),
-            "self_timeline": min(total, self.config.int("context_orchestration.self_timeline_limit", 2)),
+            "self_timeline": min(total, self.config.int("context_orchestration.self_timeline_limit", 4)),
             "user_profile": min(total, self.config.int("context_orchestration.user_profile_limit", 2)),
             "current_window": min(total, self.config.int("context_orchestration.current_window_limit", 3)),
             "conversation_summary": min(total, conversation_limit),
-            "stable_memory": min(total, self.config.int("context_orchestration.stable_memory_limit", 3)),
+            "stable_memory": min(total, self.config.int("context_orchestration.stable_memory_limit", 4)),
         }
 
     def _slot_capped_slots(
@@ -13041,8 +14188,13 @@ class MemoryCompanionService:
         if not self.config.bool("context_orchestration.include_intent_context", True):
             base = ""
         else:
+            # R12：注入正文默认不写内部遥测（检索模式/关键词/Bot 心理能量），
+            # 只有显式把 context_orchestration.include_intent_diagnostics 打开才回显。
             base = intent.format_for_injection(
-                self.config.int("context_orchestration.intent_max_chars", 520)
+                self.config.int("context_orchestration.intent_max_chars", 520),
+                include_diagnostics=self.config.bool(
+                    "context_orchestration.include_intent_diagnostics", False
+                ),
             )
         if time_intent is not None and time_intent.active:
             line = f"- 时间窗口：{time_intent.display_range}（{time_intent.label or time_intent.source}）"
@@ -13069,6 +14221,7 @@ class MemoryCompanionService:
             scope=ctx.scope,
             session_id=ctx.session_id,
             entity_id=ctx.current_target_id,
+            bot_id=ctx.bot_id,
         )
         items: list[SearchResult] = []
         for row in reversed(rows):
@@ -13283,7 +14436,7 @@ class MemoryCompanionService:
     def _compute_time_of_day(self) -> str:
         """Compute time-of-day category for atmosphere hints."""
         try:
-            hour = datetime.now(LOCAL_TZ).hour
+            hour = datetime.now(local_tz()).hour
         except Exception:
             return ""
         if 23 <= hour or hour < 4:
@@ -13755,10 +14908,20 @@ class MemoryCompanionService:
 
     def _close_store_sync(self) -> None:
         with self._database_init_lock:
+            # 两个库各自收尾：主库关闭失败不能连累作用域库，否则
+            # Windows 上残留的 sqlite 句柄会让临时目录无法删除。
             try:
                 self.store.close()
-            finally:
-                self.scoped_store.close()
+            except Exception:
+                logger.warning("[MemoryCompanion] 关闭主记忆库连接失败", exc_info=True)
+            close_scoped = getattr(self.scoped_store, "close", None)
+            if callable(close_scoped):
+                try:
+                    close_scoped()
+                except Exception:  # pragma: no cover - 收尾失败不该盖住主库关闭
+                    logger.warning(
+                        "[MemoryCompanion] 关闭作用域记忆库连接失败", exc_info=True
+                    )
 
     def shutdown_evidence(self) -> dict[str, Any]:
         """Return structured resource state for the shutdown completion log."""
@@ -13814,6 +14977,21 @@ class MemoryCompanionService:
         finally:
             self._closed = True
 
+    def _reset_stores_after_failed_initialize(self) -> None:
+        # 初始化失败时先把半开的连接收掉再抛错，别把坏句柄留给下一次。
+        # 但 store 必须保持可重试（见 test_initialization_failure_keeps_store_retryable），
+        # 所以这里是「关掉再立刻重开」，而不是彻底 close。
+        for store in (self.store, self.scoped_store):
+            reset = getattr(store, "reset_connection_after_failed_initialize", None)
+            if not callable(reset):
+                continue
+            try:
+                reset()
+            except Exception:  # pragma: no cover - 收尾失败不该盖住原始错误
+                logger.warning(
+                    "[MemoryCompanion] 初始化失败后回收数据库连接出错", exc_info=True
+                )
+
     def _initialize_database_sync(self) -> bool:
         with self._database_init_lock:
             if getattr(self, "_closing", False) or getattr(self, "_closed", False):
@@ -13823,12 +15001,14 @@ class MemoryCompanionService:
             try:
                 self.store.initialize()
             except Exception as exc:
+                self._reset_stores_after_failed_initialize()
                 raise RuntimeError(
                     f"记忆主库初始化失败 [primary_store.initialize]: {type(exc).__name__}: {exc}"
                 ) from exc
             try:
                 self.scoped_store.initialize()
             except Exception as exc:
+                self._reset_stores_after_failed_initialize()
                 raise RuntimeError(
                     f"作用域记忆库初始化失败 [scoped_store.initialize]: {type(exc).__name__}: {exc}"
                 ) from exc
@@ -13846,6 +15026,7 @@ class MemoryCompanionService:
                         internal_normalized,
                     )
             except Exception as exc:
+                self._reset_stores_after_failed_initialize()
                 raise RuntimeError(
                     f"旧记忆规范化失败 [legacy_memory.normalize]: {type(exc).__name__}: {exc}"
                 ) from exc

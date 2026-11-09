@@ -114,7 +114,10 @@ def source_visible(ctx: Any, row: dict[str, Any], metadata: dict[str, Any]) -> b
         return False
     if clean_text(metadata.get("platform"), 80) != clean_text(ctx.platform, 80):
         return False
-    if clean_text(metadata.get("persona_id"), 96) != clean_text(ctx.persona_id, 96):
+    # Rows captured before the runtime persona was resolved carry no persona;
+    # treat them as legacy so upgrading does not hide the captured history.
+    persona_id = clean_text(metadata.get("persona_id"), 96)
+    if persona_id not in {"", "legacy"} and persona_id != clean_text(ctx.persona_id, 96):
         return False
     if row.get("event_type") == "bot_response" and row.get("subject_id") != owner:
         return False
@@ -144,7 +147,9 @@ def source_partition(ctx: Any) -> tuple[str, list[str]]:
     clauses = [
         "t.scope=?", "t.session_id=?", "t.object_id=?",
         "t.event_type IN ('user_message','bot_response')",
-        f"{field('owner_bot_id')}=?", f"{field('platform')}=?", f"{field('persona_id')}=?",
+        f"{field('owner_bot_id')}=?", f"{field('platform')}=?",
+        # Empty and ``legacy`` personas predate runtime persona resolution.
+        f"{field('persona_id')} IN ('', 'legacy', ?)",
         f"{field('bot_id')} IN ('',?)",
         "(t.event_type!='bot_response' OR t.subject_id=?)",
     ]

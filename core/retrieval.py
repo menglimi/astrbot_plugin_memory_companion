@@ -72,6 +72,11 @@ class RetrievalEngine:
         proactive_message_score_penalty: float = 1.0,
         dedupe_content_ratio: float = 0.0,
         non_conversation_budget: int = 2,
+        anchor_floor_enabled: bool = False,
+        scope_bonus_scale: float = 0.2,
+        mmr_redundancy_weight: float = 0.35,
+        bm25_k1: float = 1.2,
+        bm25_b: float = 0.75,
     ):
         self.store = store
         self.policy = policy
@@ -125,6 +130,22 @@ class RetrievalEngine:
         # out user/query evidence in ordinary questions. Explicit self-timeline
         # queries remove this cap via capped_slots.
         self.non_conversation_budget = max(0, min(12, int(non_conversation_budget or 0)))
+        # R5：人工词法锚定默认关闭。开启后 _apply_anchor_floor 才允许把被
+        # rerank 模型挤出窗口的强词法命中换回窗口；默认关闭表示完全信任
+        # rerank 排序，不再用启发式「人工锚定」改写模型结果。
+        self.anchor_floor_enabled = bool(anchor_floor_enabled)
+        # R6：scope 同源加分（同 session/同 user/同群/bot_self）整体缩放系数。
+        # 历史值分别是 +0.25/+0.15/+0.15/+0.08，硬偏置会把「同窗口但无关」
+        # 的记忆顶到「跨窗口但强相关」之前。默认 0.2 把最强项压到 +0.05，
+        # 让 scope 只做轻微平手裁决；设为 1.0 可恢复历史行为。
+        self.scope_bonus_scale = max(0.0, min(1.0, float(scope_bonus_scale if scope_bonus_scale is not None else 0.2)))
+        # R7：MMR 去冗余权重。0.16 太轻，高冗余的两条会一起进 top_k；
+        # 默认 0.35 让「重复内容」在价值上明显低于「新信息」。
+        self.mmr_redundancy_weight = max(0.0, min(1.0, float(mmr_redundancy_weight if mmr_redundancy_weight is not None else 0.35)))
+        # R1：BM25 参数（k1 饱和、b 长度归一化）。b=0 会退化成纯词频，
+        # 长文档会靠「什么词都有」占便宜，所以默认 b=0.75。
+        self.bm25_k1 = max(0.0, min(8.0, float(bm25_k1 if bm25_k1 is not None else 1.2)))
+        self.bm25_b = max(0.0, min(1.0, float(bm25_b if bm25_b is not None else 0.75)))
         self._rank_path_info: dict[str, Any] = {}
         # haystack 缓存：同一 (memory.id, updated_at) 在一次召回内会被
         # _term_document_stats/_score/MMR features 多次重建，按键复用可省去
@@ -611,7 +632,13 @@ class RetrievalEngine:
             }
             return ranked
 
-        anchors = self._rerank_anchor_results(query_text, pool, final_limit)
+        # R5：锚定关闭时连锚点计算都省掉（_rerank_anchor_results 是 O(pool) 的
+        # 全量词法复核，不该为默认关闭的功能付成本）。
+        anchors = (
+            self._rerank_anchor_results(query_text, pool, final_limit)
+            if self.anchor_floor_enabled
+            else []
+        )
         merged: list[SearchResult] = []
         seen: set[str] = set()
         for item in [*reranked, *pool]:
@@ -657,6 +684,10 @@ class RetrievalEngine:
         weakest slot, evicting the least supported non-anchor row.
         """
 
+        # R5：人工锚定默认关闭，只有显式开启（anchor_floor_enabled=True）才
+        # 允许用词法锚点改写 rerank 模型的 top-k 窗口。
+        if not self.anchor_floor_enabled:
+            return 0
         if not anchors or len(merged) <= final_limit:
             return 0
         anchor_ids = {item.memory.id for item in anchors if item.memory.id}
@@ -806,7 +837,9 @@ class RetrievalEngine:
                 if upper_bound <= best_value:
                     continue
                 redundancy = max(similarity(item, chosen) for chosen in selected)
-                value = upper_bound - (0.16 * redundancy)
+                # R7：去冗余权重可配（默认 0.35，历史值 0.16 太轻，高冗余两条
+                # 会一起进 top_k）。upper_bound 仍是价值的严格上界，剪枝安全。
+                value = upper_bound - (self.mmr_redundancy_weight * redundancy)
                 if value > best_value:
                     best_value = value
                     best_index = index
@@ -846,10 +879,12 @@ class RetrievalEngine:
                 if ratio >= ratio_threshold:
                     duplicate_of = other
                     break
-            if duplicate_of is None or (item.score or 0.0) > (duplicate_of.score or 0.0):
-                if duplicate_of is not None:
-                    kept.remove(duplicate_of)
+            if duplicate_of is None:
                 kept.append(item)
+            elif (item.score or 0.0) > (duplicate_of.score or 0.0):
+                # 原地替换，别把这条更好的挪到队尾（R4）：去重之后再按顺序截
+                # top_k 时，被挪到末尾的高分项会被直接截掉。
+                kept[kept.index(duplicate_of)] = item
             # else: drop this item (duplicate with lower/equal score)
         return kept
 
@@ -863,7 +898,7 @@ class RetrievalEngine:
         exact_phrases = [str(item) for item in profile.get("exact_phrases", []) if str(item)]
         if any(phrase in compact_haystack for phrase in exact_phrases):
             return True
-        hits = sum(1 for term in terms if term and term in haystack)
+        hits = sum(1 for term in terms if term and self._term_frequency(haystack, term) > 0)
         contextual_recall = self._looks_like_contextual_recall_query(query)
         if contextual_recall and hits >= 1:
             return True
@@ -1577,6 +1612,38 @@ class RetrievalEngine:
         )
         acl_state = await self._acl_state() if self.policy.enable_acl_rules else self._empty_acl_state()
         block_profile_retrieval = self._query_blocks_profile_retrieval(query)
+        # 召回不再只看「像不像」：谁在她心里重，谁的旧事就更容易被想起。
+        person_strengths: dict[str, float] = {}
+        try:
+            subject_ids: list[str] = []
+            seen_subjects: set[str] = set()
+            for group in (
+                ranked_candidates,
+                current_window_candidates,
+                fts_candidates,
+                keyword_candidates,
+                vector_candidates,
+                time_window_candidates,
+            ):
+                for memory in group:
+                    subject = getattr(memory, "subject", None)
+                    if clean_text(getattr(subject, "kind", ""), 20) != "user":
+                        continue
+                    subject_id = clean_text(getattr(subject, "id", ""), 120)
+                    if subject_id and subject_id not in seen_subjects:
+                        seen_subjects.add(subject_id)
+                        subject_ids.append(subject_id)
+            if subject_ids:
+                person_strengths = await self.store.person_weight_map(
+                    user_ids=subject_ids[:200],
+                    platform=clean_text(getattr(ctx, "platform", ""), 40),
+                    bot_id=clean_text(getattr(ctx, "bot_id", ""), 120),
+                )
+        except Exception:
+            person_strengths = {}
+        # H10：当前会话的情绪状态参与排序（倍率 + 未了债务跟进）。只读
+        # emotion_events，没有事件时是基线（倍率 1.0、加成为 0），行为不变。
+        emotion_mood = await self._emotion_retrieval_mood(ctx)
         ranking_started = time.perf_counter()
         results, blocked, ranking_info = await asyncio.to_thread(
             self._rank_candidates_sync,
@@ -1594,11 +1661,46 @@ class RetrievalEngine:
             acl_state,
             time_intent,
             block_profile_retrieval,
+            person_strengths,
+            emotion_mood,
         )
         self._rank_path_info.update(ranking_info)
         self._rank_path_info["ranking_cpu_ms"] = int((time.perf_counter() - ranking_started) * 1000)
         self._rank_path_info["ranking_offloaded"] = True
         return results, blocked
+
+    async def _emotion_retrieval_mood(self, ctx: SessionContext) -> dict[str, object] | None:
+        """H10：把当前会话的情绪状态压成检索用的两个数（倍率、债务跟进加成）。
+
+        只读 store.list_emotion_events，不建表、不写库；没有事件或读失败时返回
+        None，排序与历史版本完全一致。
+        """
+        try:
+            from .affect_modulation import modulate
+            from .emotion_state import state_for_session
+        except Exception:
+            return None
+        try:
+            state = await state_for_session(
+                self.store,
+                bot_id=clean_text(getattr(ctx, "bot_id", ""), 120),
+                session_id=clean_text(getattr(ctx, "session_id", ""), 120),
+            )
+            mood = modulate(state)
+        except Exception:
+            return None
+        retrieval = mood.get("retrieval") if isinstance(mood, dict) else None
+        if not isinstance(retrieval, dict):
+            return None
+        try:
+            multiplier = float(retrieval.get("emotional_weight_multiplier") or 1.0)
+            boost = float(retrieval.get("debt_followup_boost") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if abs(multiplier - 1.0) < 1e-6 and boost <= 0.0:
+            # 基线状态：不注入任何额外权重，走原路径。
+            return None
+        return {"emotional_weight_multiplier": multiplier, "debt_followup_boost": boost}
 
     def _rank_candidates_sync(
         self,
@@ -1616,8 +1718,11 @@ class RetrievalEngine:
         acl_state: dict[str, object],
         time_intent: TimeIntent | None,
         block_profile_retrieval: bool,
+        person_strengths: dict[str, float] | None = None,
+        emotion_mood: dict[str, object] | None = None,
     ) -> tuple[list[SearchResult], list[dict[str, str]], dict[str, int]]:
         """Score a private candidate snapshot without touching the event loop."""
+        person_strengths = person_strengths or {}
         route_lists = (
             ("fts", fts_candidates),
             ("current_window", current_window_candidates),
@@ -1665,6 +1770,10 @@ class RetrievalEngine:
                 key = clean_text(prefilter_reason or "not_visible", 180)
                 prefiltered[key] = prefiltered.get(key, 0) + 1
         profile = self._query_profile(query, expanded_terms)
+        if emotion_mood:
+            # 情绪只影响排序权重，不改变候选集与可见性判定。
+            profile = dict(profile)
+            profile["emotion_mood"] = emotion_mood
         # IDF must describe query-aware routes, not the unrelated priority scan.
         query_aware_ids = {
             memory_id
@@ -1678,7 +1787,7 @@ class RetrievalEngine:
         ]
         if not term_pool:
             term_pool = [memory for memory, _reason in searchable]
-        term_stats = self._term_document_stats(term_pool, expanded_terms)
+        term_stats, average_doc_len = self._term_document_stats(term_pool, expanded_terms)
         route_families_by_id = {
             memory_id: self._route_families(sources)
             for memory_id, sources in candidate_sources.items()
@@ -1703,6 +1812,12 @@ class RetrievalEngine:
             )
         for memory, visibility_reason in searchable:
             memory_id = clean_text(memory.id, 120)
+            subject = getattr(memory, "subject", None)
+            subject_strength = 0.0
+            if clean_text(getattr(subject, "kind", ""), 20) == "user":
+                subject_strength = float(
+                    person_strengths.get(clean_text(getattr(subject, "id", ""), 120), 0.0)
+                )
             score, reason = self._score(
                 memory,
                 expanded_terms,
@@ -1712,6 +1827,8 @@ class RetrievalEngine:
                 vector_score=vector_scores.get(memory_id, 0.0),
                 reciprocal_rank_score=reciprocal_rank_scores.get(memory_id, 0.0),
                 route_families=route_families_by_id.get(memory_id, frozenset()),
+                person_strength=subject_strength,
+                average_doc_len=average_doc_len,
             )
             if score <= 0:
                 if len(blocked) < 40:
@@ -3229,44 +3346,30 @@ class RetrievalEngine:
 
     @staticmethod
     def _is_query_scaffold_term(term: str) -> bool:
+        # R3：这里只放「通用中文疑问/时间脚手架」。历史上这张表混进过评测
+        # 句子被切成两字后的碎片（得糖/端吗/骨吗/的胖/次颜，以及 想为/想一/
+        # 直提/提什/时你/是当/是异/近一/周的/这几 这类跨词切口），它们不是
+        # 任何正常问句里的功能词，只会让评测集里的碎片被当成停用词丢掉、又
+        # 让真实用户问句里的同样字面被误杀。删掉后这些字面重新按正常词参与
+        # 召回；通用疑问词与时间指示词保留。
         scaffold_terms = {
             "你再",
-            "再想",
             "想想",
-            "想为",
-            "想一",
             "一下",
             "你想",
             "你还",
             "就是",
-            "是当",
-            "时你",
-            "你一",
             "一直",
-            "直提",
-            "提什",
-            "我才",
-            "才说",
             "记得",
             "还记",
-            "得我",
-            "得你",
-            "得糖",
-            "我为",
-            "你为",
-            "为什",
             "什么",
-            "么说",
             "说你",
             "说我",
             "叫你",
             "叫我",
             "你是",
             "我是",
-            "是异",
             "的吗",
-            "端吗",
-            "骨吗",
             "原因",
             "之前",
             "以前",
@@ -3276,34 +3379,66 @@ class RetrievalEngine:
             "想起",
             "起来",
             "最近",
-            "近一",
             "一周",
-            "周的",
             "过去",
             "几天",
-            "这几",
             "本周",
             "这周",
-            "的胖",
-            "次颜",
         }
         return clean_text(term, 80).lower() in scaffold_terms
 
-    def _term_document_stats(self, memories: list[MemoryRecord], terms: list[str]) -> dict[str, float]:
+    # R1：英文/数字词要求词边界，避免 cat 命中 concatenate 这类子串误判。
+    _ASCII_WORD_RE = re.compile(r"[a-z0-9][a-z0-9_+.#-]*")
+
+    @classmethod
+    def _term_frequency(cls, haystack: str, term: str) -> int:
+        """词频统计（R1：带词边界，替代裸 str.count）。
+
+        纯 ASCII 词（英文/数字）按词边界匹配，中文等无空格语言仍按非重叠
+        子串计数（中文分词成本高，子串是行业常规），但统一走同一口径，避免
+        同一个 term 在 df 统计与 BM25 打分里用两种数法。
+        """
+
+        if not haystack or not term:
+            return 0
+        if cls._ASCII_WORD_RE.fullmatch(term):
+            pattern = rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])"
+            return len(re.findall(pattern, haystack))
+        count = 0
+        start = 0
+        while True:
+            index = haystack.find(term, start)
+            if index < 0:
+                return count
+            count += 1
+            start = index + len(term)
+
+    def _term_document_stats(
+        self, memories: list[MemoryRecord], terms: list[str]
+    ) -> tuple[dict[str, float], float]:
+        """返回 (IDF 表, 平均文档长度)，供 BM25 做长度归一化（R1）。
+
+        平均长度用去掉空白后的字符数近似（中文按字、英文按字母），这正是
+        BM25 的 b 参数需要的那一维：长文档不该因为什么词都有而占便宜。
+        """
+
         if not terms:
-            return {}
+            return {}, 0.0
         document_count = max(1, len(memories))
         dfs = dict.fromkeys(terms, 0)
+        total_length = 0
         for memory in memories:
             haystack = self._haystack(memory)
+            total_length += len(re.sub(r"\s+", "", haystack))
             for term in terms:
-                if term in haystack:
+                if self._term_frequency(haystack, term) > 0:
                     dfs[term] += 1
-        return {
+        idf = {
             term: math.log(1 + (document_count - df + 0.5) / (df + 0.5))
             for term, df in dfs.items()
             if df > 0
         }
+        return idf, (total_length / document_count if document_count else 0.0)
 
     def _cached_haystack(self, cache_key: tuple[str, str]) -> str | None:
         shared = self._shared_haystack_cache
@@ -3390,10 +3525,14 @@ class RetrievalEngine:
         vector_score: float = 0.0,
         reciprocal_rank_score: float = 0.0,
         route_families: frozenset[str] = frozenset(),
+        person_strength: float = 0.0,
+        average_doc_len: float = 0.0,
     ) -> tuple[float, str]:
         haystack = self._haystack(memory)
         compact_haystack = re.sub(r"\s+", "", haystack)
-        term_hits = sum(1 for term in terms if term and term in haystack)
+        term_hits = sum(
+            1 for term in terms if term and self._term_frequency(haystack, term) > 0
+        )
         exact_phrases = [str(item) for item in profile.get("exact_phrases", []) if str(item)]
         exact_hit = any(phrase in compact_haystack for phrase in exact_phrases)
         profile_hit = self._profile_query_matches_memory(
@@ -3402,6 +3541,15 @@ class RetrievalEngine:
         )
         min_hits = int(profile.get("min_hits", 1) or 1)
         vector_relevant = vector_score >= self.embedding_score_threshold if self.embedding_enabled else False
+        if (
+            not terms
+            and not vector_relevant
+            and not (route_families & self._QUERY_AWARE_ROUTE_SOURCES)
+        ):
+            # R2：没有查询词、也没有语义/多路召回证据时，不再用 importance 硬排
+            # 兜底。返回 0 分，让 _rank_candidates_sync 的 score <= 0 分支把它
+            # 归入 blocked，上层自然走「没有检索到相关记忆」的提示分支。
+            return 0.0, "no_query_terms"
         if (
             terms
             and not exact_hit
@@ -3415,29 +3563,41 @@ class RetrievalEngine:
             return 0.0, graph_guard_reason
         bm25 = 0.0
         if terms:
+            # R1：真 BM25 —— 词频饱和(k1) + 文档长度归一化(b)，不再用裸
+            # str.count 的线性词频。b=0.75 时同长度文档的取值与历史公式一致。
+            document_length = float(len(compact_haystack) or 1)
+            average_length = float(average_doc_len or 0.0) or document_length
+            length_norm = 1.0 - self.bm25_b + self.bm25_b * (
+                document_length / max(1.0, average_length)
+            )
             for term in terms:
                 if not term:
                     continue
-                freq = haystack.count(term)
+                freq = float(self._term_frequency(haystack, term))
                 if freq <= 0:
                     continue
                 idf = term_stats.get(term, 0.0)
-                bm25 += idf * ((freq * 2.2) / (freq + 1.2))
+                bm25 += idf * ((freq * (self.bm25_k1 + 1.0)) / (freq + self.bm25_k1 * length_norm))
             lexical = (0.42 if exact_hit or profile_hit else 0.24) + min(
                 0.72, bm25 * 0.18
             )
         else:
             lexical = 0.0
 
+        # R6：scope 同源加分整体缩放（默认 0.2 → 最强项 +0.05）。历史值是
+        # +0.25/+0.15/+0.15/+0.08 的硬偏置，同窗口的无关记忆会压过跨窗口
+        # 的强相关记忆；缩放后 scope 只做轻微平手裁决。scope_bonus_scale=1.0
+        # 可恢复历史行为。
+        scope_scale = self.scope_bonus_scale
         scope_bonus = 0.0
         if memory.session_id and memory.session_id == ctx.session_id:
-            scope_bonus += 0.25
+            scope_bonus += 0.25 * scope_scale
         if ctx.user_id and ctx.user_id in {memory.subject.id, memory.object.id}:
-            scope_bonus += 0.15
+            scope_bonus += 0.15 * scope_scale
         if ctx.group_id and ctx.group_id == memory.group_id:
-            scope_bonus += 0.15
+            scope_bonus += 0.15 * scope_scale
         if memory.visibility == "bot_self":
-            scope_bonus += 0.08
+            scope_bonus += 0.08 * scope_scale
 
         age_bonus = self._recency_bonus(memory.occurred_at or memory.created_at)
         persona_bonus = self._persona_relevance_bonus(memory, profile)
@@ -3451,14 +3611,21 @@ class RetrievalEngine:
                 normalized_vector = vector_score
             vector_bonus = self.embedding_weight * max(0.0, min(1.0, normalized_vector))
         rrf_bonus = min(0.55, max(0.0, float(reciprocal_rank_score)) * 12.0)
+        # 人的分量进打分（H1）：同一个人的事，她记得更牢的人更容易被想起。
+        # 权重压到 0.32，避免「重要的人」把所有无关旧事都顶上来。
+        try:
+            strength_ratio = max(0.0, min(1.0, float(person_strength or 0.0) / 100.0))
+        except (TypeError, ValueError):
+            strength_ratio = 0.0
+        person_bonus = 0.32 * strength_ratio
         # Importance should not let unrelated high-priority rows crowd out
         # query-supported memories.  Strong lexical/profile evidence keeps
         # the historical weight; weak single-channel candidates are damped.
         strong_query_evidence = exact_hit or profile_hit or (vector_relevant and term_hits >= min_hits)
         importance_weight = 0.55 if strong_query_evidence else 0.28
-        score = lexical + scope_bonus + memory.importance * importance_weight + memory.confidence * 0.25 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus + route_bonus + rrf_bonus
-        if not terms:
-            score = scope_bonus + memory.importance * 0.8 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus + route_bonus + rrf_bonus
+        score = lexical + scope_bonus + memory.importance * importance_weight + memory.confidence * 0.25 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus + route_bonus + rrf_bonus + person_bonus
+        # R2：删掉 "if not terms: importance * 0.8" 的兜底分支。无词查询只剩
+        # 向量/多路召回证据才可能走到这里，importance 只按弱证据权重 0.28 计。
         lifecycle = evaluate_memory_lifecycle(memory, ctx)
         score = apply_lifecycle_score(score, lifecycle)
         # relax：proactive_message（主动消息原文）类记忆评分降权（默认 1.0 不降权，行为与历史版本一致）。
@@ -3471,7 +3638,8 @@ class RetrievalEngine:
             f"dynamics={dynamics_bonus:.2f};recency={age_bonus:.2f};"
             f"decay={lifecycle.decay_factor:.3f};salience={lifecycle.salience:.2f};"
             f"reinforcement={lifecycle.reinforcement:.2f};{lifecycle.reason}"
-            f"routes={'+'.join(sorted(route_families)) or '-'};route_bonus={route_bonus:.2f}"
+            f"routes={'+'.join(sorted(route_families)) or '-'};route_bonus={route_bonus:.2f};"
+            f"person={person_bonus:.2f}"
         )
 
     @staticmethod
@@ -3539,7 +3707,23 @@ class RetrievalEngine:
             bonus += min(0.11, max(open_loop, promise, emotional_debt, scar) * 0.11)
         if temporal:
             bonus += min(0.040, max(freshness, emotional) * 0.040)
-        return min(0.18, bonus)
+        mood = profile.get("emotion_mood") if isinstance(profile, dict) else None
+        if not isinstance(mood, dict):
+            return min(0.18, bonus)
+        # H10：情绪在排序里只做“同等相关度下的微调”——正/负情绪和欠了话没说完
+        # 的债务会把对应记忆轻微抬起，倍率夹在 [0.7, 1.6]，最终仍受 0.24 上限约束。
+        try:
+            multiplier = max(0.7, min(1.6, float(mood.get("emotional_weight_multiplier") or 1.0)))
+        except (TypeError, ValueError):
+            multiplier = 1.0
+        bonus *= multiplier
+        if open_loop_followup:
+            try:
+                boost = max(0.0, min(0.35, float(mood.get("debt_followup_boost") or 0.0)))
+            except (TypeError, ValueError):
+                boost = 0.0
+            bonus += boost * 0.30
+        return min(0.24, bonus)
 
     def _livingmemory_graph_relevance_guard(
         self,

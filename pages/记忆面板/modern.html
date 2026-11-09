@@ -1,23 +1,16 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="zh-CN">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#e8e5e1" />
-    <meta
-      name="description"
-      content="Memory OS — Memory Companion. 交互式三维记忆终端。"
-    />
-    <title>MEMORY OS · COMPANION ARCHIVE</title>
-    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
-    <script type="module" crossorigin src="./assets/index-URVgTPOQ.js?v=2.3.3"></script>
-    <link rel="stylesheet" crossorigin href="./assets/index-CWNk7gDr.css?v=2.3.3">
-    <link rel="stylesheet" href="./injection-status.css?v=2.3.3">
-  </head>
-  <body>
-    <main id="viewport"><div id="stage"></div></main>
-    <script src="/api/plugin/page/bridge-sdk.js"></script>
-    <script defer src="./summary-status.js?v=2.1.4"></script>
-    <script defer src="./injection-status.js?v=2.3.3"></script>
-  </body>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>记忆面板</title>
+<script>
+  (function () {
+    var search = location.search || "";
+    var hash = location.hash || "";
+    location.replace("./legacy.html" + search + hash);
+  })();
+</script>
+</head>
+<body></body>
 </html>

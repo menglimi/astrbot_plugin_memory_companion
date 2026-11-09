@@ -297,11 +297,13 @@ class ActiveReconstructionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("不可泄露的来源", str(result))
                 self.assertNotIn(ref, str(result))
 
-    async def test_missing_source_and_unbound_persona_remain_gaps(self):
+    async def test_missing_source_and_foreign_persona_remain_gaps(self):
         service = self.make_service()
-        legacy_ref = await self.add_source(service)
+        foreign_ref = await self.add_source(
+            service, metadata={"persona_id": "other-persona"}
+        )
         record = self.summary_memory()
-        record.metadata["source_event_ids"] = ["tl_missing", legacy_ref]
+        record.metadata["source_event_ids"] = ["tl_missing", foreign_ref]
         record.metadata["source_expired_event_ids"] = ["tl_missing"]
         await self.insert_indexed(service, record)
         ctx = self.private_context()

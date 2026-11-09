@@ -36,6 +36,8 @@ class SummaryBatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.config = {'startup': {'background_grace_seconds': 60}, 'memory_summary': {
             'min_events': 1, 'trigger_event_count': 1, 'max_events_per_summary': 1,
             'max_retries': 3, 'retry_backoff_seconds': 0, 'max_calls_per_session_hour': 6,
+            # 单次请求的 SDK 重试次数：2.6.0 起可配置（R14），这里钉住 1 保持旧回归语义。
+            'request_max_retries': 1,
         }}
         self.service = MemoryCompanionService(context=None, config=self.config, plugin_root=ROOT, data_dir=Path(self.temp.name))
         self.addCleanup(self.service.close)
@@ -159,7 +161,7 @@ class SummaryBatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(5):
             await self.service.maybe_summarize_session(self.ctx)
         self.assertEqual(3, len(p1.calls) + len(p2.calls))
-        self.assertTrue(all(c['request_max_retries'] == 0 for c in p1.calls + p2.calls))
+        self.assertTrue(all(c['request_max_retries'] == 1 for c in p1.calls + p2.calls))
         store = self.service.store
         db_path = store.db_path
         store.close()
@@ -169,6 +171,15 @@ class SummaryBatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.service.maybe_summarize_session(self.ctx)
         self.assertEqual(3, len(p1.calls) + len(p2.calls))
         self.assertEqual('quarantined', self.batches()[0]['state'])
+
+    async def test_request_max_retries_is_configurable(self):
+        """R14：单次请求重试次数不再是写死的 1，而是读 memory_summary.request_max_retries。"""
+        self.config['memory_summary']['request_max_retries'] = 4
+        service = MemoryCompanionService(
+            context=None, config=self.config, plugin_root=ROOT, data_dir=Path(self.temp.name) / 'retry',
+        )
+        self.addCleanup(service.close)
+        self.assertEqual(4, service.summarizer.request_max_retries)
 
     async def test_hourly_budget_spans_batches_but_not_sessions(self):
         self.config['memory_summary']['max_calls_per_session_hour'] = 1

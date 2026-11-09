@@ -37,6 +37,7 @@ class LifecycleScore:
     decay_factor: float
     salience: float
     reinforcement: float
+    salience_is_copy: bool = False
 
 
 def _metadata(memory: MemoryRecord) -> dict[str, Any]:
@@ -180,7 +181,18 @@ def evaluate_memory_lifecycle(
     # Soft decay may lower rank but never silently delete an otherwise active
     # fact.  Archive/expiration decisions live in the maintenance pipeline.
     decay_factor = max(0.05, min(1.0, decay_factor))
-    salience = clamp_float(_field(memory, "salience", memory.importance), default=memory.importance)
+    importance = clamp_float(getattr(memory, "importance", 0.0), default=0.0)
+    raw_salience = _field(memory, "salience", None)
+    if raw_salience in (None, ""):
+        # 没有单独记过 salience（旧行）就沿用 importance，但调用方要能看出
+        # 「这条 salience 只是 importance 的副本」，避免同一个信号被加两次。
+        salience = importance
+        salience_is_copy = True
+    else:
+        salience = clamp_float(raw_salience, default=importance)
+        # 只有「本来就没人记过 salience、于是拿 importance 顶上」才算副本。
+        # 数值恰好相等不算：MemoryRecord 的默认 salience 可能正好等于 importance。
+        salience_is_copy = False
     reinforcement = clamp_float(_field(memory, "reinforcement_score", 0.0), default=0.0)
     return LifecycleScore(
         True,
@@ -188,14 +200,21 @@ def evaluate_memory_lifecycle(
         decay_factor,
         salience,
         reinforcement,
+        salience_is_copy,
     )
 
 
 def apply_lifecycle_score(base_score: float, lifecycle: LifecycleScore) -> float:
     if not lifecycle.eligible:
         return 0.0
-    freshness_multiplier = 0.65 + (0.35 * lifecycle.decay_factor)
-    salience_bonus = lifecycle.salience * 0.12
+    # 时间真的会磨掉一些：刚发生的事排前面，很久以前又没再被想起的事，
+    # 分数会一路掉下去，而不是只打八折。半衰期到了约打七折，两三个半衰期后
+    # 只剩三成左右，自然排不进上下文。
+    freshness_multiplier = 0.22 + (0.78 * lifecycle.decay_factor)
+    # salience 和 importance 是同一个数时只算一次，不重复加分。
+    salience_bonus = 0.0 if lifecycle.salience_is_copy else lifecycle.salience * 0.12 * (
+        0.35 + 0.65 * lifecycle.decay_factor
+    )
     reinforcement_bonus = min(0.12, lifecycle.reinforcement * 0.12)
     return max(0.0, (float(base_score) * freshness_multiplier) + salience_bonus + reinforcement_bonus)
 
