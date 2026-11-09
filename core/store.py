@@ -8131,6 +8131,21 @@ class MemoryStore(SummaryBatchStore):
         )
         identities = self._person_identity_cards_sync(user_ids)
         stats = self._person_memory_stats_sync(user_ids)
+        # 卡片是按人给的，所以「记得多少件事」也要按人合计：同一份记忆按
+        # (bot_id, platform) 各占一个桶，只取其中一个会少算，和卡片下面列出的
+        # 最近记忆对不上。按 bot 筛选时仍只看这个 bot 的桶，和筛选语义一致。
+        person_stats: dict[str, dict[str, Any]] = {}
+        if not bot_id:
+            for (_, stat_user), item in stats.items():
+                acc = person_stats.setdefault(
+                    stat_user,
+                    {"memory_count": 0, "imprint_count": 0, "last_at": ""},
+                )
+                acc["memory_count"] += int(item.get("memory_count") or 0)
+                acc["imprint_count"] += int(item.get("imprint_count") or 0)
+                stat_last = clean_text(item.get("last_at"), 40)
+                if stat_last > acc["last_at"]:
+                    acc["last_at"] = stat_last
         groups: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             user_id = clean_text(row.get("user_id"), 120)
@@ -8162,7 +8177,11 @@ class MemoryStore(SummaryBatchStore):
             profile = identity.get("profile")
             if not isinstance(profile, dict):
                 profile = {}
-            stat = stats.get(("", user_id)) or stats.get((row_bot, user_id)) or {}
+            stat = (
+                (stats.get((row_bot, user_id)) or stats.get(("", user_id)) or {})
+                if bot_id
+                else (person_stats.get(user_id) or {})
+            )
             display_name = clean_text(identity.get("display_name"), 80)
             address = clean_text(profile.get("relation_address"), 40)
             relation = clean_text(profile.get("relation_label"), 40)
@@ -8191,7 +8210,7 @@ class MemoryStore(SummaryBatchStore):
             cards.append(
                 {
                     "user_id": user_id,
-                    "platform": platforms[0] if platforms else clean_text(row.get("platform"), 40),
+                    "platform": platforms[0] if platforms else "",
                     "platforms": platforms,
                     "bot_id": row_bot,
                     "bot_ids": bot_ids,
@@ -8222,8 +8241,9 @@ class MemoryStore(SummaryBatchStore):
         total = len(cards)
         page_items = cards[max(0, offset) :][:limit]
         for card in page_items:
+            # 没按 bot 筛选时卡片代表「这个人」，最近记忆也不该只翻主卡所在的 bot。
             top_rows = self._person_top_memories_sync(
-                card["user_id"], card["bot_id"], 3
+                card["user_id"], card["bot_id"] if bot_id else "", 3
             )
             card["top"] = [
                 {
@@ -8260,6 +8280,29 @@ class MemoryStore(SummaryBatchStore):
             self._person_panel_detail_sync, user_id, platform, bot_id, limit
         )
 
+    def _person_identity_row_sync(self, user_id: str, platform: str) -> Any:
+        """人物详情用的身份行：先按平台找，找不到就退回这个人的任意平台身份。
+
+        合并成一张卡之后，卡上只带主行的一个 platform；如果那是导入来源
+        （livingmemory 之类）的伪平台，按平台过滤查不到 identities，
+        详情页的名字、称呼、关系就会一起退化成 user_id。
+        """
+        columns = (
+            "SELECT platform, entity_id, display_name, aliases, profile, updated_at "
+            "FROM identities WHERE entity_kind='user' AND entity_id=?"
+        )
+        with self._lock:
+            if platform:
+                row = self._conn.execute(
+                    columns + " AND platform=? ORDER BY updated_at DESC LIMIT 1",
+                    (user_id, platform),
+                ).fetchone()
+                if row is not None:
+                    return row
+            return self._conn.execute(
+                columns + " ORDER BY updated_at DESC LIMIT 1", (user_id,)
+            ).fetchone()
+
     def _person_panel_detail_sync(
         self, user_id: str, platform: str, bot_id: str, limit: int
     ) -> dict[str, Any]:
@@ -8273,16 +8316,7 @@ class MemoryStore(SummaryBatchStore):
         if not user_id:
             return {"user_id": "", "state": "empty", "memories": []}
         with self._lock:
-            identity_sql = (
-                "SELECT platform, entity_id, display_name, aliases, profile, updated_at "
-                "FROM identities WHERE entity_kind='user' AND entity_id=?"
-            )
-            identity_params: list[Any] = [user_id]
-            if platform:
-                identity_sql += " AND platform=?"
-                identity_params.append(platform)
-            identity_sql += " ORDER BY updated_at DESC LIMIT 1"
-            identity_row = self._conn.execute(identity_sql, identity_params).fetchone()
+            identity_row = self._person_identity_row_sync(user_id, platform)
             weight_sql = "SELECT * FROM person_weights WHERE user_id=?"
             weight_params: list[Any] = [user_id]
             if bot_id:
