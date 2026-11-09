@@ -265,6 +265,8 @@ class PeoplePanelAssetsTests(unittest.TestCase):
         self.assertIn('"people"', script)
         self.assertIn('"person/weight"', script)
         self.assertIn("让她忘掉这条", script)
+        # 跨 bot / 平台的人点开详情时不能只带主行的过滤条件。
+        self.assertIn("spansRows", script)
 
     def test_people_routes_and_exposure_are_registered(self) -> None:
         tree = ast.parse((ROOT / "page_api.py").read_text(encoding="utf-8"))

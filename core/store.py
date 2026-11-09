@@ -8123,52 +8123,103 @@ class MemoryStore(SummaryBatchStore):
         bot_id = clean_text(bot_id, 120)
         if not user_id:
             return self._empty_person_weight("")
-        current = self._refresh_person_weight_sync(user_id, platform, bot_id)
+        with self._lock:
+            known_keys = {
+                (clean_text(row["bot_id"], 120), clean_text(row["platform"], 40))
+                for row in self._conn.execute(
+                    "SELECT bot_id, platform FROM person_weights WHERE user_id=?",
+                    (user_id,),
+                ).fetchall()
+            }
+        clicked_key = (bot_id, platform)
+        if clicked_key in known_keys or not known_keys:
+            current = self._refresh_person_weight_sync(user_id, platform, bot_id)
+        else:
+            # 什么都没指定就点开了这个人（合并卡打开的详情不带 bot/平台）：
+            # 不为空 key 凭空加一行，按现有各行直接改。
+            current = {"correction": 0, "components": {}}
         base = float(current.get("base") or 0.0)
         value = int(current.get("correction") or 0)
+        target: int | None = None
         if weight is not None:
-            value = clamp_weight(weight) - int(round(base))
+            target = clamp_weight(weight)
+            value = target - int(round(base))
         elif correction is not None:
             value = int(correction)
         value = max(-100, min(100, int(round(value))))
         now = utc_now()
-        final = self._person_weight_total(base, value, 1 if base > 0 else 0)
-        band = band_of(final)
+        # 分量是对「这个人」说的，不是对某一行说的：同一个人因为 bot / 平台不同
+        # 会在 person_weights 里占好几行，而合并后的卡取各行里最大的那个分量。
+        # 只写一行的话，用户把卡调低会被另一行顶回去，看起来像没生效，
+        # 所以这里把同一个人的所有行写成同一个目标。
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO person_weights (bot_id, platform, user_id, weight, base, correction,
-                                            band, source, confidence, components, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'user', 1.0, ?, ?, ?)
-                ON CONFLICT(bot_id, platform, user_id) DO UPDATE SET
-                    weight=excluded.weight,
-                    correction=excluded.correction,
-                    band=excluded.band,
-                    source='user',
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    bot_id,
-                    platform,
-                    user_id,
-                    final,
-                    base,
-                    value,
-                    band,
-                    json_dumps(current.get("components", {})),
-                    now,
-                    now,
-                ),
-            )
+            rows = [
+                dict(row)
+                for row in self._conn.execute(
+                    "SELECT bot_id, platform, base FROM person_weights WHERE user_id=?",
+                    (user_id,),
+                ).fetchall()
+            ]
+            applied: list[tuple[str, str, int, str]] = []
+            for row in rows:
+                row_bot = clean_text(row.get("bot_id"), 120)
+                row_platform = clean_text(row.get("platform"), 40)
+                row_base = float(row.get("base") or 0.0)
+                row_correction = (
+                    target - int(round(row_base)) if target is not None else value
+                )
+                row_correction = max(-100, min(100, int(round(row_correction))))
+                row_weight = self._person_weight_total(
+                    row_base, row_correction, 1 if row_base > 0 else 0
+                )
+                row_band = band_of(row_weight)
+                applied.append((row_bot, row_platform, row_weight, row_band))
+                self._conn.execute(
+                    """
+                    INSERT INTO person_weights (bot_id, platform, user_id, weight, base, correction,
+                                                band, source, confidence, components, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1.0, ?, ?, ?)
+                    ON CONFLICT(bot_id, platform, user_id) DO UPDATE SET
+                        weight=excluded.weight,
+                        correction=excluded.correction,
+                        band=excluded.band,
+                        source=excluded.source,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        row_bot,
+                        row_platform,
+                        user_id,
+                        row_weight,
+                        row_base,
+                        row_correction,
+                        row_band,
+                        "user" if row_correction else "auto",
+                        json_dumps(current.get("components", {})),
+                        now,
+                        now,
+                    ),
+                )
             self._conn.commit()
+        # 点开的那一行可能不存在（合并卡的详情不带 bot/平台），这时按这个人
+        # 最高的那一行回报，和面板上看到的分量一致。
+        matched = [
+            item for item in applied if item[0] == bot_id and item[1] == platform
+        ]
+        if matched:
+            chosen = matched[0]
+        elif applied:
+            chosen = max(applied, key=lambda item: item[2])
+        else:
+            chosen = (bot_id, platform, 0, band_of(0))
         result = dict(current)
         result.update(
             {
-                "weight": final,
+                "weight": chosen[2],
                 "correction": value,
-                "band": band,
-                "band_label": BAND_LABELS.get(band, BAND_LABELS["stranger"]),
-                "source": "user",
+                "band": chosen[3],
+                "band_label": BAND_LABELS.get(chosen[3], BAND_LABELS["stranger"]),
+                "source": "user" if value else "auto",
                 "updated_at": now,
             }
         )
@@ -8410,19 +8461,57 @@ class MemoryStore(SummaryBatchStore):
         )
         identities = self._person_identity_cards_sync(user_ids)
         stats = self._person_memory_stats_sync(user_ids)
-        bots: dict[str, int] = {}
-        cards: list[dict[str, Any]] = []
+        # 卡片是按人给的，所以「记得多少件事」也要按人合计：同一份记忆按
+        # (bot_id, platform) 各占一个桶，只取其中一个会少算，和卡片下面列出的
+        # 最近记忆对不上。按 bot 筛选时仍只看这个 bot 的桶，和筛选语义一致。
+        person_stats: dict[str, dict[str, Any]] = {}
+        if not bot_id:
+            for (_, stat_user), item in stats.items():
+                acc = person_stats.setdefault(
+                    stat_user,
+                    {"memory_count": 0, "imprint_count": 0, "last_at": ""},
+                )
+                acc["memory_count"] += int(item.get("memory_count") or 0)
+                acc["imprint_count"] += int(item.get("imprint_count") or 0)
+                stat_last = clean_text(item.get("last_at"), 40)
+                if stat_last > acc["last_at"]:
+                    acc["last_at"] = stat_last
+        groups: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
             user_id = clean_text(row.get("user_id"), 120)
             if not user_id:
                 continue
+            groups.setdefault(user_id, []).append(row)
+        bots: dict[str, int] = {}
+        cards: list[dict[str, Any]] = []
+        for user_id, group in groups.items():
+            # 同一个人可能因为 bot / 平台不同被记成多行（空 bot_id、QQ、飞书、导入来源），
+            # 面板按人只给一张卡：取分量最高的那行当主卡，其余只用来合并平台。
+            row = max(group, key=lambda item: clamp_weight(item.get("weight")))
             row_bot = clean_text(row.get("bot_id"), 120)
-            bots[row_bot] = bots.get(row_bot, 0) + 1
+            platforms: list[str] = []
+            bot_ids: list[str] = []
+            group_bot_ids: list[str] = []
+            for item in group:
+                platform = clean_text(item.get("platform"), 40)
+                if platform and platform not in platforms:
+                    platforms.append(platform)
+                item_bot = clean_text(item.get("bot_id"), 120)
+                if item_bot not in group_bot_ids:
+                    group_bot_ids.append(item_bot)
+                if item_bot and item_bot not in bot_ids:
+                    bot_ids.append(item_bot)
+            for item_bot in group_bot_ids:
+                bots[item_bot] = bots.get(item_bot, 0) + 1
             identity = identities.get(user_id, {})
             profile = identity.get("profile")
             if not isinstance(profile, dict):
                 profile = {}
-            stat = stats.get((row_bot, user_id)) or stats.get(("", user_id)) or {}
+            stat = (
+                (stats.get((row_bot, user_id)) or stats.get(("", user_id)) or {})
+                if bot_id
+                else (person_stats.get(user_id) or {})
+            )
             display_name = clean_text(identity.get("display_name"), 80)
             address = clean_text(profile.get("relation_address"), 40)
             relation = clean_text(profile.get("relation_label"), 40)
@@ -8451,8 +8540,10 @@ class MemoryStore(SummaryBatchStore):
             cards.append(
                 {
                     "user_id": user_id,
-                    "platform": clean_text(row.get("platform"), 40),
+                    "platform": platforms[0] if platforms else "",
+                    "platforms": platforms,
                     "bot_id": row_bot,
+                    "bot_ids": bot_ids,
                     "display_name": display_name or address or user_id,
                     "address": address,
                     "relation_label": relation,
@@ -8480,8 +8571,9 @@ class MemoryStore(SummaryBatchStore):
         total = len(cards)
         page_items = cards[max(0, offset) :][:limit]
         for card in page_items:
+            # 没按 bot 筛选时卡片代表「这个人」，最近记忆也不该只翻主卡所在的 bot。
             top_rows = self._person_top_memories_sync(
-                card["user_id"], card["bot_id"], 3
+                card["user_id"], card["bot_id"] if bot_id else "", 3
             )
             card["top"] = [
                 {
@@ -8518,6 +8610,29 @@ class MemoryStore(SummaryBatchStore):
             self._person_panel_detail_sync, user_id, platform, bot_id, limit
         )
 
+    def _person_identity_row_sync(self, user_id: str, platform: str) -> Any:
+        """人物详情用的身份行：先按平台找，找不到就退回这个人的任意平台身份。
+
+        合并成一张卡之后，卡上只带主行的一个 platform；如果那是导入来源
+        （livingmemory 之类）的伪平台，按平台过滤查不到 identities，
+        详情页的名字、称呼、关系就会一起退化成 user_id。
+        """
+        columns = (
+            "SELECT platform, entity_id, display_name, aliases, profile, updated_at "
+            "FROM identities WHERE entity_kind='user' AND entity_id=?"
+        )
+        with self._lock:
+            if platform:
+                row = self._conn.execute(
+                    columns + " AND platform=? ORDER BY updated_at DESC LIMIT 1",
+                    (user_id, platform),
+                ).fetchone()
+                if row is not None:
+                    return row
+            return self._conn.execute(
+                columns + " ORDER BY updated_at DESC LIMIT 1", (user_id,)
+            ).fetchone()
+
     def _person_panel_detail_sync(
         self, user_id: str, platform: str, bot_id: str, limit: int
     ) -> dict[str, Any]:
@@ -8531,16 +8646,7 @@ class MemoryStore(SummaryBatchStore):
         if not user_id:
             return {"user_id": "", "state": "empty", "memories": []}
         with self._lock:
-            identity_sql = (
-                "SELECT platform, entity_id, display_name, aliases, profile, updated_at "
-                "FROM identities WHERE entity_kind='user' AND entity_id=?"
-            )
-            identity_params: list[Any] = [user_id]
-            if platform:
-                identity_sql += " AND platform=?"
-                identity_params.append(platform)
-            identity_sql += " ORDER BY updated_at DESC LIMIT 1"
-            identity_row = self._conn.execute(identity_sql, identity_params).fetchone()
+            identity_row = self._person_identity_row_sync(user_id, platform)
             weight_sql = "SELECT * FROM person_weights WHERE user_id=?"
             weight_params: list[Any] = [user_id]
             if bot_id:
@@ -8551,6 +8657,14 @@ class MemoryStore(SummaryBatchStore):
                 weight_params.append(platform)
             weight_sql += " ORDER BY weight DESC LIMIT 1"
             weight_row = self._conn.execute(weight_sql, weight_params).fetchone()
+            if weight_row is None and (bot_id or platform):
+                # 这个人是在别的 bot / 平台下被记过的：详情仍然要给出分量，
+                # 否则合并卡点开会显示成 0。
+                weight_row = self._conn.execute(
+                    "SELECT * FROM person_weights WHERE user_id=?"
+                    " ORDER BY weight DESC LIMIT 1",
+                    (user_id,),
+                ).fetchone()
         identity = dict(identity_row) if identity_row is not None else {}
         profile = json_loads(identity.get("profile"), {}) if identity else {}
         if not isinstance(profile, dict):
