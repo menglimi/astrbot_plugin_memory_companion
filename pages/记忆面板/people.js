@@ -6,7 +6,7 @@
 const API = "/api/plug/astrbot_plugin_memory_companion/page";
 const PAGE_ENDPOINT_PREFIX = "page";
 
-const state = { items: [], bots: [], total: 0, query: "", sort: "weight", botId: "", selected: null, loading: false };
+const state = { items: [], bots: [], total: 0, query: "", sort: "weight", botId: "", selected: null, selectedScope: { platform: "", bot_id: "" }, loading: false };
 
 const el = (id) => document.getElementById(id);
 const grid = el("grid");
@@ -268,12 +268,16 @@ function closeDrawer() {
   drawer.hidden = true;
   scrim.hidden = true;
   state.selected = null;
+  state.selectedScope = { platform: "", bot_id: "" };
 }
 
 async function openPerson(userId, platform, botId) {
   drawer.hidden = false;
   scrim.hidden = false;
   drawerBody.innerHTML = `<p class="loading">正在翻开她的记忆…</p>`;
+  // 记住这次是从哪个范围点开的：合并卡点开时是空的，表示「这个人」，
+  // 后续改分量、擦除都该按人算，而不是按详情回填的某个平台。
+  state.selectedScope = { platform: platform || "", bot_id: botId || "" };
   try {
     const data = await request("GET", "person", { user_id: userId, platform: platform || "", bot_id: botId || "" });
     state.selected = data;
@@ -281,6 +285,11 @@ async function openPerson(userId, platform, botId) {
   } catch (error) {
     drawerBody.innerHTML = `<p class="loading">翻不开了：${esc(error.message || error)}</p>`;
   }
+}
+
+function personScope() {
+  const scope = state.selectedScope || {};
+  return { platform: scope.platform || "", bot_id: scope.bot_id || "" };
 }
 
 function weightText(weight) {
@@ -369,10 +378,11 @@ async function savePerson() {
   const data = state.selected;
   if (!data) return;
   const weight = Number(el("weightInput").value);
+  const scope = personScope();
   const payload = {
     user_id: data.user_id,
-    platform: data.platform || "",
-    bot_id: data.bot_id || "",
+    platform: scope.platform,
+    bot_id: scope.bot_id,
     weight,
     address: el("addressInput").value.trim(),
     label: el("relationInput").value.trim(),
@@ -384,7 +394,7 @@ async function savePerson() {
     await request("POST", "person/weight", null, payload);
     toast("记住了");
     await load();
-    await openPerson(data.user_id, data.platform, data.bot_id);
+    await openPerson(data.user_id, scope.platform, scope.bot_id);
   } catch (error) {
     toast(`没存上：${error.message || error}`);
   }
@@ -393,11 +403,12 @@ async function savePerson() {
 async function resetWeight() {
   const data = state.selected;
   if (!data) return;
+  const scope = personScope();
   try {
-    await request("POST", "person/weight", null, { user_id: data.user_id, platform: data.platform || "", bot_id: data.bot_id || "", weight: null, confirm: "CONFIRM:/person/weight" });
+    await request("POST", "person/weight", null, { user_id: data.user_id, platform: scope.platform, bot_id: scope.bot_id, weight: null, confirm: "CONFIRM:/person/weight" });
     toast("分量交回给她自己算");
     await load();
-    await openPerson(data.user_id, data.platform, data.bot_id);
+    await openPerson(data.user_id, scope.platform, scope.bot_id);
   } catch (error) {
     toast(`没改成功：${error.message || error}`);
   }
@@ -416,6 +427,7 @@ async function erasePerson() {
     return;
   }
   const name = data.display_name || data.user_id;
+  const scope = personScope();
   hint.hidden = false;
   hint.textContent = "正在擦，别关面板…";
   if (!window.confirm(`真的要把「${name}」从她的记忆里整个擦掉吗？分量、称呼和记得的事都会没，找不回来。`)) {
@@ -425,8 +437,8 @@ async function erasePerson() {
   try {
     await request("POST", "person/erase", null, {
       user_id: data.user_id,
-      platform: data.platform || "",
-      bot_id: data.bot_id || "",
+      platform: scope.platform,
+      bot_id: scope.bot_id,
       confirm: `ERASE:${data.user_id}`,
     });
     toast(`已经把「${name}」擦掉了`);
@@ -445,7 +457,8 @@ async function forgetMemory(memoryId) {
   try {
     await request("POST", "memory/update", null, { id: memoryId, durability: "short" });
     toast("这条放轻了");
-    if (data) await openPerson(data.user_id, data.platform, data.bot_id);
+    const scope = personScope();
+    if (data) await openPerson(data.user_id, scope.platform, scope.bot_id);
   } catch (error) {
     toast(`没改成：${error.message || error}`);
   }
