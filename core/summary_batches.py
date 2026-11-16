@@ -404,6 +404,43 @@ class SummaryBatchStore:
 
         return await asyncio.to_thread(read)
 
+    async def summary_recovery_sessions(self, *, limit=1, after_session_id="", exclude_session_ids=()):
+        """Discover quiet sessions with due batches or unassigned originals."""
+        def read():
+            with self._lock:
+                excluded = sorted(set(exclude_session_ids))
+                exclusion = ""
+                if excluded:
+                    exclusion = "WHERE session_id NOT IN (" + ",".join("?" for _ in excluded) + ")"
+                rows = self._conn.execute(
+                    f"""SELECT session_id, scope, MIN(created_at) AS created_at FROM (
+                        SELECT b.session_id,b.scope,b.created_at FROM summary_batches b
+                        WHERE b.state IN ('pending','retry_pending')
+                          AND EXISTS(SELECT 1 FROM summary_batch_events e WHERE e.batch_id=b.id)
+                          AND {self._due_clause('b')}
+                        UNION ALL
+                        SELECT t.session_id,t.scope,t.created_at FROM timeline t
+                        WHERE t.summarized_at='' AND t.scope IN ('private','group')
+                          AND NOT EXISTS(SELECT 1 FROM summary_batch_events e WHERE e.event_id=t.id)
+                    ) {exclusion} GROUP BY session_id,scope
+                    ORDER BY CASE WHEN session_id>? THEN 0 ELSE 1 END,session_id,created_at LIMIT ?""",
+                    [*self._due_params(), *excluded, clean_text(after_session_id, 200), max(1, int(limit))],
+                ).fetchall()
+                return [dict(row) for row in rows]
+        return await asyncio.to_thread(read)
+
+    async def summary_budget_available(self, session_id: str, hourly_limit: int) -> bool:
+        """Cheap admission hint; reserve_summary_call remains the final authority."""
+        def read():
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec='seconds')
+            with self._lock:
+                calls = self._conn.execute(
+                    'SELECT COUNT(*) FROM summary_batch_calls WHERE session_id=? AND automatic=1 AND attempted_at>?',
+                    (session_id, cutoff),
+                ).fetchone()[0]
+                return calls < max(1, hourly_limit)
+        return await asyncio.to_thread(read)
+
     async def summary_batch_context(self, batch_id: str) -> dict[str, Any] | None:
         """Return the batch snapshot and every owned event's persisted context.
 
@@ -592,6 +629,7 @@ class SummaryBatchStore:
         delay=60,
         only_if_due=False,
         lease_token="",
+        preserve_lease=None,
     ) -> bool:
         """Defer a batch, optionally preserving a newer lease or completion.
 
@@ -625,6 +663,13 @@ class SummaryBatchStore:
                     )
                     where_params.extend(self._due_params())
                 keep_lease = bool(owner_token and current_owner == owner_token and not quarantine)
+                if preserve_lease is not None:
+                    keep_lease = bool(
+                        preserve_lease
+                        and owner_token
+                        and current_owner == owner_token
+                        and not quarantine
+                    )
                 cursor = self._conn.execute(
                     f"UPDATE summary_batches SET state=?,last_error=?,next_retry_at=?,retry_reason='',lease_token=?,lease_expires_at=?,updated_at=? WHERE {where}",
                     ('quarantined' if quarantine else 'retry_pending', clean_text(redact_sensitive_text(error), 1800),
@@ -927,7 +972,7 @@ class SummaryBatchStore:
             with self._lock, self._transaction_sync():
                 if lease_token:
                     row = self._conn.execute(
-                        "SELECT state,lease_token FROM summary_batches WHERE id=?",
+                        "SELECT state,lease_token,lease_expires_at FROM summary_batches WHERE id=?",
                         (batch_id,),
                     ).fetchone()
                     if (

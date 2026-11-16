@@ -466,6 +466,7 @@ class MemoryCompanionService:
         self._summary_workers: dict[str, asyncio.Task[Any]] = {}
         self._summary_recovery_task: asyncio.Task[Any] | None = None
         self._summary_recovery_cursor: str = ""
+        self._summary_prefer_old: dict[str, bool] = {}
         self._summary_recovery_status: dict[str, Any] = {
             "state": "idle",
             "last_error": "",
@@ -6373,7 +6374,7 @@ class MemoryCompanionService:
         task.add_done_callback(clear)
 
     async def _summary_recovery_loop(self) -> None:
-        """Wake only already-persisted, due batches; never create timeline work."""
+        """Recover due batches and eligible originals without requiring a new message."""
         startup_delay = max(
             0, min(3600, self.config.int("memory_summary.recovery_startup_delay_seconds", 60))
         )
@@ -6388,7 +6389,7 @@ class MemoryCompanionService:
             if startup_delay:
                 await asyncio.sleep(startup_delay)
             while not self._closing and not self._closed:
-                if not self.config.bool("memory_summary.enabled", True):
+                if not self.config.bool("memory_summary.enabled", True) or not self.config.bool("memory_summary.recovery_enabled", True):
                     self._summary_recovery_status.update(state="paused", last_scheduled=0, last_skipped=0)
                     await asyncio.sleep(poll_interval)
                     continue
@@ -6398,21 +6399,39 @@ class MemoryCompanionService:
                         for session_id, worker in self._summary_workers.items()
                         if worker is not None and not worker.done()
                     }
-                    batches = await self.store.next_due_summary_batches(
+                    sessions = await self.store.summary_recovery_sessions(
                         limit=session_limit,
                         exclude_session_ids=active_sessions,
                         after_session_id=self._summary_recovery_cursor,
                     )
                     scheduled = 0
                     skipped = 0
-                    for batch in batches:
-                        session_id = clean_text(batch.get("session_id"), 200)
-                        batch_id = clean_text(batch.get("id"), 160)
-                        if not session_id or not batch_id:
+                    for session in sessions:
+                        session_id = session["session_id"]
+                        self._summary_recovery_cursor = session_id
+                        if self._summary_call_semaphore.locked() or not await self.store.summary_budget_available(
+                            session_id, self.config.int("memory_summary.max_calls_per_session_hour", 24)
+                        ):
                             skipped += 1
                             continue
-                        self._summary_recovery_cursor = session_id
-                        context, reason = await self._summary_recovery_context(batch)
+                        batch = await self.store.next_summary_batch(session_id)
+                        window = await self.store.unsummarized_timeline_window(
+                            session_id=session_id, scope=session["scope"],
+                            limit=self.config.int("memory_summary.max_events_per_summary", 40),
+                            exclude_assigned=True,
+                        )
+                        new_ready = self._summary_window_ready(window, force=False)
+                        if batch is not None and (not new_ready or self._summary_prefer_old.get(session_id, True)):
+                            batch_id = batch["id"]
+                            context, reason = await self._summary_recovery_context(batch)
+                        elif new_ready:
+                            batch_id = ""
+                            context, reason = self._summary_context_from_sources(
+                                session_id, session["scope"], {}, list(window.get("rows") or [])
+                            )
+                        else:
+                            skipped += 1
+                            continue
                         if context is None:
                             skipped += 1
                             delay = max(
@@ -6421,12 +6440,12 @@ class MemoryCompanionService:
                                     "memory_summary.recovery_identity_retry_seconds", 3600
                                 )),
                             )
-                            await self.store.defer_summary_batch(
-                                batch_id,
-                                f"recovery_identity_skipped:{reason}",
-                                delay=delay,
-                                only_if_due=True,
-                            )
+                            if batch_id:
+                                await self.store.defer_summary_batch(
+                                    batch_id, f"recovery_identity_skipped:{reason}",
+                                    delay=delay, only_if_due=True,
+                                )
+                            self._summary_recovery_status["last_skip_reason"] = f"identity:{reason}"
                             logger.warning(
                                 "[MemoryCompanion] 摘要恢复因身份信息不完整或冲突而跳过: session=%s batch=%s reason=%s",
                                 session_id,
@@ -6442,12 +6461,11 @@ class MemoryCompanionService:
                                     "memory_summary.recovery_disabled_retry_seconds", 3600
                                 )),
                             )
-                            await self.store.defer_summary_batch(
-                                batch_id,
-                                "recovery_capture_disabled",
-                                delay=delay,
-                                only_if_due=True,
-                            )
+                            if batch_id:
+                                await self.store.defer_summary_batch(
+                                    batch_id, "recovery_capture_disabled",
+                                    delay=delay, only_if_due=True,
+                                )
                             continue
                         worker = self._summary_workers.get(session_id)
                         if worker is not None and not worker.done():
@@ -6509,6 +6527,14 @@ class MemoryCompanionService:
         if not events:
             return None, "batch_or_event_missing"
         batch_metadata = persisted.get("batch_metadata")
+        return self._summary_context_from_sources(batch_session, batch_scope, batch_metadata, events)
+
+    def _summary_context_from_sources(
+        self, batch_session: str, batch_scope: str, batch_metadata: dict[str, Any], events: list[dict[str, Any]]
+    ) -> tuple[SessionContext | None, str]:
+        """Validate source identity equally for batches and unassigned originals."""
+        if batch_scope not in {"private", "group"} or not events:
+            return None, "source_identity_invalid"
         batch_metadata = batch_metadata if isinstance(batch_metadata, dict) else {}
         event_metadata = []
         for event in events:
@@ -6520,6 +6546,8 @@ class MemoryCompanionService:
             ) != (batch_session, batch_scope):
                 return None, "event_session_or_scope_mismatch"
             metadata = event.get("metadata")
+            if isinstance(metadata, str):
+                metadata = json_loads(metadata, {})
             event_metadata.append(metadata if isinstance(metadata, dict) else {})
 
         metadata_sources = [batch_metadata, *event_metadata]
@@ -6736,6 +6764,7 @@ class MemoryCompanionService:
         for sid in stale:
             self._summary_locks.pop(sid, None)
             self._summary_lock_ts.pop(sid, None)
+            self._summary_prefer_old.pop(sid, None)
 
     @staticmethod
     def _summary_failure_is_transient(error: Any) -> bool:
@@ -6918,7 +6947,13 @@ class MemoryCompanionService:
         async with lock:
             max_calls = max(1, self.config.int("memory_summary.max_retries", 5))
             hourly_limit = max(1, self.config.int("memory_summary.max_calls_per_session_hour", 24))
+            if not force and (
+                self._summary_call_semaphore.locked()
+                or not await self.store.summary_budget_available(ctx.session_id, hourly_limit)
+            ):
+                return ""
             recovery_id = clean_text(recovery_batch_id, 160)
+            old_batch = None
             if recovery_id:
                 # Recovery is deliberately exact and side-effect free with
                 # respect to queue construction: it may consume only the
@@ -6939,7 +6974,8 @@ class MemoryCompanionService:
                             transient=self._summary_failure_is_transient(legacy_failure.get("last_error")),
                         ),
                     )
-                batch = await self.store.next_summary_batch(ctx.session_id, force=True) if force else None
+                old_batch = await self.store.next_summary_batch(ctx.session_id, force=force)
+                batch = old_batch if force or self._summary_prefer_old.get(ctx.session_id, False) else None
                 window = await self.store.unsummarized_timeline_window(
                     session_id=ctx.session_id, scope=ctx.scope,
                     limit=self.config.int("memory_summary.max_events_per_summary", 40),
@@ -6947,7 +6983,7 @@ class MemoryCompanionService:
                     # Keep current upstream's bot ownership filter.
                     bot_id=ctx.bot_id,
                 )
-                # New messages take priority over bounded recovery of historical batches.
+                # Alternate old batches and fresh windows when both are ready.
                 if batch is None and self._summary_window_ready(
                     window, force=force, allow_aged_backlog=allow_aged_backlog,
                 ):
@@ -6970,10 +7006,11 @@ class MemoryCompanionService:
                     )
                     batch = await self.store.get_summary_batch(batch_id)
                 if batch is None:
-                    batch = await self.store.next_summary_batch(ctx.session_id, force=force)
+                    batch = old_batch
             if batch is None:
                 return ""
             batch_id = batch["id"]
+            self._summary_prefer_old[ctx.session_id] = not bool(recovery_id or batch is old_batch)
             rows = await self.store.summary_batch_rows(batch_id)
             total = len(rows)
             if not rows:
@@ -7036,11 +7073,17 @@ class MemoryCompanionService:
                         current = await self.store.get_summary_batch(batch_id)
                         exhausted = not force and current["automatic_calls"] >= max_calls
                         has_usable_body = bool(payload and self.summarizer.compose_memory_content(payload))
+                        can_continue_with_fallback = (
+                            attempt_index + 1 < len(summary_attempts)
+                            and round_calls < max_calls
+                            and not exhausted
+                        )
                         await self.store.defer_summary_batch(
                             batch_id, request_error,
                             quarantine=exhausted and not has_usable_body,
                             delay=self._summary_retry_backoff_seconds(current["automatic_calls"]),
                             lease_token=lease_token if not force else "",
+                            preserve_lease=has_usable_body or can_continue_with_fallback,
                         )
                         if exhausted and not has_usable_body:
                             self._warn_summary_batch_quarantined(
