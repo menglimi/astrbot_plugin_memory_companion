@@ -169,6 +169,7 @@ from .query_session import (
 from .scoped_store import ScopedStore
 from .summarizer import MemorySummarizer, SummaryFormatError
 from .summary_admission import SummaryAdmission, SummaryAdmissionMethods
+from .summary_status import SummaryStatusMethods
 from .time_intent import TimeIntent, parse_time_intent
 from .turn_signal import analyze_turn_signal, message_terms
 from .visibility import (
@@ -360,7 +361,7 @@ class _HookStageTimer:
         return int(round((time.perf_counter_ns() - self._started) / 1_000_000))
 
 
-class MemoryCompanionService(SummaryAdmissionMethods):
+class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
     _SCOPE_CONTROL_FEATURES = frozenset({"capture", "recall", "topology"})
     # Token statistics are rewritten at most this often; the document grows to
     # several megabytes, so an unbounded write per provider call would dominate

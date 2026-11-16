@@ -193,6 +193,9 @@ async function load() {
     state.total = Number(data.total || state.items.length);
     state.bots = Array.isArray(data.bots) ? data.bots : [];
     renderSummary();
+    request("GET", "maintenance/summary_status").then((payload) => {
+      renderRecoveryStatus(payload.status);
+    }).catch(() => { el("recovery").hidden = true; });
     renderBotFilter();
     renderGrid();
   } catch (error) {
@@ -204,6 +207,22 @@ async function load() {
     state.loading = false;
     loading.hidden = true;
   }
+}
+
+function renderRecoveryStatus(status) {
+  const node = el("recovery");
+  const progress = status.progress;
+  const originals = status.unbatched;
+  const waits = Object.keys(status.wait_labels).filter((key) => status.waits[key] > 0)
+    .map((key) => esc(status.wait_labels[key]) + " " + Number(status.waits[key]) + " 批").join(" · ");
+  const minutes = Math.floor(Number(status.oldest_wait_seconds) / 60);
+  node.hidden = false;
+  node.innerHTML = `<summary>记忆整理：待处理 <b>${Number(status.pending_batches)}</b> 批</summary>
+    <p>全局状态，包含所有机器人。最老等待 ${minutes >= 1440 ? Math.floor(minutes / 1440) + " 天" : minutes >= 60 ? Math.floor(minutes / 60) + " 小时" : minutes + " 分钟"}。
+    ${waits || "没有有效待处理批次"}。</p>
+    <p>未分批原文 ${Number(originals.events)} 条，下一轮达到条件且身份有效 ${Number(originals.eligible_events)} 条。
+    正式会话记忆 ${Number(progress.adopted_memories)} 条，待审候选 ${Number(progress.review_candidates)} 条，隔离批次 ${Number(progress.quarantined_batches)} 批。</p>
+    <p>查看状态不会调用模型或通过候选。<a href="./legacy.html">在完整控制台查看详细等待原因</a></p>`;
 }
 
 function renderSummary() {
