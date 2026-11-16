@@ -62,6 +62,7 @@ class OperationPresetTests(unittest.TestCase):
         self.assertEqual(5, schema["memory_summary"]["items"]["max_retries"]["default"])
         self.assertEqual(24, schema["memory_summary"]["items"]["max_calls_per_session_hour"]["default"])
         self.assertEqual(0, schema["memory_summary"]["items"]["max_calls_per_session_hour"]["min"])
+        self.assertEqual(0, schema["memory_summary"]["items"]["max_calls_per_session_hour"]["slider"]["min"])
         self.assertEqual(300, schema["memory_summary"]["items"]["provider_timeout_seconds"]["default"])
 
     def test_summary_recovery_controls_have_expected_schema_types_and_defaults(self) -> None:
