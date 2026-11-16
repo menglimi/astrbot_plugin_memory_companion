@@ -222,6 +222,7 @@ MEMORY_VISIBILITY_FILTERS = {
     "restricted": ("restricted", "internal"),
 }
 UI_ENDPOINT_EXPOSURE = {
+    "/maintenance/summary_admission": {"exposure": "advanced", "reason": "管理员通过受保护的维护入口暂停、限量试跑或恢复记忆整理"},
     "/ui/capabilities": {"exposure": "internal", "reason": "前端启动时用于自校验，不作为业务按钮"},
     "/memory/visibility": {"exposure": "compat", "reason": "由统一 memory/update 表单覆盖"},
     "/memory/lifecycle": {"exposure": "compat", "reason": "由统一 memory/update 表单覆盖"},
