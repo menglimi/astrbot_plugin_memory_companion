@@ -168,6 +168,7 @@ vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
 context.snapshot = JSON.parse(process.argv[2]);
 process.stdout.write(JSON.stringify(vm.runInContext(`({
   card: summaryRecoveryCard(snapshot),
+  unlimitedCard: summaryRecoveryCard({...snapshot, limits: {...snapshot.limits, calls_per_session_hour: 0}}),
   overview: VIEWS.overview.render({recovery: snapshot, stats: {
     summary_progress: {quarantined_batches: 987654, no_memory_batches: 987653, frozen_events: 987652}
   }})
@@ -181,6 +182,8 @@ process.stdout.write(JSON.stringify(vm.runInContext(`({
         rendered = output["card"]
         self.assertIn('class="card ', rendered)
         self.assertIn("待处理 1 批", rendered)
+        self.assertIn("每会话每小时 6 次", rendered)
+        self.assertIn("每会话每小时 不限", output["unlimitedCard"])
         self.assertIn(status["wait_labels"]["paused"], rendered)
         self.assertIn("待审候选 0 条", rendered)
         self.assertNotIn("qq:FriendMessage:u1", rendered)

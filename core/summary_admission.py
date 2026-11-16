@@ -152,6 +152,8 @@ class SummaryAdmissionMethods:
             gate.save(mode="paused", batches=[], results=[], stop_reason="")
             try:
                 await self._drain_summary_admissions()
+                if self.config.int("memory_summary.max_calls_per_session_hour", 24) == 0:
+                    await self.store.release_summary_budget_deferrals()
                 batches = await self.store.oldest_due_summary_batches(limit=limit)
                 manifest = []
                 for batch in batches:
