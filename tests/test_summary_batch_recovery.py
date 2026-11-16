@@ -172,6 +172,103 @@ class SummaryBatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(3, len(p1.calls) + len(p2.calls))
         self.assertEqual('quarantined', self.batches()[0]['state'])
 
+    async def test_request_failure_waits_for_backoff_and_recovers_without_repair(self):
+        self.config['memory_summary']['retry_backoff_seconds'] = 60
+        event_id = await self.event()
+        error = RuntimeError('400 Invalid request parameter')
+        error.response = SimpleNamespace(status_code=400)
+        provider = Provider([error, self.payload(event_id)])
+        self.use(provider)
+
+        self.assertEqual('', await self.service.maybe_summarize_session(self.ctx))
+
+        batch = self.batches()[0]
+        self.assertEqual(1, len(provider.calls))
+        self.assertEqual(1, batch['automatic_calls'])
+        self.assertEqual('retry_pending', batch['state'])
+        self.assertEqual(0, batch['repair_used'])
+        self.assertIn('400 Invalid request parameter', batch['last_error'])
+        self.assertFalse(batch['last_error'].startswith('repair:'))
+        self.assertGreater(datetime.fromisoformat(batch['next_retry_at']), datetime.now(timezone.utc))
+        self.assertFalse((await self.service.store.get_timeline_by_ids([event_id]))[event_id]['summarized_at'])
+        self.assertEqual('', await self.service.maybe_summarize_session(self.ctx))
+        self.assertEqual(1, len(provider.calls))
+
+        self.service.store._conn.execute(
+            "UPDATE summary_batches SET next_retry_at=? WHERE id=?",
+            ('2000-01-01T00:00:00+00:00', batch['id']),
+        )
+        self.service.store._conn.commit()
+        self.assertTrue(await self.service.maybe_summarize_session(self.ctx))
+        self.assertEqual(2, len(provider.calls))
+        self.assertNotIn('validation_errors', provider.calls[1]['prompt'])
+        self.assertEqual('completed', self.batches()[0]['state'])
+
+    async def test_request_failure_uses_fallback_without_repeating_the_failed_provider(self):
+        self.config['memory_summary']['retry_backoff_seconds'] = 60
+        event_id = await self.event()
+        primary = Provider([RuntimeError('400 Invalid request parameter')])
+        fallback = Provider([self.payload(event_id)])
+        self.use(primary, fallback)
+
+        self.assertTrue(await self.service.maybe_summarize_session(self.ctx))
+
+        self.assertEqual(1, len(primary.calls))
+        self.assertEqual(1, len(fallback.calls))
+        self.assertNotIn('validation_errors', fallback.calls[0]['prompt'])
+        self.assertEqual(2, self.batches()[0]['automatic_calls'])
+        self.assertEqual(0, self.batches()[0]['repair_used'])
+        self.assertEqual('completed', self.batches()[0]['state'])
+
+    async def test_request_failures_keep_the_batch_budget_across_rounds(self):
+        event_id = await self.event()
+        provider = Provider([RuntimeError('400 Invalid request parameter')] * 3)
+        self.use(provider)
+
+        for calls in range(1, 4):
+            self.assertEqual('', await self.service.maybe_summarize_session(self.ctx))
+            self.assertEqual(calls, len(provider.calls))
+            batch = self.batches()[0]
+            self.assertEqual(calls, batch['automatic_calls'])
+            self.assertEqual('quarantined' if calls == 3 else 'retry_pending', batch['state'])
+        self.assertEqual('', await self.service.maybe_summarize_session(self.ctx))
+        self.assertEqual(3, len(provider.calls))
+        self.assertFalse((await self.service.store.get_timeline_by_ids([event_id]))[event_id]['summarized_at'])
+        self.assertEqual([event_id], [row['id'] for row in await self.service.store.summary_batch_rows(batch['id'])])
+
+    async def test_fallback_keeps_validation_feedback_after_a_repair_request_fails(self):
+        event_id = await self.event()
+        invalid = self.payload(event_id)
+        invalid['summary_refs'] = ['missing-event']
+        primary = Provider([invalid, RuntimeError('400 Invalid request parameter')])
+        fallback = Provider([self.payload(event_id)])
+        self.use(primary, fallback)
+
+        self.assertTrue(await self.service.maybe_summarize_session(self.ctx))
+
+        self.assertEqual(2, len(primary.calls))
+        self.assertEqual(1, len(fallback.calls))
+        self.assertIn('summary_refs 含本批次不存在的 event_id', fallback.calls[0]['prompt'])
+        self.assertNotIn('Invalid request parameter', fallback.calls[0]['prompt'])
+        self.assertEqual('completed', self.batches()[0]['state'])
+
+    async def test_request_failure_after_a_repair_keeps_the_reviewable_body(self):
+        self.config['memory_summary']['max_retries'] = 2
+        event_id = await self.event()
+        invalid = self.payload(event_id)
+        invalid['summary_refs'] = ['missing-event']
+        provider = Provider([invalid, TimeoutError('503 Service Unavailable')])
+        self.use(provider)
+
+        memory_id = await self.service.maybe_summarize_session(self.ctx)
+
+        self.assertTrue(memory_id)
+        record = await self.service.store.get_memory(memory_id)
+        self.assertEqual('short_term_candidate', record.lifecycle)
+        self.assertEqual('pending', record.review_status)
+        self.assertEqual(2, len(provider.calls))
+        self.assertEqual('completed', self.batches()[0]['state'])
+
     async def test_request_max_retries_is_configurable(self):
         """R14：单次请求重试次数不再是写死的 1，而是读 memory_summary.request_max_retries。"""
         self.config['memory_summary']['request_max_retries'] = 4

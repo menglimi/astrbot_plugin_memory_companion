@@ -164,7 +164,7 @@ from .query_session import (
     track_query,
 )
 from .scoped_store import ScopedStore
-from .summarizer import MemorySummarizer
+from .summarizer import MemorySummarizer, SummaryFormatError
 from .time_intent import TimeIntent, parse_time_intent
 from .turn_signal import analyze_turn_signal, message_terms
 from .visibility import (
@@ -6423,34 +6423,39 @@ class MemoryCompanionService:
                             break
                         feedback = "; ".join(errors)
                         previous_response = json_dumps(payload or {})
-                    except Exception as exc:
+                    except SummaryFormatError as exc:
                         provider_failed = True
                         feedback = self._describe_exception(exc)
-                        if self._summary_failure_is_transient(feedback):
-                            current = await self.store.get_summary_batch(batch_id)
-                            exhausted = not force and current["automatic_calls"] >= max_calls
-                            await self.store.defer_summary_batch(
-                                batch_id, "repair:" + feedback if repair else feedback,
-                                quarantine=exhausted,
-                                delay=self._summary_retry_backoff_seconds(current["automatic_calls"]),
+                        previous_response = exc.response
+                    except Exception as exc:
+                        # A failed request has no model output to repair.
+                        # Try each fallback once, then wait for the next round.
+                        request_error = self._describe_exception(exc)
+                        current = await self.store.get_summary_batch(batch_id)
+                        exhausted = not force and current["automatic_calls"] >= max_calls
+                        has_usable_body = bool(payload and self.summarizer.compose_memory_content(payload))
+                        await self.store.defer_summary_batch(
+                            batch_id, request_error,
+                            quarantine=exhausted and not has_usable_body,
+                            delay=self._summary_retry_backoff_seconds(current["automatic_calls"]),
+                        )
+                        if exhausted and not has_usable_body:
+                            self._warn_summary_batch_quarantined(
+                                ctx, batch_id,
+                                event_count=total,
+                                reason=request_error,
+                                calls=current["automatic_calls"],
                             )
-                            if exhausted:
-                                self._warn_summary_batch_quarantined(
-                                    ctx, batch_id,
-                                    event_count=total,
-                                    reason=feedback,
-                                    calls=current["automatic_calls"],
-                                )
-                                return ""
-                            attempt_index += 1
-                            continue
-                        previous_response = getattr(exc, "response", "")
+                            return ""
+                        if exhausted:
+                            break
+                        attempt_index += 1
+                        continue
                     current = await self.store.get_summary_batch(batch_id)
                     exhausted = not force and current["automatic_calls"] >= max_calls
                     if provider_failed:
-                        # The provider itself is unusable for this round, so the
-                        # batch is frozen rather than retried forever. Its events
-                        # stay owned and auditable instead of being consumed.
+                        # Only malformed model output reaches this repair path.
+                        # Keep its events owned until a bounded repair succeeds.
                         has_usable_body = bool(payload and self.summarizer.compose_memory_content(payload))
                         await self.store.defer_summary_batch(
                             batch_id, "repair:" + feedback,
