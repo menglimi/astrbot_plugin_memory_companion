@@ -168,6 +168,7 @@ from .query_session import (
 )
 from .scoped_store import ScopedStore
 from .summarizer import MemorySummarizer, SummaryFormatError
+from .summary_admission import SummaryAdmission, SummaryAdmissionMethods
 from .time_intent import TimeIntent, parse_time_intent
 from .turn_signal import analyze_turn_signal, message_terms
 from .visibility import (
@@ -359,7 +360,7 @@ class _HookStageTimer:
         return int(round((time.perf_counter_ns() - self._started) / 1_000_000))
 
 
-class MemoryCompanionService:
+class MemoryCompanionService(SummaryAdmissionMethods):
     _SCOPE_CONTROL_FEATURES = frozenset({"capture", "recall", "topology"})
     # Token statistics are rewritten at most this often; the document grows to
     # several megabytes, so an unbounded write per provider call would dominate
@@ -462,6 +463,7 @@ class MemoryCompanionService:
             mention_policy_relax=self.config.bool("memory_capture.relax_mention_policy", False)
         )
         self._summary_locks: dict[str, asyncio.Lock] = {}
+        self._summary_admission = SummaryAdmission(self.data_dir / "summary_admission.json")
         self._summary_lock_ts: dict[str, float] = {}
         self._summary_workers: dict[str, asyncio.Task[Any]] = {}
         self._summary_recovery_task: asyncio.Task[Any] | None = None
@@ -6308,6 +6310,8 @@ class MemoryCompanionService:
         return self._bot_entity(ctx).id
 
     def _schedule_session_summary(self, ctx: SessionContext, *, reason: str) -> None:
+        if not self._summary_admission.normal:
+            return
         if not self.config.bool("memory_summary.enabled", True):
             return
         if not self._scope_feature_enabled(ctx, "capture"):
@@ -6350,6 +6354,9 @@ class MemoryCompanionService:
         """Start the durable pending-batch dispatcher after database startup."""
         if self._closing or self._closed or not self._database_initialized:
             return
+        if not self._summary_admission.normal:
+            self._summary_recovery_status["state"] = "paused"
+            return
         if not self.config.bool("memory_summary.recovery_enabled", True):
             self._summary_recovery_status["state"] = "disabled"
             return
@@ -6389,7 +6396,7 @@ class MemoryCompanionService:
             if startup_delay:
                 await asyncio.sleep(startup_delay)
             while not self._closing and not self._closed:
-                if not self.config.bool("memory_summary.enabled", True) or not self.config.bool("memory_summary.recovery_enabled", True):
+                if not self._summary_admission.normal or not self.config.bool("memory_summary.enabled", True) or not self.config.bool("memory_summary.recovery_enabled", True):
                     self._summary_recovery_status.update(state="paused", last_scheduled=0, last_skipped=0)
                     await asyncio.sleep(poll_interval)
                     continue
@@ -6930,6 +6937,8 @@ class MemoryCompanionService:
         recovery_batch_id: str = "",
         allow_aged_backlog: bool = False,
     ) -> str:
+        if not self._summary_admission.allows(recovery_batch_id, force=force):
+            return ""
         if not force and not self.config.bool("memory_summary.enabled", True):
             return ""
         if not ctx.session_id:
@@ -6945,6 +6954,8 @@ class MemoryCompanionService:
                 force,
             )
         async with lock:
+            if not self._summary_admission.allows(recovery_batch_id, force=force):
+                return ""
             max_calls = max(1, self.config.int("memory_summary.max_retries", 5))
             hourly_limit = max(1, self.config.int("memory_summary.max_calls_per_session_hour", 24))
             if not force and (
@@ -7035,6 +7046,7 @@ class MemoryCompanionService:
             try:
                 while attempt_index < len(summary_attempts) and round_calls < max_calls:
                     attempt = summary_attempts[attempt_index]
+                    await self._validate_summary_trial(batch, summary_attempts)
                     if not await self.store.reserve_summary_call(
                         batch_id, max_calls=max_calls, hourly_limit=hourly_limit,
                         repair=repair, force=force,

@@ -318,6 +318,21 @@ class SummaryBatchStore:
                 return dict(row) if row else None
         return await asyncio.to_thread(read)
 
+    async def oldest_due_summary_batches(self, *, limit: int = 5) -> list[dict[str, Any]]:
+        """Freeze a globally oldest bounded trial manifest, including one session's multiple batches."""
+        def read():
+            with self._lock:
+                rows = self._conn.execute(
+                    f"""SELECT b.* FROM summary_batches b
+                        WHERE b.state IN ('pending','retry_pending')
+                          AND EXISTS(SELECT 1 FROM summary_batch_events e WHERE e.batch_id=b.id)
+                          AND {self._due_clause('b')}
+                        ORDER BY b.created_at,b.id LIMIT ?""",
+                    [*self._due_params(), max(1, min(5, int(limit)))],
+                ).fetchall()
+                return [dict(row) for row in rows]
+        return await asyncio.to_thread(read)
+
     async def next_due_summary_batches(
         self,
         *,
