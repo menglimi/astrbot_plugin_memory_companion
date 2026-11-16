@@ -63,6 +63,25 @@ class OperationPresetTests(unittest.TestCase):
         self.assertEqual(24, schema["memory_summary"]["items"]["max_calls_per_session_hour"]["default"])
         self.assertEqual(300, schema["memory_summary"]["items"]["provider_timeout_seconds"]["default"])
 
+    def test_summary_recovery_controls_have_expected_schema_types_and_defaults(self) -> None:
+        schema = json.loads((Path(__file__).resolve().parents[1] / "_conf_schema.json").read_text(encoding="utf-8"))
+        items = schema["memory_summary"]["items"]
+        expected = {
+            "recovery_enabled": ("bool", True),
+            "recovery_startup_delay_seconds": ("int", 60),
+            "recovery_poll_interval_seconds": ("int", 60),
+            "recovery_sessions_per_round": ("int", 1),
+            "recovery_identity_retry_seconds": ("int", 3600),
+            "recovery_disabled_retry_seconds": ("int", 3600),
+        }
+
+        for key, (expected_type, expected_default) in expected.items():
+            with self.subTest(key=key):
+                self.assertEqual(expected_type, items[key]["type"])
+                self.assertEqual(expected_default, items[key]["default"])
+                self.assertTrue(items[key]["description"])
+                self.assertTrue(items[key]["hint"])
+
     def test_persist_runtime_config_is_utf8_and_atomic_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             data_dir = Path(temp) / "plugin_data" / "astrbot_plugin_memory_companion"
