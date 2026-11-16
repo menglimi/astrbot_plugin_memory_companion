@@ -149,6 +149,10 @@ class SummaryStatusTests(unittest.IsolatedAsyncioTestCase):
         if node is None:
             self.skipTest("Node.js is needed only for the panel rendering check")
         await self.batch()
+        empty_batch, empty_event = await self.batch(1)
+        with self.service.store._lock, self.service.store._transaction_sync():
+            self.service.store._conn.execute("UPDATE timeline SET content='   ' WHERE id=?", (empty_event,))
+        self.change(empty_batch, state="quarantined")
         self.service._summary_admission.save(mode="paused")
         status = await self.service.summary_recovery_status()
         from pathlib import Path
@@ -162,17 +166,28 @@ const context = vm.createContext({
 });
 vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
 context.snapshot = JSON.parse(process.argv[2]);
-process.stdout.write(vm.runInContext('summaryRecoveryCard(snapshot)', context));
+process.stdout.write(JSON.stringify(vm.runInContext(`({
+  card: summaryRecoveryCard(snapshot),
+  overview: VIEWS.overview.render({recovery: snapshot, stats: {
+    summary_progress: {quarantined_batches: 987654, no_memory_batches: 987653, frozen_events: 987652}
+  }})
+})`, context)));
 """
         rendered = subprocess.run(
             [node, "-e", code, str(script), json.dumps(status)],
             capture_output=True, text=True, encoding="utf-8", check=True,
         ).stdout
+        output = json.loads(rendered)
+        rendered = output["card"]
         self.assertIn('class="card ', rendered)
         self.assertIn("待处理 1 批", rendered)
         self.assertIn(status["wait_labels"]["paused"], rendered)
         self.assertIn("待审候选 0 条", rendered)
         self.assertNotIn("qq:FriendMessage:u1", rendered)
+        self.assertNotIn("987", output["overview"])
+        self.assertIn("待修复批次", output["overview"])
+        self.assertIn("已处理，无新增记忆", output["overview"])
+        self.assertNotIn("冻结原文", output["overview"])
 
 
 class SummaryStatusApiTests(unittest.IsolatedAsyncioTestCase):
