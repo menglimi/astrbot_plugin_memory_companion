@@ -12542,6 +12542,64 @@ class MemoryStore(SummaryBatchStore):
             ).fetchall()
         return [MemoryRecord.from_row(row) for row in rows]
 
+    async def read_authorized_linked_memories(self, authorization, *, limit=8):
+        """Exact native sessions + bot + persona; one predicate for rows/counts.
+
+        The caller must validate the host lease before and after this await.
+        No aliases, identity rewriting, group expansion or fallback search.
+        """
+        return await self._run_recoverable_database_operation(
+            self._read_authorized_linked_memories_sync, authorization, limit)
+
+    def _read_authorized_linked_memories_sync(self, authorization, limit):
+        members = authorization.get("members", [])
+        persona = authorization.get("persona_id")
+        reader = authorization.get("reader_user_id")
+        if (authorization.get("schema") != "companion.linked-memory-read.v1"
+                or not isinstance(persona, str) or not persona or not reader
+                or not isinstance(members, list) or not 1 <= len(members) <= 16):
+            raise ValueError("invalid authorized memory scope")
+        clauses, params = [], []
+        for member in members:
+            session = member["session_id"]
+            scope, target = parse_scope_from_session(session)
+            if (scope != "private" or not target or not member["native_account_id"]
+                    or not member["bot_id"] or not member["account_id"]
+                    or not session.startswith(member["platform"] + ":")):
+                raise ValueError("incomplete native private route")
+            clause = "(session_id=? AND owner_bot_id=?)"
+            values = [session, member["account_id"]]
+            if member.get("since") is not None:
+                clause = (clause[:-1] + " AND julianday(created_at)>=julianday(?) AND julianday(occurred_at)>=julianday(?) "
+                    "AND (json_extract(metadata, '$.start_at') IS NULL "
+                    "OR julianday(json_extract(metadata, '$.start_at'))>=julianday(?)))")
+                values.extend([member["since"]] * 3)
+            clauses.append(clause)
+            params.extend(values)
+        validity, validity_params = validity_where_clause(valid_at=utc_now())
+        # A new host authorization never overrides an explicit Memory deny.
+        owner = "CASE WHEN subject_kind='user' THEN subject_id WHEN object_kind='user' THEN object_id ELSE '' END"
+        where = ("scope='private' AND visibility IN ('private_pair','shareable') "
+                 "AND review_status!='pending' AND lifecycle='stable_memory' "
+                 "AND json_extract(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,'$.persona_id')=? "
+                 "AND (" + " OR ".join(clauses) + ") AND " + validity +
+                 " AND NOT EXISTS (SELECT 1 FROM memory_acl_rules acl WHERE acl.enabled=1 "
+                 "AND acl.effect='deny' AND acl.owner_scope='private' AND acl.reader_scope='private' "
+                 "AND acl.owner_id=(" + owner + ") AND acl.reader_id=?)")
+        params = [persona, *params, *validity_params, reader]
+        safe_limit = max(0, min(20, int(limit)))
+        with self._lock:
+            revision = self._memory_revision_sync()
+            rows = self._conn.execute("SELECT * FROM memories WHERE " + where +
+                " ORDER BY occurred_at DESC, created_at DESC, id DESC LIMIT ?", [*params, safe_limit]).fetchall()
+            counts = self._conn.execute("SELECT memory_type,COUNT(*) AS n FROM memories WHERE " +
+                where + " GROUP BY memory_type", params).fetchall()
+            if self._memory_revision_sync() != revision:
+                raise RuntimeError("memory_summary_snapshot_changed")
+        return {"records": [MemoryRecord.from_row(row) for row in rows],
+                "type_counts": {row["memory_type"]: int(row["n"]) for row in counts},
+                "memory_revision": int(revision)}
+
     async def read_user_memory_summary_records(
         self,
         user_id: str,
