@@ -11740,6 +11740,31 @@ class MemoryStore(SummaryBatchStore):
                 self._upsert_memory_fts_row(row)
         return {"ok": True, "id": record.id, "revision": next_revision}
 
+    async def delete_automatic_core_memory(self, memory_id: str, *, expected_revision: int) -> dict[str, Any]:
+        """Remove an empty automatic projection only if it has not been edited."""
+        return await self._run_recoverable_database_operation(
+            self._delete_automatic_core_memory_sync, memory_id, expected_revision,
+        )
+
+    def _delete_automatic_core_memory_sync(self, memory_id: str, expected_revision: int) -> dict[str, Any]:
+        with self._lock:
+            with self._transaction_sync():
+                row = self._conn.execute(
+                    "SELECT memory_type, source_plugin, metadata FROM memories WHERE id=?", (memory_id,)
+                ).fetchone()
+                if row is None:
+                    return {"ok": False, "code": "not_found"}
+                metadata = json_loads(row["metadata"], {})
+                revision = int(metadata.get("core_revision") or 0) if isinstance(metadata, dict) else 0
+                if (
+                    row["memory_type"] != "core_memory"
+                    or row["source_plugin"] != "memory_companion_core_auto"
+                    or revision != expected_revision
+                ):
+                    return {"ok": False, "code": "revision_conflict"}
+                self._delete_memory_cascade_sync([memory_id])
+                return {"ok": True}
+
     async def list_schedule_context_memories(
         self,
         *,

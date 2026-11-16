@@ -72,7 +72,7 @@ from .memory_revision import current_memory, memory_ref
 from .memory_lifecycle import is_open_loop_candidate, open_loop_expired
 from .emotion_event_contract import normalize_emotion_event
 from .emotion_targeting import memory_emotion_refs
-from .identity import IdentityResolver, looks_like_command, maybe_await, normalize_session_context_fields, session_target_id
+from .identity import IdentityResolver, canonical_user_id, looks_like_command, maybe_await, normalize_session_context_fields, session_target_id
 from .importance import ImportanceEvaluator
 from .injection import (
     DEFAULT_CORE_MEMORY_CHARS,
@@ -94,6 +94,7 @@ from .models import (
     SearchResult,
     SessionContext,
     clean_text,
+    is_memory_placeholder,
     json_dumps,
     json_loads,
     memory_embedding_text,
@@ -169,6 +170,7 @@ from .time_intent import TimeIntent, parse_time_intent
 from .turn_signal import analyze_turn_signal, message_terms
 from .visibility import (
     VisibilityPolicy,
+    _platform_family,
     can_change_person_weight,
     can_remember_in_scope,
 )
@@ -453,6 +455,7 @@ class MemoryCompanionService:
         self._summary_lock_last_cleanup: float = time.monotonic()
         self._SUMMARY_LOCK_TTL: float = 600.0  # 10 minutes
         self._decay_lock = asyncio.Lock()
+        self._core_distill_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._portrait_dispatch_task: asyncio.Task[Any] | None = None
         self._maintenance_dispatch_task: asyncio.Task[Any] | None = None
@@ -1939,26 +1942,109 @@ class MemoryCompanionService:
     def _core_distill_line(record: Any) -> str:
         return clean_text(record.content, 120)
 
+    @staticmethod
+    def _core_distill_owner(record: MemoryRecord) -> tuple[str, str, str, str, str, str] | None:
+        """Identify the original visibility boundary before promoting a fact."""
+        scope = clean_text(record.scope, 24).lower()
+        visibility = clean_text(record.visibility, 40).lower()
+        allowed = {
+            "global": {"bot_self"},
+            "private": {"private_pair", "bot_self"},
+            "group": {"group_public", "bot_self"},
+        }
+        if visibility not in allowed.get(scope, set()):
+            return None
+        metadata = record.metadata if isinstance(record.metadata, dict) else {}
+        bot_id = clean_text(record.owner_bot_id, 120)
+        metadata_bot_id = clean_text(metadata.get("owner_bot_id"), 120)
+        platform = _platform_family(record.platform)
+        if (
+            not bot_id or bot_id == "self" or not platform or bot_id.casefold() == platform
+            or (metadata_bot_id and metadata_bot_id != bot_id)
+        ):
+            return None
+        if len(platform) > 80:
+            return None
+        if scope == "private":
+            # A memory's subject may be a third person mentioned in this chat.
+            # Only the session itself identifies the private window's owner.
+            target_id = canonical_user_id(session_target_id(record.session_id, "private"))
+            if not target_id:
+                return None
+        elif scope == "group":
+            target_id = clean_text(record.group_id, 160)
+            session_target = session_target_id(record.session_id, "group")
+            if not target_id or (session_target and session_target != target_id):
+                return None
+        else:
+            target_id = ""
+        persona_id = clean_text(metadata.get("persona_id"), 120)
+        session_id = clean_text(record.session_id, 220)
+        return scope, target_id, bot_id, platform, persona_id, session_id
+
+    @classmethod
+    def _core_distill_source_owner(cls, record: MemoryRecord) -> tuple[str, str, str, str, str, str] | None:
+        if (
+            record.memory_type == "core_memory"
+            or record.lifecycle not in {"stable_memory", "working_memory", ""}
+            or record.review_status in {"pending", "rejected"}
+            or record.sensitivity == "restricted"
+            or not current_memory(record)
+            or open_loop_expired(record)
+            or is_memory_placeholder(record)
+            or not RetrievalEngine._profile_retrieval_decision(record)[0]
+        ):
+            return None
+        return cls._core_distill_owner(record)
+
+    @staticmethod
+    def _core_distill_block_owner(block: MemoryRecord) -> tuple[str, str, str, str, str, str]:
+        metadata = block.metadata if isinstance(block.metadata, dict) else {}
+        return (
+            clean_text(metadata.get("core_scope"), 24).lower(),
+            clean_text(metadata.get("target_id"), 160),
+            clean_text(metadata.get("owner_bot_id"), 120),
+            _platform_family(block.platform),
+            clean_text(metadata.get("persona_id"), 120),
+            clean_text(block.session_id, 220),
+        )
+
     async def auto_distill_core_memory(self) -> dict[str, Any]:
-        """把长期积累的高价值记忆沉淀为核心记忆块（只补到上限，不覆盖已有块）。"""
+        """按原始可见边界将长期记忆沉淀为核心块，不改写手工块。"""
+        async with self._core_distill_lock:
+            task = asyncio.create_task(self._auto_distill_core_memory_locked())
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # A cancelled database await may still be writing in its worker
+                # thread. Keep the lock until this run has actually finished.
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if not task.cancelled():
+                    task.exception()
+                raise
+
+    async def _auto_distill_core_memory_locked(self) -> dict[str, Any]:
         if not self.config.bool("core_memory.enabled", True):
             return {"ok": True, "code": "core_memory_disabled"}
         if not self.config.bool("core_memory.auto_distill_enabled", True):
             return {"ok": True, "code": "auto_distill_disabled"}
         max_blocks = max(1, self.config.int("core_memory.auto_distill_max_blocks", 3))
         existing = await self.list_core_memory_blocks()
-        if len(existing) >= max_blocks:
-            return {"ok": True, "code": "core_memory_full", "blocks": len(existing)}
         min_salience = self.config.float("core_memory.auto_distill_min_salience", 0.45)
         try:
             memories = await self.store.list_memories(limit=1200, include_pending=False)
         except Exception as exc:
             return {"ok": False, "code": "list_failed", "error": self._describe_exception(exc)}
-        buckets: dict[str, list[Any]] = {"global": [], "private": [], "group": []}
+        buckets: dict[tuple[str, str, str, str, str, str], list[MemoryRecord]] = defaultdict(list)
         for record in memories:
-            if record.memory_type == "core_memory":
-                continue
-            if record.lifecycle not in {"stable_memory", "working_memory", ""}:
+            owner = self._core_distill_source_owner(record)
+            if owner is None:
                 continue
             try:
                 score = float(record.salience or 0.0)
@@ -1966,85 +2052,89 @@ class MemoryCompanionService:
                 score = 0.0
             if score < min_salience:
                 continue
-            bucket = clean_text(record.scope, 24).lower() or "global"
-            if bucket not in buckets:
-                bucket = "global"
-            buckets[bucket].append(record)
+            buckets[owner].append(record)
+        automatic_blocks = [block for block in existing if block.source_plugin == "memory_companion_core_auto"]
+        automatic = {
+            self._core_distill_block_owner(block): block
+            for block in automatic_blocks
+        }
+        source_ids = [
+            ref.get("id", "")
+            for block in automatic.values()
+            for ref in (block.metadata or {}).get("core_source_refs", [])
+            if isinstance(ref, dict)
+        ]
+        previous_sources: dict[str, MemoryRecord] = {}
+        for start in range(0, len(source_ids), 400):
+            previous_sources.update(await self.store.get_memories_by_ids(source_ids[start:start + 400]))
         created = 0
-        for bucket in ("global", "private", "group"):
-            if len(existing) + created >= max_blocks:
-                break
-            rows = sorted(buckets[bucket], key=lambda item: float(item.salience or 0.0), reverse=True)
-            if len(rows) < 2:
+        updated = 0
+        removed = 0
+        scope_order = {"global": 0, "private": 1, "group": 2}
+        for owner in sorted(set(buckets) | set(automatic), key=lambda key: (scope_order.get(key[0], 3), key[1:])):
+            scope, target_id, bot_id, platform, persona_id, session_id = owner
+            if scope not in scope_order or not bot_id or not platform:
                 continue
-            facts: list[str] = []
+            matching = automatic.get(owner)
+            rows = sorted(buckets.get(owner, []), key=lambda item: float(item.salience or 0.0), reverse=True)
+            if matching is None and len(rows) < 2:
+                continue
+            selected: list[MemoryRecord] = []
             seen: set[str] = set()
-            for record in rows:
-                text = self._core_distill_line(record)
-                if not text:
+            old_refs = (matching.metadata or {}).get("core_source_refs", []) if matching else []
+            old_sources = [previous_sources.get(ref.get("id", "")) for ref in old_refs if isinstance(ref, dict)]
+            for record in old_sources + rows[:6]:
+                if record is None or self._core_distill_source_owner(record) != owner:
                     continue
-                key = text.casefold()
-                if key in seen:
+                fact = self._core_distill_line(record)
+                if not fact or fact.casefold() in seen:
                     continue
-                seen.add(key)
-                facts.append(text)
-                if len(facts) >= 6:
-                    break
-            if not facts:
+                seen.add(fact.casefold())
+                selected.append(record)
+            selected = selected[-20:]
+            if not selected:
+                if matching is not None:
+                    result = await self.store.delete_automatic_core_memory(
+                        matching.id, expected_revision=(matching.metadata or {}).get("core_revision", 0)
+                    )
+                    removed += int(result.get("ok", False))
                 continue
-            target_id = ""
-            bot_id = "self"
-            if bucket == "private":
-                subject_id = clean_text(getattr(rows[0].subject, "id", ""), 160)
-                if not subject_id or subject_id == "self":
-                    continue
-                target_id = subject_id
-                bot_id = clean_text(rows[0].owner_bot_id, 120) or "self"
-            elif bucket == "group":
-                group_id = clean_text(rows[0].group_id, 160)
-                if not group_id:
-                    continue
-                target_id = group_id
-                bot_id = clean_text(rows[0].owner_bot_id, 120) or "self"
-            label = "长期记忆·" + {"global": "整体", "private": "私聊", "group": "群聊"}[bucket]
+            platform_label = platform if len(platform) <= 40 else platform[:30] + "-" + hashlib.sha256(platform.encode()).hexdigest()[:12]
+            label = "长期记忆·" + {"global": "整体", "private": "私聊", "group": "群聊"}[scope] + "·" + platform_label
+            if session_id:
+                label += "·" + hashlib.sha256(session_id.encode()).hexdigest()[:12]
             payload = {
                 "label": label,
-                "content": "；".join(facts),
-                "scope": bucket,
+                "content": "；".join(self._core_distill_line(record) for record in selected),
+                "scope": scope,
                 "target_id": target_id,
                 "kind": "fact",
                 "priority": 60,
                 "bot_id": bot_id,
+                "platform": platform,
+                "persona_id": persona_id,
+                "session_id": session_id,
+                "core_source_refs": [memory_ref(record) for record in selected],
             }
-            # 同名块已存在时合并更新（保留最近 20 条事实），否则每轮都会
-            # 因 label 冲突失败、核心记忆永远停在第一条。
-            for block in existing:
-                if not isinstance(block, dict):
+            if matching is not None:
+                if payload["content"] == matching.content and payload["core_source_refs"] == old_refs:
                     continue
-                if clean_text(block.get("label"), 80) != label:
-                    continue
-                if clean_text(block.get("scope"), 24) != bucket:
-                    continue
-                merged = [
-                    part.strip()
-                    for part in clean_text(block.get("content"), 4000).split("；")
-                    if part.strip()
-                ]
-                for fact in facts:
-                    if fact not in merged:
-                        merged.append(fact)
-                payload["content"] = "；".join(merged[-20:])
-                payload["id"] = clean_text(block.get("id"), 160)
-                break
-            result = await self.save_core_memory_block(payload)
+                payload["id"] = matching.id
+                payload["expected_revision"] = matching.metadata.get("core_revision", 0)
+            elif len(automatic_blocks) + created - removed >= max_blocks:
+                continue
+            result = await self.save_core_memory_block(payload, auto_distilled=True)
             if result.get("ok"):
-                created += 1
+                if matching is None:
+                    created += 1
+                else:
+                    updated += 1
                 logger.info(
                     "[MemoryCompanion] 自动沉淀核心记忆块: %s%s",
                     label,
                     "（合并更新）" if payload.get("id") else "",
                 )
-        return {"ok": True, "code": "distilled", "created": created, "blocks": len(existing) + created}
+        return {"ok": True, "code": "distilled", "created": created, "updated": updated, "removed": removed, "blocks": len(existing) + created - removed}
 
     async def _lifecycle_maintenance_dispatch_loop(self) -> None:
         startup_delay = max(
@@ -7598,6 +7688,23 @@ class MemoryCompanionService:
             limit=max(20, result_limit, self.config.int("core_memory.scan_limit", 200))
         )
         policy = self.visibility_policy()
+        automatic = [record for record in candidates if record.source_plugin == "memory_companion_core_auto"]
+        source_ids = [
+            ref.get("id", "")
+            for record in automatic
+            for ref in (record.metadata or {}).get("core_source_refs", [])
+            if isinstance(ref, dict)
+        ]
+        sources: dict[str, MemoryRecord] = {}
+        for start in range(0, len(source_ids), 400):
+            sources.update(await self.store.get_memories_by_ids(source_ids[start:start + 400]))
+        visible_sources: set[str] = set()
+        if sources:
+            engine = self._retrieval_validation_engine()
+            source_results, _ = await engine.filter_visible_candidates(
+                list(sources.values()), ctx, reason="automatic_core_source",
+            )
+            visible_sources = {item.memory.id for item in source_results}
         visible: list[MemoryRecord] = []
         for record in candidates:
             metadata = record.metadata if isinstance(record.metadata, dict) else {}
@@ -7612,6 +7719,33 @@ class MemoryCompanionService:
                 continue
             if core_scope == "group" and target_id and target_id != clean_text(ctx.group_id, 160):
                 continue
+            if record.source_plugin == "memory_companion_core_auto":
+                owner = self._core_distill_block_owner(record)
+                refs = metadata.get("core_source_refs", [])
+                if (
+                    not isinstance(refs, list) or not refs
+                    or (core_scope in {"private", "group"} and ctx.scope != core_scope)
+                    or not owner[3] or owner[3] != _platform_family(ctx.platform)
+                ):
+                    continue
+                current_sources = []
+                for ref in refs:
+                    source = sources.get(ref.get("id", "")) if isinstance(ref, dict) else None
+                    if (
+                        source is None or source.id not in visible_sources
+                        or self._core_distill_source_owner(source) != owner
+                        or memory_ref(source) != ref
+                    ):
+                        break
+                    current_sources.append(source)
+                else:
+                    if record.content == "；".join(self._core_distill_line(source) for source in current_sources):
+                        allowed, _reason = policy.is_visible(record, ctx)
+                        if allowed:
+                            visible.append(record)
+                    if len(visible) >= result_limit:
+                        break
+                continue
             allowed, _reason = policy.is_visible(record, ctx)
             if not allowed:
                 continue
@@ -7623,7 +7757,7 @@ class MemoryCompanionService:
     async def list_core_memory_blocks(self) -> list[MemoryRecord]:
         return await self.store.list_core_memories(limit=1000)
 
-    async def save_core_memory_block(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def save_core_memory_block(self, payload: dict[str, Any], *, auto_distilled: bool = False) -> dict[str, Any]:
         label = clean_text(payload.get("label"), 80)
         content = clean_text(payload.get("content"), 4000)
         if not label:
@@ -7704,6 +7838,9 @@ class MemoryCompanionService:
             "owner_bot_id": bot_id,
             "managed_by": "memory_panel",
         }
+        if auto_distilled:
+            metadata["managed_by"] = "auto_distillation"
+            metadata["core_source_refs"] = payload["core_source_refs"]
         record = MemoryRecord(
             id=memory_id,
             memory_type="core_memory",
@@ -7732,7 +7869,7 @@ class MemoryCompanionService:
             review_status="manual",
             tags=["core_memory", core_kind, f"core:{label}"],
             metadata=metadata,
-            source_plugin="memory_companion_core",
+            source_plugin="memory_companion_core_auto" if auto_distilled else "memory_companion_core",
         )
         expected_revision: int | None = None
         if payload.get("expected_revision") is not None:
