@@ -381,6 +381,7 @@ UI_WRITE_ENDPOINTS = frozenset(
         "/maintenance/repair_livingmemory_content",
         "/maintenance/release_summary_batch",
         "/maintenance/release_summary_batches",
+        "/maintenance/summary_admission",
         "/ui-preferences/save",
         # 双方法路由的写分支（GET 分支只读，见 UI_READ_ENDPOINTS）。
         "/operations/preset",
@@ -532,6 +533,7 @@ class PluginPageApi:
             ("/maintenance/clear_scope", self.clear_scope, ["POST"], "MemoryCompanion Page clear scoped memory data"),
             ("/maintenance/release_summary_batch", self.release_summary_batch, ["POST"], "MemoryCompanion Page release quarantined summary batch"),
             ("/maintenance/summary_batches", self.summary_batches, ["GET"], "MemoryCompanion Page list quarantined summary batches"),
+            ("/maintenance/summary_admission", self.summary_admission, ["POST"], "MemoryCompanion Page control summary admission"),
             ("/maintenance/release_summary_batches", self.release_summary_batches, ["POST"], "MemoryCompanion Page bulk release quarantined summary batches"),
             ("/import/livingmemory/preview", self.import_preview, ["GET"], "MemoryCompanion Page import preview"),
             ("/import/livingmemory/run", self.import_run, ["POST"], "MemoryCompanion Page import run"),
@@ -4185,6 +4187,31 @@ class PluginPageApi:
             if cleaned:
                 rows.append(f"{window} {cleaned}".strip() if window else cleaned)
         return rows
+
+    async def summary_admission(self):
+        """Operate on the live service through the existing admin/CSRF guard."""
+        if self._dashboard_admin_state() != "allowed":
+            return self._admin_required_response()
+        payload = await self._json()
+        action = payload.get("action")
+        service = self.plugin.service
+        if action == "pause":
+            state = await service.pause_summary_admission()
+        elif action == "trial":
+            # This transport deliberately exposes only the reviewed five-ID
+            # operation, never caller-provided IDs, force or budget overrides.
+            state = await service.run_summary_recovery_trial(limit=5)
+        elif action == "resume":
+            await service.resume_summary_admission()
+            state = service._summary_admission.state
+        else:
+            return self._err("action 必须为 pause（暂停）、trial（最多五批试跑）或 resume（恢复）", 400)
+        return self._ok({"data": {
+            "mode": state["mode"],
+            "selected_batches": len(state.get("batches", [])),
+            "attempted_batches": len(state.get("results", [])),
+            "stop_reason": state.get("stop_reason", ""),
+        }})
 
     async def maintenance(self):
         result = await self.plugin.service.sleep_maintenance(reason="page_maintenance")
