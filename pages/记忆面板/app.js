@@ -1253,7 +1253,7 @@ function summaryRecoveryCard(status) {
     '<div class="pill-row">' +
       badge("待处理 " + fmtInt(status.pending_batches) + " 批", "accent") +
       badge("最老等待 " + summaryWaitDuration(status.oldest_wait_seconds), "fact") +
-      badge("每会话每小时 " + fmtInt((status.limits || {}).calls_per_session_hour) + " 次") +
+      badge("每会话每小时 " + ((status.limits || {}).calls_per_session_hour === 0 ? "不限" : fmtInt((status.limits || {}).calls_per_session_hour) + " 次")) +
       badge("全局并发 " + fmtInt((status.limits || {}).global_concurrency)) +
     '</div><div class="row-list">' + (rows || emptyState("没有有效待处理批次", "空白历史行不计入积压。")) + '</div>' +
     '<p class="section-note">未分批原文 ' + fmtInt(originals.events) + " 条；下一轮达到条件且身份有效 " +

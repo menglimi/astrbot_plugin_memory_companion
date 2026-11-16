@@ -6402,6 +6402,8 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                     await asyncio.sleep(poll_interval)
                     continue
                 try:
+                    if self.config.int("memory_summary.max_calls_per_session_hour", 24) == 0:
+                        await self.store.release_summary_budget_deferrals()
                     active_sessions = {
                         session_id
                         for session_id, worker in self._summary_workers.items()
@@ -6958,7 +6960,10 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             if not self._summary_admission.allows(recovery_batch_id, force=force):
                 return ""
             max_calls = max(1, self.config.int("memory_summary.max_retries", 5))
-            hourly_limit = max(1, self.config.int("memory_summary.max_calls_per_session_hour", 24))
+            configured_hourly_limit = self.config.int("memory_summary.max_calls_per_session_hour", 24)
+            hourly_limit = 0 if configured_hourly_limit == 0 else max(1, configured_hourly_limit)
+            if hourly_limit == 0:
+                await self.store.release_summary_budget_deferrals()
             if not force and (
                 self._summary_call_semaphore.locked()
                 or not await self.store.summary_budget_available(ctx.session_id, hourly_limit)
