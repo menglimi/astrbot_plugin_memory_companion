@@ -162,6 +162,22 @@ class SummaryAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.provider.calls)
         self.assertEqual(1, self.service.store._conn.execute("SELECT COUNT(*) FROM summary_batch_calls").fetchone()[0])
 
+    async def test_switched_current_session_provider_with_empty_id_stops_trial(self):
+        await self.batch()
+        replacement = Provider([])
+        calls = 0
+
+        async def attempts(ctx):
+            nonlocal calls
+            calls += 1
+            provider = self.provider if calls == 1 else replacement
+            return [{"provider": provider, "provider_id": "", "source": "current_session"}]
+        self.service._summary_provider_attempts = attempts
+        result = await self.service.run_summary_recovery_trial()
+        self.assertEqual("trial_source_or_provider_changed", result["stop_reason"])
+        self.assertFalse(self.provider.calls)
+        self.assertFalse(replacement.calls)
+
     async def test_trial_fallback_and_repair_are_automatic_and_share_budget(self):
         batch_id, event_id = await self.batch()
         first = Provider([TimeoutError("fake provider timeout")])

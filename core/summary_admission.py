@@ -61,6 +61,15 @@ class SummaryAdmission:
 class SummaryAdmissionMethods:
     """Service operations; use the live service's providers, locks and budget."""
 
+    def _summary_trial_provider_keys(self, attempts: list[dict[str, Any]]) -> list[tuple[Any, ...]]:
+        # current_session has an empty configured ID. Include runtime identity
+        # and the actual in-process object so a switched provider cannot look
+        # identical merely because both attempts say "current_session".
+        return [(
+            str(item.get("provider_id") or ""), str(item.get("source") or ""),
+            self._provider_runtime_id(item["provider"], fallback_type=False), id(item["provider"]),
+        ) for item in attempts]
+
     async def _drain_summary_admissions(self) -> None:
         # Admission is already paused. A caller queued on a session lock must
         # recheck admission under that lock, so it cannot start new work here.
@@ -109,7 +118,7 @@ class SummaryAdmissionMethods:
             raise ValueError("trial_provider_unavailable")
         # Provider identities are compared inside the summary call too; the
         # actual provider objects are always resolved by this service instance.
-        providers = [(str(item.get("provider_id") or ""), str(item.get("source") or "")) for item in attempts]
+        providers = self._summary_trial_provider_keys(attempts)
         return context, {
             "id": batch["id"],
             "source_hash": self._summary_admission.fingerprint(persisted),
@@ -125,7 +134,7 @@ class SummaryAdmissionMethods:
             raise ValueError("trial_admission_changed")
         _, current = await self._summary_trial_snapshot(batch)
         expected = next(item for item in gate.state["batches"] if item["id"] == batch["id"])
-        providers = [(str(item.get("provider_id") or ""), str(item.get("source") or "")) for item in attempts]
+        providers = self._summary_trial_provider_keys(attempts)
         if current != expected or gate.fingerprint(providers) != expected["providers_hash"]:
             raise ValueError("trial_source_or_provider_changed")
 
