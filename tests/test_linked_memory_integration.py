@@ -179,3 +179,43 @@ class LinkedMemoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], (await self.registry.invoke(self.entry, "read", request))["items"])
         self.plugin.service.config.bool = lambda *args: False
         self.assertEqual([], (await self.registry.invoke(self.entry, "read", self.issue()))["items"])
+
+
+    async def native_legacy_fixture(self):
+        self.configure(history="all")
+        self.app.private_account_link_memory_identity = lambda context: {
+            "owner_bot_id": "wechat-login" if context.scope.native_scope_id == "b" else "native-bot-a",
+            "platform_name": "wechat_native" if context.scope.native_scope_id == "b" else "aiocqhttp"}
+        source = await self.store.add_timeline_event(event_type="user_message", scope="private",
+            session_id=member("b")["session_id"], subject_id="b", object_id="b", content="SYNTHETIC_SOURCE",
+            metadata={"owner_bot_id":"wechat-login", "persona_id":"persona", "platform":"wechat_native"},
+            occurred_at=AFTER)
+        item = record("b", identifier="native-legacy", persona="")
+        item.memory_type="conversation_summary";item.owner_bot_id="self";item.subject.id=""
+        item.metadata["source_event_ids"]=[source]
+        await self.store.insert_memory(item)
+        return source
+
+    async def test_native_legacy_recall_has_verified_and_original_provenance(self):
+        await self.native_legacy_fixture()
+        result = await self.read("a")
+        item = next(i for i in result["items"] if i["id"] == "native-legacy")
+        self.assertEqual((item["source_user_id"],item["source_bot_id"],item["source_original_bot_id"]),
+            ("b","wechat-login","self"))
+        summary = await self.registry.invoke(self.entry,"summary",self.issue("a","summary"))
+        self.assertEqual(len(result["items"]),summary["counts"]["total"])
+        old=self.issue("a")
+        self.app.private_account_link_memory_identity=lambda context: {
+            "owner_bot_id":"new-login", "platform_name":"wechat_native"}
+        self.assertEqual([], (await self.registry.invoke(self.entry,"read",old))["items"])
+
+    async def test_source_persona_change_during_await_discards_result(self):
+        source=await self.native_legacy_fixture()
+        original=self.store.read_authorized_linked_memories
+        async def raced(*args,**kwargs):
+            result=await original(*args,**kwargs)
+            self.store._conn.execute("UPDATE timeline SET metadata=json_set(metadata,'$.persona_id','other') WHERE id=?",(source,))
+            self.store._conn.commit()
+            return result
+        self.store.read_authorized_linked_memories=raced
+        self.assertEqual([], (await self.read("a"))["items"])

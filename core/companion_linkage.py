@@ -224,7 +224,9 @@ class CompanionMemoryLinkage:
             raise ValueError("scoped_memory_reader_unavailable")
         raw = await reader(scope, limit=limit)
         revision = await self._service.store.memory_revision()
-        if str(raw.get("memory_revision")) != revision:
+        source_revision = await self._service.store.source_revision()
+        if (str(raw.get("memory_revision")) != revision
+                or raw.get("source_revision") != source_revision):
             raise ValueError("memory_read_snapshot_changed")
         if not config.bool("private_companion_bridge.enabled", True):
             raise ValueError("bridge_disabled")
@@ -250,11 +252,14 @@ class CompanionMemoryLinkage:
             if not content or used + len(content) > max_chars:
                 continue
             used += len(content)
+            provenance = raw.get("provenance", {}).get(record.id, {})
             items.append({"id": _clean(record.id, 120), "content": content,
                 "occurred_at": _clean(record.occurred_at or record.created_at, 40),
                 "source": "memory_companion", "source_session_id": record.session_id,
-                "source_user_id": record.subject.id if record.subject.kind == "user" else record.object.id,
-                "source_bot_id": record.owner_bot_id})
+                "source_user_id": provenance.get("user_id") or (
+                    record.subject.id if record.subject.kind == "user" else record.object.id),
+                "source_bot_id": provenance.get("owner_bot_id", record.owner_bot_id),
+                "source_original_bot_id": record.owner_bot_id})
         return {"items": items}
 
     async def _summary(self, request: Any) -> dict[str, Any]:
