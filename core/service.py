@@ -7119,15 +7119,20 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                     exhausted = not force and current["automatic_calls"] >= max_calls
                     if provider_failed:
                         # Only malformed model output reaches this repair path.
-                        # Keep its events owned until a bounded repair succeeds.
+                        # Automatic retries must yield until their backoff is due;
+                        # keep immediate repairs only for an explicit zero delay or
+                        # a bounded manual round.
                         has_usable_body = bool(payload and self.summarizer.compose_memory_content(payload))
+                        retry_delay = self._summary_retry_backoff_seconds(current["automatic_calls"])
+                        retry_in_round = not (has_usable_body or exhausted) and (force or retry_delay == 0)
                         await self.store.defer_summary_batch(
                             batch_id, "repair:" + feedback,
                             quarantine=False if has_usable_body else exhausted,
-                            delay=self._summary_retry_backoff_seconds(current["automatic_calls"]),
+                            delay=retry_delay,
                             lease_token=lease_token if not force else "",
+                            preserve_lease=retry_in_round or has_usable_body,
                         )
-                        if has_usable_body or exhausted:
+                        if not retry_in_round:
                             break
                         repair = True
                         continue
