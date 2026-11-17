@@ -101,6 +101,16 @@ def _merge_schema(target: dict[str, Any], source: dict[str, Any], *, branch: boo
 
 
 def _finalize_schema(schema: dict[str, Any]) -> None:
+    enum = schema.get("enum")
+    if isinstance(enum, list):
+        # Gemini's function declaration schema accepts only string enum values.
+        # Runtime validators still enforce the original numeric constraints.
+        if schema.get("type") not in (None, "string") or any(
+            not isinstance(value, str) for value in enum
+        ):
+            schema.pop("enum")
+        elif "type" not in schema:
+            schema["type"] = "string"
     if schema.get("type") == "array":
         items = schema.get("items")
         if not isinstance(items, dict):

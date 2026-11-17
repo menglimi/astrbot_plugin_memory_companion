@@ -22,7 +22,7 @@ CONTRACTS = Path(__file__).parents[1] / "docs/contracts"
 REQUEST_SCHEMAS = sorted(CONTRACTS.glob("**/schemas/request.schema.json"))
 
 
-def provider_problems(node, path=""):
+def provider_problems(node, path="", *, require_string_enum=False):
     """Return every construct a strict function-calling provider rejects."""
 
     found = []
@@ -32,13 +32,15 @@ def provider_problems(node, path=""):
         enum = node.get("enum")
         if isinstance(enum, list) and (not enum or any(value in (None, []) or value == "" for value in enum)):
             found.append(f"{path}.enum={enum}")
+        if require_string_enum and isinstance(enum, list) and any(not isinstance(value, str) for value in enum):
+            found.append(f"{path}.enum has a non-string value: {enum}")
         if node.get("type") == "array" and not isinstance(node.get("items"), dict):
             found.append(f"{path}: type array without items")
         for key, value in node.items():
-            found += provider_problems(value, f"{path}.{key}")
+            found += provider_problems(value, f"{path}.{key}", require_string_enum=require_string_enum)
     elif isinstance(node, list):
         for index, value in enumerate(node):
-            found += provider_problems(value, f"{path}[{index}]")
+            found += provider_problems(value, f"{path}[{index}]", require_string_enum=require_string_enum)
     return found
 
 
@@ -133,6 +135,15 @@ async def test_request_projection_parameters_are_provider_safe(service, ctx):
     service.config.raw.setdefault("memory_tools", {})["enable_source_query_v2"] = True
     tools, _ = tools_for_batch()
     event = SimpleNamespace()
-    offer_query_tool(service, SimpleNamespace(func_tool=tools), ctx, event)
+    request = SimpleNamespace(func_tool=tools)
+    offer_query_tool(service, request, ctx, event)
 
-    assert provider_problems(tools.tools) == []
+    assert event._memory_source_query_v2
+    for tool in request.func_tool.tools:
+        assert provider_problems(tool.parameters, require_string_enum=True) == []
+
+    source = request.func_tool.get_tool("memory_companion_sources")
+    read_request = {"action": "read", "source_ref": "timeline:tl_example", "excerpt_offset": 5, "limit": 2}
+    Draft202012Validator(source.parameters).validate(read_request)
+    original = json.loads((CONTRACTS / "source-query/v1/schemas/request.schema.json").read_text(encoding="utf-8"))
+    Draft202012Validator(original).validate(read_request)
