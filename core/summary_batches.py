@@ -239,15 +239,22 @@ class SummaryBatchStore:
         return await asyncio.to_thread(read)
 
     async def next_summary_batch(self, session_id: str, *, force=False):
+        def _query(conn):
+            states = "('pending','retry_pending','quarantined')" if force else "('pending','retry_pending')"
+            due = '' if force else f'AND {self._due_clause("b")}'
+            params = [session_id] if force else [session_id, *self._due_params()]
+            row = conn.execute(f'''SELECT * FROM summary_batches b WHERE session_id=? AND state IN {states} {due}
+                AND EXISTS(SELECT 1 FROM summary_batch_events e WHERE e.batch_id=b.id)
+                ORDER BY created_at,id LIMIT 1''', params).fetchone()
+            return dict(row) if row else None
+
         def read():
+            read_conn = getattr(self, "_read_conn_sync", None)
+            if callable(read_conn):
+                with read_conn() as conn:
+                    return _query(conn)
             with self._lock:
-                states = "('pending','retry_pending','quarantined')" if force else "('pending','retry_pending')"
-                due = '' if force else f'AND {self._due_clause("b")}'
-                params = [session_id] if force else [session_id, *self._due_params()]
-                row = self._conn.execute(f'''SELECT * FROM summary_batches b WHERE session_id=? AND state IN {states} {due}
-                    AND EXISTS(SELECT 1 FROM summary_batch_events e WHERE e.batch_id=b.id)
-                    ORDER BY created_at,id LIMIT 1''', params).fetchone()
-                return dict(row) if row else None
+                return _query(self._conn)
         return await asyncio.to_thread(read)
 
     async def summary_batch_rows(self, batch_id: str):

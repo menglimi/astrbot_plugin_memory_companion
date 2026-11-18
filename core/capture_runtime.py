@@ -102,6 +102,9 @@ class CaptureRuntime:
             message_at=datetime.fromtimestamp(float(stamp),timezone.utc).isoformat() if stamp else ''
         except (TypeError,ValueError,OverflowError,OSError):
             message_at=''
+        fast_commit=getattr(self.store,'stage_and_commit_incoming',None)
+        if callable(fast_commit):
+            return await self._incoming_single_hop(event,identity,body,message_at,fast_commit)
         try:
             prepared=await _in_thread(self.store.prepare,identity,body=body,source_message_at=message_at,observed_at=utc_now())
             authorize=lambda: self.allowed(identity)
@@ -193,3 +196,37 @@ class CaptureRuntime:
     def status(self):
         return {**self.store.status(),'last_error':self.last_error,
                 'worker_running':bool(self.task and not self.task.done())}
+
+    async def _incoming_single_hop(self,event,identity,body,message_at,fast_commit):
+        """Execute incoming capture in one worker-thread hop and one SQLite commit."""
+        def run_sync():
+            store_dict=getattr(self.store,'__dict__',{})
+            if any(name in store_dict for name in ('prepare','stage','commit')):
+                prepared=self.store.prepare(identity,body=body,source_message_at=message_at,observed_at=utc_now())
+                authorize=lambda: self.allowed(identity)
+                result=self.store.stage(prepared,generation=self.generation,authorize=authorize)
+                if result['status'] in {'staged','uncertain','retry_due'}:
+                    result=self.store.commit(prepared['operation'],generation=self.generation,authorize=authorize)
+                return result
+            return fast_commit(
+                identity,
+                body=body,
+                source_message_at=message_at,
+                observed_at=utc_now(),
+                generation=self.generation,
+                authorize=lambda: self.allowed(identity),
+            )
+
+        try:
+            result=await asyncio.to_thread(run_sync)
+            setattr(event,'_memory_capture_receipt',result)
+            self.wake.set()
+            return result
+        except (ValueError,UnicodeError) as exc:
+            result={'status':'held','reason':str(exc),'durably_staged':False}
+        except Exception as exc:
+            result={'status':'uncertain','reason':type(exc).__name__}
+        setattr(event,'_memory_capture_receipt',result)
+        self.last_error=result['reason']
+        self.wake.set()
+        return result
