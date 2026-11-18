@@ -74,6 +74,82 @@ _ACL_UNSET = object()
 _RECORD_LIGHT_CACHE_MAX_ENTRIES = 16384
 
 
+class _RecordLightCacheEntry:
+    """Cached immutable row template with per-max-chars embedding text hashes."""
+
+    __slots__ = (
+        "updated_at",
+        "raw_metadata",
+        "raw_tags",
+        "template",
+        "revision",
+        "embedding_hashes",
+    )
+
+    def __init__(
+        self,
+        updated_at: Any,
+        raw_metadata: Any,
+        raw_tags: Any,
+        template: MemoryRecord,
+        revision: str,
+    ) -> None:
+        self.updated_at = updated_at
+        self.raw_metadata = raw_metadata
+        self.raw_tags = raw_tags
+        self.template = template
+        self.revision = revision
+        self.embedding_hashes: dict[int, str] | None = None
+
+
+def _row_scalar_fields_match(row: Any, template: MemoryRecord) -> bool:
+    """Return whether all non-counter columns of ``row`` still match ``template``."""
+    subject = template.subject
+    obj = template.object
+    return (
+        row_value(row, "content", "") == template.content
+        and row_value(row, "visibility", "internal") == template.visibility
+        and row_value(row, "lifecycle", "raw_event") == template.lifecycle
+        and row_value(row, "validity_status", "active") == template.validity_status
+        and row_value(row, "valid_from", "") == template.valid_from
+        and row_value(row, "valid_to", "") == template.valid_to
+        and row_value(row, "review_status", "auto") == template.review_status
+        and row_value(row, "evidence", "") == template.evidence
+        and row_value(row, "memory_type", "observation") == template.memory_type
+        and row_value(row, "scope", "unknown") == template.scope
+        and row_value(row, "session_id", "") == template.session_id
+        and row_value(row, "platform", "") == template.platform
+        and row_value(row, "message_id", "") == template.message_id
+        and row_value(row, "group_id", "") == template.group_id
+        and row_value(row, "sayability", "indirect") == template.sayability
+        and row_value(row, "reality_level", "imported_summary") == template.reality_level
+        and row_value(row, "owner_bot_id", "") == template.owner_bot_id
+        and row_value(row, "subject_person_id", "") == template.subject_person_id
+        and row_value(row, "identity_assurance", "") == template.identity_assurance
+        and row_value(row, "durability", "normal") == template.durability
+        and row_value(row, "sensitivity", "private") == template.sensitivity
+        and row_value(row, "canonical_key", "") == template.canonical_key
+        and row_value(row, "created_at", "") == template.created_at
+        and row_value(row, "occurred_at", "") == template.occurred_at
+        and row_value(row, "source_plugin", "memory_companion") == template.source_plugin
+        and row_value(row, "import_batch_id", "") == template.import_batch_id
+        and row_value(row, "content_fingerprint", "") == template.content_fingerprint
+        and row_value(row, "supersedes_id", "") == template.supersedes_id
+        and row_value(row, "subject_kind", "user") == subject.kind
+        and row_value(row, "subject_id", "") == subject.id
+        and row_value(row, "subject_name", "") == subject.name
+        and row_value(row, "subject_role", "unknown") == subject.role
+        and row_value(row, "object_kind", "user") == obj.kind
+        and row_value(row, "object_id", "") == obj.id
+        and row_value(row, "object_name", "") == obj.name
+        and row_value(row, "object_role", "unknown") == obj.role
+        and float(row_value(row, "confidence", 0.5) or 0.0) == template.confidence
+        and float(row_value(row, "importance", 0.3) or 0.0) == template.importance
+        and float(row_value(row, "salience", 0.3) or 0.0) == template.salience
+        and int(row_value(row, "merged_count", 1) or 1) == template.merged_count
+    )
+
+
 class MemoryStoreUnavailableError(sqlite3.OperationalError):
     """The memory database cannot be opened for writing.
 
@@ -529,6 +605,7 @@ class MemoryStore(SummaryBatchStore):
         connection.execute("PRAGMA busy_timeout=3000")
         if not self._read_only:
             connection.execute("PRAGMA wal_autocheckpoint=500")
+            connection.execute("PRAGMA synchronous=NORMAL")
         return connection
 
     def _open_dedicated_read_connection(self) -> sqlite3.Connection:
@@ -1220,6 +1297,7 @@ class MemoryStore(SummaryBatchStore):
             return
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self.last_schema_backup_path = self._backup_before_schema_upgrade_sync()
             self._conn.executescript(
@@ -12371,15 +12449,23 @@ class MemoryStore(SummaryBatchStore):
             include_pending,
         )
 
-    def _cached_from_row_light(self, row: Any, *, revision: str = "") -> MemoryRecord:
-        """Parse a stored row via ``MemoryRecord.from_row_light`` with bounded memoization.
+    def _cached_from_row_light(
+        self,
+        row: Any,
+        *,
+        revision: str = "",
+        copy: bool = True,
+    ) -> MemoryRecord:
+        """Parse a stored row via ``MemoryRecord.from_row_light`` with incremental memoization.
 
-        Candidate-bundle reads repeatedly deserialize thousands of unchanged rows
-        whose large ``metadata`` JSON dominates ``parse_ms``.  Cached template
-        records are cleared whenever ``retrieval_revision`` changes and verified
-        per row against ``(updated_at, raw_metadata, raw_tags)``; non-trigger
-        counter/access columns are refreshed from ``row`` and ``metadata``/``tags``
-        are shallow-copied so caller mutations never pollute the cache.
+        Candidate-bundle and vector-scan reads repeatedly deserialize thousands of
+        unchanged rows whose large ``metadata`` JSON dominates ``parse_ms``.
+        Entries are retained across ``retrieval_revision`` increments and verified
+        per row against ``(updated_at, raw_metadata, raw_tags)`` (plus scalar
+        non-counter columns when the revision changed or is empty).  Read-only
+        hot paths may pass ``copy=False`` when they never mutate ``metadata`` or
+        ``tags``; callers using the default ``copy=True`` receive shallow copies
+        so mutations never pollute the cache.
         """
         row_id = str(row_value(row, "id", "") or "")
         if not row_id:
@@ -12399,39 +12485,119 @@ class MemoryStore(SummaryBatchStore):
             if cache is None:
                 cache = {}
                 self._record_light_cache = cache
-                self._record_light_cache_revision = ""
-            if rev and rev != self._record_light_cache_revision:
-                cache.clear()
-                self._record_light_cache_revision = rev
-            observed_rev = self._record_light_cache_revision
             entry = cache.get(row_id)
             if (
                 entry is not None
-                and entry[0] == updated_at
-                and entry[1] == raw_metadata
-                and entry[2] == raw_tags
+                and entry.updated_at == updated_at
+                and entry.raw_metadata == raw_metadata
+                and entry.raw_tags == raw_tags
             ):
-                template_record = entry[3]
-                return replace(
-                    template_record,
-                    reinforcement_score=float(row_value(row, "reinforcement_score", 0.0) or 0.0),
-                    injection_count=int(row_value(row, "injection_count", 0) or 0),
-                    last_injected_at=row_value(row, "last_injected_at", ""),
-                    last_accessed_at=row_value(row, "last_accessed_at", ""),
-                    access_count=int(row_value(row, "access_count", 0) or 0),
-                    metadata=dict(template_record.metadata),
-                    tags=list(template_record.tags),
-                )
+                template_record = entry.template
+                if (rev and entry.revision == rev) or _row_scalar_fields_match(row, template_record):
+                    if rev and entry.revision != rev:
+                        entry.revision = rev
+                    reinforcement = float(row_value(row, "reinforcement_score", 0.0) or 0.0)
+                    injection_count = int(row_value(row, "injection_count", 0) or 0)
+                    last_injected_at = row_value(row, "last_injected_at", "")
+                    last_accessed_at = row_value(row, "last_accessed_at", "")
+                    access_count = int(row_value(row, "access_count", 0) or 0)
+                    if not copy:
+                        if (
+                            reinforcement == template_record.reinforcement_score
+                            and injection_count == template_record.injection_count
+                            and last_injected_at == template_record.last_injected_at
+                            and last_accessed_at == template_record.last_accessed_at
+                            and access_count == template_record.access_count
+                        ):
+                            return template_record
+                        return replace(
+                            template_record,
+                            reinforcement_score=reinforcement,
+                            injection_count=injection_count,
+                            last_injected_at=last_injected_at,
+                            last_accessed_at=last_accessed_at,
+                            access_count=access_count,
+                        )
+                    return replace(
+                        template_record,
+                        reinforcement_score=reinforcement,
+                        injection_count=injection_count,
+                        last_injected_at=last_injected_at,
+                        last_accessed_at=last_accessed_at,
+                        access_count=access_count,
+                        metadata=dict(template_record.metadata),
+                        tags=list(template_record.tags),
+                    )
 
         rec = MemoryRecord.from_row_light(row)
-        template = replace(rec, metadata=dict(rec.metadata), tags=list(rec.tags))
+        template = replace(rec, metadata=dict(rec.metadata), tags=list(rec.tags)) if copy else rec
         with lock:
             cache = self.__dict__.get("_record_light_cache")
-            if cache is not None and self._record_light_cache_revision == observed_rev:
+            if cache is not None:
                 if row_id not in cache and len(cache) >= _RECORD_LIGHT_CACHE_MAX_ENTRIES:
                     cache.pop(next(iter(cache)))
-                cache[row_id] = (updated_at, raw_metadata, raw_tags, template)
+                cache[row_id] = _RecordLightCacheEntry(
+                    updated_at,
+                    raw_metadata,
+                    raw_tags,
+                    template,
+                    rev,
+                )
         return rec
+
+    def _cached_embedding_text_hash(
+        self,
+        memory: MemoryRecord,
+        *,
+        max_chars: int = 1200,
+        revision: str = "",
+    ) -> str:
+        """Return ``memory_embedding_text_hash`` memoized on the immutable row cache entry."""
+        try:
+            limit = max(200, int(max_chars or 1200))
+        except (TypeError, ValueError):
+            limit = 1200
+
+        row_id = memory.id
+        if not row_id:
+            return memory_embedding_text_hash(memory, max_chars=limit)
+
+        lock = getattr(self, "_record_light_cache_lock", None)
+        cache = self.__dict__.get("_record_light_cache")
+        rev = str(revision or "")
+
+        def _entry_matches(entry: _RecordLightCacheEntry) -> bool:
+            template = entry.template
+            if template is memory:
+                return True
+            return bool(
+                rev
+                and entry.revision == rev
+                and template.updated_at == memory.updated_at
+                and template.content == memory.content
+                and template.evidence == memory.evidence
+                and template.memory_type == memory.memory_type
+                and template.scope == memory.scope
+                and template.visibility == memory.visibility
+            )
+
+        if lock is not None and cache is not None:
+            with lock:
+                entry = cache.get(row_id)
+                if entry is not None and _entry_matches(entry) and entry.embedding_hashes is not None:
+                    cached_hash = entry.embedding_hashes.get(limit)
+                    if cached_hash is not None:
+                        return cached_hash
+
+        digest = memory_embedding_text_hash(memory, max_chars=limit)
+        if lock is not None and cache is not None:
+            with lock:
+                entry = cache.get(row_id)
+                if entry is not None and _entry_matches(entry):
+                    if entry.embedding_hashes is None:
+                        entry.embedding_hashes = {}
+                    entry.embedding_hashes[limit] = digest
+        return digest
 
     def _list_retrieval_candidate_bundle_sync(
         self,
@@ -12548,14 +12714,22 @@ class MemoryStore(SummaryBatchStore):
         try:
             return conn.execute(
                 f"""
+                WITH matched AS (
+                    SELECT m.rowid AS _rid,
+                           bm25(memory_fts) AS _rank,
+                           m.importance AS _imp,
+                           {_memory_time_sql('m')} AS _ts
+                    FROM memory_fts
+                    JOIN memories m ON m.id = memory_fts.memory_id
+                    WHERE memory_fts MATCH ?
+                      AND {where}
+                    ORDER BY _rank, _imp DESC, _ts DESC
+                    LIMIT ?
+                )
                 SELECT m.*
-                FROM memory_fts
-                JOIN memories m ON m.id = memory_fts.memory_id
-                WHERE memory_fts MATCH ?
-                  AND {where}
-                ORDER BY bm25(memory_fts), m.importance DESC,
-                         {_memory_time_sql('m')} DESC
-                LIMIT ?
+                FROM matched
+                JOIN memories m ON m.rowid = matched._rid
+                ORDER BY matched._rank, matched._imp DESC, matched._ts DESC
                 """,
                 params + [max(1, int(limit or 1))],
             ).fetchall()
@@ -12632,38 +12806,47 @@ class MemoryStore(SummaryBatchStore):
         if not include_pending:
             where += " AND review_status != 'pending'"
 
+        # Short columns first, large 2.3KB ``metadata`` JSON last so matching rows
+        # short-circuit before scanning ``metadata``; two-phase CTE avoids
+        # sorting full 49-column rows inside SQLite's temp B-tree.
         columns = [
             "content",
-            "evidence",
-            "tags",
-            "metadata",
-            "subject_id",
             "subject_name",
-            "object_id",
             "object_name",
+            "tags",
+            "evidence",
+            "subject_id",
+            "object_id",
             "session_id",
             "group_id",
+            "metadata",
         ]
-        term_clauses: list[str] = []
-        for term in cleaned_terms:
-            like = self._like_pattern(term)
-            term_clauses.append(
-                "(" + " OR ".join(f"{column} LIKE ? ESCAPE '\\'" for column in columns) + ")"
+        likes = [self._like_pattern(term) for term in cleaned_terms]
+        col_clauses: list[str] = []
+        for column in columns:
+            col_clauses.append(
+                "(" + " OR ".join(f"{column} LIKE ? ESCAPE '\\'" for _ in likes) + ")"
             )
-            params.extend([like] * len(columns))
-        where += " AND (" + " OR ".join(term_clauses) + ")"
+            params.extend(likes)
+        where += " AND (" + " OR ".join(col_clauses) + ")"
 
         return conn.execute(
             f"""
-            SELECT *
-            FROM memories
-            WHERE {where}
-            ORDER BY
-                CASE WHEN session_id != '' THEN 0 ELSE 1 END,
-                importance DESC,
-                occurred_at DESC,
-                created_at DESC
-            LIMIT ?
+            WITH matched AS (
+                SELECT rowid AS _rid,
+                       CASE WHEN session_id != '' THEN 0 ELSE 1 END AS _s,
+                       importance AS _imp,
+                       occurred_at AS _occ,
+                       created_at AS _cre
+                FROM memories
+                WHERE {where}
+                ORDER BY _s, _imp DESC, _occ DESC, _cre DESC
+                LIMIT ?
+            )
+            SELECT m.*
+            FROM matched
+            JOIN memories m ON m.rowid = matched._rid
+            ORDER BY matched._s, matched._imp DESC, matched._occ DESC, matched._cre DESC
             """,
             params + [max(1, int(limit or 1))],
         ).fetchall()
@@ -16174,10 +16357,25 @@ class MemoryStore(SummaryBatchStore):
         return await self._run_recoverable_database_operation(self._memory_revision_sync)
 
     def _memory_revision_sync(self) -> str:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT revision FROM retrieval_revision WHERE singleton=1"
-            ).fetchone()
+        if self._read_only:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT revision FROM retrieval_revision WHERE singleton=1"
+                ).fetchone()
+        elif self._read_lock.acquire(blocking=False):
+            try:
+                conn, _lock = self._read_connection_for_bundle()
+                row = conn.execute(
+                    "SELECT revision FROM retrieval_revision WHERE singleton=1"
+                ).fetchone()
+            finally:
+                self._read_lock.release()
+        else:
+            tl_conn, tl_lock = self._timeline_read_connection()
+            with tl_lock:
+                row = tl_conn.execute(
+                    "SELECT revision FROM retrieval_revision WHERE singleton=1"
+                ).fetchone()
         if not row:
             return "0"
         return str(int(row["revision"] or 0))

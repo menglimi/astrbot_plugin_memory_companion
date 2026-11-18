@@ -442,6 +442,7 @@ class MemoryCompanionService:
         )
         self.reply_chain = ReplyChainResolver()
         self.intent_builder = RetrievalIntentBuilder()
+        self._query_vector_cache: dict[Any, tuple[float, list[float]]] = {}
         self.classifier = MemoryClassifier(
             capture_min_chars=self.config.int("memory_capture.capture_min_chars", 2)
         )
@@ -4653,6 +4654,7 @@ class MemoryCompanionService:
             query_vector_cache_ttl_seconds=self.config.float(
                 "retrieval_advanced.query_vector_cache_ttl_seconds", 0.0
             ),
+            query_vector_cache=self._query_vector_cache,
             embedding_provider=embedding_provider,
             embedding_provider_id=embedding_provider_id,
             embedding_enabled=embedding_enabled,

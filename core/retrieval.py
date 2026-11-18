@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from functools import lru_cache
 import inspect
 import math
 import re
@@ -16,7 +17,7 @@ from .latency import (
     bounded_model_call_timeout_ms,
     exclude_model_call_wait,
 )
-from .memory_lifecycle import apply_lifecycle_score, evaluate_memory_lifecycle
+from .memory_lifecycle import LifecycleScore, apply_lifecycle_score, evaluate_memory_lifecycle
 from .models import (
     MemoryRecord,
     SearchResult,
@@ -35,6 +36,12 @@ from .visibility import VisibilityPolicy
 
 _MMR_WHITESPACE_RE = re.compile(r"\s+")
 _MMR_LATIN_TOKEN_RE = re.compile(r"[a-z0-9_]{2,}")
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+@lru_cache(maxsize=512)
+def _ascii_word_pattern(term: str) -> re.Pattern[str]:
+    return re.compile(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])")
 
 
 class RetrievalEngine:
@@ -56,6 +63,7 @@ class RetrievalEngine:
         rerank_timeout_ms: int = MAX_MODEL_CALL_TIMEOUT_MS,
         latency_budget_ms: int = 0,
         query_vector_cache_ttl_seconds: float = 0.0,
+        query_vector_cache: dict[Any, tuple[float, list[float]]] | None = None,
         embedding_provider: Any = None,
         embedding_provider_id: str = "",
         embedding_enabled: bool = False,
@@ -100,7 +108,9 @@ class RetrievalEngine:
         self.query_vector_cache_ttl_seconds = max(
             0.0, float(query_vector_cache_ttl_seconds or 0.0)
         )
-        self._query_vector_cache: dict[str, tuple[float, list[float]]] = {}
+        self._query_vector_cache: dict[Any, tuple[float, list[float]]] = (
+            query_vector_cache if query_vector_cache is not None else {}
+        )
         self.embedding_provider = embedding_provider
         self.embedding_provider_id = clean_text(embedding_provider_id, 160)
         self.embedding_enabled = bool(embedding_enabled)
@@ -1756,16 +1766,17 @@ class RetrievalEngine:
             vector_candidates,
             time_window_candidates,
         )
-        searchable: list[tuple[MemoryRecord, str]] = []
+        searchable: list[tuple[MemoryRecord, str, LifecycleScore]] = []
         prefiltered: dict[str, int] = {}
         time_filtered = 0
+        now_utc = datetime.now(timezone.utc)
         for memory in candidates:
             memory_type = clean_text(getattr(memory, "memory_type", ""), 80).lower()
             visibility_reason, prefilter_reason = self._search_visibility_reason(
                 memory, ctx, acl_state
             )
             if visibility_reason:
-                lifecycle = evaluate_memory_lifecycle(memory, ctx)
+                lifecycle = evaluate_memory_lifecycle(memory, ctx, now=now_utc)
                 if not lifecycle.eligible:
                     key = clean_text(lifecycle.reason or "lifecycle_ineligible", 180)
                     prefiltered[key] = prefiltered.get(key, 0) + 1
@@ -1781,7 +1792,7 @@ class RetrievalEngine:
                 ):
                     time_filtered += 1
                     continue
-                searchable.append((memory, visibility_reason))
+                searchable.append((memory, visibility_reason, lifecycle))
             else:
                 key = clean_text(prefilter_reason or "not_visible", 180)
                 prefiltered[key] = prefiltered.get(key, 0) + 1
@@ -1798,11 +1809,11 @@ class RetrievalEngine:
         }
         term_pool = [
             memory
-            for memory, _reason in searchable
+            for memory, _reason, _lc in searchable
             if clean_text(memory.id, 120) in query_aware_ids
         ]
         if not term_pool:
-            term_pool = [memory for memory, _reason in searchable]
+            term_pool = [memory for memory, _reason, _lc in searchable]
         term_stats, average_doc_len = self._term_document_stats(term_pool, expanded_terms)
         route_families_by_id = {
             memory_id: self._route_families(sources)
@@ -1826,7 +1837,7 @@ class RetrievalEngine:
                     "content": "",
                 }
             )
-        for memory, visibility_reason in searchable:
+        for memory, visibility_reason, lifecycle in searchable:
             memory_id = clean_text(memory.id, 120)
             subject = getattr(memory, "subject", None)
             subject_strength = 0.0
@@ -1845,6 +1856,7 @@ class RetrievalEngine:
                 route_families=route_families_by_id.get(memory_id, frozenset()),
                 person_strength=subject_strength,
                 average_doc_len=average_doc_len,
+                lifecycle=lifecycle,
             )
             if score <= 0:
                 if len(blocked) < 40:
@@ -1924,8 +1936,25 @@ class RetrievalEngine:
             self.policy.hide_pending_review, self.policy.include_raw_events,
             self.policy.enable_acl_rules, self.policy.admin_read_all,
             self.private_topology_enabled, self.group_topology_enabled,
-            (time_intent.start_at, time_intent.end_at) if time_intent and time_intent.active else None,
         )
+        ref_filter = None
+        post_filter = None
+        if time_intent is not None and time_intent.active:
+            w_start_dt = self._parse_time(time_intent.start_at)
+            w_end_dt = self._parse_time(time_intent.end_at)
+            if w_start_dt is not None and w_end_dt is not None:
+                w_start_ts = (w_start_dt - _EPOCH).total_seconds()
+                w_end_ts = (w_end_dt - _EPOCH).total_seconds()
+
+                def ref_filter(ref: Any) -> bool:
+                    return any(
+                        start < w_end_ts and end > w_start_ts
+                        for start, end in ref.time_ranges
+                    )
+
+                def post_filter(memory: MemoryRecord) -> bool:
+                    return self._memory_overlaps_time_window(memory, time_intent)
+
         # A data/ACL race retries once with current authorization and the same
         # query vector. No second provider request, no importance-based fallback.
         for attempt in range(2):
@@ -1939,18 +1968,28 @@ class RetrievalEngine:
                     return bool(
                         visible and not blocked
                         and evaluate_memory_lifecycle(memory, ctx, now=selection_time).eligible
-                        and (not time_intent or not time_intent.active
-                             or self._memory_overlaps_time_window(memory, time_intent))
                     )
 
                 try:
+                    search_kwargs: dict[str, Any] = {
+                        "provider_id": self.embedding_provider_id,
+                        "query": query_vector,
+                        "expected_revision": revision,
+                        "authorization_key": authorization_key,
+                        "eligible": eligible,
+                        "include_pending": include_pending,
+                        "top_k": self.embedding_top_k,
+                        "threshold": self.embedding_score_threshold,
+                        "batch_size": self.embedding_candidate_limit,
+                        "max_text_chars": self.embedding_max_text_chars,
+                        "selection_time": selection_time.timestamp(),
+                        "excluded_memory_types": PROFILE_MEMORY_TYPES if block_profile else frozenset(),
+                    }
+                    if ref_filter is not None:
+                        search_kwargs["ref_filter"] = ref_filter
+                        search_kwargs["post_filter"] = post_filter
                     memories, scores, diagnostics = await self.store.search_memory_embeddings(
-                        provider_id=self.embedding_provider_id, query=query_vector,
-                        expected_revision=revision, authorization_key=authorization_key, eligible=eligible,
-                        include_pending=include_pending, top_k=self.embedding_top_k,
-                        threshold=self.embedding_score_threshold, batch_size=self.embedding_candidate_limit,
-                        max_text_chars=self.embedding_max_text_chars, selection_time=selection_time.timestamp(),
-                        excluded_memory_types=PROFILE_MEMORY_TYPES if block_profile else frozenset(),
+                        **search_kwargs
                     )
                 except asyncio.CancelledError:
                     if not getattr(self.store, "_closing", False) and not getattr(self.store, "_closed", False):
@@ -2000,19 +2039,21 @@ class RetrievalEngine:
         """A repeated question should not pay for a second embedding call."""
         if self.query_vector_cache_ttl_seconds <= 0 or not text:
             return []
-        entry = self._query_vector_cache.get(text)
+        cache_key = (self.embedding_provider_id, text)
+        entry = self._query_vector_cache.get(cache_key)
         if entry is None:
             return []
         stored_at, vector = entry
         if time.monotonic() - stored_at > self.query_vector_cache_ttl_seconds:
-            self._query_vector_cache.pop(text, None)
+            self._query_vector_cache.pop(cache_key, None)
             return []
         return list(vector)
 
     def _store_query_vector(self, text: str, vector: list[float]) -> None:
         if self.query_vector_cache_ttl_seconds <= 0 or not text or not vector:
             return
-        self._query_vector_cache[text] = (time.monotonic(), list(vector))
+        cache_key = (self.embedding_provider_id, text)
+        self._query_vector_cache[cache_key] = (time.monotonic(), list(vector))
         if len(self._query_vector_cache) > 64:
             oldest = min(self._query_vector_cache.items(), key=lambda item: item[1][0])[0]
             self._query_vector_cache.pop(oldest, None)
@@ -3442,19 +3483,19 @@ class RetrievalEngine:
         同一个 term 在 df 统计与 BM25 打分里用两种数法。
         """
 
-        if not haystack or not term:
+        if not haystack or not term or term not in haystack:
             return 0
         if cls._ASCII_WORD_RE.fullmatch(term):
-            pattern = rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])"
-            return len(re.findall(pattern, haystack))
+            return len(_ascii_word_pattern(term).findall(haystack))
         count = 0
         start = 0
+        term_len = len(term)
         while True:
             index = haystack.find(term, start)
             if index < 0:
                 return count
             count += 1
-            start = index + len(term)
+            start = index + term_len
 
     def _term_document_stats(
         self, memories: list[MemoryRecord], terms: list[str]
@@ -3472,7 +3513,7 @@ class RetrievalEngine:
         total_length = 0
         for memory in memories:
             haystack = self._haystack(memory)
-            total_length += len(re.sub(r"\s+", "", haystack))
+            total_length += len("".join(haystack.split()))
             for term in terms:
                 if self._term_frequency(haystack, term) > 0:
                     dfs[term] += 1
@@ -3570,12 +3611,15 @@ class RetrievalEngine:
         route_families: frozenset[str] = frozenset(),
         person_strength: float = 0.0,
         average_doc_len: float = 0.0,
+        lifecycle: LifecycleScore | None = None,
     ) -> tuple[float, str]:
         haystack = self._haystack(memory)
-        compact_haystack = re.sub(r"\s+", "", haystack)
-        term_hits = sum(
-            1 for term in terms if term and self._term_frequency(haystack, term) > 0
-        )
+        compact_haystack = "".join(haystack.split())
+        term_freqs = [
+            self._term_frequency(haystack, term) if term else 0
+            for term in terms
+        ]
+        term_hits = sum(1 for freq in term_freqs if freq > 0)
         exact_phrases = [str(item) for item in profile.get("exact_phrases", []) if str(item)]
         exact_hit = any(phrase in compact_haystack for phrase in exact_phrases)
         profile_hit = self._profile_query_matches_memory(
@@ -3613,12 +3657,10 @@ class RetrievalEngine:
             length_norm = 1.0 - self.bm25_b + self.bm25_b * (
                 document_length / max(1.0, average_length)
             )
-            for term in terms:
-                if not term:
+            for term, freq_int in zip(terms, term_freqs):
+                if freq_int <= 0:
                     continue
-                freq = float(self._term_frequency(haystack, term))
-                if freq <= 0:
-                    continue
+                freq = float(freq_int)
                 idf = term_stats.get(term, 0.0)
                 bm25 += idf * ((freq * (self.bm25_k1 + 1.0)) / (freq + self.bm25_k1 * length_norm))
             lexical = (0.42 if exact_hit or profile_hit else 0.24) + min(
@@ -3669,7 +3711,7 @@ class RetrievalEngine:
         score = lexical + scope_bonus + memory.importance * importance_weight + memory.confidence * 0.25 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus + route_bonus + rrf_bonus + person_bonus
         # R2：删掉 "if not terms: importance * 0.8" 的兜底分支。无词查询只剩
         # 向量/多路召回证据才可能走到这里，importance 只按弱证据权重 0.28 计。
-        lifecycle = evaluate_memory_lifecycle(memory, ctx)
+        lifecycle = lifecycle if lifecycle is not None else evaluate_memory_lifecycle(memory, ctx)
         score = apply_lifecycle_score(score, lifecycle)
         # relax：proactive_message（主动消息原文）类记忆评分降权（默认 1.0 不降权，行为与历史版本一致）。
         if self.proactive_message_score_penalty < 1.0 and clean_text(memory.memory_type, 120).lower() == "proactive_message":

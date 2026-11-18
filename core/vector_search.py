@@ -19,12 +19,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 import heapq
+import inspect
 import math
 import struct
 import time
 from typing import Any, Callable, Iterable
 
-from .models import MemoryRecord, memory_embedding_text_hash
+from .models import MemoryRecord, clean_text, memory_embedding_text_hash
 
 
 # Retention budget for published snapshots. 64MB used to be hard-coded here,
@@ -64,12 +65,55 @@ class VectorSnapshotChanged(RuntimeError):
     """The caller must resolve current authorization again before retrying."""
 
 
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def parse_iso_timestamp(value: Any) -> float | None:
+    """Parse an ISO-8601 timestamp to UTC epoch seconds without OS range errors."""
+    if not value:
+        return None
+    text = value if isinstance(value, str) else str(value)
+    text = clean_text(text, 80) if ("\u3000" in text or "  " in text) else text.strip()[:80]
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (dt - _EPOCH).total_seconds()
+
+
+def memory_time_ranges(memory: MemoryRecord) -> tuple[tuple[float, float], ...]:
+    """Extract time overlap intervals identical to ``_memory_overlaps_time_window``."""
+    metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+    ranges: list[tuple[float, float]] = []
+    start_at = parse_iso_timestamp(metadata.get("start_at"))
+    end_at = parse_iso_timestamp(metadata.get("end_at"))
+    if start_at is not None or end_at is not None:
+        start = start_at if start_at is not None else end_at
+        end = end_at if end_at is not None else start_at
+        if start is not None and end is not None:
+            if end <= start:
+                end = start + 86400.0
+            ranges.append((start, end))
+    for value in (memory.occurred_at, memory.created_at, memory.updated_at):
+        ts = parse_iso_timestamp(value)
+        if ts is not None:
+            ranges.append((ts, ts + 1.0))
+    return tuple(ranges)
+
+
 @dataclass(frozen=True, slots=True)
 class VectorRef:
     memory_id: str
     text_hash: str
     updated_at: str
     memory_type: str = ""
+    time_ranges: tuple[tuple[float, float], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,9 +124,15 @@ class VectorBlock:
 
     @property
     def byte_size(self) -> int:
-        return len(self.values) + sum(256 + len(r.memory_id.encode("utf-8"))
-                                      + len(r.text_hash) + len(r.updated_at)
-                                      + len(r.memory_type) for r in self.refs)
+        return len(self.values) + sum(
+            256
+            + len(r.memory_id.encode("utf-8"))
+            + len(r.text_hash)
+            + len(r.updated_at)
+            + len(r.memory_type)
+            + len(r.time_ranges) * 32
+            for r in self.refs
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,18 +199,44 @@ def _normalized_bytes(raw: Any, dimension: int) -> tuple[bytes, str]:
     return struct.pack(f"<{dimension}d", *vector), ""
 
 
+def _normalize_blob_batch(
+    blobs: list[bytes | bytearray | memoryview],
+    dimension: int,
+    np: Any,
+) -> tuple[list[memoryview | None], list[str]]:
+    """Batch-normalize fixed-length float64 BLOBs with numpy."""
+    row_bytes = dimension * 8
+    count = len(blobs)
+    mat = np.frombuffer(b"".join(blobs), dtype="<f8").reshape(count, dimension)
+    finite_mask = np.isfinite(mat).all(axis=1)
+    scales = np.max(np.abs(mat), axis=1)
+    valid_mask = finite_mask & (scales > 0.0)
+    results: list[memoryview | None] = [None] * count
+    errors: list[str] = ["embedding_invalid"] * count
+
+    valid_indices = np.flatnonzero(valid_mask)
+    if len(valid_indices) == 0:
+        return results, errors
+    valid_mat = mat if len(valid_indices) == count else mat[valid_indices]
+    valid_scales = scales if len(valid_indices) == count else scales[valid_indices]
+    scaled = valid_mat / valid_scales[:, None]
+    norms = np.sqrt(np.einsum("ij,ij->i", scaled, scaled))
+    normalized_buf = (scaled / norms[:, None]).astype("<f8", copy=False).tobytes()
+    mv = memoryview(normalized_buf)
+    for out_idx, src_idx in enumerate(valid_indices.tolist()):
+        start = out_idx * row_bytes
+        results[src_idx] = mv[start : start + row_bytes]
+        errors[src_idx] = ""
+    return results, errors
+
+
 def _next_boundary(memory: MemoryRecord, now: float) -> float:
     boundary = math.inf
+    metadata = memory.metadata
     for name in ("valid_from", "valid_to"):
-        value = getattr(memory, name, "") or (memory.metadata or {}).get(name, "")
-        try:
-            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            stamp = dt.timestamp()
-        except (ValueError, TypeError, OverflowError):
-            continue
-        if stamp > now:
+        value = getattr(memory, name, "") or (metadata.get(name, "") if isinstance(metadata, dict) else "")
+        stamp = parse_iso_timestamp(value)
+        if stamp is not None and stamp > now:
             boundary = min(boundary, stamp)
     return boundary
 
@@ -214,6 +290,18 @@ def _candidate_where(store: Any, include_pending: bool) -> str:
     return where
 
 
+def _memory_select_columns(conn: Any) -> str:
+    """Project stored ``memories`` columns so SQLite skips VIRTUAL columns."""
+    try:
+        info = conn.execute("PRAGMA table_info(memories)").fetchall()
+    except Exception:
+        info = ()
+    if not info:
+        return "m.*"
+    names = [str(row[1]) for row in info if len(row) > 1 and row[1]]
+    return ", ".join(f"m.{name}" for name in names) if names else "m.*"
+
+
 def _row_batches(conn: Any, provider_id: str, where: str, batch_size: int,
                  restrict_ids: tuple[str, ...] = ()) -> Any:
     """Yield row batches from the candidate join, optionally restricted to ids.
@@ -222,7 +310,8 @@ def _row_batches(conn: Any, provider_id: str, where: str, batch_size: int,
     900-wide bind groups to stay portable to SQLite builds with a 999-variable
     cap (the same limit the payload reads already honour).
     """
-    columns = ("SELECT m.*, e.dimension AS embedding_dimension, "
+    m_cols = _memory_select_columns(conn)
+    columns = (f"SELECT {m_cols}, e.dimension AS embedding_dimension, "
                "e.text_hash AS embedding_text_hash FROM memory_embeddings e "
                "JOIN memories m ON m.id=e.memory_id")
     if not restrict_ids:
@@ -247,23 +336,26 @@ ReusableRow = tuple[str, str, bytes, int, int]
 def _collect_reusable_rows(
     cache: dict[tuple, VectorSnapshot],
     *,
-    revision: str,
+    revision: str | None,
     provider_id: str,
     dimension: int,
     max_text_chars: int,
     exclude_key: tuple | None = None,
 ) -> dict[str, ReusableRow]:
-    """Index normalized vector slices from active snapshots at the same revision.
+    """Index normalized vector slices from cached snapshots.
 
-    Stores zero-copy ``(text_hash, updated_at, block.values, offset, row_bytes)``
-    references into already-cached ``VectorBlock.values`` buffers so a cache-miss
-    context (e.g., a new ``session_id``) can skip SQLite BLOB reads and numpy
-    normalization without keeping a second global vector cache outside ``budget``.
+    When ``revision`` is ``None``, slices are collected across revisions so a
+    database write only re-normalizes rows whose ``text_hash`` or
+    ``updated_at`` actually changed.  Stores zero-copy
+    ``(text_hash, updated_at, block.values, offset, row_bytes)`` references into
+    already-cached ``VectorBlock.values`` buffers.
     """
     row_bytes = dimension * 8
     reusable: dict[str, ReusableRow] = {}
     for cached_key, snapshot in cache.items():
-        if cached_key == exclude_key or snapshot.revision != revision:
+        if cached_key == exclude_key:
+            continue
+        if revision is not None and snapshot.revision != revision:
             continue
         if not isinstance(cached_key, tuple) or len(cached_key) < 4:
             continue
@@ -311,6 +403,16 @@ def _build_blocks(
     """
     cached_parser = getattr(store, "_cached_from_row_light", None)
     use_cached_parser = callable(cached_parser)
+    supports_copy = False
+    if use_cached_parser:
+        try:
+            supports_copy = "copy" in inspect.signature(cached_parser).parameters
+        except (TypeError, ValueError):
+            supports_copy = False
+    cached_hasher = getattr(store, "_cached_embedding_text_hash", None)
+    use_cached_hasher = callable(cached_hasher)
+    np = _numpy()
+    row_bytes = dimension * 8
     blocks: list[VectorBlock] = []
     admitted: set[str] = set()
     truncated = False
@@ -321,11 +423,14 @@ def _build_blocks(
         allowed = []
         for row in rows:
             counts["embedding_scanned_rows"] += 1
-            memory = (
-                cached_parser(row, revision=expected_revision)
-                if use_cached_parser
-                else MemoryRecord.from_row_light(row)
-            )
+            if use_cached_parser:
+                memory = (
+                    cached_parser(row, revision=expected_revision, copy=False)
+                    if supports_copy
+                    else cached_parser(row, revision=expected_revision)
+                )
+            else:
+                memory = MemoryRecord.from_row_light(row)
             # Include not-yet-active entries so a clock boundary can
             # admit them without requiring a database write.
             valid_until = min(valid_until, _next_boundary(memory, selection_time))
@@ -333,15 +438,28 @@ def _build_blocks(
                 counts["embedding_unauthorized_or_inactive"] += 1
                 continue
             counts["embedding_candidates"] += 1
-            text_hash = memory_embedding_text_hash(memory, max_chars=max_text_chars)
+            text_hash = (
+                cached_hasher(memory, max_chars=max_text_chars, revision=expected_revision)
+                if use_cached_hasher
+                else memory_embedding_text_hash(memory, max_chars=max_text_chars)
+            )
             if not row["embedding_text_hash"] or row["embedding_text_hash"] != text_hash:
                 counts["embedding_stale"] += 1
                 continue
             if row["embedding_dimension"] != dimension:
                 counts["embedding_dim_mismatch"] += 1
                 continue
-            allowed.append(VectorRef(memory.id, text_hash, memory.updated_at, memory.memory_type))
-        refs, values = [], bytearray()
+            allowed.append(
+                VectorRef(
+                    memory.id,
+                    text_hash,
+                    memory.updated_at,
+                    memory.memory_type,
+                    memory_time_ranges(memory),
+                )
+            )
+        refs: list[VectorRef] = []
+        chunks: list[bytes | memoryview] = []
         reused_slices: list[memoryview | None] = []
         if reusable_rows:
             missing_refs: list[VectorRef] = []
@@ -371,22 +489,47 @@ def _build_blocks(
                 f"SELECT memory_id, vector FROM memory_embeddings WHERE provider_id=? "
                 f"AND memory_id IN ({placeholders})", [provider_id] + [r.memory_id for r in part])))
 
+        batch_packed: dict[int, memoryview] = {}
+        batch_errors: dict[int, str] = {}
+        if np is not None and missing_refs:
+            blob_positions: list[int] = []
+            blob_values: list[bytes | bytearray | memoryview] = []
+            for idx, ref in enumerate(allowed):
+                if reused_slices and reused_slices[idx] is not None:
+                    continue
+                raw = payloads.get(ref.memory_id)
+                if isinstance(raw, (bytes, bytearray, memoryview)) and len(raw) == row_bytes:
+                    blob_positions.append(idx)
+                    blob_values.append(raw)
+            if len(blob_values) >= 8:
+                normed_slices, norm_errors = _normalize_blob_batch(blob_values, dimension, np)
+                for pos, slice_val, err in zip(blob_positions, normed_slices, norm_errors):
+                    if err:
+                        batch_errors[pos] = err
+                    elif slice_val is not None:
+                        batch_packed[pos] = slice_val
+
         for idx, ref in enumerate(allowed):
             cached_slice = reused_slices[idx] if reused_slices else None
             if cached_slice is not None:
                 packed: bytes | memoryview = cached_slice
                 counts["embedding_reused_rows"] = counts.get("embedding_reused_rows", 0) + 1
+            elif idx in batch_errors:
+                counts[batch_errors[idx]] += 1
+                continue
+            elif idx in batch_packed:
+                packed = batch_packed[idx]
             else:
                 packed, error = _normalized_bytes(payloads.get(ref.memory_id), dimension)
                 if error:
                     counts[error] += 1
                     continue
             refs.append(ref)
-            values.extend(packed)
+            chunks.append(packed)
             admitted.add(ref.memory_id)
         if not refs:
             continue
-        block = VectorBlock(tuple(refs), bytes(values), dimension)
+        block = VectorBlock(tuple(refs), b"".join(chunks), dimension)
         accept(block)
         blocks, retained, evicted = _retain_blocks(blocks, budget, block=block, retained=retained)
         if evicted:
@@ -400,6 +543,8 @@ def search_embeddings_sync(
     include_pending: bool, top_k: int, threshold: float, batch_size: int,
     max_text_chars: int, selection_time: float, cancelled: Any,
     excluded_memory_types: frozenset[str] = frozenset(),
+    ref_filter: Callable[[VectorRef], bool] | None = None,
+    post_filter: Callable[[MemoryRecord], bool] | None = None,
 ) -> tuple[list[MemoryRecord], dict[str, float], dict[str, Any]]:
     started = time.perf_counter()
     dimension = len(query)
@@ -423,7 +568,8 @@ def search_embeddings_sync(
             top_k,
             ((max(-1.0, min(1.0, score)), ref) for score, ref in zip(scores, block.refs)
              if math.isfinite(score) and score >= threshold
-             and not (excluded_types and ref.memory_type in excluded_types)),
+             and not (excluded_types and ref.memory_type in excluded_types)
+             and (ref_filter is None or ref_filter(ref))),
             key=lambda item: (-item[0], item[1].memory_id),
         )
         selected[:] = heapq.nsmallest(top_k, selected + best,
@@ -438,21 +584,35 @@ def search_embeddings_sync(
         conn, lock = store._vector_read_connection()
         with lock:
             conn.execute("BEGIN")
+            reusable: dict[str, ReusableRow] | None = None
             try:
                 row = conn.execute("SELECT revision FROM retrieval_revision WHERE singleton=1").fetchone()
                 revision = str(row[0]) if row else "0"
                 if revision != expected_revision:
                     raise VectorSnapshotChanged("embedding_revision_changed")
+                cached = store._vector_search_cache.get(key)
+                cache_hit = (
+                    cached is not None
+                    and cached.revision == revision
+                    and cached.valid_until > selection_time
+                )
+                if not cache_hit or (cached is not None and not cached.complete):
+                    reusable = _collect_reusable_rows(
+                        store._vector_search_cache,
+                        revision=None,
+                        provider_id=provider_id,
+                        dimension=dimension,
+                        max_text_chars=max_text_chars,
+                        exclude_key=key if cache_hit else None,
+                    )
                 for cached_key, value in list(store._vector_search_cache.items()):
                     if value.revision != revision or value.valid_until <= selection_time:
                         del store._vector_search_cache[cached_key]
-                cached = store._vector_search_cache.get(key)
-                cache_hit = cached is not None
-                snapshot = cached
+                snapshot = cached if cache_hit else None
                 publish = None
                 reread_rows = 0
                 reused_rows = 0
-                if cached is not None:
+                if cache_hit and cached is not None:
                     if cached.byte_size > budget:
                         trimmed_blocks, trimmed_bytes, evicted = _retain_blocks(cached.blocks, budget)
                         if evicted:
@@ -489,44 +649,23 @@ def search_embeddings_sync(
                         ))
                         if missing:
                             scratch = {name: 0 for name in counts}
-                            reusable = _collect_reusable_rows(
-                                store._vector_search_cache,
-                                revision=revision,
-                                provider_id=provider_id,
-                                dimension=dimension,
-                                max_text_chars=max_text_chars,
-                                exclude_key=key,
+                            _blocks, _until, _truncated, admitted, _retained = _build_blocks(
+                                store, conn, provider_id, dimension, batch_size, max_text_chars,
+                                eligible, selection_time, scratch, check_cancelled, accept, budget,
+                                _candidate_where(store, include_pending), missing,
+                                reusable_rows=reusable,
+                                expected_revision=expected_revision,
                             )
-                            try:
-                                _blocks, _until, _truncated, admitted, _retained = _build_blocks(
-                                    store, conn, provider_id, dimension, batch_size, max_text_chars,
-                                    eligible, selection_time, scratch, check_cancelled, accept, budget,
-                                    _candidate_where(store, include_pending), missing,
-                                    reusable_rows=reusable,
-                                    expected_revision=expected_revision,
-                                )
-                            finally:
-                                reusable.clear()
                             reread_rows = len(admitted)
                             reused_rows = scratch.pop("embedding_reused_rows", 0)
                 else:
-                    reusable = _collect_reusable_rows(
-                        store._vector_search_cache,
-                        revision=revision,
-                        provider_id=provider_id,
-                        dimension=dimension,
-                        max_text_chars=max_text_chars,
+                    blocks, valid_until, truncated, admitted, retained = _build_blocks(
+                        store, conn, provider_id, dimension, batch_size, max_text_chars,
+                        eligible, selection_time, counts, check_cancelled, accept, budget,
+                        _candidate_where(store, include_pending),
+                        reusable_rows=reusable,
+                        expected_revision=expected_revision,
                     )
-                    try:
-                        blocks, valid_until, truncated, admitted, retained = _build_blocks(
-                            store, conn, provider_id, dimension, batch_size, max_text_chars,
-                            eligible, selection_time, counts, check_cancelled, accept, budget,
-                            _candidate_where(store, include_pending),
-                            reusable_rows=reusable,
-                            expected_revision=expected_revision,
-                        )
-                    finally:
-                        reusable.clear()
                     reused_rows = counts.pop("embedding_reused_rows", 0)
                     publish = VectorSnapshot(
                         revision, valid_until, tuple(blocks), tuple(counts.items()),
@@ -548,11 +687,14 @@ def search_embeddings_sync(
                     if (memory is None or memory.updated_at != ref.updated_at
                             or memory_embedding_text_hash(memory, max_chars=max_text_chars) != ref.text_hash
                             or not eligible(memory)
-                            or (excluded_types and memory.memory_type in excluded_types)):
+                            or (excluded_types and memory.memory_type in excluded_types)
+                            or (post_filter is not None and not post_filter(memory))):
                         raise VectorSnapshotChanged("embedding_selected_record_changed")
                     results.append(memory)
                     scores[memory.id] = score
             finally:
+                if reusable is not None:
+                    reusable.clear()
                 conn.rollback()
         check_cancelled()
         if store._memory_revision_sync() != expected_revision or time.time() >= valid_until:
