@@ -1246,6 +1246,9 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
         state = service._get_relationship_phase(ctx)
         self.assertEqual(1, state["touch_count"])
         self.assertEqual(["turn-1"], state["recent_touch_message_ids"])
+        # Phase writes are deferred to a worker thread; flush explicitly before
+        # asserting on the persisted JSON file.
+        await service.flush_relationship_phase_state()
         saved = json.loads(service._RELATIONSHIP_PHASE_FILE.read_text(encoding="utf-8"))
         self.assertIn(service._phase_key(ctx), saved)
 
