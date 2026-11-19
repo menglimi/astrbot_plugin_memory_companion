@@ -91,7 +91,11 @@ class SummaryStatusMethods:
                      'below_threshold_events': 0, 'waits': {key: 0 for key in WAIT_LABELS}}
         for (session, scope), window in snapshot['originals'].items():
             originals['events'] += window['total']
-            if not self._summary_window_ready(window, force=False):
+            if not self._summary_window_ready(
+                window,
+                force=False,
+                allow_aged_backlog=self.config.bool('memory_summary.auto_drain_enabled', True),
+            ):
                 originals['below_threshold_events'] += window['total']
                 continue
             context, _ = self._summary_context_from_sources(session, scope, {}, window['rows'])

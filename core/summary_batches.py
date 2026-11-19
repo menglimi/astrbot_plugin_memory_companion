@@ -579,6 +579,7 @@ class SummaryBatchStore:
         force=False,
         lease_seconds=240,
         lease_token="",
+        preserve_lease=False,
     ):
         """Commit the reservation before the request, including repairs and fallbacks.
 
@@ -639,10 +640,19 @@ class SummaryBatchStore:
                         # oldest counted call ages out of the sliding window,
                         # so record that exact moment and never quarantine a
                         # batch that only ran out of hourly budget.
-                        self._conn.execute(
-                            "UPDATE summary_batches SET next_retry_at=?,retry_reason=?,lease_token='',lease_expires_at=NULL,updated_at=? WHERE id=?",
-                            (self._budget_release_at(window[1], now), self.BUDGET_RETRY_REASON, utc_now(), batch_id),
-                        )
+                        # If this worker already holds the active lease (for
+                        # example, to finalize an earlier usable body), keep its
+                        # ownership intact while still recording the budget wait.
+                        if preserve_lease and same_owner:
+                            self._conn.execute(
+                                "UPDATE summary_batches SET next_retry_at=?,retry_reason=?,updated_at=? WHERE id=?",
+                                (self._budget_release_at(window[1], now), self.BUDGET_RETRY_REASON, utc_now(), batch_id),
+                            )
+                        else:
+                            self._conn.execute(
+                                "UPDATE summary_batches SET next_retry_at=?,retry_reason=?,lease_token='',lease_expires_at=NULL,updated_at=? WHERE id=?",
+                                (self._budget_release_at(window[1], now), self.BUDGET_RETRY_REASON, utc_now(), batch_id),
+                            )
                         return False
                 self._conn.execute('''UPDATE summary_batches SET automatic_calls=automatic_calls+?,repair_used=MAX(repair_used,?),
                     state='retry_pending',next_retry_at=?,retry_reason='',lease_token=?,lease_expires_at=?,updated_at=? WHERE id=?''',
@@ -1031,8 +1041,10 @@ class SummaryBatchStore:
                     result_memory_id = self._insert_memory_sync(record, _commit=False)
                 if not no_memory and mark_timeline:
                     self._mark_timeline_summarized_sync(list(consumed), _commit=False)
-                self._conn.execute('UPDATE summary_batches SET state=?,memory_id=?,last_error=?,lease_token=\'\',lease_expires_at=NULL,updated_at=? WHERE id=?',
-                    ('no_memory' if no_memory else 'completed', result_memory_id, clean_text(redact_sensitive_text(reason), 500), utc_now(), batch_id))
+                self._conn.execute(
+                    "UPDATE summary_batches SET state=?,memory_id=?,last_error=?,next_retry_at=NULL,retry_reason='',lease_token='',lease_expires_at=NULL,updated_at=? WHERE id=?",
+                    ('no_memory' if no_memory else 'completed', result_memory_id, clean_text(redact_sensitive_text(reason), 500), utc_now(), batch_id),
+                )
                 return result_memory_id
         return await asyncio.to_thread(finish)
 
