@@ -723,6 +723,53 @@ class ConcurrentReadPathTests(unittest.IsolatedAsyncioTestCase):
         res = await MemoryStore.next_summary_batch(mock_store, "qq:FriendMessage:u1", force=True)
         self.assertIsNone(res)
 
+    def test_closed_store_rejects_read_connection_helpers_without_reopening_handles(self) -> None:
+        # Open all dedicated readers first, then close and verify none can be reopened.
+        self.assertIsNotNone(self.store._ensure_read_connection())
+        self.assertIsNotNone(self.store._ensure_timeline_read_connection())
+        self.assertIsNotNone(self.store._ensure_vector_read_connection())
+
+        self.store.close()
+        self.assertTrue(self.store._closed)
+        self.assertIsNone(self.store._read_conn)
+        self.assertIsNone(self.store._timeline_read_conn)
+        self.assertIsNone(self.store._vector_read_conn)
+
+        with patch.object(
+            self.store,
+            "_open_dedicated_read_connection",
+            wraps=self.store._open_dedicated_read_connection,
+        ) as open_spy:
+            for helper in (
+                self.store._ensure_read_connection,
+                self.store._ensure_timeline_read_connection,
+                self.store._ensure_vector_read_connection,
+            ):
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    helper()
+            with self.assertRaises(sqlite3.ProgrammingError):
+                with self.store._read_conn_sync():
+                    pass
+
+        self.assertEqual(0, open_spy.call_count)
+        self.assertIsNone(self.store._read_conn)
+        self.assertIsNone(self.store._timeline_read_conn)
+        self.assertIsNone(self.store._vector_read_conn)
+
+        # Verify read-only stores also reject read connection access after close().
+        ro_store = MemoryStore(self.store.db_path, read_only=True)
+        ro_store.close()
+        for helper in (
+            ro_store._ensure_read_connection,
+            ro_store._ensure_timeline_read_connection,
+            ro_store._ensure_vector_read_connection,
+        ):
+            with self.assertRaises(sqlite3.ProgrammingError):
+                helper()
+        with self.assertRaises(sqlite3.ProgrammingError):
+            with ro_store._read_conn_sync():
+                pass
+
 
 class SingleHopSourceCaptureTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
@@ -902,6 +949,71 @@ class CanonicalHistoryDigestTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(huge, service_mod._LARGE_STR_DIGEST_CACHE)
             self.assertLessEqual(len(service_mod._LARGE_STR_DIGEST_CACHE), service_mod._LARGE_DIGEST_CACHE_MAX_ENTRIES)
             self.assertLessEqual(service_mod._LARGE_STR_DIGEST_CACHE_BYTES, service_mod._LARGE_DIGEST_CACHE_MAX_BYTES)
+
+    async def test_large_str_digest_cache_uses_utf8_byte_budget_and_clears_on_service_close(self) -> None:
+        # CJK characters are 3 UTF-8 bytes each: verify byte accounting & cap enforcement.
+        cjk_sample = "记" * 1000
+        expected_bytes = len(cjk_sample.encode("utf-8"))
+        self.assertEqual(3000, expected_bytes)
+
+        digest = service_mod._cached_large_str_sha256(cjk_sample)
+        self.assertEqual(hashlib.sha256(cjk_sample.encode("utf-8")).hexdigest(), digest)
+        with service_mod._LARGE_STR_DIGEST_LOCK:
+            self.assertIn(cjk_sample, service_mod._LARGE_STR_DIGEST_CACHE)
+            self.assertEqual(expected_bytes, service_mod._LARGE_STR_DIGEST_CACHE_BYTES)
+
+        # With a small UTF-8 byte cap, CJK strings whose char length fits but UTF-8 bytes exceed
+        # the entry or cache budget must be rejected / evicted accurately.
+        with (
+            patch.object(service_mod, "_LARGE_DIGEST_ENTRY_MAX_BYTES", 2400),
+            patch.object(service_mod, "_LARGE_DIGEST_CACHE_MAX_BYTES", 3600),
+        ):
+            service_mod._clear_large_str_digest_cache()
+            over_entry_cjk = "忆" * 900  # 900 chars < 2400, but 2700 UTF-8 bytes > 2400
+            _ = service_mod._cached_large_str_sha256(over_entry_cjk)
+            with service_mod._LARGE_STR_DIGEST_LOCK:
+                self.assertNotIn(over_entry_cjk, service_mod._LARGE_STR_DIGEST_CACHE)
+                self.assertEqual(0, service_mod._LARGE_STR_DIGEST_CACHE_BYTES)
+
+            cjk_a = "甲" * 700  # 2100 UTF-8 bytes
+            cjk_b = "乙" * 700  # 2100 UTF-8 bytes -> must evict cjk_a under 3600-byte cap
+            _ = service_mod._cached_large_str_sha256(cjk_a)
+            _ = service_mod._cached_large_str_sha256(cjk_b)
+            with service_mod._LARGE_STR_DIGEST_LOCK:
+                self.assertNotIn(cjk_a, service_mod._LARGE_STR_DIGEST_CACHE)
+                self.assertIn(cjk_b, service_mod._LARGE_STR_DIGEST_CACHE)
+                self.assertEqual(2100, service_mod._LARGE_STR_DIGEST_CACHE_BYTES)
+
+        # Deterministic cleanup on both close() and aclose().
+        with tempfile.TemporaryDirectory() as tmp:
+            service_sync = MemoryCompanionService(
+                context=None,
+                config={},
+                plugin_root=Path(ROOT),
+                data_dir=Path(tmp) / "sync",
+            )
+            _ = service_mod._cached_large_str_sha256("丙" * 600)
+            with service_mod._LARGE_STR_DIGEST_LOCK:
+                self.assertGreater(len(service_mod._LARGE_STR_DIGEST_CACHE), 0)
+                self.assertGreater(service_mod._LARGE_STR_DIGEST_CACHE_BYTES, 0)
+            service_sync.close()
+            with service_mod._LARGE_STR_DIGEST_LOCK:
+                self.assertEqual(0, len(service_mod._LARGE_STR_DIGEST_CACHE))
+                self.assertEqual(0, service_mod._LARGE_STR_DIGEST_CACHE_BYTES)
+
+            service_async = MemoryCompanionService(
+                context=None,
+                config={},
+                plugin_root=Path(ROOT),
+                data_dir=Path(tmp) / "async",
+            )
+            _ = service_mod._cached_large_str_sha256("丁" * 600)
+            with service_mod._LARGE_STR_DIGEST_LOCK:
+                self.assertGreater(len(service_mod._LARGE_STR_DIGEST_CACHE), 0)
+            await service_async.aclose()
+            with service_mod._LARGE_STR_DIGEST_LOCK:
+                self.assertEqual(0, len(service_mod._LARGE_STR_DIGEST_CACHE))
+                self.assertEqual(0, service_mod._LARGE_STR_DIGEST_CACHE_BYTES)
 
     async def test_publish_reply_memory_context_records_canonical_digest_in_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

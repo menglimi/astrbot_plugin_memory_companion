@@ -182,9 +182,17 @@ _LARGE_DIGEST_STR_LIMIT = 512
 _LARGE_DIGEST_CACHE_MAX_ENTRIES = 64
 _LARGE_DIGEST_ENTRY_MAX_BYTES = 8 * 1024 * 1024
 _LARGE_DIGEST_CACHE_MAX_BYTES = 32 * 1024 * 1024
-_LARGE_STR_DIGEST_CACHE: OrderedDict[str, str] = OrderedDict()
+_LARGE_STR_DIGEST_CACHE: OrderedDict[str, tuple[str, int]] = OrderedDict()
 _LARGE_STR_DIGEST_CACHE_BYTES = 0
 _LARGE_STR_DIGEST_LOCK = threading.Lock()
+
+
+def _clear_large_str_digest_cache() -> None:
+    """Release cached large-string SHA-256 entries and reset accounted UTF-8 bytes."""
+    global _LARGE_STR_DIGEST_CACHE_BYTES
+    with _LARGE_STR_DIGEST_LOCK:
+        _LARGE_STR_DIGEST_CACHE.clear()
+        _LARGE_STR_DIGEST_CACHE_BYTES = 0
 
 
 def _is_large_or_data_uri(text: str) -> bool:
@@ -196,15 +204,16 @@ def _is_large_or_data_uri(text: str) -> bool:
 
 
 def _cached_large_str_sha256(text: str) -> str:
-    """Return SHA-256 hex digest for a large string with bounded LRU memoization."""
+    """Return SHA-256 hex digest for a large string with UTF-8 byte-bounded LRU memoization."""
     global _LARGE_STR_DIGEST_CACHE_BYTES
     with _LARGE_STR_DIGEST_LOCK:
         cached = _LARGE_STR_DIGEST_CACHE.get(text)
         if cached is not None:
             _LARGE_STR_DIGEST_CACHE.move_to_end(text)
-            return cached
-    digest_hex = hashlib.sha256(text.encode("utf-8", errors="surrogatepass")).hexdigest()
-    size = len(text)
+            return cached[0]
+    encoded = text.encode("utf-8", errors="surrogatepass")
+    digest_hex = hashlib.sha256(encoded).hexdigest()
+    size = len(encoded)
     if size <= _LARGE_DIGEST_ENTRY_MAX_BYTES:
         with _LARGE_STR_DIGEST_LOCK:
             if text not in _LARGE_STR_DIGEST_CACHE:
@@ -212,11 +221,11 @@ def _cached_large_str_sha256(text: str) -> str:
                     len(_LARGE_STR_DIGEST_CACHE) >= _LARGE_DIGEST_CACHE_MAX_ENTRIES
                     or _LARGE_STR_DIGEST_CACHE_BYTES + size > _LARGE_DIGEST_CACHE_MAX_BYTES
                 ):
-                    evicted_key, _ = _LARGE_STR_DIGEST_CACHE.popitem(last=False)
+                    _, (_, evicted_size) = _LARGE_STR_DIGEST_CACHE.popitem(last=False)
                     _LARGE_STR_DIGEST_CACHE_BYTES = max(
-                        0, _LARGE_STR_DIGEST_CACHE_BYTES - len(evicted_key)
+                        0, _LARGE_STR_DIGEST_CACHE_BYTES - evicted_size
                     )
-                _LARGE_STR_DIGEST_CACHE[text] = digest_hex
+                _LARGE_STR_DIGEST_CACHE[text] = (digest_hex, size)
                 _LARGE_STR_DIGEST_CACHE_BYTES += size
     return digest_hex
 
@@ -15656,6 +15665,7 @@ class MemoryCompanionService:
         except Exception as exc:
             logger.warning("[MemoryCompanion] 关闭记忆库连接失败: %s", exc, exc_info=True)
         finally:
+            _clear_large_str_digest_cache()
             self._closed = True
 
     def _existing_json_writers(self) -> tuple[BackgroundJsonWriter, ...]:
@@ -15757,6 +15767,7 @@ class MemoryCompanionService:
         except Exception as exc:
             logger.warning("[MemoryCompanion] 关闭记忆库连接失败: %s", exc, exc_info=True)
         finally:
+            _clear_large_str_digest_cache()
             self._closed = True
 
     def _reset_stores_after_failed_initialize(self) -> None:

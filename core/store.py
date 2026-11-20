@@ -739,11 +739,17 @@ class MemoryStore(SummaryBatchStore):
         """
         if self._read_only:
             with self._lock:
+                if self._closed:
+                    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
                 yield self._conn
             return
+        if self._closed:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
         if self._lock.acquire(blocking=False):
             try:
-                if not self._closed and self._conn.in_transaction:
+                if self._closed:
+                    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+                if self._conn.in_transaction:
                     yield self._conn
                     return
             finally:
@@ -757,6 +763,8 @@ class MemoryStore(SummaryBatchStore):
             return
         tl_conn, tl_lock = self._timeline_read_connection()
         with tl_lock:
+            if self._closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
             yield tl_conn
 
     @staticmethod
