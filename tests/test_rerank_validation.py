@@ -25,6 +25,10 @@ from astrbot_plugin_memory_companion.core.latency import (
     bounded_model_call_timeout_ms,
 )
 from astrbot_plugin_memory_companion.core.retrieval import RetrievalEngine
+from astrbot_plugin_memory_companion.core.latency import (
+    DEFAULT_MODEL_CALL_TIMEOUT_MS,
+    MAX_CONFIGURED_MODEL_CALL_TIMEOUT_MS,
+)
 
 
 class _RecordingRerankProvider:
@@ -47,14 +51,18 @@ class RerankInputValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0.25, bounded_memory_hook_budget_seconds(0.25))
         self.assertEqual(MAX_MEMORY_HOOK_BUDGET_SECONDS, bounded_memory_hook_budget_seconds(0))
         self.assertEqual(800, bounded_model_call_timeout_ms(800))
-        self.assertEqual(MAX_MODEL_CALL_TIMEOUT_MS, bounded_model_call_timeout_ms(9000))
-        self.assertEqual(MAX_MODEL_CALL_TIMEOUT_MS, bounded_model_call_timeout_ms(0))
+        self.assertEqual(5000, bounded_model_call_timeout_ms(5000))
+        self.assertEqual(MAX_CONFIGURED_MODEL_CALL_TIMEOUT_MS, bounded_model_call_timeout_ms(20000))
+        self.assertEqual(DEFAULT_MODEL_CALL_TIMEOUT_MS, bounded_model_call_timeout_ms(0))
 
     def test_retrieval_engine_caps_provider_timeouts(self) -> None:
-        engine = RetrievalEngine(None, None, rerank_timeout_ms=9000, embedding_timeout_ms=0)
+        engine = RetrievalEngine(None, None, rerank_timeout_ms=5000, embedding_timeout_ms=0)
+        capped = RetrievalEngine(None, None, rerank_timeout_ms=25000, embedding_timeout_ms=25000)
 
-        self.assertEqual(MAX_MODEL_CALL_TIMEOUT_MS, engine.rerank_timeout_ms)
-        self.assertEqual(MAX_MODEL_CALL_TIMEOUT_MS, engine.embedding_timeout_ms)
+        self.assertEqual(5000, engine.rerank_timeout_ms)
+        self.assertEqual(DEFAULT_MODEL_CALL_TIMEOUT_MS, engine.embedding_timeout_ms)
+        self.assertEqual(MAX_CONFIGURED_MODEL_CALL_TIMEOUT_MS, capped.rerank_timeout_ms)
+        self.assertEqual(MAX_CONFIGURED_MODEL_CALL_TIMEOUT_MS, capped.embedding_timeout_ms)
 
     async def test_memory_hook_budget_excludes_embedding_and_rerank_waits(self) -> None:
         class SlowEmbeddingProvider:

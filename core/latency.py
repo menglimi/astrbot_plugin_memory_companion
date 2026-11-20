@@ -138,11 +138,38 @@ def bounded_memory_hook_budget_seconds(value: Any) -> float:
     return min(configured, MAX_MEMORY_HOOK_BUDGET_SECONDS)
 
 
-def bounded_model_call_timeout_ms(value: Any) -> int:
+DEFAULT_MODEL_CALL_TIMEOUT_MS = MAX_MODEL_CALL_TIMEOUT_MS
+MAX_CONFIGURED_MODEL_CALL_TIMEOUT_MS = 10000
+
+
+def bounded_model_call_timeout_ms(
+    value: Any,
+    *,
+    max_timeout_ms: int | None = None,
+) -> int:
+    """Clamp a configured remote model-call timeout into ``[1, cap]``.
+
+    Booleans and values that are missing, invalid, or not positive fall back to
+    ``DEFAULT_MODEL_CALL_TIMEOUT_MS`` (2000 ms). Explicit positive values are
+    honored up to ``MAX_CONFIGURED_MODEL_CALL_TIMEOUT_MS`` (10000 ms) so
+    multi-document rerank or embedding batches are not silently clamped down to
+    2000 ms while still preventing unbounded remote waits.
+    """
+    cap = MAX_CONFIGURED_MODEL_CALL_TIMEOUT_MS
+    if max_timeout_ms is not None and not isinstance(max_timeout_ms, bool):
+        try:
+            custom_cap = int(max_timeout_ms)
+        except (TypeError, ValueError, OverflowError):
+            custom_cap = cap
+        if custom_cap > 0:
+            cap = min(custom_cap, MAX_CONFIGURED_MODEL_CALL_TIMEOUT_MS)
+    default_timeout = min(DEFAULT_MODEL_CALL_TIMEOUT_MS, cap)
+    if isinstance(value, bool):
+        return default_timeout
     try:
         configured = int(value)
     except (TypeError, ValueError, OverflowError):
-        return MAX_MODEL_CALL_TIMEOUT_MS
+        return default_timeout
     if configured <= 0:
-        return MAX_MODEL_CALL_TIMEOUT_MS
-    return min(configured, MAX_MODEL_CALL_TIMEOUT_MS)
+        return default_timeout
+    return min(configured, cap)
