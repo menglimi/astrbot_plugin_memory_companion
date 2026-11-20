@@ -147,7 +147,10 @@ async def run_case(plugin, provider, case, fixture, data_dir, request_limit, rep
         case_report["tool_definition_chars"] = len(json.dumps([
             {"name": tool.name, "description": tool.description, "parameters": tool.parameters}
             for tool in tools.tools if tool.active], ensure_ascii=False))
-        case_report["reconstruction_prompt_offered"] = "<MemoryCompanion-Reconstruction-Contract>" in req.system_prompt
+        case_report["reconstruction_prompt_offered"] = any(
+            "<MemoryCompanion-Reconstruction-Turn-State>" in getattr(part, "text", "")
+            for part in getattr(req, "extra_user_content_parts", [])
+        )
         case_report["general_guidance_offered"] = "<MemoryCompanion-Recall-Guidance>" in req.system_prompt
         case_report["initial_injection"] = getattr(req, "memory_companion_injection_state", {})
         messages = [{"role": "system", "content": req.system_prompt}, *req.contexts,

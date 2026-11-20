@@ -307,10 +307,12 @@ class MemoryCompanionPlugin(Star):
                 stage,
                 budget,
             )
+            self.service.ensure_request_prefix_contracts_on_fallback(event, req)
         except Exception:
             logger.exception(
                 "[MemoryCompanion] on_llm_request 钩子异常，本轮放行"
             )
+            self.service.ensure_request_prefix_contracts_on_fallback(event, req)
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
     async def on_group_message(self, event: AstrMessageEvent):
