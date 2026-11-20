@@ -2275,7 +2275,7 @@ class MemoryCompanionService:
                                 "[MemoryCompanion] 自动消化完成: session=%s memory=%s", session_id, memory_id
                             )
                         else:
-                            logger.info(
+                            logger.debug(
                                 "[MemoryCompanion] 自动消化跳过: session=%s",
                                 session_id,
                             )

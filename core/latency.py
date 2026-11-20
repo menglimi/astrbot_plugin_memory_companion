@@ -14,7 +14,13 @@ MAX_MODEL_CALL_TIMEOUT_MS = 2000
 
 
 class _ActiveTimeBudget:
-    def __init__(self, timeout_seconds: float):
+    def __init__(
+        self,
+        timeout_seconds: float,
+        *,
+        model_call_budget_fraction: float | None = None,
+        max_model_call_wait_seconds: float | None = None,
+    ):
         self._loop = asyncio.get_running_loop()
         self._timeout = max(0.0, float(timeout_seconds))
         self._started_at = self._loop.time()
@@ -22,6 +28,22 @@ class _ActiveTimeBudget:
         self._paused_at: float | None = None
         self._pause_depth = 0
         self._changed = asyncio.Event()
+        if model_call_budget_fraction is None:
+            self._model_call_budget_fraction: float | None = None
+        else:
+            parsed_fraction = float(model_call_budget_fraction)
+            if math.isfinite(parsed_fraction):
+                self._model_call_budget_fraction = min(1.0, max(0.0, parsed_fraction))
+            else:
+                self._model_call_budget_fraction = None
+        if max_model_call_wait_seconds is None:
+            self._max_model_call_wait_seconds: float | None = None
+        else:
+            parsed_max_wait = float(max_model_call_wait_seconds)
+            if math.isfinite(parsed_max_wait):
+                self._max_model_call_wait_seconds = max(0.0, parsed_max_wait)
+            else:
+                self._max_model_call_wait_seconds = None
 
     @property
     def remaining(self) -> float:
@@ -29,6 +51,31 @@ class _ActiveTimeBudget:
         paused = now - self._paused_at if self._paused_at is not None else 0.0
         elapsed = now - self._started_at - self._excluded_seconds - paused
         return max(0.0, self._timeout - elapsed)
+
+    @property
+    def excluded_elapsed(self) -> float:
+        now = self._loop.time()
+        paused = now - self._paused_at if self._paused_at is not None else 0.0
+        return self._excluded_seconds + paused
+
+    @property
+    def wall_remaining(self) -> float:
+        elapsed = self._loop.time() - self._started_at
+        return max(0.0, self._timeout - elapsed)
+
+    @property
+    def model_call_budget_fraction(self) -> float | None:
+        return self._model_call_budget_fraction
+
+    @property
+    def max_model_call_wait_seconds(self) -> float | None:
+        return self._max_model_call_wait_seconds
+
+    @property
+    def model_call_wait_remaining(self) -> float | None:
+        if self._max_model_call_wait_seconds is None:
+            return None
+        return max(0.0, self._max_model_call_wait_seconds - self.excluded_elapsed)
 
     def pause(self) -> None:
         self._pause_depth += 1
@@ -71,12 +118,56 @@ def _consume_task_result(task: asyncio.Future[Any]) -> None:
         pass
 
 
+MAX_HOOK_MODEL_CALL_WAIT_SECONDS = 12.0
+
+
+def effective_model_call_timeout_seconds(timeout_seconds: float) -> float:
+    """Bound a remote model call timeout against the active memory-hook budget.
+
+    Outside an active ``on_llm_request`` hook (or when neither
+    ``max_model_call_wait_seconds`` nor ``model_call_budget_fraction`` is set),
+    returns ``max(0.0, float(timeout_seconds))`` unchanged.
+
+    Inside a hook with remote-wait protection enabled:
+    - If active local hook budget (``budget.remaining``, excluding
+      ``exclude_model_call_wait()`` pauses) is already exhausted, returns
+      ``0.0`` so downstream remote calls fail fast.
+    - When ``max_model_call_wait_seconds`` is set, caps the call against the
+      remaining shared excluded-wait ceiling ``budget.model_call_wait_remaining``
+      so prior excluded external I/O (such as embedding) does not starve
+      downstream rerank against the local hook budget while still enforcing a
+      hard upper wall safety cap across all remote calls in the hook.
+    - When ``model_call_budget_fraction`` is explicitly set, caps against
+      ``budget.remaining * fraction`` (active remaining time rather than raw
+      wall time) so excluded external waits do not eat into the local budget.
+    """
+    parsed = float(timeout_seconds)
+    configured = 0.0 if math.isnan(parsed) else max(0.0, parsed)
+    budget = _ACTIVE_MEMORY_HOOK_BUDGET.get()
+    if budget is None:
+        return configured
+    max_wait_remaining = budget.model_call_wait_remaining
+    fraction = budget.model_call_budget_fraction
+    if max_wait_remaining is None and fraction is None:
+        return configured
+    active_remaining = budget.remaining
+    if active_remaining <= 0.0:
+        return 0.0
+    effective = configured
+    if max_wait_remaining is not None:
+        effective = min(effective, max_wait_remaining)
+    if fraction is not None:
+        effective = min(effective, active_remaining * fraction)
+    return max(0.0, effective)
+
+
 async def await_with_timeout(awaitable: Any, timeout_seconds: float) -> Any:
     """Return at the deadline without waiting for provider cancellation cleanup."""
+    effective_timeout = effective_model_call_timeout_seconds(timeout_seconds)
     task = asyncio.ensure_future(awaitable)
     try:
         done, _pending = await asyncio.wait(
-            {task}, timeout=max(0.0, float(timeout_seconds))
+            {task}, timeout=effective_timeout
         )
     except asyncio.CancelledError:
         task.cancel()
@@ -103,9 +194,19 @@ async def exclude_model_call_wait() -> Any:
         budget.resume()
 
 
-async def await_with_memory_hook_budget(awaitable: Any, timeout_seconds: float) -> Any:
+async def await_with_memory_hook_budget(
+    awaitable: Any,
+    timeout_seconds: float,
+    *,
+    model_call_budget_fraction: float | None = None,
+    max_model_call_wait_seconds: float | None = None,
+) -> Any:
     """Bound plugin work while allowing explicitly marked model calls to wait."""
-    budget = _ActiveTimeBudget(timeout_seconds)
+    budget = _ActiveTimeBudget(
+        timeout_seconds,
+        model_call_budget_fraction=model_call_budget_fraction,
+        max_model_call_wait_seconds=max_model_call_wait_seconds,
+    )
     token = _ACTIVE_MEMORY_HOOK_BUDGET.set(budget)
     task = asyncio.ensure_future(awaitable)
     deadline_task = asyncio.create_task(budget.wait_until_spent())
