@@ -207,6 +207,7 @@ class MemoryCompanionPlugin(Star):
             except Exception as exc:  # pragma: no cover - 注册失败不降级插件
                 logger.debug("[MemoryCompanion] companion linkage start failed: %s", exc)
             self.service.capture.start()
+            self.service.schedule_startup_vector_warmup()
         except Exception:
             # 初始化失败只降级本插件：宿主 star_manager 外层是 except BaseException，
             # 这里不捕就会让整个插件加载失败，用户其它功能一起陪葬。

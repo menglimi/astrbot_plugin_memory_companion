@@ -5,9 +5,9 @@ import math
 import threading
 import time
 import threading
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, is_dataclass, replace
 import json
 import hashlib
 import inspect
@@ -123,7 +123,7 @@ from .latency import (
     bounded_model_call_timeout_ms,
     detach_memory_hook_budget,
 )
-from .retrieval import RetrievalEngine
+from .retrieval import RerankCircuitBreaker, RetrievalEngine
 from .store import MemoryStore
 from .vector_search import bounded_cache_bytes
 from .source_query import query_sources, source_visible
@@ -179,6 +179,126 @@ from .visibility import (
 )
 
 USER_MEMORY_SUMMARY_VERSION = "memory.user_memory_summary.v1"
+_LARGE_DIGEST_STR_LIMIT = 512
+_LARGE_DIGEST_CACHE_MAX_ENTRIES = 64
+_LARGE_DIGEST_ENTRY_MAX_BYTES = 8 * 1024 * 1024
+_LARGE_DIGEST_CACHE_MAX_BYTES = 32 * 1024 * 1024
+_LARGE_STR_DIGEST_CACHE: OrderedDict[str, tuple[str, int]] = OrderedDict()
+_LARGE_STR_DIGEST_CACHE_BYTES = 0
+_LARGE_STR_DIGEST_LOCK = threading.Lock()
+
+
+def _clear_large_str_digest_cache() -> None:
+    """Release cached large-string SHA-256 entries and reset accounted UTF-8 bytes."""
+    global _LARGE_STR_DIGEST_CACHE_BYTES
+    with _LARGE_STR_DIGEST_LOCK:
+        _LARGE_STR_DIGEST_CACHE.clear()
+        _LARGE_STR_DIGEST_CACHE_BYTES = 0
+
+
+def _is_large_or_data_uri(text: str) -> bool:
+    if len(text) > _LARGE_DIGEST_STR_LIMIT:
+        return True
+    if text.startswith("data:") and ";base64," in text[:128]:
+        return True
+    return False
+
+
+def _cached_large_str_sha256(text: str) -> str:
+    """Return SHA-256 hex digest for a large string with UTF-8 byte-bounded LRU memoization."""
+    global _LARGE_STR_DIGEST_CACHE_BYTES
+    with _LARGE_STR_DIGEST_LOCK:
+        cached = _LARGE_STR_DIGEST_CACHE.get(text)
+        if cached is not None:
+            _LARGE_STR_DIGEST_CACHE.move_to_end(text)
+            return cached[0]
+    encoded = text.encode("utf-8", errors="surrogatepass")
+    digest_hex = hashlib.sha256(encoded).hexdigest()
+    size = len(encoded)
+    if size <= min(_LARGE_DIGEST_ENTRY_MAX_BYTES, _LARGE_DIGEST_CACHE_MAX_BYTES):
+        with _LARGE_STR_DIGEST_LOCK:
+            if text not in _LARGE_STR_DIGEST_CACHE:
+                while _LARGE_STR_DIGEST_CACHE and (
+                    len(_LARGE_STR_DIGEST_CACHE) >= _LARGE_DIGEST_CACHE_MAX_ENTRIES
+                    or _LARGE_STR_DIGEST_CACHE_BYTES + size > _LARGE_DIGEST_CACHE_MAX_BYTES
+                ):
+                    _, (_, evicted_size) = _LARGE_STR_DIGEST_CACHE.popitem(last=False)
+                    _LARGE_STR_DIGEST_CACHE_BYTES = max(
+                        0, _LARGE_STR_DIGEST_CACHE_BYTES - evicted_size
+                    )
+                _LARGE_STR_DIGEST_CACHE[text] = (digest_hex, size)
+                _LARGE_STR_DIGEST_CACHE_BYTES += size
+    return digest_hex
+
+
+def _canonicalize_digest_value(value: Any, *, depth: int = 0) -> Any:
+    """Recursively canonicalize values for ``history_digest`` without copying multi-MB base64."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        if _is_large_or_data_uri(value):
+            return f"__sha256__:{len(value)}:{_cached_large_str_sha256(value)}"
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        return f"__bytes_sha256__:{len(raw)}:{hashlib.sha256(raw).hexdigest()}"
+    if depth >= 16:
+        return clean_text(value, 256)
+    if isinstance(value, dict):
+        return {
+            str(key): _canonicalize_digest_value(val, depth=depth + 1)
+            for key, val in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonicalize_digest_value(item, depth=depth + 1) for item in value]
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return _canonicalize_digest_value(
+            model_dump(mode="json", exclude_none=True),
+            depth=depth + 1,
+        )
+    if is_dataclass(value) and not isinstance(value, type):
+        return _canonicalize_digest_value(
+            {f.name: getattr(value, f.name) for f in value.__dataclass_fields__.values()},
+            depth=depth + 1,
+        )
+    if hasattr(value, "__dict__"):
+        return _canonicalize_digest_value(
+            {k: v for k, v in vars(value).items() if not str(k).startswith("_")},
+            depth=depth + 1,
+        )
+    text = str(value)
+    if _is_large_or_data_uri(text):
+        return f"__sha256__:{len(text)}:{_cached_large_str_sha256(text)}"
+    return text
+
+
+def _canonical_history_digest(history: Any) -> tuple[str, int]:
+    """Compute a content-sensitive SHA-256 digest of ``req.contexts`` without MB-scale JSON churn."""
+    items = history or []
+    projection: list[Any] = []
+    for item in items:
+        if isinstance(item, dict) or callable(getattr(item, "model_dump", None)):
+            projection.append(_canonicalize_digest_value(item))
+        else:
+            content = getattr(item, "content", None)
+            if isinstance(content, (list, tuple, dict)) or callable(getattr(content, "model_dump", None)):
+                content_val = _canonicalize_digest_value(content)
+            else:
+                content_val = _canonicalize_digest_value(_plain_request_text(item))
+            projection.append(
+                {
+                    "role": _canonicalize_digest_value(getattr(item, "role", "")),
+                    "content": content_val,
+                }
+            )
+    payload = json.dumps(
+        projection,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    ).encode("utf-8", errors="surrogatepass")
+    return hashlib.sha256(payload).hexdigest(), len(projection)
 _USER_MEMORY_PROFILE_TYPES = frozenset({"user_profile", "user_habit", "manual_memory"})
 _USER_MEMORY_PREFERENCE_TYPES = frozenset({"user_preference"})
 _USER_MEMORY_RELATIONSHIP_TYPES = frozenset({"relationship_claim", "relationship_phase_summary"})
@@ -444,6 +564,8 @@ class MemoryCompanionService:
         self.reply_chain = ReplyChainResolver()
         self.intent_builder = RetrievalIntentBuilder()
         self._query_vector_cache: dict[Any, tuple[float, list[float]]] = {}
+        self._rerank_circuit_breaker = RerankCircuitBreaker()
+        self._hook_persistence_tasks: set[asyncio.Task[Any]] = set()
         self.classifier = MemoryClassifier(
             capture_min_chars=self.config.int("memory_capture.capture_min_chars", 2)
         )
@@ -4032,7 +4154,7 @@ class MemoryCompanionService:
                 break
         return open_loops
 
-    async def _detect_and_queue_emotional_events(
+    def _collect_and_queue_emotional_events(
         self,
         ctx: SessionContext,
         results: list[Any],
@@ -4040,10 +4162,10 @@ class MemoryCompanionService:
         companion_bot_mood: str = "",
         companion_bot_energy: float = 0.0,
         emotional_tone: str = "neutral",
-    ) -> None:
-        """Detect emotional signals from recalled memories and queue drift events for the companion plugin."""
+    ) -> list[dict[str, Any]]:
+        """Detect emotional signals from recalled memories, queue them in memory, and return fresh events."""
         if not results:
-            return
+            return []
         now = time.time()
         events: list[dict[str, Any]] = []
         for item in results:
@@ -4125,18 +4247,37 @@ class MemoryCompanionService:
             })
             events.append(event)
         if not events:
-            return
+            return []
         self._cleanup_emotional_event_queue(now=now)
         queue = self._emotional_event_queue.setdefault(ctx.session_id, [])
         existing_ids = {clean_text(item.get("id"), 80) for item in queue if isinstance(item, dict)}
         fresh_events = [event for event in events if clean_text(event.get("id"), 80) not in existing_ids]
         queue.extend(fresh_events)
-        for event in fresh_events:
-            await self.store.upsert_emotion_event(event)
         # Trim old events
         queue[:] = [e for e in queue if (now - e.get("ts", 0)) < self._EMOTIONAL_EVENT_TTL]
         if len(queue) > self._EMOTIONAL_EVENT_MAX_PER_SESSION:
             queue[:] = queue[-self._EMOTIONAL_EVENT_MAX_PER_SESSION:]
+        return fresh_events
+
+    async def _detect_and_queue_emotional_events(
+        self,
+        ctx: SessionContext,
+        results: list[Any],
+        *,
+        companion_bot_mood: str = "",
+        companion_bot_energy: float = 0.0,
+        emotional_tone: str = "neutral",
+    ) -> None:
+        """Detect emotional signals from recalled memories and persist drift events."""
+        fresh_events = self._collect_and_queue_emotional_events(
+            ctx,
+            results,
+            companion_bot_mood=companion_bot_mood,
+            companion_bot_energy=companion_bot_energy,
+            emotional_tone=emotional_tone,
+        )
+        for event in fresh_events:
+            await self.store.upsert_emotion_event(event)
 
     def _cleanup_emotional_event_queue(self, *, now: float | None = None) -> None:
         """Drop expired session buckets so long-lived processes do not retain old keys."""
@@ -4651,6 +4792,7 @@ class MemoryCompanionService:
             rerank_timeout_ms=bounded_model_call_timeout_ms(
                 self.config.int("retrieval.rerank_timeout_ms", MAX_MODEL_CALL_TIMEOUT_MS)
             ),
+            rerank_circuit_breaker=self._configured_rerank_circuit_breaker(),
             latency_budget_ms=self.config.int("retrieval_advanced.recall_latency_budget_ms", 0),
             query_vector_cache_ttl_seconds=self.config.float(
                 "retrieval_advanced.query_vector_cache_ttl_seconds", 0.0
@@ -5310,6 +5452,120 @@ class MemoryCompanionService:
 
         task.add_done_callback(_done)
         return task
+
+    def _configured_rerank_circuit_breaker(self) -> RerankCircuitBreaker:
+        threshold = self.config.int("retrieval_advanced.rerank_failure_cooldown_threshold", 2)
+        if threshold < 0:
+            threshold = 2
+        cooldown_raw = self.config.float("retrieval_advanced.rerank_failure_cooldown_seconds", 60.0)
+        if not math.isfinite(cooldown_raw) or cooldown_raw <= 0.0:
+            cooldown = 60.0
+        else:
+            cooldown = max(5.0, min(600.0, cooldown_raw))
+        breaker = self.__dict__.get("_rerank_circuit_breaker")
+        if not isinstance(breaker, RerankCircuitBreaker):
+            breaker = RerankCircuitBreaker(
+                failure_threshold=threshold,
+                cooldown_seconds=cooldown,
+            )
+            self._rerank_circuit_breaker = breaker
+        else:
+            breaker.configure(failure_threshold=threshold, cooldown_seconds=cooldown)
+        return breaker
+
+    def schedule_startup_vector_warmup(self, *, settle_seconds: float = 0.5) -> bool:
+        """Schedule background vector corpus warmup right after initialization without API calls."""
+        if getattr(self, "_closing", False) or getattr(self, "_closed", False):
+            return False
+        if not self.config.bool("retrieval.embedding_enabled", False):
+            return False
+        if not self.config.bool("retrieval_advanced.startup_vector_warmup_enabled", True):
+            return False
+        self.store.vector_snapshot_cache_bytes = bounded_cache_bytes(
+            self.config.int("retrieval_advanced.vector_snapshot_cache_mb", 512)
+        )
+        provider_id = clean_text(self.config.get("retrieval.embedding_provider_id", ""), 160)
+        include_pending = not self.config.bool("visibility.hide_pending_review", True)
+        max_text_chars = max(200, int(self.config.int("retrieval.embedding_max_text_chars", 1200) or 1200))
+        batch_size = max(1, int(self.config.int("retrieval.embedding_candidate_limit", 1200) or 1200))
+        scheduler = getattr(self.store, "schedule_startup_vector_corpus_warmup", None)
+        if not callable(scheduler):
+            return False
+        return bool(
+            scheduler(
+                provider_id=provider_id,
+                include_pending=include_pending,
+                batch_size=batch_size,
+                max_text_chars=max_text_chars,
+                settle_seconds=settle_seconds,
+            )
+        )
+
+    def _enqueue_hook_persistence(
+        self,
+        coro: Any,
+        *,
+        label: str = "hook-persist",
+    ) -> asyncio.Task[Any] | None:
+        """Run non-prompt post-injection SQLite writes asynchronously and track for flush."""
+        if getattr(self, "_closing", False) or getattr(self, "_closed", False):
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            return None
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(coro, name=f"memory_companion:{label}")
+        except RuntimeError:
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            return None
+        tasks = self.__dict__.get("_hook_persistence_tasks")
+        if not isinstance(tasks, set):
+            tasks = set()
+            self._hook_persistence_tasks = tasks
+        tasks.add(task)
+
+        def _done(done_task: asyncio.Task[Any]) -> None:
+            tasks.discard(done_task)
+            if done_task.cancelled():
+                return
+            try:
+                exc = done_task.exception()
+            except Exception as error:
+                logger.warning("[MemoryCompanion] 钩子后置持久化状态读取失败: %s error=%s", label, error)
+                return
+            if exc:
+                logger.warning("[MemoryCompanion] 钩子后置持久化异常: %s error=%s", label, exc)
+
+        task.add_done_callback(_done)
+        return task
+
+    async def flush_hook_persistence(self) -> None:
+        """Wait for all queued post-injection SQLite persistence tasks to finish."""
+        while True:
+            tasks = self.__dict__.get("_hook_persistence_tasks")
+            if not isinstance(tasks, set) or not tasks:
+                return
+            pending = [t for t in list(tasks) if not t.done()]
+            if not pending:
+                tasks.clear()
+                return
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _persist_post_injection_bookkeeping(
+        self,
+        emotion_events: list[dict[str, Any]],
+        injection_log_kwargs: dict[str, Any] | None,
+    ) -> None:
+        for emotion_event in emotion_events:
+            try:
+                await self.store.upsert_emotion_event(emotion_event)
+            except Exception as exc:
+                logger.warning("[MemoryCompanion] 钩子后置情绪事件持久化异常: error=%s", exc)
+        if injection_log_kwargs is not None:
+            await self.store.add_injection_log(**injection_log_kwargs)
 
     def _schedule_memory_embedding(self, memory_id: str, record: MemoryRecord | None = None) -> None:
         if not self.config.bool("retrieval.embedding_enabled", False):
@@ -11448,15 +11704,18 @@ class MemoryCompanionService:
                     strategy_id="existing.core_and_recent_context",
                 )
             if self.config.bool("memory_injection.enable_injection_logs", True):
-                await self.store.add_injection_log(
-                    session_id=ctx.session_id,
-                    scope=ctx.scope,
-                    query="",
-                    selected_memory_ids=actual_injected_memory_ids if published else [],
-                    blocked_reasons=blocked,
-                    injection_chars=len(injection) if published else 0,
-                    user_id=ctx.user_id,
-                    bot_id=ctx.bot_id,
+                self._enqueue_hook_persistence(
+                    self.store.add_injection_log(
+                        session_id=ctx.session_id,
+                        scope=ctx.scope,
+                        query="",
+                        selected_memory_ids=actual_injected_memory_ids if published else [],
+                        blocked_reasons=blocked,
+                        injection_chars=len(injection) if published else 0,
+                        user_id=ctx.user_id,
+                        bot_id=ctx.bot_id,
+                    ),
+                    label="injection-log-empty-query",
                 )
             return
         blocked: list[dict[str, Any]] = []
@@ -11610,8 +11869,9 @@ class MemoryCompanionService:
             slot_map,
             recent_fact_context=(recent_fact_context if "<recent_fact_context>" in injection else ""),
         )
-        await self._detect_and_queue_emotional_events(
-            ctx, results,
+        pending_emotion_events = self._collect_and_queue_emotional_events(
+            ctx,
+            results,
             companion_bot_mood=_bot_mood,
             companion_bot_energy=_bot_energy,
             emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"),
@@ -11646,21 +11906,27 @@ class MemoryCompanionService:
             reason = self._memory_companion_injection_payload(req).get("reason_code")
             if reason:
                 blocked.append({"id": "", "reason": reason, "content": ""})
+        log_kwargs: dict[str, Any] | None = None
         if self.config.bool("memory_injection.enable_injection_logs", True):
-            await self.store.add_injection_log(
-                session_id=ctx.session_id,
-                scope=ctx.scope,
-                query=intent.query,
-                selected_memory_ids=actual_injected_memory_ids if published else [],
-                blocked_reasons=blocked[:30],
-                injection_chars=len(injection) if published else 0,
-                retrieval_info={
+            log_kwargs = {
+                "session_id": ctx.session_id,
+                "scope": ctx.scope,
+                "query": intent.query,
+                "selected_memory_ids": actual_injected_memory_ids if published else [],
+                "blocked_reasons": blocked[:30],
+                "injection_chars": len(injection) if published else 0,
+                "retrieval_info": {
                     "slot_counts": retrieval_path_info.get("slot_counts", {}),
                     "slot_limits": retrieval_path_info.get("slot_limits", {}),
                     "capped_slots": retrieval_path_info.get("capped_slots", []),
                 },
-                user_id=ctx.user_id,
-                bot_id=ctx.bot_id,
+                "user_id": ctx.user_id,
+                "bot_id": ctx.bot_id,
+            }
+        if pending_emotion_events or log_kwargs is not None:
+            self._enqueue_hook_persistence(
+                self._persist_post_injection_bookkeeping(pending_emotion_events, log_kwargs),
+                label="post-injection-bookkeeping",
             )
         if stage_timer:
             stage_timer.mark("compose_log")
@@ -11759,17 +12025,7 @@ class MemoryCompanionService:
             logger.info("[MemoryCompanion] 本轮记忆依据已变化或不可用，继续使用当前对话: session=%s", ctx.session_id)
             return False
         history = getattr(req, "contexts", None) or []
-        history_projection = []
-        for item in history:
-            if isinstance(item, dict):
-                history_projection.append(item)
-            elif callable(getattr(item, "model_dump", None)):
-                history_projection.append(item.model_dump(mode="json", exclude_none=True))
-            else:
-                history_projection.append({"role": getattr(item, "role", ""), "content": _plain_request_text(item)})
-        history_digest = hashlib.sha256(json.dumps(
-            history_projection, ensure_ascii=False, sort_keys=True, default=str,
-        ).encode("utf-8")).hexdigest()
+        history_digest, history_count = _canonical_history_digest(history)
         immediate_refs = [f"history:{history_digest}"]
         if ctx.message_id:
             immediate_refs.append(f"message:{ctx.message_id}")
@@ -11782,7 +12038,7 @@ class MemoryCompanionService:
                 "strategy_id": strategy_id,
                 "mode": "existing_temporal" if slot_map.get("time_window_timeline") else "relevant",
                 "complete": False,
-                "available_history_items": len(history_projection),
+                "available_history_items": history_count,
                 "recent_fact_context": "<recent_fact_context>" in injection,
                 "recent_cross_window_context": "<recent_cross_window_context>" in injection,
                 "memory_refs_revalidated": True,
@@ -11822,7 +12078,14 @@ class MemoryCompanionService:
                 role_sources.published(ctx, req, event, injection, refs, timeline_reads, role_before)
             except Exception as exc:
                 logger.warning("[MemoryCompanion] Role input receipt unavailable: %s", type(exc).__name__)
-        await self._mark_injected_memories([ref["id"] for ref in refs])
+        injected_ids = [ref["id"] for ref in refs]
+        if "_mark_injected_memories" in self.__dict__:
+            await self._mark_injected_memories(injected_ids)
+        elif injected_ids:
+            self._enqueue_hook_persistence(
+                self._mark_injected_memories(injected_ids),
+                label="mark-injected",
+            )
         info = retrieval_info or {}
         logger.info(
             "[MemoryCompanion] 已注入当前轮记忆: session=%s snapshot=%s count=%s chars=%s slots=%s limits=%s capped=%s",
@@ -15373,6 +15636,15 @@ class MemoryCompanionService:
             result[slot] = gated
         return result
 
+    def _cancel_hook_persistence_tasks(self) -> None:
+        hook_tasks = self.__dict__.get("_hook_persistence_tasks")
+        if not isinstance(hook_tasks, set):
+            return
+        for task in list(hook_tasks):
+            if not task.done():
+                task.cancel()
+        hook_tasks.clear()
+
     def close(self) -> None:
         if self._closed:
             return
@@ -15380,6 +15652,10 @@ class MemoryCompanionService:
         for task in list(self._background_tasks):
             task.cancel()
         self._background_tasks.clear()
+        cancel_warmup = getattr(self.store, "_cancel_vector_warmup_tasks", None)
+        if callable(cancel_warmup):
+            cancel_warmup()
+        self._cancel_hook_persistence_tasks()
         for task in list(self._summary_workers.values()):
             task.cancel()
         self._summary_workers.clear()
@@ -15392,6 +15668,7 @@ class MemoryCompanionService:
         except Exception as exc:
             logger.warning("[MemoryCompanion] 关闭记忆库连接失败: %s", exc, exc_info=True)
         finally:
+            _clear_large_str_digest_cache()
             self._closed = True
 
     def _existing_json_writers(self) -> tuple[BackgroundJsonWriter, ...]:
@@ -15467,6 +15744,11 @@ class MemoryCompanionService:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._background_tasks.clear()
+        cancel_warmup = getattr(self.store, "_cancel_vector_warmup_tasks", None)
+        warmup_tasks = list(cancel_warmup() or []) if callable(cancel_warmup) else []
+        if warmup_tasks:
+            await asyncio.gather(*warmup_tasks, return_exceptions=True)
+        await self.flush_hook_persistence()
         # Summary workers are tracked separately from _background_tasks.
         # Cancel and await them before closing SQLite connections.
         summary_tasks = [
@@ -15488,6 +15770,7 @@ class MemoryCompanionService:
         except Exception as exc:
             logger.warning("[MemoryCompanion] 关闭记忆库连接失败: %s", exc, exc_info=True)
         finally:
+            _clear_large_str_digest_cache()
             self._closed = True
 
     def _reset_stores_after_failed_initialize(self) -> None:

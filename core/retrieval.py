@@ -8,6 +8,7 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
 from typing import Any
 
 from .identity import session_target_id
@@ -44,6 +45,117 @@ def _ascii_word_pattern(term: str) -> re.Pattern[str]:
     return re.compile(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])")
 
 
+@dataclass(slots=True)
+class _BreakerState:
+    consecutive_failures: int = 0
+    open_until: float = 0.0
+    half_open_in_flight: bool = False
+
+
+class RerankCircuitBreaker:
+    """Thread-safe per-provider circuit breaker for failing/timing-out rerank providers.
+
+    Tracks consecutive transport/timeout/provider exceptions across per-turn
+    ``RetrievalEngine`` instances. Once ``failure_threshold`` consecutive failures
+    occur, subsequent requests skip the rerank call for ``cooldown_seconds`` with
+    reason ``rerank_circuit_open``, then allow a single half-open probe.
+    """
+
+    @staticmethod
+    def _normalize_threshold(value: Any) -> int:
+        if isinstance(value, bool):
+            return 0
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    @staticmethod
+    def _normalize_cooldown(value: Any) -> float:
+        if isinstance(value, bool):
+            return 0.0
+        try:
+            cooldown = float(value or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        if not math.isfinite(cooldown) or cooldown <= 0.0:
+            return 0.0
+        return cooldown
+
+    def __init__(
+        self,
+        *,
+        failure_threshold: int = 2,
+        cooldown_seconds: float = 60.0,
+    ) -> None:
+        self._lock = threading.Lock()
+        self.failure_threshold = self._normalize_threshold(failure_threshold)
+        self.cooldown_seconds = self._normalize_cooldown(cooldown_seconds)
+        self._states: dict[str, _BreakerState] = {}
+
+    def configure(self, *, failure_threshold: int, cooldown_seconds: float) -> None:
+        """Update breaker thresholds dynamically without dropping active state."""
+        with self._lock:
+            self.failure_threshold = self._normalize_threshold(failure_threshold)
+            self.cooldown_seconds = self._normalize_cooldown(cooldown_seconds)
+            if self.failure_threshold <= 0 or self.cooldown_seconds <= 0.0:
+                self._states.clear()
+
+    def allow_request(self, provider_id: str, *, now: float | None = None) -> tuple[bool, bool]:
+        """Return ``(allowed, is_half_open_probe)`` for ``provider_id``."""
+        key = clean_text(provider_id, 160) or "<auto>"
+        current = time.monotonic() if now is None else float(now)
+        with self._lock:
+            if self.failure_threshold <= 0 or self.cooldown_seconds <= 0.0:
+                return True, False
+            state = self._states.get(key)
+            if state is None or state.open_until <= 0.0:
+                return True, False
+            if current < state.open_until:
+                return False, False
+            if state.half_open_in_flight:
+                return False, False
+            state.half_open_in_flight = True
+            return True, True
+
+    def record_success(self, provider_id: str) -> None:
+        """Reset failure count and close the circuit after a successful response."""
+        key = clean_text(provider_id, 160) or "<auto>"
+        with self._lock:
+            self._states.pop(key, None)
+
+    def record_failure(
+        self,
+        provider_id: str,
+        *,
+        is_probe: bool = False,
+        now: float | None = None,
+    ) -> None:
+        """Record a transport/timeout/provider exception and trip cooldown when needed."""
+        key = clean_text(provider_id, 160) or "<auto>"
+        current = time.monotonic() if now is None else float(now)
+        with self._lock:
+            if self.failure_threshold <= 0 or self.cooldown_seconds <= 0.0:
+                self._states.pop(key, None)
+                return
+            state = self._states.get(key)
+            if state is None:
+                state = _BreakerState()
+                self._states[key] = state
+            state.half_open_in_flight = False
+            state.consecutive_failures += 1
+            if is_probe or state.consecutive_failures >= self.failure_threshold:
+                state.open_until = current + self.cooldown_seconds
+
+    def release_probe(self, provider_id: str) -> None:
+        """Release an aborted half-open probe without counting cancellation as a failure."""
+        key = clean_text(provider_id, 160) or "<auto>"
+        with self._lock:
+            state = self._states.get(key)
+            if state is not None:
+                state.half_open_in_flight = False
+
+
 class RetrievalEngine:
     DEFAULT_MATERIALIZE_LIMIT = 2000
     # Recall sources that were selected because of the query itself. The
@@ -61,6 +173,7 @@ class RetrievalEngine:
         rerank_candidate_multiplier: int = 5,
         rerank_candidate_limit: int = 32,
         rerank_timeout_ms: int = MAX_MODEL_CALL_TIMEOUT_MS,
+        rerank_circuit_breaker: RerankCircuitBreaker | None = None,
         latency_budget_ms: int = 0,
         query_vector_cache_ttl_seconds: float = 0.0,
         query_vector_cache: dict[Any, tuple[float, list[float]]] | None = None,
@@ -100,6 +213,7 @@ class RetrievalEngine:
         self.rerank_candidate_multiplier = max(1, int(rerank_candidate_multiplier or 5))
         self.rerank_candidate_limit = max(1, int(rerank_candidate_limit or 32))
         self.rerank_timeout_ms = bounded_model_call_timeout_ms(rerank_timeout_ms)
+        self.rerank_circuit_breaker = rerank_circuit_breaker
         # A latency budget is spent on optional model calls, never on results.
         # Lowering top_k to go faster removes exactly the context this plugin
         # exists to supply, so the speed has to come from somewhere else.
@@ -610,10 +724,35 @@ class RetrievalEngine:
                 **self._rank_path_info,
             }
             return ranked
+        breaker = getattr(self, "rerank_circuit_breaker", None)
+        provider_key = self.rerank_provider_id or "<auto>"
+        is_probe = False
+        if breaker is not None:
+            allowed, is_probe = breaker.allow_request(provider_key)
+            if not allowed:
+                self.last_path_info = {
+                    "mode": self.retrieval_mode,
+                    "path": "fallback_basic",
+                    "provider_id": self.rerank_provider_id,
+                    "reason": "rerank_circuit_open",
+                    "candidate_count": len(ranked),
+                    "rerank_pool": len(rerank_pool),
+                    "rerank_filtered": filtered_count,
+                    **request_shape,
+                    **self._rank_path_info,
+                }
+                return ranked
+        probe_settled = False
         try:
             rerank_resp = await self._call_rerank_provider(query_text, documents)
             reranked = self._apply_rerank_response(rerank_resp, rerank_pool)
+            if breaker is not None:
+                breaker.record_success(provider_key)
+                probe_settled = True
         except Exception as error:
+            if breaker is not None:
+                breaker.record_failure(provider_key, is_probe=is_probe)
+                probe_settled = True
             self.last_path_info = {
                 "mode": self.retrieval_mode,
                 "path": "fallback_basic",
@@ -628,6 +767,9 @@ class RetrievalEngine:
                 **self._rank_path_info,
             }
             return ranked
+        finally:
+            if breaker is not None and is_probe and not probe_settled:
+                breaker.release_probe(provider_key)
 
         if not reranked:
             self.last_path_info = {
@@ -976,7 +1118,7 @@ class RetrievalEngine:
             success = True
             return resp
         except Exception as exc:
-            error = str(exc)
+            error = clean_text(str(exc), 200) or type(exc).__name__
             raise
         finally:
             elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
@@ -1551,6 +1693,19 @@ class RetrievalEngine:
                 bundle_error_type = type(error).__name__
                 return None
 
+        acl_revision_before: str | None = None
+        if self.policy.enable_acl_rules:
+            if self.embedding_enabled:
+                acl_rev_fn = getattr(self.store, "acl_revision", None)
+                mem_rev_fn = getattr(self.store, "memory_revision", None)
+                if callable(acl_rev_fn):
+                    acl_revision_before = await acl_rev_fn()
+                elif callable(mem_rev_fn):
+                    acl_revision_before = await mem_rev_fn()
+            acl_state = await self._acl_state()
+        else:
+            acl_state = self._empty_acl_state()
+
         # A local read failure must not restart the concurrent model request.
         # Keep its one bounded attempt and fall back only the failed source.
         bundle, vector_result = await asyncio.gather(
@@ -1560,6 +1715,8 @@ class RetrievalEngine:
                 ctx,
                 include_pending=include_pending,
                 time_intent=time_intent,
+                acl_state=acl_state,
+                acl_revision=acl_revision_before,
             ),
         )
         if bundle is not None:
@@ -1636,7 +1793,6 @@ class RetrievalEngine:
                 "keyword_candidates": len(keyword_candidates),
             }
         )
-        acl_state = await self._acl_state() if self.policy.enable_acl_rules else self._empty_acl_state()
         block_profile_retrieval = self._query_blocks_profile_retrieval(query)
         # 召回不再只看「像不像」：谁在她心里重，谁的旧事就更容易被想起。
         person_strengths: dict[str, float] = {}
@@ -1892,6 +2048,8 @@ class RetrievalEngine:
         *,
         include_pending: bool,
         time_intent: TimeIntent | None = None,
+        acl_state: dict[str, object] | None = None,
+        acl_revision: str | None = None,
     ) -> tuple[list[MemoryRecord], dict[str, float], dict[str, Any]]:
         info: dict[str, Any] = {
             "embedding_enabled": bool(self.embedding_enabled),
@@ -1957,14 +2115,34 @@ class RetrievalEngine:
 
         # A data/ACL race retries once with current authorization and the same
         # query vector. No second provider request, no importance-based fallback.
+        acl_rev_fn = getattr(self.store, "acl_revision", None)
         for attempt in range(2):
             try:
                 revision = await self.store.memory_revision()
-                acl_state = await self._acl_state() if self.policy.enable_acl_rules else self._empty_acl_state()
+                reuse_acl = False
+                if attempt == 0 and acl_state is not None:
+                    if not self.policy.enable_acl_rules:
+                        reuse_acl = True
+                    elif acl_revision is not None:
+                        current_acl_rev = (
+                            await acl_rev_fn() if callable(acl_rev_fn) else revision
+                        )
+                        reuse_acl = current_acl_rev == acl_revision
+                if reuse_acl:
+                    current_acl_state = acl_state
+                else:
+                    current_acl_state = (
+                        await self._acl_state()
+                        if self.policy.enable_acl_rules
+                        else self._empty_acl_state()
+                    )
+                    if acl_state is not None:
+                        acl_state.clear()
+                        acl_state.update(current_acl_state)
                 selection_time = datetime.now(timezone.utc)
 
                 def eligible(memory: MemoryRecord) -> bool:
-                    visible, blocked = self._search_visibility_reason(memory, ctx, acl_state)
+                    visible, blocked = self._search_visibility_reason(memory, ctx, current_acl_state)
                     return bool(
                         visible and not blocked
                         and evaluate_memory_lifecycle(memory, ctx, now=selection_time).eligible
