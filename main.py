@@ -18,6 +18,7 @@ from .core.companion_linkage import CompanionMemoryLinkage
 from .core.models import json_dumps
 from .core.event_query import bind_event_tool_schema
 from .core.latency import (
+    MAX_HOOK_MODEL_CALL_WAIT_SECONDS,
     MAX_MEMORY_HOOK_BUDGET_SECONDS,
     await_with_memory_hook_budget,
     bounded_memory_hook_budget_seconds,
@@ -301,6 +302,7 @@ class MemoryCompanionPlugin(Star):
             await await_with_memory_hook_budget(
                 initialize_and_handle_request(),
                 budget,
+                max_model_call_wait_seconds=MAX_HOOK_MODEL_CALL_WAIT_SECONDS,
             )
         except asyncio.TimeoutError:
             logger.warning(

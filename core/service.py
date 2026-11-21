@@ -121,6 +121,7 @@ from .latency import (
     MAX_MODEL_CALL_TIMEOUT_MS,
     await_with_timeout,
     bounded_model_call_timeout_ms,
+    detach_memory_hook_budget,
 )
 from .retrieval import RetrievalEngine
 from .store import MemoryStore
@@ -2275,7 +2276,7 @@ class MemoryCompanionService:
                                 "[MemoryCompanion] 自动消化完成: session=%s memory=%s", session_id, memory_id
                             )
                         else:
-                            logger.info(
+                            logger.debug(
                                 "[MemoryCompanion] 自动消化跳过: session=%s",
                                 session_id,
                             )
@@ -5190,7 +5191,8 @@ class MemoryCompanionService:
                 close()
             return None
         try:
-            task = loop.create_task(coro, name=f"memory_companion:{label}")
+            with detach_memory_hook_budget():
+                task = loop.create_task(coro, name=f"memory_companion:{label}")
         except RuntimeError:
             close = getattr(coro, "close", None)
             if callable(close):
@@ -5271,7 +5273,8 @@ class MemoryCompanionService:
 
                 coro = _deferred_background()
         try:
-            task = asyncio.create_task(coro, name=f"memory_companion:{label}")
+            with detach_memory_hook_budget():
+                task = asyncio.create_task(coro, name=f"memory_companion:{label}")
         except RuntimeError:
             close = getattr(coro, "close", None)
             if callable(close):
