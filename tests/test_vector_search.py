@@ -204,7 +204,7 @@ class VectorSearchTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(warm_info["embedding_cache_hit"])
             self.assertGreater(warm_info["embedding_reread_rows"], 0)
 
-    async def test_explicit_time_window_enters_cache_key_and_filters_before_topk(self):
+    async def test_explicit_time_window_reuses_snapshot_and_filters_before_topk(self):
         self.seed([(self.record("outside", occurred_at="2025-01-01T00:00:00+00:00"), [1., 0.]),
                    (self.record("inside", occurred_at="2025-06-01T00:00:00+00:00",
                                 created_at="2025-06-01T00:00:00+00:00", updated_at="2025-06-01T00:00:00+00:00"), [.8, .6])])
@@ -213,7 +213,8 @@ class VectorSearchTests(unittest.IsolatedAsyncioTestCase):
         result = await self.engine._embedding_candidate_memories("那次临时换了交通方式为什么晚到", self.ctx,
                                                                  include_pending=False, time_intent=window)
         self.assertEqual(["inside"], [m.id for m in result[0]])
-        self.assertFalse(result[2]["embedding_cache_hit"])
+        self.assertTrue(result[2]["embedding_cache_hit"])
+        self.assertEqual(0, result[2]["embedding_scanned_rows"])
 
     async def test_provider_dimension_changes_and_read_only_store(self):
         self.seed([(self.record("item"), [1., 0.])])

@@ -31,9 +31,16 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
 
 
+_PERSON_ID_RE = re.compile(r"person_[0-9a-f]{24}")
+
+
 def clean_text(value: Any, limit: int = 2000) -> str:
-    text = "" if value is None else str(value)
-    text = re.sub(r"\s+", " ", text.replace("\u3000", " ")).strip()
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else str(value)
+    if not text:
+        return ""
+    text = " ".join(text.split())
     if len(text) > limit:
         return text[: max(0, limit - 1)].rstrip() + "…"
     return text
@@ -42,13 +49,13 @@ def clean_text(value: Any, limit: int = 2000) -> str:
 def normalize_explicit_person_binding(person_id: Any, identity_assurance: Any) -> tuple[str, str]:
     normalized_id = clean_text(person_id, 80)
     assurance = clean_text(identity_assurance, 40)
-    if assurance != "explicit_linked" or re.fullmatch(r"person_[0-9a-f]{24}", normalized_id) is None:
+    if assurance != "explicit_linked" or _PERSON_ID_RE.fullmatch(normalized_id) is None:
         return "", ""
     return normalized_id, assurance
 
 
 def is_valid_person_id(person_id: Any) -> bool:
-    return re.fullmatch(r"person_[0-9a-f]{24}", clean_text(person_id, 80)) is not None
+    return _PERSON_ID_RE.fullmatch(clean_text(person_id, 80)) is not None
 
 
 def is_memory_placeholder(memory: Any) -> bool:
