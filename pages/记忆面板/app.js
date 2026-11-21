@@ -3261,7 +3261,7 @@ defineView("migrate", {
       },
       {
         title: "7. 汇总批次释放",
-        desc: "被证据门禁隔离的批次会永远持有其时间线事件，那些原文不会再进入任何后续批次。填批次 ID 后由人工复核决定：重新排队（事件交还，可被新批次消费）或放弃（承认丢失，不再悬空）。",
+        desc: "被证据门禁隔离的批次会永远持有其时间线事件，那些原文不会再进入任何后续批次。填批次 ID 后由人工复核决定：重新排队（事件交还，可被新批次消费）或放弃（永久删除原文，无法通过重新排队恢复）。",
         input: "releaseBatchId",
         placeholder: "sb_... 批次 ID",
         actions: [
@@ -3375,7 +3375,7 @@ defineView("migrate", {
       if (!batchId) throw new Error("请先填写批次 ID");
       const confirmed = await showInlineConfirmation(
         "放弃该批次的事件",
-        "这些原始消息将被标记为已总结，等于承认它们不会进入长期记忆。确定继续？",
+        "这些原始消息将被永久删除，不会进入长期记忆，且无法通过重新排队恢复。确定继续？",
         "放弃"
       );
       if (!confirmed) throw new Error("已取消");
@@ -3569,7 +3569,7 @@ const batchesView = (fixedTab, viewId, getOffset, setOffset) => {
           return bulkRelease("retry", "已重新排队");
         }, "全部重新排队", 800);
         bind("#qDiscardAllBtn", async () => {
-          const confirmed = await showInlineConfirmation("全部放弃", "把全部待修复批次的原文标记为已总结，等于承认它们不再进入长期记忆。确定继续？", "全部放弃");
+          const confirmed = await showInlineConfirmation("全部放弃", "全部待修复批次的原始消息将被永久删除，不会进入长期记忆，且无法通过重新排队恢复。确定继续？", "全部放弃");
           if (!confirmed) throw new Error("已取消");
           return bulkRelease("discard", "已放弃");
         }, "全部放弃", 800);
@@ -3583,7 +3583,7 @@ const batchesView = (fixedTab, viewId, getOffset, setOffset) => {
           const batchId = button.dataset.qBatch;
           if (button.dataset.qAction === "discard") {
             run("放弃批次", async () => {
-              const confirmed = await showInlineConfirmation("放弃该批次", "该批次的原文将被标记为已总结，不再进入长期记忆。确定继续？", "放弃");
+              const confirmed = await showInlineConfirmation("放弃该批次", "该批次的原始消息将被永久删除，不会进入长期记忆，且无法通过重新排队恢复。确定继续？", "放弃");
               if (!confirmed) throw new Error("已取消");
               return apiPost("/maintenance/release_summary_batches", { batch_ids: [batchId], mode: "discard" });
             });
