@@ -7319,6 +7319,11 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                         repair=repair, force=force,
                         lease_seconds=max(240, self.config.int("memory_summary.provider_timeout_seconds", 300) + 60),
                         lease_token=lease_token,
+                        preserve_lease=bool(
+                            not force
+                            and payload
+                            and self.summarizer.compose_memory_content(payload)
+                        ),
                     ):
                         break
                     round_calls += 1
