@@ -30,7 +30,7 @@ from .profile_quality import PROFILE_MEMORY_TYPES, profile_quality_decision
 
 from .store import MemoryStore
 from .time_intent import TimeIntent
-from .visibility import VisibilityPolicy, _platform_family
+from .visibility import VisibilityPolicy
 
 
 _MMR_WHITESPACE_RE = re.compile(r"\s+")
@@ -260,25 +260,16 @@ class RetrievalEngine:
             if is_memory_placeholder(memory):
                 blocked.append({"id": memory_id, "reason": "placeholder_memory", "content": ""})
                 continue
-            memory_platform = _platform_family(getattr(memory, "platform", ""))
-            current_platform = _platform_family(getattr(ctx, "platform", ""))
-            same_session = bool(
-                getattr(memory, "session_id", "")
-                and getattr(memory, "session_id", "") == getattr(ctx, "session_id", "")
-            )
             explicit_person_link = self.policy.explicit_person_link_matches(memory, ctx)
-            linked_private_user = bool(
-                memory.visibility == "private_pair"
-                and ctx.scope == "private"
-                and self.policy.is_visible(memory, ctx)[0]
-            )
-            if (
-                memory_platform and current_platform
-                and memory_platform != current_platform
-                and not same_session
-                and not explicit_person_link
-                and not linked_private_user
-            ):
+            # One question, one answer: cross-platform candidates survive only
+            # when the platform difference is backed by explicit identity
+            # evidence (see VisibilityPolicy.platform_identity_allows). The
+            # removed ``linked_private_user`` clause instead asked is_visible(),
+            # which returns True for every shareable row regardless of platform;
+            # the removed bare ``same_session`` test compared only a string the
+            # host adapter copies, so it could not distinguish a renamed adapter
+            # from a different one. Both let a foreign platform through.
+            if not self.policy.platform_identity_allows(memory, ctx):
                 blocked.append({"id": memory_id, "reason": "other_platform", "content": ""})
                 continue
             owner_visible, owner_reason = self.policy._bot_owner_visible(memory, ctx)
