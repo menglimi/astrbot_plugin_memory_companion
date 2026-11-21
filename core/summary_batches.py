@@ -16,6 +16,13 @@ class SummaryBatchStore:
 
     BUDGET_RETRY_REASON = "budget"
 
+    @staticmethod
+    def _summary_content_clause(*, unsummarized: bool = False) -> str:
+        pending = "AND t.summarized_at=''" if unsummarized else ""
+        return f"""EXISTS(SELECT 1 FROM summary_batch_events e JOIN timeline t ON t.id=e.event_id
+            WHERE e.batch_id=b.id {pending}
+              AND trim(COALESCE(t.content,''),char(9)||char(10)||char(13)||' ')<>'')"""
+
     @classmethod
     def _due_clause(cls, alias: str = "") -> str:
         """The single definition of "this batch may be dispatched now".
@@ -829,10 +836,11 @@ class SummaryBatchStore:
         """
         def read():
             with self._lock:
+                valid = self._summary_content_clause(unsummarized=True)
                 total = self._conn.execute(
                     "SELECT COUNT(*) FROM summary_batches b "
                     "WHERE b.state IN ('pending','retry_pending') "
-                    "AND EXISTS(SELECT 1 FROM summary_batch_events e WHERE e.batch_id=b.id)"
+                    f"AND {valid}"
                 ).fetchone()[0]
                 rows = self._conn.execute(
                     "SELECT b.id, b.session_id, b.scope, b.automatic_calls, b.repair_used, "
@@ -840,7 +848,7 @@ class SummaryBatchStore:
                     "(SELECT COUNT(*) FROM summary_batch_events e WHERE e.batch_id=b.id) AS event_count "
                     "FROM summary_batches b "
                     "WHERE b.state IN ('pending','retry_pending') "
-                    "AND EXISTS(SELECT 1 FROM summary_batch_events e WHERE e.batch_id=b.id) "
+                    f"AND {valid} "
                     "ORDER BY b.updated_at DESC, b.id LIMIT ? OFFSET ?",
                     (max(1, int(limit)), max(0, int(offset)))).fetchall()
                 return {
@@ -1042,4 +1050,60 @@ class SummaryBatchStore:
                         'legacy_failures': int(legacy or 0),
                         'frozen_events': int(frozen or 0),
                         'no_memory_batches': counts.get('no_memory', 0)}
+        return await asyncio.to_thread(read)
+
+    async def summary_status_snapshot(self, *, max_events: int) -> dict[str, Any]:
+        """Internal read-only snapshot; source identity never crosses the page API.
+
+        Read the queue, ownership and call ledger under one store lock. Do not
+        create batches, migrate failures, reserve calls or advance retry times.
+        """
+        def read():
+            with self._lock:
+                meaningful = "trim(COALESCE(t.content,''),char(9)||char(10)||char(13)||' ')<>''"
+                active = f"b.state IN ('pending','retry_pending') AND {self._summary_content_clause(unsummarized=True)}"
+                batches = [dict(row) for row in self._conn.execute(f"""
+                    SELECT b.*, {self._due_clause('b')} AS due
+                    FROM summary_batches b WHERE {active} ORDER BY b.created_at,b.id
+                    """, self._due_params()).fetchall()]
+                by_batch = {batch['id']: [] for batch in batches}
+                for row in self._conn.execute(f"""
+                    SELECT e.batch_id,t.id,t.event_type,t.session_id,t.scope,
+                           t.subject_id,t.object_id,t.metadata
+                    FROM summary_batch_events e JOIN timeline t ON t.id=e.event_id
+                    JOIN summary_batches b ON b.id=e.batch_id WHERE {active}
+                    ORDER BY e.batch_id,t.created_at,t.id
+                    """).fetchall():
+                    by_batch[row['batch_id']].append(dict(row))
+                cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec='seconds')
+                budgets = {row['session_id']: int(row['calls']) for row in self._conn.execute("""
+                    SELECT session_id,COUNT(*) AS calls FROM summary_batch_calls
+                    WHERE automatic=1 AND attempted_at>? GROUP BY session_id
+                    """, (cutoff,)).fetchall()}
+                originals = {}
+                for row in self._conn.execute(f"""
+                    SELECT t.id,t.event_type,t.session_id,t.scope,t.subject_id,t.object_id,
+                           t.metadata,t.occurred_at,t.created_at
+                    FROM timeline t WHERE t.summarized_at='' AND {meaningful}
+                      AND NOT EXISTS(SELECT 1 FROM summary_batch_events e WHERE e.event_id=t.id)
+                    ORDER BY COALESCE(julianday(NULLIF(t.occurred_at,'')),
+                        julianday(NULLIF(t.created_at,'')),0),t.created_at,t.id
+                    """).fetchall():
+                    key = (row['session_id'], row['scope'])
+                    window = originals.setdefault(key, {'total': 0, 'first_occurred_at': row['occurred_at'] or row['created_at'], 'rows': []})
+                    window['total'] += 1
+                    if len(window['rows']) < max(1, max_events):
+                        window['rows'].append(dict(row))
+                counts = dict(self._conn.execute(f"""
+                    SELECT b.state,COUNT(*) FROM summary_batches b
+                    WHERE {self._summary_content_clause()} GROUP BY b.state
+                    """).fetchall())
+                memories = dict(self._conn.execute("""SELECT CASE WHEN review_status IN ('auto','manual')
+                        THEN 'adopted' ELSE review_status END AS status,COUNT(*) FROM memories
+                    WHERE memory_type='conversation_summary' AND lifecycle!='archived'
+                    GROUP BY status""").fetchall())
+                raw_events = self._conn.execute(f"SELECT COUNT(*) FROM timeline t WHERE {meaningful}").fetchone()[0]
+                return {'batches': batches, 'sources': by_batch, 'budgets': budgets,
+                        'originals': originals, 'counts': counts, 'memories': memories,
+                        'raw_events': int(raw_events)}
         return await asyncio.to_thread(read)

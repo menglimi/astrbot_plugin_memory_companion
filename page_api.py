@@ -349,6 +349,7 @@ UI_READ_ENDPOINTS = frozenset(
         "/maintenance/audit/preview",
         "/maintenance/audit/status",
         "/maintenance/summary_batches",
+        "/maintenance/summary_status",
         "/import/livingmemory/preview",
         "/persona-state",
         # 双方法路由：GET 只读状态，POST 才落盘，按请求方法分档。
@@ -534,6 +535,7 @@ class PluginPageApi:
             ("/maintenance/clear_scope", self.clear_scope, ["POST"], "MemoryCompanion Page clear scoped memory data"),
             ("/maintenance/release_summary_batch", self.release_summary_batch, ["POST"], "MemoryCompanion Page release quarantined summary batch"),
             ("/maintenance/summary_batches", self.summary_batches, ["GET"], "MemoryCompanion Page list quarantined summary batches"),
+            ("/maintenance/summary_status", self.summary_status, ["GET"], "MemoryCompanion Page read-only recovery waits"),
             ("/maintenance/summary_admission", self.summary_admission, ["POST"], "MemoryCompanion Page control summary admission"),
             ("/maintenance/release_summary_batches", self.release_summary_batches, ["POST"], "MemoryCompanion Page bulk release quarantined summary batches"),
             ("/import/livingmemory/preview", self.import_preview, ["GET"], "MemoryCompanion Page import preview"),
@@ -4188,6 +4190,11 @@ class PluginPageApi:
             if cleaned:
                 rows.append(f"{window} {cleaned}".strip() if window else cleaned)
         return rows
+
+    async def summary_status(self):
+        if not self._is_bound_dashboard_admin():
+            return self._admin_required_response()
+        return self._ok({"status": await self.plugin.service.summary_recovery_status()})
 
     async def summary_admission(self):
         """Operate on the live service through the existing admin/CSRF guard."""
