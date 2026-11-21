@@ -458,8 +458,22 @@ class SummaryBatchStore:
                 return [dict(row) for row in rows]
         return await asyncio.to_thread(read)
 
+    async def release_summary_budget_deferrals(self) -> None:
+        """Release pending delays that were caused only by the hourly budget."""
+        def release():
+            with self._lock, self._transaction_sync():
+                self._conn.execute(
+                    "UPDATE summary_batches SET next_retry_at=NULL,retry_reason='',updated_at=? "
+                    "WHERE state IN ('pending','retry_pending') AND retry_reason=?",
+                    (utc_now(), self.BUDGET_RETRY_REASON),
+                )
+        await asyncio.to_thread(release)
+
     async def summary_budget_available(self, session_id: str, hourly_limit: int) -> bool:
         """Cheap admission hint; reserve_summary_call remains the final authority."""
+        if hourly_limit == 0:
+            return True
+
         def read():
             cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec='seconds')
             with self._lock:
@@ -627,7 +641,7 @@ class SummaryBatchStore:
                     window = self._conn.execute('''SELECT COUNT(*),MIN(attempted_at) FROM summary_batch_calls
                         WHERE session_id=? AND automatic=1 AND attempted_at>?''',
                         (row['session_id'], (now - timedelta(hours=1)).isoformat(timespec='seconds'))).fetchone()
-                    if int(window[0] or 0) >= hourly_limit:
+                    if hourly_limit > 0 and int(window[0] or 0) >= hourly_limit:
                         # Temporary by construction: the slot opens when the
                         # oldest counted call ages out of the sliding window,
                         # so record that exact moment and never quarantine a

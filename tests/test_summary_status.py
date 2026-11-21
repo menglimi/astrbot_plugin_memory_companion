@@ -88,6 +88,17 @@ class SummaryStatusTests(unittest.IsolatedAsyncioTestCase):
                     (batch_id, self.ctx().session_id, datetime.now(timezone.utc).isoformat()),
                 )
         self.assertEqual(1, (await reason())["hourly_budget"])
+        self.config["memory_summary"]["max_calls_per_session_hour"] = 0
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        self.change(batch_id, retry_reason=self.service.store.BUDGET_RETRY_REASON, next_retry_at=future)
+        before = "\n".join(self.service.store._conn.iterdump())
+        unlimited_status = await self.service.summary_recovery_status()
+        self.assertEqual(0, unlimited_status["limits"]["calls_per_session_hour"])
+        self.assertEqual(1, unlimited_status["waits"]["runnable"])
+        self.assertEqual(0, unlimited_status["waits"]["hourly_budget"])
+        self.assertEqual(before, "\n".join(self.service.store._conn.iterdump()))
+        self.change(batch_id, retry_reason="", next_retry_at=future)
+        self.assertEqual(1, (await reason())["retry"])
 
     async def test_originals_candidates_and_blank_history_stay_separate(self):
         identity = {"platform": "qq", "owner_bot_id": "b1", "persona_id": "persona-1", "user_id": "u1"}
@@ -168,6 +179,7 @@ vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
 context.snapshot = JSON.parse(process.argv[2]);
 process.stdout.write(JSON.stringify(vm.runInContext(`({
   card: summaryRecoveryCard(snapshot),
+  unlimitedCard: summaryRecoveryCard({...snapshot, limits: {...snapshot.limits, calls_per_session_hour: 0}}),
   overview: VIEWS.overview.render({recovery: snapshot, stats: {
     summary_progress: {quarantined_batches: 987654, no_memory_batches: 987653, frozen_events: 987652}
   }})
@@ -181,6 +193,8 @@ process.stdout.write(JSON.stringify(vm.runInContext(`({
         rendered = output["card"]
         self.assertIn('class="card ', rendered)
         self.assertIn("待处理 1 批", rendered)
+        self.assertIn("每会话每小时 6 次", rendered)
+        self.assertIn("每会话每小时 不限", output["unlimitedCard"])
         self.assertIn(status["wait_labels"]["paused"], rendered)
         self.assertIn("待审候选 0 条", rendered)
         self.assertNotIn("qq:FriendMessage:u1", rendered)

@@ -843,6 +843,31 @@ class SummaryBatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
         finally:
             self.service._summary_call_semaphore.release()
 
+    async def test_unlimited_budget_releases_old_budget_deferrals(self):
+        event_id = await self.event()
+        rows = list((await self.service.store.get_timeline_by_ids([event_id])).values())
+        batch_id = await self.service.store.create_summary_batch(self.ctx.session_id, self.ctx.scope, rows)
+        self.assertTrue(await self.service.store.reserve_summary_call(batch_id, max_calls=3, hourly_limit=1))
+        await self.service.store.defer_summary_batch(batch_id, 'temporary', delay=0)
+        self.assertFalse(await self.service.store.reserve_summary_call(batch_id, max_calls=3, hourly_limit=1))
+        self.assertIsNone(await self.service.store.next_summary_batch(self.ctx.session_id))
+        self.config['memory_summary']['max_calls_per_session_hour'] = 0
+        provider = Provider([self.payload(event_id)])
+        self.use(provider)
+        self.assertTrue(await self.service.maybe_summarize_session(self.ctx))
+        self.assertEqual(1, len(provider.calls))
+        self.assertEqual('completed', (await self.service.store.get_summary_batch(batch_id))['state'])
+
+    async def test_unlimited_preserves_error_cooldown_and_batch_limit(self):
+        event_id = await self.event()
+        rows = list((await self.service.store.get_timeline_by_ids([event_id])).values())
+        batch_id = await self.service.store.create_summary_batch(self.ctx.session_id, self.ctx.scope, rows)
+        self.assertTrue(await self.service.store.reserve_summary_call(batch_id, max_calls=1, hourly_limit=0))
+        await self.service.store.defer_summary_batch(batch_id, 'temporary', delay=600)
+        await self.service.store.release_summary_budget_deferrals()
+        self.assertIsNone(await self.service.store.next_summary_batch(self.ctx.session_id))
+        self.assertFalse(await self.service.store.reserve_summary_call(batch_id, max_calls=1, hourly_limit=0))
+
     async def test_disabled_automatic_summary_leaves_quiet_originals_unassigned(self):
         await self.recovery_event()
         self.config['memory_summary'].update(enabled=False, recovery_startup_delay_seconds=0)

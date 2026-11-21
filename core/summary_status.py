@@ -35,7 +35,8 @@ class SummaryStatusMethods:
         now = datetime.now(timezone.utc)
         timestamp = utc_now()
         enabled = self.config.bool('memory_summary.enabled', True)
-        hourly = max(1, self.config.int('memory_summary.max_calls_per_session_hour', 24))
+        configured_hourly = self.config.int('memory_summary.max_calls_per_session_hour', 24)
+        hourly = 0 if configured_hourly == 0 else max(1, configured_hourly)
         max_calls = max(1, self.config.int('memory_summary.max_retries', 5))
         gate = self._summary_admission
         waits = {key: 0 for key in WAIT_LABELS}
@@ -51,7 +52,7 @@ class SummaryStatusMethods:
                 return 'paused'
             if not self._scope_feature_enabled(context, 'capture'):
                 return 'capture_disabled'
-            if snapshot['budgets'].get(context.session_id, 0) >= hourly:
+            if hourly > 0 and snapshot['budgets'].get(context.session_id, 0) >= hourly:
                 return 'hourly_budget'
             if context.session_id in busy_sessions:
                 return 'session_busy'
@@ -73,9 +74,11 @@ class SummaryStatusMethods:
                 reason = 'disabled' if not enabled else 'paused'
             elif batch['automatic_calls'] >= max_calls:
                 reason = 'call_limit'
-            elif snapshot['budgets'].get(context.session_id, 0) >= hourly:
+            elif hourly > 0 and snapshot['budgets'].get(context.session_id, 0) >= hourly:
                 reason = 'hourly_budget'
-            elif not batch['due']:
+            elif not batch['due'] and not (
+                hourly == 0 and batch['retry_reason'] == self.store.BUDGET_RETRY_REASON
+            ):
                 reason = 'hourly_budget' if batch['retry_reason'] == self.store.BUDGET_RETRY_REASON else 'retry'
             else:
                 reason = admission_reason(context)

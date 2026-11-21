@@ -162,6 +162,17 @@ class SummaryAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.provider.calls)
         self.assertEqual(1, self.service.store._conn.execute("SELECT COUNT(*) FROM summary_batch_calls").fetchone()[0])
 
+    async def test_unlimited_trial_selects_previously_budget_deferred_batch(self):
+        batch_id, _ = await self.batch()
+        self.assertTrue(await self.service.store.reserve_summary_call(batch_id, max_calls=3, hourly_limit=1))
+        await self.service.store.defer_summary_batch(batch_id, 'temporary', delay=0)
+        self.assertFalse(await self.service.store.reserve_summary_call(batch_id, max_calls=3, hourly_limit=1))
+        self.config['memory_summary']['max_calls_per_session_hour'] = 0
+        result = await self.service.run_summary_recovery_trial(limit=1)
+        self.assertEqual('', result['stop_reason'])
+        self.assertEqual([batch_id], [item['id'] for item in result['batches']])
+        self.assertEqual('no_memory', (await self.service.store.get_summary_batch(batch_id))['state'])
+
     async def test_switched_current_session_provider_with_empty_id_stops_trial(self):
         await self.batch()
         replacement = Provider([])
