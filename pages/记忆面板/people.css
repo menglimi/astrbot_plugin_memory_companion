@@ -132,12 +132,12 @@ main { padding: 8px clamp(18px, 4vw, 48px) 64px; }
   padding: 24px 22px 40px; overflow-y: auto; z-index: 50;
   box-shadow: -24px 0 48px rgba(0, 0, 0, 0.4);
 }
-.close {
+.drawer > .close {
   position: absolute; top: 12px; right: 14px; width: 34px; height: 34px;
   border-radius: 50%; border: 1px solid var(--line); background: var(--card);
   color: var(--text); font-size: 20px; line-height: 1; cursor: pointer;
 }
-.close:hover { border-color: var(--accent); }
+.drawer > .close:hover { border-color: var(--accent); }
 
 .person-head { display: flex; gap: 14px; align-items: center; margin: 6px 34px 14px 0; }
 .person-head .avatar { width: 56px; height: 56px; font-size: 22px; }
