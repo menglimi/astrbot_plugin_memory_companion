@@ -75,12 +75,25 @@ class OperationPresetTests(unittest.TestCase):
             "recovery_disabled_retry_seconds": ("int", 3600),
         }
 
+        expected_bounds = {
+            "recovery_startup_delay_seconds": (0, 3600, 10),
+            "recovery_poll_interval_seconds": (5, 3600, 5),
+            "recovery_sessions_per_round": (1, 32, 1),
+            "recovery_identity_retry_seconds": (60, 604800, 60),
+            "recovery_disabled_retry_seconds": (60, 604800, 60),
+        }
+
         for key, (expected_type, expected_default) in expected.items():
             with self.subTest(key=key):
                 self.assertEqual(expected_type, items[key]["type"])
                 self.assertEqual(expected_default, items[key]["default"])
                 self.assertTrue(items[key]["description"])
                 self.assertTrue(items[key]["hint"])
+                if key in expected_bounds:
+                    lo, hi, step = expected_bounds[key]
+                    self.assertEqual(lo, items[key]["min"])
+                    self.assertEqual(hi, items[key]["max"])
+                    self.assertEqual({"min": lo, "max": hi, "step": step}, items[key]["slider"])
 
     def test_persist_runtime_config_is_utf8_and_atomic_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
