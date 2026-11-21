@@ -16665,29 +16665,25 @@ class MemoryStore(SummaryBatchStore):
         return await self._run_recoverable_database_operation(self._memory_revision_sync)
 
     def _memory_revision_sync(self) -> str:
-        if self._read_only:
-            with self._lock:
-                if self._closed:
-                    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
-                row = self._conn.execute(
-                    "SELECT revision FROM retrieval_revision WHERE singleton=1"
-                ).fetchone()
-        elif self._read_lock.acquire(blocking=False):
+        with self._read_conn_sync() as conn:
+            row = conn.execute(
+                "SELECT revision FROM retrieval_revision WHERE singleton=1"
+            ).fetchone()
+        if not row:
+            return "0"
+        return str(int(row["revision"] or 0))
+
+    async def acl_revision(self) -> str:
+        return await self._run_recoverable_database_operation(self._acl_revision_sync)
+
+    def _acl_revision_sync(self) -> str:
+        with self._read_conn_sync() as conn:
             try:
-                if self._closed:
-                    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
-                conn, _lock = self._read_connection_for_bundle()
                 row = conn.execute(
-                    "SELECT revision FROM retrieval_revision WHERE singleton=1"
+                    "SELECT revision FROM acl_revision WHERE singleton=1"
                 ).fetchone()
-            finally:
-                self._read_lock.release()
-        else:
-            tl_conn, tl_lock = self._timeline_read_connection()
-            with tl_lock:
-                if self._closed:
-                    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
-                row = tl_conn.execute(
+            except sqlite3.OperationalError:
+                row = conn.execute(
                     "SELECT revision FROM retrieval_revision WHERE singleton=1"
                 ).fetchone()
         if not row:

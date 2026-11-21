@@ -214,7 +214,7 @@ def _cached_large_str_sha256(text: str) -> str:
     encoded = text.encode("utf-8", errors="surrogatepass")
     digest_hex = hashlib.sha256(encoded).hexdigest()
     size = len(encoded)
-    if size <= _LARGE_DIGEST_ENTRY_MAX_BYTES:
+    if size <= min(_LARGE_DIGEST_ENTRY_MAX_BYTES, _LARGE_DIGEST_CACHE_MAX_BYTES):
         with _LARGE_STR_DIGEST_LOCK:
             if text not in _LARGE_STR_DIGEST_CACHE:
                 while _LARGE_STR_DIGEST_CACHE and (
@@ -296,7 +296,7 @@ def _canonical_history_digest(history: Any) -> tuple[str, int]:
         ensure_ascii=False,
         sort_keys=True,
         default=str,
-    ).encode("utf-8")
+    ).encode("utf-8", errors="surrogatepass")
     return hashlib.sha256(payload).hexdigest(), len(projection)
 _USER_MEMORY_PROFILE_TYPES = frozenset({"user_profile", "user_habit", "manual_memory"})
 _USER_MEMORY_PREFERENCE_TYPES = frozenset({"user_preference"})

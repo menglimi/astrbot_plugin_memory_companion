@@ -61,6 +61,27 @@ class RerankCircuitBreaker:
     reason ``rerank_circuit_open``, then allow a single half-open probe.
     """
 
+    @staticmethod
+    def _normalize_threshold(value: Any) -> int:
+        if isinstance(value, bool):
+            return 0
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    @staticmethod
+    def _normalize_cooldown(value: Any) -> float:
+        if isinstance(value, bool):
+            return 0.0
+        try:
+            cooldown = float(value or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        if not math.isfinite(cooldown) or cooldown <= 0.0:
+            return 0.0
+        return cooldown
+
     def __init__(
         self,
         *,
@@ -68,15 +89,15 @@ class RerankCircuitBreaker:
         cooldown_seconds: float = 60.0,
     ) -> None:
         self._lock = threading.Lock()
-        self.failure_threshold = max(0, int(failure_threshold or 0))
-        self.cooldown_seconds = max(0.0, float(cooldown_seconds or 0.0))
+        self.failure_threshold = self._normalize_threshold(failure_threshold)
+        self.cooldown_seconds = self._normalize_cooldown(cooldown_seconds)
         self._states: dict[str, _BreakerState] = {}
 
     def configure(self, *, failure_threshold: int, cooldown_seconds: float) -> None:
         """Update breaker thresholds dynamically without dropping active state."""
         with self._lock:
-            self.failure_threshold = max(0, int(failure_threshold or 0))
-            self.cooldown_seconds = max(0.0, float(cooldown_seconds or 0.0))
+            self.failure_threshold = self._normalize_threshold(failure_threshold)
+            self.cooldown_seconds = self._normalize_cooldown(cooldown_seconds)
             if self.failure_threshold <= 0 or self.cooldown_seconds <= 0.0:
                 self._states.clear()
 
@@ -1672,7 +1693,18 @@ class RetrievalEngine:
                 bundle_error_type = type(error).__name__
                 return None
 
-        acl_state = await self._acl_state() if self.policy.enable_acl_rules else self._empty_acl_state()
+        acl_revision_before: str | None = None
+        if self.policy.enable_acl_rules:
+            if self.embedding_enabled:
+                acl_rev_fn = getattr(self.store, "acl_revision", None)
+                mem_rev_fn = getattr(self.store, "memory_revision", None)
+                if callable(acl_rev_fn):
+                    acl_revision_before = await acl_rev_fn()
+                elif callable(mem_rev_fn):
+                    acl_revision_before = await mem_rev_fn()
+            acl_state = await self._acl_state()
+        else:
+            acl_state = self._empty_acl_state()
 
         # A local read failure must not restart the concurrent model request.
         # Keep its one bounded attempt and fall back only the failed source.
@@ -1684,6 +1716,7 @@ class RetrievalEngine:
                 include_pending=include_pending,
                 time_intent=time_intent,
                 acl_state=acl_state,
+                acl_revision=acl_revision_before,
             ),
         )
         if bundle is not None:
@@ -2016,6 +2049,7 @@ class RetrievalEngine:
         include_pending: bool,
         time_intent: TimeIntent | None = None,
         acl_state: dict[str, object] | None = None,
+        acl_revision: str | None = None,
     ) -> tuple[list[MemoryRecord], dict[str, float], dict[str, Any]]:
         info: dict[str, Any] = {
             "embedding_enabled": bool(self.embedding_enabled),
@@ -2081,10 +2115,20 @@ class RetrievalEngine:
 
         # A data/ACL race retries once with current authorization and the same
         # query vector. No second provider request, no importance-based fallback.
+        acl_rev_fn = getattr(self.store, "acl_revision", None)
         for attempt in range(2):
             try:
                 revision = await self.store.memory_revision()
+                reuse_acl = False
                 if attempt == 0 and acl_state is not None:
+                    if not self.policy.enable_acl_rules:
+                        reuse_acl = True
+                    elif acl_revision is not None:
+                        current_acl_rev = (
+                            await acl_rev_fn() if callable(acl_rev_fn) else revision
+                        )
+                        reuse_acl = current_acl_rev == acl_revision
+                if reuse_acl:
                     current_acl_state = acl_state
                 else:
                     current_acl_state = (

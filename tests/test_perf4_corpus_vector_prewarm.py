@@ -1347,6 +1347,217 @@ class RerankBreakerAndAclReuseTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 store.close()
 
+    async def test_acl_revoked_during_embedding_http_call_refreshes_acl_and_never_poisons_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            store.initialize()
+            try:
+                priv_secret = _make_record(
+                    "priv-secret",
+                    scope="private",
+                    session_id="qq:FriendMessage:u1",
+                    group_id="",
+                    visibility="private_pair",
+                    content="绝对保密的蓝风铃暗语",
+                )
+                grp_pub = _make_record("grp-pub", content="群里公开的普通聊天")
+                _seed_vectors(store, [(priv_secret, [1.0, 0.0]), (grp_pub, [0.5, 0.5])])
+                await store.upsert_acl_rule(
+                    owner_scope="private",
+                    owner_id="u1",
+                    reader_scope="group",
+                    reader_id="g1",
+                    effect="allow",
+                )
+                await store.prewarm_vector_corpus(provider_id="test")
+
+                revoked_midflight = {"done": False}
+
+                class _AclRevokingEmbeddingProvider:
+                    async def get_embedding(self, text: str) -> list[float]:
+                        if not revoked_midflight["done"]:
+                            revoked_midflight["done"] = True
+                            await store.upsert_acl_rule(
+                                owner_scope="private",
+                                owner_id="u1",
+                                reader_scope="group",
+                                reader_id="g1",
+                                effect="deny",
+                            )
+                        return [1.0, 0.0]
+
+                engine = RetrievalEngine(
+                    store,
+                    VisibilityPolicy(),
+                    embedding_enabled=True,
+                    embedding_provider=_AclRevokingEmbeddingProvider(),
+                    embedding_provider_id="test",
+                    embedding_candidate_limit=64,
+                    embedding_top_k=4,
+                    embedding_score_threshold=0.0,
+                    knowledge_graph_enabled=False,
+                )
+                ctx = SessionContext(
+                    session_id="onebot_qq:GroupMessage:g1",
+                    scope="group",
+                    platform="qq",
+                    user_id="u1",
+                    group_id="g1",
+                    bot_id="b1",
+                    persona_id="p1",
+                    message_text="蓝风铃暗语",
+                )
+
+                # Mid-flight ACL deny must take effect immediately and never leak or poison caches.
+                with patch.object(engine, "_acl_state", wraps=engine._acl_state) as acl_spy:
+                    results_1, _ = await engine._rank_candidates("蓝风铃暗语", ctx)
+                self.assertEqual(2, acl_spy.call_count)
+                self.assertNotIn("priv-secret", [r.memory.id for r in results_1])
+                self.assertIn("grp-pub", [r.memory.id for r in results_1])
+
+                # Subsequent cached turn must also exclude priv-secret (no selection_cache / snapshot poisoning).
+                results_2, _ = await engine._rank_candidates("蓝风铃暗语", ctx)
+                self.assertNotIn("priv-secret", [r.memory.id for r in results_2])
+                self.assertIn("grp-pub", [r.memory.id for r in results_2])
+            finally:
+                store.close()
+
+    async def test_evicted_search_cache_slices_reused_when_corpus_cache_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            store.initialize()
+            try:
+                _seed_vectors(
+                    store,
+                    [
+                        (_make_record("ev-1", content="第一条向量"), [1.0, 0.0]),
+                        (_make_record("ev-2", content="第二条向量"), [0.6, 0.8]),
+                    ],
+                )
+                provider = _StrictQueryOnlyEmbeddingProvider([1.0, 0.0])
+                engine = RetrievalEngine(
+                    store,
+                    VisibilityPolicy(),
+                    embedding_enabled=True,
+                    embedding_provider=provider,
+                    embedding_provider_id="test",
+                    embedding_candidate_limit=64,
+                    embedding_top_k=4,
+                    embedding_score_threshold=0.0,
+                    knowledge_graph_enabled=False,
+                )
+                ctx = SessionContext(
+                    session_id="onebot_qq:GroupMessage:g1",
+                    scope="group",
+                    platform="qq",
+                    user_id="u1",
+                    group_id="g1",
+                    bot_id="b1",
+                    persona_id="p1",
+                    message_text="向量",
+                )
+                await engine._embedding_candidate_memories("向量", ctx, include_pending=False)
+                self.assertTrue(store._vector_search_cache)
+
+                # Drop corpus cache while leaving the previous-revision snapshot in _vector_search_cache.
+                store._vector_corpus_cache.clear()
+                _seed_vectors(store, [(_make_record("ev-3", content="第三条向量"), [0.0, 1.0])])
+
+                memories, _, info = await engine._embedding_candidate_memories(
+                    "向量", ctx, include_pending=False,
+                )
+                self.assertEqual({"ev-1", "ev-2", "ev-3"}, {m.id for m in memories})
+                self.assertTrue(info["embedding_corpus_full_scan"])
+                self.assertEqual(2, info["embedding_reused_rows"])
+            finally:
+                store.close()
+
+    async def test_breaker_non_finite_guards_and_pr96_rerank_timeout_synergy(self) -> None:
+        nan_breaker = RerankCircuitBreaker(failure_threshold=2, cooldown_seconds=float("nan"))
+        self.assertEqual(0.0, nan_breaker.cooldown_seconds)
+        inf_breaker = RerankCircuitBreaker(failure_threshold=True, cooldown_seconds=float("inf"))  # type: ignore[arg-type]
+        self.assertEqual(0, inf_breaker.failure_threshold)
+        self.assertEqual(0.0, inf_breaker.cooldown_seconds)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MemoryCompanionService(
+                context=None,
+                config={
+                    "retrieval": {
+                        "mode": "rerank",
+                        "rerank_timeout_ms": 6000,
+                    },
+                    "retrieval_advanced": {
+                        "rerank_failure_cooldown_threshold": 2,
+                        "rerank_failure_cooldown_seconds": 30.0,
+                    },
+                },
+                plugin_root=Path(ROOT),
+                data_dir=Path(tmp),
+            )
+            try:
+                ctx = SessionContext(
+                    session_id="qq:FriendMessage:u1",
+                    scope="private",
+                    platform="qq",
+                    user_id="u1",
+                    bot_id="b1",
+                )
+                fake_provider = SimpleNamespace(rerank=AsyncMock(side_effect=asyncio.TimeoutError()))
+                with patch.object(
+                    service,
+                    "_resolve_rerank_provider",
+                    AsyncMock(return_value=(fake_provider, "slow-rerank")),
+                ):
+                    engine = await service._retrieval_engine(ctx)
+                # PR #96 timeout up to 10s cap is honored while PR #90 breaker is wired.
+                self.assertEqual(6000, engine.rerank_timeout_ms)
+                self.assertIs(engine.rerank_circuit_breaker, service._rerank_circuit_breaker)
+                candidates = [
+                    SearchResult(memory=_make_record(f"t{i}", content=f"cand {i}"), score=1.0 - i * 0.1)
+                    for i in range(2)
+                ]
+                await engine._maybe_rerank_results("问题", candidates, 2)
+                await engine._maybe_rerank_results("问题", candidates, 2)
+                await engine._maybe_rerank_results("问题", candidates, 2)
+                self.assertEqual(2, fake_provider.rerank.await_count)
+                self.assertEqual("rerank_circuit_open", engine.last_path_info["reason"])
+            finally:
+                await service.aclose()
+
+    def test_memory_revision_uncommitted_tx_and_surrogate_history_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            store.initialize()
+            try:
+                before = int(store._memory_revision_sync())
+                store._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    store._insert_memory_sync(_make_record("uncommitted-rev"), _commit=False)
+                    during = int(store._memory_revision_sync())
+                    self.assertGreater(during, before)
+                finally:
+                    store._conn.rollback()
+                self.assertEqual(before, int(store._memory_revision_sync()))
+            finally:
+                store.close()
+
+        # Short string with lone UTF-16 surrogate must hash cleanly without UnicodeEncodeError.
+        digest_surr, count_surr = _canonical_history_digest([{"role": "user", "content": "hi \ud800 there"}])
+        self.assertEqual(64, len(digest_surr))
+        self.assertEqual(1, count_surr)
+
+        # Cache byte cap smaller than entry cap must still prevent oversized cache entries.
+        with (
+            patch.object(service_mod, "_LARGE_DIGEST_ENTRY_MAX_BYTES", 4096),
+            patch.object(service_mod, "_LARGE_DIGEST_CACHE_MAX_BYTES", 1024),
+        ):
+            service_mod._clear_large_str_digest_cache()
+            _ = service_mod._cached_large_str_sha256("A" * 2048)
+            with service_mod._LARGE_STR_DIGEST_LOCK:
+                self.assertEqual(0, len(service_mod._LARGE_STR_DIGEST_CACHE))
+                self.assertEqual(0, service_mod._LARGE_STR_DIGEST_CACHE_BYTES)
+
 
 if __name__ == "__main__":
     unittest.main()

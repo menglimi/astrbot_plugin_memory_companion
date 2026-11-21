@@ -1030,7 +1030,11 @@ def _populate_corpus_from_rows(
                     freshly_normalized_ids.add(ref.memory_id)
                 else:
                     cached_row = reusable_rows[ref.memory_id]
-                    if cached_row[0] != ref.text_hash or cached_row[1] != ref.updated_at:
+                    if (
+                        cached_row[0] != ref.text_hash
+                        or cached_row[1] != ref.updated_at
+                        or cached_row[2] != ref.embedding_updated_at
+                    ):
                         freshly_normalized_ids.add(ref.memory_id)
             _append_corpus_blocks(corpus, refs, chunks, dimension, budget, on_block=on_block)
     return eligible_ids, freshly_normalized_ids, counts, valid_until
@@ -1635,6 +1639,7 @@ def search_embeddings_sync(
             conn.execute("BEGIN")
             reusable: dict[str, ReusableRow] | None = None
             reusable_built = False
+            evicted_snapshots: dict[tuple, VectorSnapshot] = {}
             corpus_to_publish: VectorCorpus | None = None
             corpus_hit = False
             corpus_delta_rows = 0
@@ -1658,8 +1663,13 @@ def search_embeddings_sync(
                     if reusable_built:
                         return reusable
                     reusable_built = True
+                    combined_snapshots = (
+                        {**evicted_snapshots, **search_cache}
+                        if evicted_snapshots
+                        else search_cache
+                    )
                     collected = _collect_reusable_rows(
-                        search_cache,
+                        combined_snapshots,
                         revision=None,
                         provider_id=provider_id,
                         dimension=dimension,
@@ -1676,6 +1686,7 @@ def search_embeddings_sync(
 
                 for cached_key, value in list(search_cache.items()):
                     if value.revision != revision or value.valid_until <= selection_time:
+                        evicted_snapshots[cached_key] = value
                         del search_cache[cached_key]
                 snapshot = cached if cache_hit else None
                 publish = None
@@ -1805,6 +1816,7 @@ def search_embeddings_sync(
             finally:
                 if reusable is not None:
                     reusable.clear()
+                evicted_snapshots.clear()
                 conn.rollback()
         check_cancelled()
         if store._memory_revision_sync() != expected_revision or time.time() >= valid_until:
