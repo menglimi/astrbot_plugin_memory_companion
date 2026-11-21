@@ -296,6 +296,77 @@
         "type": "bool",
         "default": true
       },
+      "recovery_enabled": {
+        "description": "启用静默会话恢复",
+        "hint": "开启后，插件会定期检查到期批次和达到总结条件但尚未分批的原文；没有新消息的会话也能继续整理。仅处理身份信息完整且一致的内容，仍受原有调用额度与并发限制。",
+        "type": "bool",
+        "default": true
+      },
+      "recovery_startup_delay_seconds": {
+        "description": "启动后恢复等待秒数",
+        "hint": "数据库初始化完成后再等待多久开始扫描待恢复批次，避免插件刚启动时与宿主数据库迁移争用资源。",
+        "type": "int",
+        "default": 60,
+        "min": 0,
+        "max": 3600,
+        "slider": {
+          "min": 0,
+          "max": 3600,
+          "step": 10
+        }
+      },
+      "recovery_poll_interval_seconds": {
+        "description": "恢复扫描间隔秒数",
+        "hint": "每轮恢复扫描之间等待的时间。值越小恢复越及时，也会增加少量数据库查询。运行时最低为 5 秒。",
+        "type": "int",
+        "default": 60,
+        "min": 5,
+        "max": 3600,
+        "slider": {
+          "min": 5,
+          "max": 3600,
+          "step": 5
+        }
+      },
+      "recovery_sessions_per_round": {
+        "description": "每轮恢复会话数",
+        "hint": "每轮最多尝试恢复多少个不同会话的批次。值越大恢复越快，但可能同时增加模型负载。运行时范围为 1 到 32。",
+        "type": "int",
+        "default": 1,
+        "min": 1,
+        "max": 32,
+        "slider": {
+          "min": 1,
+          "max": 32,
+          "step": 1
+        }
+      },
+      "recovery_identity_retry_seconds": {
+        "description": "身份校验失败重试秒数",
+        "hint": "批次身份信息缺失或互相冲突时，等待多久再检查。插件不会猜测身份或把批次内容交给模型。运行时最长为 7 天。",
+        "type": "int",
+        "default": 3600,
+        "min": 60,
+        "max": 604800,
+        "slider": {
+          "min": 60,
+          "max": 604800,
+          "step": 60
+        }
+      },
+      "recovery_disabled_retry_seconds": {
+        "description": "捕获关闭重试秒数",
+        "hint": "对应私聊或群聊的记忆捕获暂时关闭时，等待多久再检查该批次；开启后无需新消息即可继续恢复。运行时最长为 7 天。",
+        "type": "int",
+        "default": 3600,
+        "min": 60,
+        "max": 604800,
+        "slider": {
+          "min": 60,
+          "max": 604800,
+          "step": 60
+        }
+      },
       "provider_id": {
         "description": "通用总结模型提供商（兼容回退）",
         "_special": "select_provider",
