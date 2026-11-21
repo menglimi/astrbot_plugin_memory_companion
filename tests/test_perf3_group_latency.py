@@ -197,6 +197,33 @@ class IncrementalRowCacheTests(unittest.TestCase):
         self.assertEqual(memory_embedding_text_hash(mem2, max_chars=1200), h_new)
         self.assertNotEqual(expected_1200, h_new)
 
+    def test_cached_embedding_text_hash_detects_tags_or_metadata_mutation_on_copy(self) -> None:
+        rec = _make_record("hash-mut", content="正文", tags=["tag_a"], metadata={"canonical_summary": "原摘要"})
+        self.store._insert_memory_sync(rec)
+        rev1 = self.store._memory_revision_sync()
+        row1 = self.store._conn.execute("SELECT * FROM memories WHERE id='hash-mut'").fetchone()
+
+        cached_view = self.store._cached_from_row_light(row1, revision=rev1, copy=False)
+        base_hash = self.store._cached_embedding_text_hash(cached_view, max_chars=1200, revision=rev1)
+        self.assertEqual(memory_embedding_text_hash(cached_view, max_chars=1200), base_hash)
+
+        mutated_tags = self.store._cached_from_row_light(row1, revision=rev1, copy=True)
+        mutated_tags.tags.append("tag_b")
+        self.assertEqual(
+            memory_embedding_text_hash(mutated_tags, max_chars=1200),
+            self.store._cached_embedding_text_hash(mutated_tags, max_chars=1200, revision=rev1),
+        )
+        self.assertNotEqual(base_hash, self.store._cached_embedding_text_hash(mutated_tags, max_chars=1200, revision=rev1))
+
+        mutated_meta = self.store._cached_from_row_light(row1, revision=rev1, copy=True)
+        mutated_meta.metadata["canonical_summary"] = "新摘要"
+        self.assertEqual(
+            memory_embedding_text_hash(mutated_meta, max_chars=1200),
+            self.store._cached_embedding_text_hash(mutated_meta, max_chars=1200, revision=rev1),
+        )
+        # Cached entry hash must remain unpolluted.
+        self.assertEqual(base_hash, self.store._cached_embedding_text_hash(cached_view, max_chars=1200, revision=rev1))
+
 
 class VectorCrossRevisionAndTimeIntentTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
@@ -385,6 +412,47 @@ class VectorCrossRevisionAndTimeIntentTests(unittest.IsolatedAsyncioTestCase):
         for exp_score, mid in expected:
             self.assertAlmostEqual(exp_score, scores[mid], places=12)
 
+    async def test_cross_revision_reuse_refreshes_when_embedding_updated_at_changes(self) -> None:
+        rec1 = _make_record("emb-upd-1")
+        rec2 = _make_record("emb-upd-2")
+        self.seed([(rec1, [0.0, 1.0]), (rec2, [0.6, 0.8])])
+
+        m_a, scores_a, _info_a = await self.engine._embedding_candidate_memories(
+            "群里最近讨论了什么", self.ctx, include_pending=False,
+        )
+        self.assertEqual(["emb-upd-2", "emb-upd-1"], [m.id for m in m_a])
+        self.assertAlmostEqual(0.0, scores_a["emb-upd-1"], places=6)
+
+        # Re-embed emb-upd-1 in place (new vector + newer embedding updated_at) without
+        # changing memories.updated_at or text_hash.
+        with self.store._lock, self.store._conn:
+            self.store._conn.execute(
+                "UPDATE memory_embeddings SET vector=?, updated_at=? WHERE memory_id=? AND provider_id=?",
+                (_pack_embedding_vector([1.0, 0.0]), "2026-11-18T03:00:00+00:00", "emb-upd-1", "test"),
+            )
+
+        m_b, scores_b, info_b = await self.engine._embedding_candidate_memories(
+            "群里最近讨论了什么", self.ctx, include_pending=False,
+        )
+        self.assertEqual(["emb-upd-1", "emb-upd-2"], [m.id for m in m_b])
+        self.assertAlmostEqual(1.0, scores_b["emb-upd-1"], places=6)
+        # Only unchanged emb-upd-2 should be reused across the revision bump.
+        self.assertEqual(1, info_b["embedding_reused_rows"])
+
+    def test_normalize_blob_batch_handles_empty_zero_dim_and_all_invalid_inputs(self) -> None:
+        np = vector_search._numpy()
+        if np is None:
+            self.skipTest("numpy unavailable")
+        self.assertEqual(([], []), vector_search._normalize_blob_batch([], 4, np))
+        self.assertEqual(
+            ([None, None], ["embedding_invalid", "embedding_invalid"]),
+            vector_search._normalize_blob_batch([b"", b""], 0, np),
+        )
+        all_bad = [_pack_embedding_vector([0.0, 0.0]), _pack_embedding_vector([math.nan, 1.0])]
+        slices, errors = vector_search._normalize_blob_batch(all_bad, 2, np)
+        self.assertEqual([None, None], slices)
+        self.assertEqual(["embedding_invalid", "embedding_invalid"], errors)
+
 
 class HotPathScoringAndSharedCacheTests(unittest.IsolatedAsyncioTestCase):
     def test_clean_text_fast_path_matches_regex_reference(self) -> None:
@@ -569,8 +637,39 @@ class LockContentionCaptureAndReplyChainTests(unittest.IsolatedAsyncioTestCase):
 
                 reopened = SourceCapture(store, default_enabled=True)
                 self.assertFalse(reopened.source_capture_enabled())
+
+                # Deleting the explicit override row must restore default_enabled on switch inspection.
+                with store._lock, store._transaction_sync():
+                    store._conn.execute("DELETE FROM capture_runtime WHERE key='source_capture_enabled'")
+                sw = cap.source_capture_switch()
+                self.assertFalse(sw["explicit"])
+                self.assertTrue(sw["enabled"])
+                self.assertTrue(cap.source_capture_enabled())
             finally:
                 store.close()
+
+    def test_closed_store_guards_dedicated_read_connections_and_clears_light_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            store.initialize()
+            rec = _make_record("close-guard-1")
+            store._insert_memory_sync(rec)
+            row = store._conn.execute("SELECT * FROM memories WHERE id='close-guard-1'").fetchone()
+            store._cached_from_row_light(row, revision=store._memory_revision_sync(), copy=False)
+            self.assertGreater(len(store.__dict__.get("_record_light_cache", {})), 0)
+            store.close()
+            self.assertEqual(0, len(store.__dict__.get("_record_light_cache", {})))
+            with self.assertRaises(sqlite3.ProgrammingError):
+                store._memory_revision_sync()
+            with self.assertRaises(sqlite3.ProgrammingError):
+                store._read_connection_for_bundle()
+            with self.assertRaises(sqlite3.ProgrammingError):
+                store._timeline_read_connection()
+            with self.assertRaises(sqlite3.ProgrammingError):
+                store._vector_read_connection()
+            self.assertIsNone(store._read_conn)
+            self.assertIsNone(store._timeline_read_conn)
+            self.assertIsNone(store._vector_read_conn)
 
     async def test_reply_chain_get_msg_is_excluded_from_hook_budget_and_bounded_by_timeout(self) -> None:
         resolver = ReplyChainResolver(get_msg_timeout_seconds=0.5)

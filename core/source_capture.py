@@ -128,8 +128,11 @@ class SourceCapture:
     def source_capture_switch(self):
         with self.store._lock:
             rows = dict(self.db.execute("SELECT key,value FROM capture_runtime WHERE key IN ('source_capture_enabled','source_capture_enabled_by','source_capture_enabled_at')").fetchall())
-        if 'source_capture_enabled' in rows:
-            self._source_capture_enabled = str(rows['source_capture_enabled']).strip().lower() in {'1', 'true', 'yes', 'on'}
+        self._source_capture_enabled = (
+            str(rows['source_capture_enabled']).strip().lower() in {'1', 'true', 'yes', 'on'}
+            if 'source_capture_enabled' in rows
+            else self.default_enabled
+        )
         return {'enabled': self._source_capture_enabled, 'explicit': 'source_capture_enabled' in rows,
                 'actor': rows.get('source_capture_enabled_by', ''), 'updated_at': rows.get('source_capture_enabled_at', '')}
 

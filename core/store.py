@@ -644,10 +644,16 @@ class MemoryStore(SummaryBatchStore):
         connection, which is already opened with mode=ro.
         """
         if self._read_only:
+            if self._closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
             return self._conn
+        if self._closed:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
         conn = self._read_conn
         if conn is None:
             with self._read_lock:
+                if self._closed:
+                    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
                 conn = self._read_conn
                 if conn is None:
                     conn = self._open_dedicated_read_connection()
@@ -656,15 +662,23 @@ class MemoryStore(SummaryBatchStore):
 
     def _read_connection_for_bundle(self) -> tuple[sqlite3.Connection, threading.RLock]:
         if self._read_only:
+            if self._closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
             return self._conn, self._lock
         return self._ensure_read_connection(), self._read_lock
 
     def _ensure_timeline_read_connection(self) -> sqlite3.Connection:
         if self._read_only:
+            if self._closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
             return self._conn
+        if self._closed:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
         conn = self._timeline_read_conn
         if conn is None:
             with self._timeline_read_lock:
+                if self._closed:
+                    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
                 conn = self._timeline_read_conn
                 if conn is None:
                     conn = self._open_dedicated_read_connection()
@@ -673,15 +687,23 @@ class MemoryStore(SummaryBatchStore):
 
     def _timeline_read_connection(self) -> tuple[sqlite3.Connection, threading.RLock]:
         if self._read_only:
+            if self._closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
             return self._conn, self._lock
         return self._ensure_timeline_read_connection(), self._timeline_read_lock
 
     def _ensure_vector_read_connection(self) -> sqlite3.Connection:
         if self._read_only:
+            if self._closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
             return self._conn
+        if self._closed:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
         conn = self._vector_read_conn
         if conn is None:
             with self._vector_read_lock:
+                if self._closed:
+                    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
                 conn = self._vector_read_conn
                 if conn is None:
                     conn = self._open_dedicated_read_connection()
@@ -699,6 +721,8 @@ class MemoryStore(SummaryBatchStore):
         stores keep reusing the main connection, which is already ``mode=ro``.
         """
         if self._read_only:
+            if self._closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
             return self._conn, self._lock
         return self._ensure_vector_read_connection(), self._vector_read_lock
 
@@ -4343,6 +4367,11 @@ class MemoryStore(SummaryBatchStore):
             self._conn.close()
             self._closed = True
             self._vector_search_cache.clear()
+        light_lock = getattr(self, "_record_light_cache_lock", None)
+        light_cache = self.__dict__.get("_record_light_cache")
+        if light_lock is not None and light_cache is not None:
+            with light_lock:
+                light_cache.clear()
         with self._read_lock:
             if self._read_conn is not None:
                 try:
@@ -12579,6 +12608,8 @@ class MemoryStore(SummaryBatchStore):
                 and template.memory_type == memory.memory_type
                 and template.scope == memory.scope
                 and template.visibility == memory.visibility
+                and (template.tags is memory.tags or template.tags == memory.tags)
+                and (template.metadata is memory.metadata or template.metadata == memory.metadata)
             )
 
         if lock is not None and cache is not None:
@@ -16359,11 +16390,15 @@ class MemoryStore(SummaryBatchStore):
     def _memory_revision_sync(self) -> str:
         if self._read_only:
             with self._lock:
+                if self._closed:
+                    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
                 row = self._conn.execute(
                     "SELECT revision FROM retrieval_revision WHERE singleton=1"
                 ).fetchone()
         elif self._read_lock.acquire(blocking=False):
             try:
+                if self._closed:
+                    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
                 conn, _lock = self._read_connection_for_bundle()
                 row = conn.execute(
                     "SELECT revision FROM retrieval_revision WHERE singleton=1"
@@ -16373,6 +16408,8 @@ class MemoryStore(SummaryBatchStore):
         else:
             tl_conn, tl_lock = self._timeline_read_connection()
             with tl_lock:
+                if self._closed:
+                    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
                 row = tl_conn.execute(
                     "SELECT revision FROM retrieval_revision WHERE singleton=1"
                 ).fetchone()

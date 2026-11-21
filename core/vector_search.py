@@ -25,6 +25,7 @@ import struct
 import time
 from typing import Any, Callable, Iterable
 
+from .memory_atom import row_value
 from .models import MemoryRecord, clean_text, memory_embedding_text_hash
 
 
@@ -114,6 +115,7 @@ class VectorRef:
     updated_at: str
     memory_type: str = ""
     time_ranges: tuple[tuple[float, float], ...] = ()
+    embedding_updated_at: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +133,7 @@ class VectorBlock:
             + len(r.updated_at)
             + len(r.memory_type)
             + len(r.time_ranges) * 32
+            + len(r.embedding_updated_at)
             for r in self.refs
         )
 
@@ -205,8 +208,10 @@ def _normalize_blob_batch(
     np: Any,
 ) -> tuple[list[memoryview | None], list[str]]:
     """Batch-normalize fixed-length float64 BLOBs with numpy."""
-    row_bytes = dimension * 8
     count = len(blobs)
+    if count == 0 or dimension <= 0:
+        return [None] * count, ["embedding_invalid"] * count
+    row_bytes = dimension * 8
     mat = np.frombuffer(b"".join(blobs), dtype="<f8").reshape(count, dimension)
     finite_mask = np.isfinite(mat).all(axis=1)
     scales = np.max(np.abs(mat), axis=1)
@@ -221,6 +226,14 @@ def _normalize_blob_batch(
     valid_scales = scales if len(valid_indices) == count else scales[valid_indices]
     scaled = valid_mat / valid_scales[:, None]
     norms = np.sqrt(np.einsum("ij,ij->i", scaled, scaled))
+    norm_valid = np.isfinite(norms) & (norms > 0.0)
+    if not norm_valid.all():
+        keep = np.flatnonzero(norm_valid)
+        if len(keep) == 0:
+            return results, errors
+        valid_indices = valid_indices[keep]
+        scaled = scaled[keep]
+        norms = norms[keep]
     normalized_buf = (scaled / norms[:, None]).astype("<f8", copy=False).tobytes()
     mv = memoryview(normalized_buf)
     for out_idx, src_idx in enumerate(valid_indices.tolist()):
@@ -312,7 +325,8 @@ def _row_batches(conn: Any, provider_id: str, where: str, batch_size: int,
     """
     m_cols = _memory_select_columns(conn)
     columns = (f"SELECT {m_cols}, e.dimension AS embedding_dimension, "
-               "e.text_hash AS embedding_text_hash FROM memory_embeddings e "
+               "e.text_hash AS embedding_text_hash, "
+               "e.updated_at AS embedding_updated_at FROM memory_embeddings e "
                "JOIN memories m ON m.id=e.memory_id")
     if not restrict_ids:
         cursor = conn.execute(f"{columns} WHERE {where}", (provider_id,))
@@ -330,7 +344,7 @@ def _row_batches(conn: Any, provider_id: str, where: str, batch_size: int,
             yield rows
 
 
-ReusableRow = tuple[str, str, bytes, int, int]
+ReusableRow = tuple[str, str, str, bytes, int, int]
 
 
 def _collect_reusable_rows(
@@ -345,10 +359,11 @@ def _collect_reusable_rows(
     """Index normalized vector slices from cached snapshots.
 
     When ``revision`` is ``None``, slices are collected across revisions so a
-    database write only re-normalizes rows whose ``text_hash`` or
-    ``updated_at`` actually changed.  Stores zero-copy
-    ``(text_hash, updated_at, block.values, offset, row_bytes)`` references into
-    already-cached ``VectorBlock.values`` buffers.
+    database write only re-normalizes rows whose ``text_hash``,
+    ``updated_at``, or ``embedding_updated_at`` actually changed.  Stores
+    zero-copy ``(text_hash, updated_at, embedding_updated_at, block.values,
+    offset, row_bytes)`` references into already-cached ``VectorBlock.values``
+    buffers.
     """
     row_bytes = dimension * 8
     reusable: dict[str, ReusableRow] = {}
@@ -369,6 +384,7 @@ def _collect_reusable_rows(
                 reusable[ref.memory_id] = (
                     ref.text_hash,
                     ref.updated_at,
+                    ref.embedding_updated_at,
                     buf,
                     index * row_bytes,
                     row_bytes,
@@ -456,6 +472,7 @@ def _build_blocks(
                     memory.updated_at,
                     memory.memory_type,
                     memory_time_ranges(memory),
+                    str(row_value(row, "embedding_updated_at", "") or ""),
                 )
             )
         refs: list[VectorRef] = []
@@ -467,9 +484,10 @@ def _build_blocks(
                 cached_row = reusable_rows.get(ref.memory_id)
                 if (cached_row is not None
                         and cached_row[0] == ref.text_hash
-                        and cached_row[1] == ref.updated_at):
+                        and cached_row[1] == ref.updated_at
+                        and cached_row[2] == ref.embedding_updated_at):
                     reused_slices.append(
-                        memoryview(cached_row[2])[cached_row[3]:cached_row[3] + cached_row[4]]
+                        memoryview(cached_row[3])[cached_row[4]:cached_row[4] + cached_row[5]]
                     )
                 else:
                     reused_slices.append(None)
