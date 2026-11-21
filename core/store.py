@@ -8,6 +8,7 @@ import os
 
 from contextlib import closing, contextmanager
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime, timezone
 import re
 import sqlite3
@@ -42,6 +43,7 @@ from .memory_atom import (
     normalize_durability,
     normalize_sensitivity,
     normalize_validity_status,
+    row_value,
     validity_where_clause,
 )
 from .models import (
@@ -69,6 +71,7 @@ from .source_query import SourceQuery, SourceQueryError, source_partition
 
 
 _ACL_UNSET = object()
+_RECORD_LIGHT_CACHE_MAX_ENTRIES = 16384
 
 
 class MemoryStoreUnavailableError(sqlite3.OperationalError):
@@ -343,6 +346,15 @@ class MemoryStore(SummaryBatchStore):
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_memories_archive_ref "
             "ON memories(is_archive_ref, source_plugin)"
+        )
+        time_no_updated_sql = _memory_time_sql(include_updated=False)
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_archive_time_order_nullif "
+            f"ON memories(is_archive_ref, {time_no_updated_sql} DESC)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_archive_importance_time_nullif "
+            f"ON memories(is_archive_ref, importance DESC, {time_no_updated_sql} DESC)"
         )
         self._archive_ref_column_available = True
 
@@ -1735,6 +1747,8 @@ class MemoryStore(SummaryBatchStore):
                 """
             )
             self._repair_internal_control_tables_sync()
+            pre_memory_indexes = self._table_index_names_sync("memories")
+            pre_timeline_indexes = self._table_index_names_sync("timeline")
             self._ensure_memory_columns_sync()
             try:
                 # 旧库第一次启动时补一次"轻重"；失败也只警告，不能挡住她开机。
@@ -1916,6 +1930,10 @@ class MemoryStore(SummaryBatchStore):
                 f"ON timeline(session_id, scope, {event_time_sql}, created_at, id)"
             )
             self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_timeline_scope_event_time "
+                f"ON timeline(scope, {event_time_sql}, created_at, id)"
+            )
+            self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at)"
             )
             self._conn.execute(
@@ -1936,20 +1954,49 @@ class MemoryStore(SummaryBatchStore):
                 "ON memories(julianday(updated_at))"
             )
             # ORDER BY 用的是 COALESCE(julianday(occurred_at), julianday(updated_at),
-            # julianday(created_at), 0)，表达式必须逐字一致才能命中索引。
+            # julianday(created_at), 0)，保留原索引以兼容老查询；同时补充与
+            # _memory_time_sql(include_updated=False/True) 的 NULLIF 写法逐字一致的
+            # 表达式索引，以及 session_id / current-window 分支排序索引。
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_time_order "
                 "ON memories(COALESCE(julianday(occurred_at), julianday(updated_at), "
                 "julianday(created_at), 0))"
             )
-            # #47: 没有 sqlite_stat1 统计时优化器会挑 idx_memories_archive_ref
-            #      然后全表扫 + TEMP B-TREE 排序；有了统计才会走 MULTI-INDEX OR。
-            #      本机 8k 行 ANALYZE memories 约 0.1s，启动跑一次代价可接受。
-            try:
-                self._conn.execute("ANALYZE memories")
-            except sqlite3.OperationalError:
-                # 只读快照/离线工具打开老库时 sqlite_stat1 不可写，忽略即可。
-                pass
+            time_no_updated_sql = _memory_time_sql(include_updated=False)
+            time_with_updated_sql = _memory_time_sql(include_updated=True)
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_session_id "
+                "ON memories(session_id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_time_order_nullif "
+                f"ON memories({time_no_updated_sql})"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_time_order_updated_nullif "
+                f"ON memories({time_with_updated_sql})"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_session_order "
+                f"ON memories(session_id, importance DESC, {time_with_updated_sql} DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_scope_group_order "
+                f"ON memories(scope, group_id, importance DESC, {time_with_updated_sql} DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_scope_subject_order "
+                f"ON memories(scope, subject_id, importance DESC, {time_with_updated_sql} DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_scope_object_order "
+                f"ON memories(scope, object_id, importance DESC, {time_with_updated_sql} DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_scope_person_order "
+                "ON memories(scope, visibility, subject_person_id, identity_assurance, "
+                f"importance DESC, {time_with_updated_sql} DESC)"
+            )
             # c5: emotion 投递查询使用 LOWER(scope) 导致 scope 列索引失效，
             #     用表达式索引精确匹配 LOWER(scope) 谓词
             self._conn.execute(
@@ -1958,6 +2005,8 @@ class MemoryStore(SummaryBatchStore):
             )
             self._ensure_memory_archive_ref_column_sync()
             self._ensure_memory_timeline_ref_column_sync()
+            self._refresh_memories_stats_if_needed_sync(pre_memory_indexes)
+            self._refresh_timeline_stats_if_needed_sync(pre_timeline_indexes)
             self._redact_existing_sensitive_rows_sync()
             self._cleanup_placeholder_memory_indexes_sync()
             self._conn.execute(
@@ -1973,6 +2022,82 @@ class MemoryStore(SummaryBatchStore):
             self._acl_projection_revision = self._memory_revision_sync()
             # From here on a reconnect must find this schema, never a fresh file.
             self._schema_ready = True
+
+    def _table_index_names_sync(self, table_name: str) -> set[str]:
+        return {
+            row["name"]
+            for row in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=?",
+                (table_name,),
+            ).fetchall()
+        }
+
+    def _refresh_table_stats_if_needed_sync(
+        self,
+        table_name: str,
+        pre_indexes: set[str],
+        required_stats: set[str],
+    ) -> None:
+        """Run ANALYZE on a table only when indexes were newly added or stats are missing."""
+        if table_name not in {"memories", "timeline"}:
+            raise ValueError(f"Unsupported stats refresh table: {table_name}")
+        post_indexes = self._table_index_names_sync(table_name)
+        needs_analyze = bool(post_indexes - pre_indexes)
+        if not needs_analyze:
+            try:
+                has_rows = (
+                    self._conn.execute(f"SELECT 1 FROM {table_name} LIMIT 1").fetchone()
+                    is not None
+                )
+                if has_rows:
+                    stat_table = self._conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'"
+                    ).fetchone()
+                    if stat_table is None:
+                        needs_analyze = True
+                    else:
+                        analyzed_indexes = {
+                            row["idx"]
+                            for row in self._conn.execute(
+                                "SELECT idx FROM sqlite_stat1 WHERE tbl=?",
+                                (table_name,),
+                            ).fetchall()
+                        }
+                        needs_analyze = not required_stats.issubset(analyzed_indexes)
+            except sqlite3.OperationalError:
+                needs_analyze = True
+        if not needs_analyze:
+            return
+        try:
+            self._conn.execute(f"ANALYZE {table_name}")
+        except sqlite3.OperationalError:
+            # 只读快照/离线工具打开老库时 sqlite_stat1 不可写，忽略即可。
+            pass
+
+    def _refresh_memories_stats_if_needed_sync(self, pre_memory_indexes: set[str]) -> None:
+        """Run ANALYZE memories only when indexes were newly added or stats are missing."""
+        self._refresh_table_stats_if_needed_sync(
+            "memories",
+            pre_memory_indexes,
+            {
+                "idx_memories_session_id",
+                "idx_memories_time_order_nullif",
+                "idx_memories_time_order_updated_nullif",
+                "idx_memories_archive_time_order_nullif",
+                "idx_memories_archive_importance_time_nullif",
+            },
+        )
+
+    def _refresh_timeline_stats_if_needed_sync(self, pre_timeline_indexes: set[str]) -> None:
+        """Run ANALYZE timeline only when indexes were newly added or stats are missing."""
+        self._refresh_table_stats_if_needed_sync(
+            "timeline",
+            pre_timeline_indexes,
+            {
+                "idx_timeline_session_event_time",
+                "idx_timeline_scope_event_time",
+            },
+        )
 
     def _cleanup_placeholder_memory_indexes_sync(self) -> int:
         """Remove historical placeholder entries from recall-only indexes.
@@ -10907,8 +11032,9 @@ class MemoryStore(SummaryBatchStore):
             return []
         event_time_sql = _timeline_time_sql()
         bot_clause, bot_params = self._bot_scope_clause("bot_id", owner_bot)
-        with self._lock:
-            rows = self._conn.execute(
+        conn, lock = self._timeline_read_connection()
+        with lock:
+            rows = conn.execute(
                 f"""
                 SELECT * FROM timeline
                 WHERE scope=?
@@ -12076,46 +12202,77 @@ class MemoryStore(SummaryBatchStore):
             subject_person_id,
             identity_assurance,
         )
-        clauses: list[str] = []
-        params: list[Any] = []
+        branches: list[tuple[str, list[Any]]] = []
         if session_id:
-            clauses.append("session_id=?")
-            params.append(session_id)
+            branches.append(("session_id=?", [session_id]))
         if scope == "group" and group_id:
-            clauses.append("(scope='group' AND group_id=?)")
-            params.append(group_id)
+            branches.append(("scope='group' AND group_id=?", [group_id]))
         elif scope == "private" and user_id:
-            private_subject_clause = "subject_id=? OR object_id=?"
-            params.extend([user_id, user_id])
+            branches.append(("scope='private' AND subject_id=?", [user_id]))
+            branches.append(("scope='private' AND object_id=?", [user_id]))
             if subject_person_id:
-                private_subject_clause += (
-                    " OR (visibility='private_pair' AND subject_person_id=? "
-                    "AND identity_assurance='explicit_linked')"
+                branches.append(
+                    (
+                        "scope='private' AND visibility='private_pair' "
+                        "AND subject_person_id=? AND identity_assurance='explicit_linked'",
+                        [subject_person_id],
+                    )
                 )
-                params.append(subject_person_id)
-            clauses.append(f"(scope='private' AND ({private_subject_clause}))")
-        if not clauses:
+        if not branches:
             return []
-        where = f"lifecycle != 'archived' AND {self._recallable_memory_sql()} AND (" + " OR ".join(clauses) + ")"
+        bounded_limit = max(1, int(limit or 1))
+        base_where = f"lifecycle != 'archived' AND {self._recallable_memory_sql()}"
         if not include_pending:
-            where += " AND review_status != 'pending'"
-        order_by = "importance DESC, " + _memory_time_sql(include_updated=True) + " DESC"
+            base_where += " AND review_status != 'pending'"
+        time_sql = _memory_time_sql(include_updated=True)
+        order_by = f"importance DESC, {time_sql} DESC"
+        order_params: list[Any] = []
         if subject_person_id:
             order_by = (
                 "CASE WHEN subject_person_id=? AND identity_assurance='explicit_linked' "
                 "THEN 0 ELSE 1 END, " + order_by
             )
-            params.append(subject_person_id)
-        return conn.execute(
-            f"""
-            SELECT *
-            FROM memories
-            WHERE {where}
-            ORDER BY {order_by}
-            LIMIT ?
-            """,
-            params + [max(1, int(limit or 1))],
-        ).fetchall()
+            order_params.append(subject_person_id)
+
+        by_id: dict[str, Any] = {}
+        non_empty_branches: list[list[Any]] = []
+        for branch_where, branch_params in branches:
+            rows = conn.execute(
+                f"""
+                SELECT *, ({time_sql}) AS _cw_sort_time
+                FROM memories
+                WHERE {base_where} AND {branch_where}
+                ORDER BY {order_by}
+                LIMIT ?
+                """,
+                [*branch_params, *order_params, bounded_limit],
+            ).fetchall()
+            if not rows:
+                continue
+            non_empty_branches.append(rows)
+            for row in rows:
+                row_id = str(row["id"])
+                if row_id not in by_id:
+                    by_id[row_id] = row
+        if not by_id:
+            return []
+        if len(non_empty_branches) == 1:
+            return non_empty_branches[0][:bounded_limit]
+        merged = list(by_id.values())
+        merged.sort(
+            key=lambda row: (
+                0
+                if (
+                    subject_person_id
+                    and row["subject_person_id"] == subject_person_id
+                    and row["identity_assurance"] == "explicit_linked"
+                )
+                else 1,
+                -float(row["importance"] if row["importance"] is not None else 0.0),
+                -float(row["_cw_sort_time"] if row["_cw_sort_time"] is not None else 0.0),
+            )
+        )
+        return merged[:bounded_limit]
 
     async def list_time_window_candidate_memories(
         self,
@@ -12214,6 +12371,68 @@ class MemoryStore(SummaryBatchStore):
             include_pending,
         )
 
+    def _cached_from_row_light(self, row: Any, *, revision: str = "") -> MemoryRecord:
+        """Parse a stored row via ``MemoryRecord.from_row_light`` with bounded memoization.
+
+        Candidate-bundle reads repeatedly deserialize thousands of unchanged rows
+        whose large ``metadata`` JSON dominates ``parse_ms``.  Cached template
+        records are cleared whenever ``retrieval_revision`` changes and verified
+        per row against ``(updated_at, raw_metadata, raw_tags)``; non-trigger
+        counter/access columns are refreshed from ``row`` and ``metadata``/``tags``
+        are shallow-copied so caller mutations never pollute the cache.
+        """
+        row_id = str(row_value(row, "id", "") or "")
+        if not row_id:
+            return MemoryRecord.from_row_light(row)
+
+        updated_at = row_value(row, "updated_at", "")
+        raw_metadata = row_value(row, "metadata", "{}")
+        raw_tags = row_value(row, "tags", "[]")
+        rev = str(revision or "")
+
+        lock = getattr(self, "_record_light_cache_lock", None)
+        if lock is None:
+            lock = self.__dict__.setdefault("_record_light_cache_lock", threading.Lock())
+
+        with lock:
+            cache = self.__dict__.get("_record_light_cache")
+            if cache is None:
+                cache = {}
+                self._record_light_cache = cache
+                self._record_light_cache_revision = ""
+            if rev and rev != self._record_light_cache_revision:
+                cache.clear()
+                self._record_light_cache_revision = rev
+            observed_rev = self._record_light_cache_revision
+            entry = cache.get(row_id)
+            if (
+                entry is not None
+                and entry[0] == updated_at
+                and entry[1] == raw_metadata
+                and entry[2] == raw_tags
+            ):
+                template_record = entry[3]
+                return replace(
+                    template_record,
+                    reinforcement_score=float(row_value(row, "reinforcement_score", 0.0) or 0.0),
+                    injection_count=int(row_value(row, "injection_count", 0) or 0),
+                    last_injected_at=row_value(row, "last_injected_at", ""),
+                    last_accessed_at=row_value(row, "last_accessed_at", ""),
+                    access_count=int(row_value(row, "access_count", 0) or 0),
+                    metadata=dict(template_record.metadata),
+                    tags=list(template_record.tags),
+                )
+
+        rec = MemoryRecord.from_row_light(row)
+        template = replace(rec, metadata=dict(rec.metadata), tags=list(rec.tags))
+        with lock:
+            cache = self.__dict__.get("_record_light_cache")
+            if cache is not None and self._record_light_cache_revision == observed_rev:
+                if row_id not in cache and len(cache) >= _RECORD_LIGHT_CACHE_MAX_ENTRIES:
+                    cache.pop(next(iter(cache)))
+                cache[row_id] = (updated_at, raw_metadata, raw_tags, template)
+        return rec
+
     def _list_retrieval_candidate_bundle_sync(
         self,
         materialize_limit: int,
@@ -12230,6 +12449,13 @@ class MemoryStore(SummaryBatchStore):
         conn, lock = self._read_connection_for_bundle()
         with lock:
             lock_acquired_at = time.perf_counter()
+            try:
+                rev_row = conn.execute(
+                    "SELECT revision FROM retrieval_revision WHERE singleton=1"
+                ).fetchone()
+                bundle_revision = str(int(rev_row["revision"] or 0)) if rev_row else ""
+            except sqlite3.OperationalError:
+                bundle_revision = ""
             ranked_rows = self._materialized_candidate_rows(conn, materialize_limit, include_pending)
             current_window_rows = self._current_window_candidate_rows(
                 conn,
@@ -12255,12 +12481,22 @@ class MemoryStore(SummaryBatchStore):
                 time_rows = self._time_window_candidate_rows(conn, start_at, end_at, tw_limit, include_pending)
             queries_done_at = time.perf_counter()
         parsed = {
-            "ranked_candidates": [MemoryRecord.from_row_light(row) for row in ranked_rows],
-            "current_window_candidates": [MemoryRecord.from_row_light(row) for row in current_window_rows],
-            "fts_candidates": [MemoryRecord.from_row_light(row) for row in fts_rows],
-            "keyword_candidates": [MemoryRecord.from_row_light(row) for row in keyword_rows],
+            "ranked_candidates": [
+                self._cached_from_row_light(row, revision=bundle_revision) for row in ranked_rows
+            ],
+            "current_window_candidates": [
+                self._cached_from_row_light(row, revision=bundle_revision) for row in current_window_rows
+            ],
+            "fts_candidates": [
+                self._cached_from_row_light(row, revision=bundle_revision) for row in fts_rows
+            ],
+            "keyword_candidates": [
+                self._cached_from_row_light(row, revision=bundle_revision) for row in keyword_rows
+            ],
             "keyword_fallback_used": keyword_fallback_used,
-            "time_window_candidates": [MemoryRecord.from_row_light(row) for row in time_rows],
+            "time_window_candidates": [
+                self._cached_from_row_light(row, revision=bundle_revision) for row in time_rows
+            ],
         }
         parsed["_timing"] = {
             "lock_wait_ms": int((lock_acquired_at - bundle_started) * 1000),

@@ -33,6 +33,10 @@ from .time_intent import TimeIntent
 from .visibility import VisibilityPolicy
 
 
+_MMR_WHITESPACE_RE = re.compile(r"\s+")
+_MMR_LATIN_TOKEN_RE = re.compile(r"[a-z0-9_]{2,}")
+
+
 class RetrievalEngine:
     DEFAULT_MATERIALIZE_LIMIT = 2000
     # Recall sources that were selected because of the query itself. The
@@ -780,30 +784,33 @@ class RetrievalEngine:
         scores = [float(item.score) for item in pool]
         minimum = min(scores)
         maximum = max(scores)
-
-        def relevance(item: SearchResult) -> float:
-            if maximum <= minimum:
-                return 1.0
-            return (float(item.score) - minimum) / (maximum - minimum)
+        if maximum <= minimum:
+            upper_bounds = {id(item): 0.84 for item in pool}
+        else:
+            span = maximum - minimum
+            upper_bounds = {
+                id(item): 0.84 * ((float(item.score) - minimum) / span)
+                for item in pool
+            }
 
         def features(item: SearchResult) -> set[str]:
             memory = item.memory
-            text = re.sub(r"\s+", "", self._haystack(memory))
-            cjk = frozenset(
-                text[index : index + 2]
-                for index in range(max(0, len(text) - 1))
-                if text[index : index + 2]
-            )
+            text = _MMR_WHITESPACE_RE.sub("", self._haystack(memory))
+            text_len = len(text)
+            cjk = {text[index : index + 2] for index in range(text_len - 1)} if text_len > 1 else set()
             # Avoid sorting the common case while preserving the historical
             # deterministic 180-feature cap for unusually long memories.
             if len(cjk) > 180:
-                cjk_features = set(sorted(cjk)[:180])
-            else:
-                cjk_features = set(cjk)
-            latin = set(re.findall(r"[a-z0-9_]{2,}", text))
-            tags = {f"tag:{clean_text(tag, 40).lower()}" for tag in (memory.tags or []) if clean_text(tag, 40)}
+                cjk = set(sorted(cjk)[:180])
+            cjk.update(_MMR_LATIN_TOKEN_RE.findall(text))
+            for tag in memory.tags or ():
+                cleaned_tag = clean_text(tag, 40)
+                if cleaned_tag:
+                    cjk.add(f"tag:{cleaned_tag.lower()}")
             source = clean_text(memory.source_plugin, 60).lower()
-            return cjk_features | latin | tags | ({f"source:{source}"} if source else set())
+            if source:
+                cjk.add(f"source:{source}")
+            return cjk
 
         feature_map: dict[int, set[str]] = {}
 
@@ -815,28 +822,40 @@ class RetrievalEngine:
                 feature_map[item_id] = cached
             return cached
 
-        def similarity(left: SearchResult, right: SearchResult) -> float:
-            left_features = feature_for(left)
-            right_features = feature_for(right)
-            union = left_features | right_features
-            return (len(left_features & right_features) / len(union)) if union else 0.0
-
+        redundancy_weight = self.mmr_redundancy_weight
         selected: list[SearchResult] = [pool.pop(0)]
+        max_redundancy: dict[int, float] = {}
+        evaluated_count: dict[int, int] = {}
         target = min(len(ranked), max(1, int(selection_limit or 1)))
         while pool and len(selected) < target:
+            selected_len = len(selected)
             best_index = 0
             best_value = -math.inf
             for index, item in enumerate(pool):
+                item_id = id(item)
                 # Redundancy is non-negative, so this is an exact upper bound
                 # for the candidate's MMR value. Candidates that cannot beat
                 # the current winner need no expensive feature/intersection work.
-                upper_bound = 0.84 * relevance(item)
+                upper_bound = upper_bounds[item_id]
                 if upper_bound <= best_value:
                     continue
-                redundancy = max(similarity(item, chosen) for chosen in selected)
+                done_count = evaluated_count.get(item_id, 0)
+                redundancy = max_redundancy.get(item_id, 0.0)
+                if done_count < selected_len:
+                    item_features = feature_for(item)
+                    item_feature_len = len(item_features)
+                    for chosen in selected[done_count:]:
+                        chosen_features = feature_for(chosen)
+                        inter = len(item_features & chosen_features)
+                        union_len = item_feature_len + len(chosen_features) - inter
+                        sim = (inter / union_len) if union_len else 0.0
+                        if sim > redundancy:
+                            redundancy = sim
+                    max_redundancy[item_id] = redundancy
+                    evaluated_count[item_id] = selected_len
                 # R7：去冗余权重可配（默认 0.35，历史值 0.16 太轻，高冗余两条
                 # 会一起进 top_k）。upper_bound 仍是价值的严格上界，剪枝安全。
-                value = upper_bound - (self.mmr_redundancy_weight * redundancy)
+                value = upper_bound - (redundancy_weight * redundancy)
                 if value > best_value:
                     best_value = value
                     best_index = index
