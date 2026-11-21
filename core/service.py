@@ -2147,30 +2147,16 @@ class MemoryCompanionService:
                         scope=clean_text(item.get("scope"), 40),
                         bot_id=clean_text(item.get("bot_id"), 120),
                     )
-                    oldest_raw = clean_text(item.get("oldest"), 60)
-                    pending_events = int(item.get("pending_events") or 0)
-                    force = False
-                    if oldest_raw and pending_events >= 2:
-                        try:
-                            oldest_at = datetime.fromisoformat(
-                                oldest_raw.replace("Z", "+00:00")
-                            )
-                            if oldest_at.tzinfo is None:
-                                oldest_at = oldest_at.replace(tzinfo=timezone.utc)
-                            force = (datetime.now(timezone.utc) - oldest_at).days >= 2
-                        except Exception:
-                            force = False
                     try:
-                        memory_id = await self.maybe_summarize_session(ctx, force=force)
+                        memory_id = await self.maybe_summarize_session(ctx, allow_aged_backlog=True)
                         if memory_id:
                             logger.info(
                                 "[MemoryCompanion] 自动消化完成: session=%s memory=%s", session_id, memory_id
                             )
                         else:
                             logger.info(
-                                "[MemoryCompanion] 自动消化跳过: session=%s force=%s",
+                                "[MemoryCompanion] 自动消化跳过: session=%s",
                                 session_id,
-                                force,
                             )
                     except asyncio.CancelledError:
                         raise
@@ -6254,8 +6240,20 @@ class MemoryCompanionService:
         cooldown = self._summary_transient_cooldown_seconds()
         return min(base * (2**exponent), cooldown) if cooldown > 0 else base * (2**exponent)
 
-    def _summary_window_ready(self, window: dict[str, Any], *, force: bool) -> bool:
+    def _summary_window_ready(
+        self,
+        window: dict[str, Any],
+        *,
+        force: bool,
+        allow_aged_backlog: bool = False,
+    ) -> bool:
         total = int(window.get("total") or 0)
+        # Old automatic work may relax the event threshold, but must keep
+        # ordinary budgets, concurrency, cooldowns and quarantine boundaries.
+        if allow_aged_backlog and total >= 2 and self.summarizer.interval_elapsed(
+            str(window.get("first_occurred_at") or ""), 2 * 24 * 60,
+        ):
+            return True
         min_events = self.config.int("memory_summary.min_events", 20)
         if total < (1 if force else min_events):
             return False
@@ -6328,7 +6326,13 @@ class MemoryCompanionService:
             int(calls or 0),
         )
 
-    async def maybe_summarize_session(self, ctx: SessionContext, *, force: bool = False) -> str:
+    async def maybe_summarize_session(
+        self,
+        ctx: SessionContext,
+        *,
+        force: bool = False,
+        allow_aged_backlog: bool = False,
+    ) -> str:
         if not force and not self.config.bool("memory_summary.enabled", True):
             return ""
         if not ctx.session_id:
@@ -6363,7 +6367,9 @@ class MemoryCompanionService:
                 bot_id=ctx.bot_id,
             )
             # New messages take priority over bounded recovery of historical batches.
-            if batch is None and self._summary_window_ready(window, force=force):
+            if batch is None and self._summary_window_ready(
+                window, force=force, allow_aged_backlog=allow_aged_backlog,
+            ):
                 rows = self.summarizer.rows_for_prompt(list(window.get("rows") or []))
                 if not rows:
                     return ""
