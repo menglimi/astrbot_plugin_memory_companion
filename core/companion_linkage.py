@@ -127,8 +127,9 @@ class CompanionMemoryLinkage:
                 priority=10,
                 handles_model_memory=False,
                 timeout_seconds=5.0,
+                linked_memory_read=True,
             )
-        except Exception as exc:  # 注册失败不阻断插件，V2 会回落到 v1 探测
+        except Exception as exc:  # 旧宿主不支持范围授权时不注册，禁止降级为按裸用户 ID 召回
             self._last_reason = "register_exc: %s" % (exc,)
             logger.info("[MemoryCompanion] private_companion provider 注册失败: %s", exc)
             return False
@@ -204,72 +205,75 @@ class CompanionMemoryLinkage:
 
     # -- provider 回调 ------------------------------------------------------
 
-    async def _read(self, request: Any) -> dict[str, Any]:
-        """返回该用户最近一段私聊记忆，供 V2 注入「外部记忆参考」。"""
-
-        user_id, _platform, _bot_id = _request_identity(request)
-        if not user_id:
-            return {"items": []}
-        store = getattr(self._service, "store", None)
-        reader = getattr(store, "read_user_memory_summary_records", None)
+    async def _authorized_records(self, request, *, limit):
+        """Resolve opaque host authority; never trust member IDs supplied in JSON."""
+        if not isinstance(request, Mapping):
+            raise ValueError("memory_read_authorization_required")
+        registry = self._registry
+        if registry is None or registry is not getattr(self.plugin.context, REGISTRY_ATTRIBUTE, None):
+            raise ValueError("memory_registry_changed")
+        authorize = getattr(registry, "authorize_memory_read", None)
+        if not callable(authorize):
+            raise ValueError("scoped_memory_authorization_required")
+        scope = authorize(request)
+        config = getattr(self._service, "config", None)
+        if config is None or not config.bool("private_companion_bridge.enabled", True):
+            raise ValueError("bridge_disabled")
+        reader = getattr(getattr(self._service, "store", None), "read_authorized_linked_memories", None)
         if not callable(reader):
-            return {"items": []}
+            raise ValueError("scoped_memory_reader_unavailable")
+        raw = await reader(scope, limit=limit)
+        revision = await self._service.store.memory_revision()
+        source_revision = await self._service.store.source_revision()
+        if (str(raw.get("memory_revision")) != revision
+                or raw.get("source_revision") != source_revision):
+            raise ValueError("memory_read_snapshot_changed")
+        if not config.bool("private_companion_bridge.enabled", True):
+            raise ValueError("bridge_disabled")
+        if authorize(request) != scope:
+            raise ValueError("memory_read_authorization_changed")
+        return raw
+
+    async def _read(self, request: Any) -> dict[str, Any]:
         payload = request if isinstance(request, Mapping) else {}
         limit = _int(payload.get("limit"), 8, 1, 20)
         max_chars = _int(payload.get("max_chars"), 2400, 0, 20000)
         try:
-            raw = await reader(user_id, session_id="", limit=limit)
+            raw = await self._authorized_records(request, limit=limit)
         except Exception as exc:
-            logger.debug("[MemoryCompanion] 外部记忆 read 失败: %s", exc)
-            return {"items": []}
+            logger.debug("[MemoryCompanion] scoped recall unavailable: %s", type(exc).__name__)
+            return {"items": [], "reason": "memory_read_authorization_unavailable"}
         records = raw.get("records") if isinstance(raw, Mapping) else None
         if not isinstance(records, (list, tuple)):
             return {"items": []}
-        items: list[dict[str, str]] = []
-        used = 0
+        items, used = [], 0
         for record in records:
             content = _clean(getattr(record, "content", ""), 1200)
-            if not content:
+            if not content or used + len(content) > max_chars:
                 continue
-            size = len(content)
-            if max_chars and used + size > max_chars:
-                continue
-            used += size
-            items.append(
-                {
-                    "id": _clean(getattr(record, "id", ""), 120),
-                    "content": content,
-                    "occurred_at": _clean(
-                        getattr(record, "occurred_at", "") or getattr(record, "created_at", ""),
-                        40,
-                    ),
-                    "source": "memory_companion",
-                }
-            )
+            used += len(content)
+            provenance = raw.get("provenance", {}).get(record.id, {})
+            items.append({"id": _clean(record.id, 120), "content": content,
+                "occurred_at": _clean(record.occurred_at or record.created_at, 40),
+                "source": "memory_companion", "source_session_id": record.session_id,
+                "source_user_id": provenance.get("user_id") or (
+                    record.subject.id if record.subject.kind == "user" else record.object.id),
+                "source_bot_id": provenance.get("owner_bot_id", record.owner_bot_id),
+                "source_original_bot_id": record.owner_bot_id})
         return {"items": items}
 
     async def _summary(self, request: Any) -> dict[str, Any]:
-        """返回按类别聚合的记忆条数，供 V2 记忆面板展示。"""
-
-        user_id, _platform, _bot_id = _request_identity(request)
-        if not user_id:
-            return {"state": "unavailable", "ok": False, "reason": "missing_user_id"}
-        reader = getattr(self._service, "read_user_memory_summary", None)
-        if not callable(reader):
-            return {"state": "unavailable", "ok": False, "reason": "service_unavailable"}
         try:
-            raw = await reader(user_id, session_id="", limit=8)
+            raw = await self._authorized_records(request, limit=0)
+            category = self._service._user_memory_category
+            counts = {key: 0 for key in (*SUMMARY_CATEGORIES, "total")}
+            for memory_type, count in raw["type_counts"].items():
+                counts[category(memory_type)] += count
+                counts["total"] += count
+            return {"state": "ready", "ok": True, "counts": counts}
         except Exception as exc:
-            logger.debug("[MemoryCompanion] 外部记忆 summary 失败: %s", exc)
-            return {"state": "unavailable", "ok": False, "reason": "summary_read_failed"}
-        if not isinstance(raw, Mapping):
-            return {"state": "unavailable", "ok": False, "reason": "invalid_summary_response"}
-        raw_counts = raw.get("counts") if isinstance(raw.get("counts"), Mapping) else {}
-        counts = {
-            key: _int(raw_counts.get(key), 0, 0, 1000000000)
-            for key in (*SUMMARY_CATEGORIES, "total")
-        }
-        return {"state": "ready", "ok": True, "counts": counts}
+            logger.debug("[MemoryCompanion] scoped summary unavailable: %s", type(exc).__name__)
+            return {"state": "unavailable", "ok": False, "reason": "memory_read_authorization_unavailable"}
 
 
 __all__ = ["CompanionMemoryLinkage", "PROVIDER_ID", "PROVIDER_API_VERSION", "REGISTRY_ATTRIBUTE"]
