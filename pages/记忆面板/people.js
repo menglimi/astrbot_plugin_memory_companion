@@ -193,9 +193,6 @@ async function load() {
     state.total = Number(data.total || state.items.length);
     state.bots = Array.isArray(data.bots) ? data.bots : [];
     renderSummary();
-    request("GET", "maintenance/summary_status").then((payload) => {
-      renderRecoveryStatus(payload.status);
-    }).catch(() => { el("recovery").hidden = true; });
     renderBotFilter();
     renderGrid();
   } catch (error) {
@@ -209,20 +206,57 @@ async function load() {
   }
 }
 
+let recoveryTicket = 0;
+
+async function loadRecoveryStatus() {
+  const ticket = ++recoveryTicket;
+  const node = el("recovery");
+  try {
+    const payload = await request("GET", "maintenance/summary_status");
+    if (ticket !== recoveryTicket) return;
+    renderRecoveryStatus(payload && payload.status);
+  } catch (_error) {
+    if (ticket !== recoveryTicket) return;
+    if (node) node.hidden = true;
+  }
+}
+
+function safeInt(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0;
+}
+
+function formatWaitDuration(seconds) {
+  const value = safeInt(seconds);
+  if (value === 0) return "无";
+  if (value < 60) return "不足 1 分钟";
+  if (value >= 86400) return `${Math.floor(value / 86400)} 天 ${Math.floor((value % 86400) / 3600)} 小时`;
+  if (value >= 3600) return `${Math.floor(value / 3600)} 小时 ${Math.floor((value % 3600) / 60)} 分钟`;
+  return `${Math.floor(value / 60)} 分钟`;
+}
+
 function renderRecoveryStatus(status) {
   const node = el("recovery");
-  const progress = status.progress;
-  const originals = status.unbatched;
-  const waits = Object.keys(status.wait_labels).filter((key) => status.waits[key] > 0)
-    .map((key) => esc(status.wait_labels[key]) + " " + Number(status.waits[key]) + " 批").join(" · ");
-  const minutes = Math.floor(Number(status.oldest_wait_seconds) / 60);
+  if (!node || !status || typeof status !== "object") {
+    if (node) node.hidden = true;
+    return;
+  }
+  const progress = status.progress && typeof status.progress === "object" ? status.progress : {};
+  const originals = status.unbatched && typeof status.unbatched === "object" ? status.unbatched : {};
+  const labels = status.wait_labels && typeof status.wait_labels === "object" ? status.wait_labels : {};
+  const waitsMap = status.waits && typeof status.waits === "object" ? status.waits : {};
+  const waits = Object.keys(labels)
+    .filter((key) => safeInt(waitsMap[key]) > 0)
+    .map((key) => `${esc(labels[key])} ${safeInt(waitsMap[key])} 批`)
+    .join(" · ");
+  const searchSuffix = typeof location !== "undefined" && location && location.search ? location.search : "";
   node.hidden = false;
-  node.innerHTML = `<summary>记忆整理：待处理 <b>${Number(status.pending_batches)}</b> 批</summary>
-    <p>全局状态，包含所有机器人。最老等待 ${minutes >= 1440 ? Math.floor(minutes / 1440) + " 天" : minutes >= 60 ? Math.floor(minutes / 60) + " 小时" : minutes + " 分钟"}。
+  node.innerHTML = `<summary>记忆整理：待处理 <b>${safeInt(status.pending_batches)}</b> 批</summary>
+    <p>全局状态，包含所有机器人。最老等待 ${formatWaitDuration(status.oldest_wait_seconds)}。
     ${waits || "没有有效待处理批次"}。</p>
-    <p>未分批原文 ${Number(originals.events)} 条，下一轮达到条件且身份有效 ${Number(originals.eligible_events)} 条。
-    正式会话记忆 ${Number(progress.adopted_memories)} 条，待审候选 ${Number(progress.review_candidates)} 条，隔离批次 ${Number(progress.quarantined_batches)} 批。</p>
-    <p>查看状态不会调用模型或通过候选。<a href="./legacy.html">在完整控制台查看详细等待原因</a></p>`;
+    <p>未分批原文 ${safeInt(originals.events)} 条，下一轮达到条件且身份有效 ${safeInt(originals.eligible_events)} 条。
+    正式会话记忆 ${safeInt(progress.adopted_memories)} 条，待审候选 ${safeInt(progress.review_candidates)} 条，隔离批次 ${safeInt(progress.quarantined_batches)} 批。</p>
+    <p>查看状态不会调用模型或通过候选。<a href="./legacy.html${esc(searchSuffix)}">在完整控制台查看详细等待原因</a></p>`;
 }
 
 function renderSummary() {
@@ -491,9 +525,13 @@ search.addEventListener("input", () => {
 });
 sortSelect.addEventListener("change", () => { state.sort = sortSelect.value; load(); });
 botFilter.addEventListener("change", () => { state.botId = botFilter.value; load(); });
-el("refresh").addEventListener("click", load);
+el("refresh").addEventListener("click", () => {
+  load();
+  loadRecoveryStatus();
+});
 el("close").addEventListener("click", closeDrawer);
 scrim.addEventListener("click", closeDrawer);
 document.addEventListener("keydown", (event) => { if (event.key === "Escape") closeDrawer(); });
 
 load();
+loadRecoveryStatus();

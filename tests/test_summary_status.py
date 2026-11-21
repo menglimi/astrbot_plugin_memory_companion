@@ -189,6 +189,106 @@ process.stdout.write(JSON.stringify(vm.runInContext(`({
         self.assertIn("已处理，无新增记忆", output["overview"])
         self.assertNotIn("冻结原文", output["overview"])
 
+    async def test_panel_recovery_guards_styles_and_people_banner(self):
+        from pathlib import Path
+        pages = Path(__file__).resolve().parents[1] / "pages" / "记忆面板"
+        app_css = (pages / "app.css").read_text(encoding="utf-8")
+        legacy_html = (pages / "legacy.html").read_text(encoding="utf-8")
+        people_html = (pages / "people.html").read_text(encoding="utf-8")
+        people_css = (pages / "people.css").read_text(encoding="utf-8")
+        people_js = (pages / "people.js").read_text(encoding="utf-8")
+
+        self.assertIn("./app.css?v=2.6.6-summary-status", legacy_html)
+        self.assertIn("./people.css?v=2.6.6-summary-status", people_html)
+        self.assertIn('<details id="recovery" class="recovery" hidden></details>', people_html)
+        self.assertIn(".recovery-card .pill-row", app_css)
+        self.assertIn(".section-note {", app_css)
+        self.assertIn('html[data-ui-mode="cinema"] .terminal-stage + .recovery-card', app_css)
+        self.assertIn(".recovery summary {", people_css)
+        self.assertIn("recoveryTicket", people_js)
+        self.assertIn("loadRecoveryStatus()", people_js)
+
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is needed only for the panel rendering check")
+        code = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const appCtx = vm.createContext({
+  document: {documentElement: {dataset: {}}, readyState: 'loading', addEventListener() {}},
+  window: {addEventListener() {}},
+});
+vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), appCtx);
+const appRes = vm.runInContext(`({
+  zero: summaryWaitDuration(0),
+  short: summaryWaitDuration(30),
+  degraded: summaryRecoveryCard({
+    summary_enabled: true, admission: "normal", recovery_enabled: true,
+    dispatcher_state: "degraded", pending_batches: 2, oldest_wait_seconds: 30,
+    waits: {identity: 1, call_limit: 1, running: 1},
+    wait_labels: {identity: "来源身份缺失或冲突", call_limit: "本批调用次数已用完", running: "正在整理"},
+    unbatched: {events: 0, eligible_events: 0, eligible_windows: 0, waits: {}},
+    progress: {adopted_memories: 0, review_candidates: 0, completed_batches: 0, no_memory_batches: 0, quarantined_batches: 0},
+    limits: {calls_per_session_hour: 24, global_concurrency: 1},
+  }),
+  partialOverview: VIEWS.overview.render({
+    recovery: {pending_batches: 2},
+    stats: {summary_progress: {raw_events: 9999, quarantined_batches: 8888}},
+  }),
+})`, appCtx);
+
+const nodes = {};
+const makeNode = () => ({hidden: true, innerHTML: '', textContent: '', value: '', addEventListener() {}, focus() {}});
+const peopleCtx = vm.createContext({
+  document: {
+    getElementById(id) { return nodes[id] || (nodes[id] = makeNode()); },
+    addEventListener() {},
+  },
+  window: {addEventListener() {}, confirm: () => false},
+  location: {search: '?asset_token=tok123'},
+  fetch: () => Promise.resolve({ok: true, json: () => Promise.resolve({ok: true, data: {items: [], bots: []}})}),
+  setTimeout, clearTimeout, URLSearchParams,
+});
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), peopleCtx);
+const peopleRes = vm.runInContext(`(() => {
+  renderRecoveryStatus(null);
+  const hiddenOnNull = document.getElementById('recovery').hidden;
+  renderRecoveryStatus({});
+  const partialHtml = document.getElementById('recovery').innerHTML;
+  renderRecoveryStatus({
+    pending_batches: 3, oldest_wait_seconds: 45,
+    waits: {retry: 2}, wait_labels: {retry: '等待错误重试'},
+    unbatched: {events: 5, eligible_events: 2},
+    progress: {adopted_memories: 4, review_candidates: 1, quarantined_batches: 0},
+  });
+  return {hiddenOnNull, partialHtml, fullHtml: document.getElementById('recovery').innerHTML};
+})()`, peopleCtx);
+process.stdout.write(JSON.stringify({appRes, peopleRes}));
+"""
+        raw = subprocess.run(
+            [node, "-e", code, str(pages / "app.js"), str(pages / "people.js")],
+            capture_output=True, text=True, encoding="utf-8", check=True,
+        ).stdout
+        data = json.loads(raw)
+        self.assertEqual("无", data["appRes"]["zero"])
+        self.assertEqual("不足 1 分钟", data["appRes"]["short"])
+        self.assertIn("card recovery-card", data["appRes"]["degraded"])
+        self.assertIn("后台恢复已开启（调度器异常）", data["appRes"]["degraded"])
+        self.assertIn('data-tone="warn"', data["appRes"]["degraded"])
+        self.assertIn('data-tone="danger"', data["appRes"]["degraded"])
+        self.assertIn('data-tone="ok"', data["appRes"]["degraded"])
+        self.assertNotIn('data-tone="gold"', data["appRes"]["degraded"])
+        self.assertIn("待处理批次", data["appRes"]["partialOverview"])
+        self.assertNotIn("9,999", data["appRes"]["partialOverview"])
+        self.assertNotIn("8,888", data["appRes"]["partialOverview"])
+
+        self.assertTrue(data["peopleRes"]["hiddenOnNull"])
+        self.assertNotIn("NaN", data["peopleRes"]["partialHtml"])
+        self.assertIn("最老等待 无", data["peopleRes"]["partialHtml"])
+        self.assertIn("最老等待 不足 1 分钟", data["peopleRes"]["fullHtml"])
+        self.assertIn('./legacy.html?asset_token=tok123', data["peopleRes"]["fullHtml"])
+        self.assertNotIn("NaN", data["peopleRes"]["fullHtml"])
+
 
 class SummaryStatusApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_get_requires_bound_admin_and_has_no_write_path(self):

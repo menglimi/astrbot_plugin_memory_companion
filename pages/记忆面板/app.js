@@ -1216,26 +1216,38 @@ function applyMode(mode) {
    ============================================================ */
 function summaryWaitDuration(seconds) {
   const value = Math.max(0, int(seconds));
+  if (value === 0) return "无";
+  if (value < 60) return "不足 1 分钟";
   if (value >= 86400) return Math.floor(value / 86400) + " 天 " + Math.floor(value % 86400 / 3600) + " 小时";
   if (value >= 3600) return Math.floor(value / 3600) + " 小时 " + Math.floor(value % 3600 / 60) + " 分钟";
   return Math.floor(value / 60) + " 分钟";
 }
 
+function summaryWaitTone(key) {
+  if (key === "identity" || key === "retry" || key === "paused" || key === "disabled") return "warn";
+  if (key === "call_limit") return "danger";
+  if (key === "running") return "ok";
+  return "fact";
+}
+
 function summaryRecoveryCard(status) {
-  if (!status) return card("记忆整理进度", "只读状态", emptyState("状态暂不可用", "请使用已登录的管理员面板刷新。"));
+  if (!status || typeof status !== "object") {
+    return card("记忆整理进度", "只读状态", emptyState("状态暂不可用", "请使用已登录的管理员面板刷新。"), "", "recovery-card");
+  }
   const waits = status.waits || {};
   const originals = status.unbatched || {};
   const progress = status.progress || {};
   const labels = status.wait_labels || {};
   const rows = Object.keys(labels).filter((key) => int(waits[key]) > 0).map((key) =>
-    '<div class="row"><div class="row-main"><div class="row-title">' + esc(labels[key]) +
-    '</div></div><div class="row-meta">' + badge(fmtInt(waits[key]) + " 批", key === "identity" ? "gold" : "fact") + "</div></div>"
+    '<div class="row"><div class="row-main"><div class="row-title" title="' + esc(labels[key]) + '">' + esc(labels[key]) +
+    '</div></div><div class="row-meta">' + badge(fmtInt(waits[key]) + " 批", summaryWaitTone(key)) + "</div></div>"
   ).join("");
   const originalWaits = Object.keys(labels).filter((key) => int((originals.waits || {})[key]) > 0)
     .map((key) => labels[key] + " " + fmtInt(originals.waits[key]) + " 个窗口").join(" · ");
   const mode = !status.summary_enabled ? "自动总结已关闭"
     : status.admission !== "normal" ? "已暂停常规整理"
     : !status.recovery_enabled ? "后台恢复已关闭，聊天仍可触发整理"
+    : status.dispatcher_state === "degraded" ? "后台恢复已开启（调度器异常）"
     : "后台恢复已开启";
   return card("记忆整理进度", mode,
     '<div class="pill-row">' +
@@ -1251,7 +1263,8 @@ function summaryRecoveryCard(status) {
       fmtInt(progress.review_candidates) + " 条 · 已处理批次 " + fmtInt(progress.completed_batches) +
       " 批 · 无新增记忆 " + fmtInt(progress.no_memory_batches) + " 批 · 隔离批次 " +
       fmtInt(progress.quarantined_batches) + ' 批。</p>' +
-    '<p class="section-note">可以尝试整理表示队列条件已满足；模型是否可用会在实际整理时检查。查看状态不会发起模型调用或通过候选。</p>');
+    '<p class="section-note">可以尝试整理表示队列条件已满足；模型是否可用会在实际整理时检查。查看状态不会发起模型调用或通过候选。</p>',
+    "", "recovery-card");
 }
 
 function renderCinemaOverview(data) {
@@ -1348,8 +1361,8 @@ defineView("overview", {
     if (state.mode === "cinema") return renderCinemaOverview(data);
     const stats = data.stats || {};
     const byScope = stats.by_scope || {};
-    const progress = stats.summary_progress || {};
-    const recovery = data.recovery;
+    const recovery = data.recovery && typeof data.recovery === "object" ? data.recovery : null;
+    const recoveryProgress = recovery && recovery.progress && typeof recovery.progress === "object" ? recovery.progress : null;
     const storageMb = (int(stats.memory_storage_bytes) / 1048576).toFixed(1);
     const privateCount = int(byScope.private);
     const groupCount = int(byScope.group);
@@ -1361,11 +1374,11 @@ defineView("overview", {
       kpi("用户档案", fmtInt(stats.identities), "已识别身份", "relation", "inspect", "tag", "profile"),
       kpi("核心记忆", fmtInt((data.core || []).length), "强制注入块", "gold", "core", "star"),
       kpi("开放线程", fmtInt(stats.open_threads), "跨窗口续接", "fact", "navigate", "link"),
-      kpi("原文已记录", recovery ? fmtInt(recovery.progress.raw_events) : "—", "不含空白历史行", "group", "inspect", "library"),
-      kpi("正式会话记忆", recovery ? fmtInt(recovery.progress.adopted_memories) : "—", "待审候选另列", "fact", "inspect", "chat"),
+      kpi("原文已记录", recoveryProgress ? fmtInt(recoveryProgress.raw_events) : "—", "不含空白历史行", "group", "inspect", "library"),
+      kpi("正式会话记忆", recoveryProgress ? fmtInt(recoveryProgress.adopted_memories) : "—", "待审候选另列", "fact", "inspect", "chat"),
       kpi("待处理批次", recovery ? fmtInt(recovery.pending_batches) : "—", "等待原因见整理进度", "accent", "queue", "clock"),
-      kpi("待修复批次", recovery ? fmtInt(recovery.progress.quarantined_batches) : "—", "总结失败被隔离", "gold", "quarantine", "shield"),
-      kpi("已处理，无新增记忆", recovery ? fmtInt(recovery.progress.no_memory_batches) : "—", "原文保留，不重复总结", "private", "processed", "box"),
+      kpi("待修复批次", recoveryProgress ? fmtInt(recoveryProgress.quarantined_batches) : "—", "总结失败被隔离", "gold", "quarantine", "shield"),
+      kpi("已处理，无新增记忆", recoveryProgress ? fmtInt(recoveryProgress.no_memory_batches) : "—", "原文保留，不重复总结", "private", "processed", "box"),
     ].join("");
 
     const entries = [
@@ -3455,7 +3468,7 @@ const BATCH_TAB_META = {
   pending: {
     title: "排队处理",
     eyebrow: "Queue · Pending",
-    hint: "正常排队等后台总结的批次，只读；总结失败的会进入「待修复」",
+    hint: "排队等待整理的批次，只读；具体等待原因见整理进度，总结失败的会进入「待修复」",
   },
   processed: {
     title: "已处理批次",
@@ -3561,7 +3574,7 @@ const batchesView = (fixedTab, viewId, getOffset, setOffset) => {
           isRepair
             ? "隔离批次持有其原文事件，释放后事件才会重新进入总结流程"
             : fixedTab === "pending"
-              ? "正常排队等后台总结的批次，只读；总结失败的会进入「待修复」"
+              ? "排队等待整理的批次，只读；具体等待原因见上方整理进度，总结失败的会进入「待修复」"
               : "已完成的总结批次，仅供查阅",
           summary + bulk + rows + pager
         ) +
