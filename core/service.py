@@ -123,6 +123,7 @@ from .latency import (
 )
 from .retrieval import RetrievalEngine
 from .store import MemoryStore
+from .vector_search import bounded_cache_bytes
 from .source_query import query_sources, source_visible
 from .source_discovery import discover_sources as run_source_discovery
 from .source_evidence import record_source_read, message_source_version, remember_source_reads
@@ -4591,6 +4592,11 @@ class MemoryCompanionService:
         mode = clean_text(self.config.get("retrieval.mode", "auto"), 40).lower()
         if mode not in {"auto", "basic", "rerank"}:
             mode = "auto"
+        # 向量快照的保留预算走既有的 retrieval_advanced 读取路径，每轮读一次，
+        # 面板改完下一轮就生效（与上面那些 config 读取完全同构）。
+        self.store.vector_snapshot_cache_bytes = bounded_cache_bytes(
+            self.config.int("retrieval_advanced.vector_snapshot_cache_mb", 512)
+        )
         provider = None
         provider_id = ""
         if mode != "basic":

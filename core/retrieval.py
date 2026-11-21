@@ -1904,7 +1904,7 @@ class RetrievalEngine:
             self.policy.allow_self_timeline_everywhere, self.policy.allow_group_public_in_private,
             self.policy.hide_pending_review, self.policy.include_raw_events,
             self.policy.enable_acl_rules, self.policy.admin_read_all,
-            self.private_topology_enabled, self.group_topology_enabled, block_profile,
+            self.private_topology_enabled, self.group_topology_enabled,
             (time_intent.start_at, time_intent.end_at) if time_intent and time_intent.active else None,
         )
         # A data/ACL race retries once with current authorization and the same
@@ -1920,18 +1920,45 @@ class RetrievalEngine:
                     return bool(
                         visible and not blocked
                         and evaluate_memory_lifecycle(memory, ctx, now=selection_time).eligible
-                        and not (block_profile and memory.memory_type in PROFILE_MEMORY_TYPES)
                         and (not time_intent or not time_intent.active
                              or self._memory_overlaps_time_window(memory, time_intent))
                     )
 
-                memories, scores, diagnostics = await self.store.search_memory_embeddings(
-                    provider_id=self.embedding_provider_id, query=query_vector,
-                    expected_revision=revision, authorization_key=authorization_key, eligible=eligible,
-                    include_pending=include_pending, top_k=self.embedding_top_k,
-                    threshold=self.embedding_score_threshold, batch_size=self.embedding_candidate_limit,
-                    max_text_chars=self.embedding_max_text_chars, selection_time=selection_time.timestamp(),
-                )
+                try:
+                    memories, scores, diagnostics = await self.store.search_memory_embeddings(
+                        provider_id=self.embedding_provider_id, query=query_vector,
+                        expected_revision=revision, authorization_key=authorization_key, eligible=eligible,
+                        include_pending=include_pending, top_k=self.embedding_top_k,
+                        threshold=self.embedding_score_threshold, batch_size=self.embedding_candidate_limit,
+                        max_text_chars=self.embedding_max_text_chars, selection_time=selection_time.timestamp(),
+                        excluded_memory_types=PROFILE_MEMORY_TYPES if block_profile else frozenset(),
+                    )
+                except asyncio.CancelledError:
+                    if not getattr(self.store, "_closing", False) and not getattr(self.store, "_closed", False):
+                        warmup_key = (
+                            self.embedding_provider_id,
+                            len(query_vector),
+                            bool(include_pending),
+                            self.embedding_max_text_chars,
+                            authorization_key,
+                        )
+                        schedule_warmup = getattr(self.store, "schedule_vector_snapshot_warmup", None)
+                        if callable(schedule_warmup):
+                            schedule_warmup(
+                                warmup_key=warmup_key,
+                                provider_id=self.embedding_provider_id,
+                                query=query_vector,
+                                expected_revision=revision,
+                                authorization_key=authorization_key,
+                                eligible=eligible,
+                                include_pending=include_pending,
+                                top_k=self.embedding_top_k,
+                                threshold=self.embedding_score_threshold,
+                                batch_size=self.embedding_candidate_limit,
+                                max_text_chars=self.embedding_max_text_chars,
+                                selection_time=selection_time.timestamp(),
+                            )
+                    raise
                 info.update(diagnostics)
                 return memories, scores, info
             except VectorSnapshotChanged:

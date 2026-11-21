@@ -440,6 +440,15 @@ class MemoryStore(SummaryBatchStore):
         # 近期时间线单独使用连接，避免与候选读取共用同一把线程锁。
         self._timeline_read_conn: sqlite3.Connection | None = None
         self._timeline_read_lock = threading.RLock()
+        # 向量扫描同样单独使用连接：它和候选包在 retrieval._rank_candidates 里
+        # 由 asyncio.gather 同时发起，共用一个连接就只能排队（实测两段锁窗口
+        # 首尾相接、零重叠，每轮白付约 1 秒）。WAL 下第三条读连接看到的仍是
+        # 一致快照，语义不变。
+        self._vector_read_conn: sqlite3.Connection | None = None
+        self._vector_read_lock = threading.RLock()
+        # 向量快照缓存的字节预算。None = 用 core.vector_search.CACHE_BYTES 默认值；
+        # service 启动时按 retrieval_advanced.vector_snapshot_cache_mb 注入。
+        self.vector_snapshot_cache_bytes: int | None = None
         # S4：is_archive_ref 生成列是否可用。None = 还没探测（只读库打不开迁移），
         # False 时谓词退回旧的 lower(content) LIKE，老库/只读快照仍可查询。
         self._archive_ref_column_available: bool | None = None
@@ -463,6 +472,8 @@ class MemoryStore(SummaryBatchStore):
         ] = {}
         self._vector_search_lock = threading.RLock()
         self._vector_search_cache: dict[tuple, Any] = {}
+        self._vector_warmup_lock = threading.Lock()
+        self._vector_warmup_tasks: dict[tuple, tuple[asyncio.Task[Any], threading.Event]] = {}
         self._acl_feature_override_cache: dict[
             tuple[str, str], tuple[bool | None, bool | None]
         ] = {}
@@ -508,6 +519,33 @@ class MemoryStore(SummaryBatchStore):
             connection.execute("PRAGMA wal_autocheckpoint=500")
         return connection
 
+    def _open_dedicated_read_connection(self) -> sqlite3.Connection:
+        """Open one worker-thread-shared read-only connection.
+
+        Every dedicated reader (candidate bundle, timeline, vector scan) is a
+        plain ``mode=ro`` handle with the same settings; only the owning
+        attribute and its lock differ. Keeping the open code in one place makes
+        that invariant impossible to break by editing a single copy.
+        """
+        conn = sqlite3.connect(
+            f"{self.db_path.resolve().as_uri()}?mode=ro",
+            timeout=3.0,
+            check_same_thread=False,
+            uri=True,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=3000")
+        for pragma in (
+            "PRAGMA cache_size=-65536",
+            "PRAGMA temp_store=MEMORY",
+            "PRAGMA mmap_size=268435456",
+        ):
+            try:
+                conn.execute(pragma)
+            except sqlite3.OperationalError:
+                pass
+        return conn
+
     def _ensure_read_connection(self) -> sqlite3.Connection:
         """Lazily open a dedicated read-only connection.
 
@@ -523,14 +561,7 @@ class MemoryStore(SummaryBatchStore):
             with self._read_lock:
                 conn = self._read_conn
                 if conn is None:
-                    conn = sqlite3.connect(
-                        f"{self.db_path.resolve().as_uri()}?mode=ro",
-                        timeout=3.0,
-                        check_same_thread=False,
-                        uri=True,
-                    )
-                    conn.row_factory = sqlite3.Row
-                    conn.execute("PRAGMA busy_timeout=3000")
+                    conn = self._open_dedicated_read_connection()
                     self._read_conn = conn
         return conn
 
@@ -547,14 +578,7 @@ class MemoryStore(SummaryBatchStore):
             with self._timeline_read_lock:
                 conn = self._timeline_read_conn
                 if conn is None:
-                    conn = sqlite3.connect(
-                        f"{self.db_path.resolve().as_uri()}?mode=ro",
-                        timeout=3.0,
-                        check_same_thread=False,
-                        uri=True,
-                    )
-                    conn.row_factory = sqlite3.Row
-                    conn.execute("PRAGMA busy_timeout=3000")
+                    conn = self._open_dedicated_read_connection()
                     self._timeline_read_conn = conn
         return conn
 
@@ -562,6 +586,32 @@ class MemoryStore(SummaryBatchStore):
         if self._read_only:
             return self._conn, self._lock
         return self._ensure_timeline_read_connection(), self._timeline_read_lock
+
+    def _ensure_vector_read_connection(self) -> sqlite3.Connection:
+        if self._read_only:
+            return self._conn
+        conn = self._vector_read_conn
+        if conn is None:
+            with self._vector_read_lock:
+                conn = self._vector_read_conn
+                if conn is None:
+                    conn = self._open_dedicated_read_connection()
+                    self._vector_read_conn = conn
+        return conn
+
+    def _vector_read_connection(self) -> tuple[sqlite3.Connection, threading.RLock]:
+        """Reader pair for the exact embedding scan.
+
+        Must stay distinct from ``_read_connection_for_bundle``: the candidate
+        bundle and the vector scan are started together by ``asyncio.gather``
+        in ``retrieval._rank_candidates``, so sharing one connection/lock
+        serializes them (observed: lock windows [28..886ms] then
+        [904..2437ms] with zero overlap, ~1.2s wasted per turn). Read-only
+        stores keep reusing the main connection, which is already ``mode=ro``.
+        """
+        if self._read_only:
+            return self._conn, self._lock
+        return self._ensure_vector_read_connection(), self._vector_read_lock
 
     @staticmethod
     def _is_database_path_error(error: BaseException) -> bool:
@@ -4017,6 +4067,7 @@ class MemoryStore(SummaryBatchStore):
             "main_conn_closed": bool(self._closed),
             "read_conn_closed": self._read_conn is None,
             "timeline_read_conn_closed": self._timeline_read_conn is None,
+            "vector_read_conn_closed": self._vector_read_conn is None,
             "tracked_ops": tracked_ops,
             "operation_owner_stack": owner_stack,
         }
@@ -4035,11 +4086,46 @@ class MemoryStore(SummaryBatchStore):
                 pass
             self._conn = self._open_connection()
 
+    def _cancel_vector_warmup_tasks(self) -> list[asyncio.Task[Any]]:
+        """Signal and cancel all active background vector snapshot warmup tasks."""
+        with self._vector_warmup_lock:
+            entries = list(self._vector_warmup_tasks.values())
+            self._vector_warmup_tasks.clear()
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        cancelled_tasks: list[asyncio.Task[Any]] = []
+        for task, cancel_event in entries:
+            cancel_event.set()
+            if task is current_task or task.done():
+                continue
+            cancelled_tasks.append(task)
+            task_loop = task.get_loop()
+            if running_loop is task_loop:
+                task.cancel()
+            elif task_loop.is_running():
+                try:
+                    task_loop.call_soon_threadsafe(task.cancel)
+                except RuntimeError:
+                    pass
+            elif not task_loop.is_closed():
+                task.cancel()
+        return cancelled_tasks
+
     def close(self) -> None:
         with self._operation_condition:
             if self._closed:
                 return
             self._closing = True
+        self._cancel_vector_warmup_tasks()
+        with self._operation_condition:
+            if self._closed:
+                return
             if self._active_tracked_operations:
                 self._operation_waiters += 1
                 try:
@@ -4068,6 +4154,24 @@ class MemoryStore(SummaryBatchStore):
                 except sqlite3.Error:
                     pass
                 self._timeline_read_conn = None
+        with self._vector_read_lock:
+            if self._vector_read_conn is not None:
+                try:
+                    self._vector_read_conn.close()
+                except sqlite3.Error:
+                    pass
+                self._vector_read_conn = None
+
+    async def aclose(self) -> None:
+        """Cancel active vector warmup tasks, drain tracked operations, and close handles."""
+        with self._operation_condition:
+            if self._closed:
+                return
+            self._closing = True
+        tasks = self._cancel_vector_warmup_tasks()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.to_thread(self.close)
 
     def backup(self, suffix: str = "") -> Path:
         stamp = utc_now().replace(":", "").replace("-", "").replace("+", "_")
@@ -15458,6 +15562,100 @@ class MemoryStore(SummaryBatchStore):
         except asyncio.CancelledError:
             cancelled.set()
             raise
+
+    def schedule_vector_snapshot_warmup(
+        self,
+        *,
+        warmup_key: tuple,
+        provider_id: str,
+        query: list[float],
+        expected_revision: str,
+        authorization_key: tuple,
+        eligible: Callable[[MemoryRecord], bool],
+        include_pending: bool,
+        top_k: int,
+        threshold: float,
+        batch_size: int,
+        max_text_chars: int,
+        selection_time: float,
+    ) -> bool:
+        """Schedule a detached single-flight vector snapshot build after a cold-miss cancel."""
+        if self._closing or self._closed or not query:
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+
+        cache_key = (
+            provider_id,
+            len(query),
+            bool(include_pending),
+            max_text_chars,
+            authorization_key,
+        )
+        if self._vector_search_lock.acquire(blocking=False):
+            try:
+                cached = self._vector_search_cache.get(cache_key)
+                if (
+                    cached is not None
+                    and cached.revision == expected_revision
+                    and cached.valid_until > selection_time
+                ):
+                    return False
+            finally:
+                self._vector_search_lock.release()
+
+        cancel_event = threading.Event()
+        query_copy = list(query)
+        safe_top_k = max(1, int(top_k or 1))
+
+        async def _run_warmup() -> None:
+            from .vector_search import search_embeddings_sync
+
+            try:
+                await self._run_recoverable_database_operation(
+                    lambda: search_embeddings_sync(
+                        self,
+                        provider_id=provider_id,
+                        query=query_copy,
+                        expected_revision=expected_revision,
+                        authorization_key=authorization_key,
+                        eligible=eligible,
+                        include_pending=include_pending,
+                        top_k=safe_top_k,
+                        threshold=threshold,
+                        batch_size=batch_size,
+                        max_text_chars=max_text_chars,
+                        selection_time=selection_time,
+                        cancelled=cancel_event,
+                    )
+                )
+            except asyncio.CancelledError:
+                cancel_event.set()
+                raise
+            except Exception as exc:
+                logger.debug(
+                    "[MemoryStore] vector snapshot warmup failed: %s",
+                    exc,
+                )
+
+        def _cleanup(done_task: asyncio.Task[Any]) -> None:
+            with self._vector_warmup_lock:
+                current = self._vector_warmup_tasks.get(warmup_key)
+                if current is not None and current[0] is done_task:
+                    self._vector_warmup_tasks.pop(warmup_key, None)
+
+        with self._vector_warmup_lock:
+            if self._closing or self._closed:
+                return False
+            existing = self._vector_warmup_tasks.get(warmup_key)
+            if existing is not None and not existing[0].done():
+                return False
+            task = loop.create_task(_run_warmup())
+            self._vector_warmup_tasks[warmup_key] = (task, cancel_event)
+            task.add_done_callback(_cleanup)
+        return True
 
     async def list_embedding_candidate_rows(
         self,

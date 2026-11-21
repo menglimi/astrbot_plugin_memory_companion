@@ -181,13 +181,28 @@ class VectorSearchTests(unittest.IsolatedAsyncioTestCase):
                 self.assertAlmostEqual(score, scores[mid], places=12)
 
     async def test_cache_budget_overflow_keeps_search_complete(self):
+        """超预算时按块淘汰最旧，不再整份丢弃，且结果仍然完整。
+
+        旧行为是「超过 CACHE_BYTES 就 blocks.clear() + 不可缓存」，于是任何
+        真实规模（4096 维 × 1.1 万行 ≈ 350MB）的快照永远发布不了，每轮都重扫。
+        新契约：最旧的块被淘汰，最新的保留，命中时补读被淘汰的行。
+        """
         self.seed([(self.record(f"item-{i}"), [0., 1.]) for i in range(15)] + [(self.record("z-target"), [1., 0.])])
         self.engine.embedding_candidate_limit = 2
         with patch.object(vector_search, "CACHE_BYTES", 100):
             memories, _, info = await self.search()
-        self.assertEqual(["z-target"], [m.id for m in memories])
-        self.assertFalse(info["embedding_cache_retained"])
-        self.assertFalse(self.store._vector_search_cache)
+            self.assertEqual(["z-target"], [m.id for m in memories])
+            # 仍然是「能缓存」，只是部分：整份清空的老行为已废除。
+            self.assertTrue(info["embedding_cache_retained"])
+            self.assertTrue(info["embedding_snapshot_partial"])
+            cached = list(self.store._vector_search_cache.values())[0]
+            self.assertFalse(cached.complete)
+            self.assertEqual(1, len(cached.blocks))  # 至少保留一块，不会空
+            # 命中时补读被淘汰的行：答案与首次一致，且确实发生了补读。
+            warm_memories, _, warm_info = await self.search()
+            self.assertEqual(["z-target"], [m.id for m in warm_memories])
+            self.assertTrue(warm_info["embedding_cache_hit"])
+            self.assertGreater(warm_info["embedding_reread_rows"], 0)
 
     async def test_explicit_time_window_enters_cache_key_and_filters_before_topk(self):
         self.seed([(self.record("outside", occurred_at="2025-01-01T00:00:00+00:00"), [1., 0.]),
