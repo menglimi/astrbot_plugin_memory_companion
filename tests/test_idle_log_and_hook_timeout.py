@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import importlib.util
 import logging
 import sys
@@ -10,6 +11,7 @@ import tempfile
 import time
 import types
 import unittest
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -25,10 +27,12 @@ ROOT = bootstrap_package()
 from astrbot_plugin_memory_companion.core import latency as latency_mod
 from astrbot_plugin_memory_companion.core import service as service_mod
 from astrbot_plugin_memory_companion.core.latency import (
+    MAX_CONFIGURED_MODEL_CALL_TIMEOUT_MS,
     MAX_HOOK_MODEL_CALL_WAIT_SECONDS,
     _ActiveTimeBudget,
     await_with_memory_hook_budget,
     await_with_timeout,
+    bounded_model_call_timeout_ms,
     effective_model_call_timeout_seconds,
     exclude_model_call_wait,
 )
@@ -150,8 +154,8 @@ class IdleSkipLogAndHookTimeoutTests(unittest.IsolatedAsyncioTestCase):
                     await service._summary_drain_dispatch_loop()
 
                 self.assertTrue(
-                    any("自动消化跳过" in line and "idle-u1" in line for line in debug_records),
-                    f"expected skip log at DEBUG, got debug={debug_records} info={info_records}",
+                    any("自动消化跳过" in line and "idle-u1" in line and "force=" not in line for line in debug_records),
+                    f"expected skip log at DEBUG without force=, got debug={debug_records} info={info_records}",
                 )
                 self.assertFalse(
                     any("自动消化跳过" in line for line in info_records),
@@ -466,6 +470,319 @@ class IdleSkipLogAndHookTimeoutTests(unittest.IsolatedAsyncioTestCase):
         finally:
             latency_mod._ACTIVE_MEMORY_HOOK_BUDGET.reset(token)
         self.assertLess(time.monotonic() - started, 0.25)
+
+    async def test_background_tasks_spawned_inside_hook_do_not_inherit_hook_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MemoryCompanionService(
+                context=None,
+                config={"retrieval": {"embedding_timeout_ms": 2000}},
+                plugin_root=Path(ROOT),
+                data_dir=Path(tmp),
+            )
+            service._background_grace_seconds = 0
+            try:
+                class HealthyEmbeddingProvider:
+                    async def get_embedding(self, _text: str) -> list[float]:
+                        await asyncio.sleep(0.03)
+                        return [0.25, 0.75]
+
+                bg_observed: dict[str, Any] = {}
+                persist_observed: dict[str, Any] = {}
+                raw_observed: dict[str, Any] = {}
+                hook_done = asyncio.Event()
+                bg_started = asyncio.Event()
+
+                async def background_work() -> None:
+                    bg_observed["during_hook"] = effective_model_call_timeout_seconds(5.0)
+                    bg_started.set()
+                    await hook_done.wait()
+                    await asyncio.sleep(0.12)
+                    bg_observed["after_hook_expired"] = effective_model_call_timeout_seconds(5.0)
+                    bg_observed["vector"] = await service._embed_text_with_provider(
+                        HealthyEmbeddingProvider(),
+                        "后台向量索引不应受请求钩子预算污染",
+                    )
+
+                async def persistence_work() -> None:
+                    persist_observed["during_hook"] = effective_model_call_timeout_seconds(5.0)
+                    await hook_done.wait()
+                    await asyncio.sleep(0.12)
+                    persist_observed["after_hook_expired"] = effective_model_call_timeout_seconds(5.0)
+
+                async def raw_stray_task() -> None:
+                    await hook_done.wait()
+                    await asyncio.sleep(0.12)
+                    raw_observed["after_hook_closed"] = effective_model_call_timeout_seconds(5.0)
+
+                tasks: list[asyncio.Task[Any]] = []
+
+                async def hook_body() -> None:
+                    bg_task = service._spawn_background(background_work(), label="audit-bg-embed")
+                    persist_task = service._spawn_persistence_task(
+                        persistence_work(),
+                        label="audit-bg-persist",
+                    )
+                    stray_task = asyncio.create_task(raw_stray_task())
+                    self.assertIsNotNone(bg_task)
+                    self.assertIsNotNone(persist_task)
+                    assert bg_task is not None and persist_task is not None
+                    tasks.extend([bg_task, persist_task, stray_task])
+                    await bg_started.wait()
+                    # Hook's own context still retains the active ceiling.
+                    self.assertLessEqual(effective_model_call_timeout_seconds(5.0), 0.08)
+
+                await await_with_memory_hook_budget(
+                    hook_body(),
+                    0.08,
+                    max_model_call_wait_seconds=0.08,
+                )
+                hook_done.set()
+                await asyncio.gather(*tasks)
+
+                self.assertEqual(5.0, bg_observed["during_hook"])
+                self.assertEqual(5.0, bg_observed["after_hook_expired"])
+                self.assertEqual([0.25, 0.75], bg_observed["vector"])
+                self.assertEqual(5.0, persist_observed["during_hook"])
+                self.assertEqual(5.0, persist_observed["after_hook_expired"])
+                self.assertEqual(5.0, raw_observed["after_hook_closed"])
+            finally:
+                await service.aclose()
+
+    async def test_await_with_timeout_zero_or_nonfinite_fails_fast_without_starting_coroutine(self) -> None:
+        started = 0
+
+        async def side_effect_remote() -> str:
+            nonlocal started
+            started += 1
+            await asyncio.sleep(1.0)
+            return "late"
+
+        async def immediate_remote() -> str:
+            nonlocal started
+            started += 1
+            return "instant"
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", RuntimeWarning)
+            for raw_timeout in (0.0, -1.0, float("nan"), float("-inf")):
+                with self.subTest(raw_timeout=raw_timeout):
+                    with self.assertRaises(asyncio.TimeoutError):
+                        await await_with_timeout(side_effect_remote(), raw_timeout)
+                    with self.assertRaises(asyncio.TimeoutError):
+                        await await_with_timeout(immediate_remote(), raw_timeout)
+
+            pending_future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+            with self.assertRaises(asyncio.TimeoutError):
+                await await_with_timeout(pending_future, 0.0)
+            self.assertTrue(pending_future.cancelled())
+
+        self.assertEqual(0, started)
+        self.assertFalse(
+            any("was never awaited" in str(item.message) for item in caught),
+            f"unexpected unawaited coroutine warning: {[str(item.message) for item in caught]}",
+        )
+
+    async def test_nested_exclude_model_call_wait_concurrent_hooks_and_unwind(self) -> None:
+        # 1. Nested exclude_model_call_wait keeps active budget frozen until outer exits,
+        # tracks wall union without double-counting, and unwinds cleanly on inner exception.
+        observed: dict[str, Any] = {}
+
+        async def nested_waits() -> None:
+            budget = latency_mod._ACTIVE_MEMORY_HOOK_BUDGET.get()
+            self.assertIsNotNone(budget)
+            assert budget is not None
+            async with exclude_model_call_wait():
+                await asyncio.sleep(0.06)
+                with self.assertRaisesRegex(RuntimeError, "inner boom"):
+                    async with exclude_model_call_wait():
+                        await asyncio.sleep(0.06)
+                        raise RuntimeError("inner boom")
+                # Outer pause must still be active after inner exception unwind.
+                self.assertEqual(1, budget._pause_depth)
+                await asyncio.sleep(0.06)
+            observed["pause_depth_after"] = budget._pause_depth
+            observed["remaining_after"] = budget.remaining
+            observed["excluded_elapsed"] = budget.excluded_elapsed
+
+        await await_with_memory_hook_budget(
+            nested_waits(),
+            0.12,
+            max_model_call_wait_seconds=2.0,
+        )
+        self.assertEqual(0, observed["pause_depth_after"])
+        self.assertGreater(observed["remaining_after"], 0.04)
+        self.assertGreaterEqual(observed["excluded_elapsed"], 0.14)
+        self.assertLess(observed["excluded_elapsed"], 0.5)
+        self.assertIsNone(latency_mod._ACTIVE_MEMORY_HOOK_BUDGET.get())
+
+        # 2. Concurrent hooks have isolated ContextVars with distinct ceilings.
+        barrier = asyncio.Event()
+
+        async def worker(wait_ceiling: float, probe_timeout: float) -> float:
+            if wait_ceiling < 1.0:
+                await barrier.wait()
+            else:
+                barrier.set()
+            return effective_model_call_timeout_seconds(probe_timeout)
+
+        short_cap, long_cap = await asyncio.gather(
+            await_with_memory_hook_budget(worker(0.25, 10.0), 0.5, max_model_call_wait_seconds=0.25),
+            await_with_memory_hook_budget(worker(8.0, 10.0), 0.5, max_model_call_wait_seconds=8.0),
+        )
+        self.assertLessEqual(short_cap, 0.25)
+        self.assertGreater(short_cap, 0.0)
+        self.assertGreater(long_cap, 7.0)
+        self.assertLessEqual(long_cap, 8.0)
+
+        # 3. External cancellation unwinds pause depth and resets ContextVar cleanly.
+        entered_pause = asyncio.Event()
+        cancelled_budget_holder: list[_ActiveTimeBudget] = []
+
+        async def cancellable_hook() -> None:
+            budget = latency_mod._ACTIVE_MEMORY_HOOK_BUDGET.get()
+            assert budget is not None
+            cancelled_budget_holder.append(budget)
+            async with exclude_model_call_wait():
+                entered_pause.set()
+                await asyncio.sleep(5.0)
+
+        hook_task = asyncio.create_task(
+            await_with_memory_hook_budget(
+                cancellable_hook(),
+                0.5,
+                max_model_call_wait_seconds=5.0,
+            )
+        )
+        await entered_pause.wait()
+        hook_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await hook_task
+        await asyncio.sleep(0)
+        self.assertTrue(cancelled_budget_holder[0].closed)
+        self.assertEqual(0, cancelled_budget_holder[0]._pause_depth)
+        self.assertIsNone(latency_mod._ACTIVE_MEMORY_HOOK_BUDGET.get())
+
+        # 4. Invalid awaitable and NaN/negative budget durations do not leak ContextVar.
+        with self.assertRaises(TypeError):
+            await await_with_memory_hook_budget("not-an-awaitable", 1.0)
+        self.assertIsNone(latency_mod._ACTIVE_MEMORY_HOOK_BUDGET.get())
+
+        for invalid_budget in (float("nan"), -1.0, 0.0):
+            with self.subTest(invalid_budget=invalid_budget):
+                with self.assertRaises(asyncio.TimeoutError):
+                    await await_with_memory_hook_budget(asyncio.sleep(0.5), invalid_budget)
+                self.assertIsNone(latency_mod._ACTIVE_MEMORY_HOOK_BUDGET.get())
+
+        # Non-finite ceilings disable the cap without crashing.
+        async def probe_nonfinite_cap() -> float:
+            return effective_model_call_timeout_seconds(9.5)
+
+        for nonfinite in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(nonfinite=nonfinite):
+                result = await await_with_memory_hook_budget(
+                    probe_nonfinite_cap(),
+                    0.5,
+                    max_model_call_wait_seconds=nonfinite,
+                    model_call_budget_fraction=nonfinite,
+                )
+                self.assertEqual(9.5, result)
+
+    async def test_configured_10s_timeouts_integrate_cleanly_with_12s_hook_ceiling(self) -> None:
+        max_configured_seconds = bounded_model_call_timeout_ms(MAX_CONFIGURED_MODEL_CALL_TIMEOUT_MS) / 1000.0
+        self.assertEqual(10.0, max_configured_seconds)
+        self.assertEqual(12.0, MAX_HOOK_MODEL_CALL_WAIT_SECONDS)
+        self.assertEqual(10.0, effective_model_call_timeout_seconds(max_configured_seconds))
+
+        observed: dict[str, float] = {}
+
+        async def check_10s_under_12s_ceiling() -> None:
+            observed["initial_10s"] = effective_model_call_timeout_seconds(max_configured_seconds)
+            async with exclude_model_call_wait():
+                await asyncio.sleep(0.15)
+            observed["after_short_embed_10s"] = effective_model_call_timeout_seconds(max_configured_seconds)
+            observed["oversized_20s"] = effective_model_call_timeout_seconds(20.0)
+
+        await await_with_memory_hook_budget(
+            check_10s_under_12s_ceiling(),
+            1.0,
+            max_model_call_wait_seconds=MAX_HOOK_MODEL_CALL_WAIT_SECONDS,
+        )
+        self.assertEqual(10.0, observed["initial_10s"])
+        self.assertEqual(10.0, observed["after_short_embed_10s"])
+        self.assertLessEqual(observed["oversized_20s"], MAX_HOOK_MODEL_CALL_WAIT_SECONDS)
+        self.assertGreater(observed["oversized_20s"], MAX_HOOK_MODEL_CALL_WAIT_SECONDS - 1.0)
+
+    async def test_hook_budget_zero_or_nonfinite_fails_fast_without_starting_coroutine(self) -> None:
+        started = 0
+
+        async def immediate_hook() -> str:
+            nonlocal started
+            started += 1
+            return "instant"
+
+        async def suspending_hook() -> str:
+            nonlocal started
+            started += 1
+            await asyncio.sleep(1.0)
+            return "late"
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", RuntimeWarning)
+            for invalid_budget in (0.0, -1.0, float("nan"), float("-inf")):
+                with self.subTest(invalid_budget=invalid_budget):
+                    with self.assertRaises(asyncio.TimeoutError):
+                        await await_with_memory_hook_budget(immediate_hook(), invalid_budget)
+                    with self.assertRaises(asyncio.TimeoutError):
+                        await await_with_memory_hook_budget(suspending_hook(), invalid_budget)
+                    self.assertIsNone(latency_mod._ACTIVE_MEMORY_HOOK_BUDGET.get())
+
+            pending_future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+            with self.assertRaises(asyncio.TimeoutError):
+                await await_with_memory_hook_budget(pending_future, 0.0)
+            self.assertTrue(pending_future.cancelled())
+
+            with self.assertRaises(TypeError):
+                await await_with_memory_hook_budget("not-an-awaitable", 0.0)
+            with self.assertRaises(TypeError):
+                await await_with_timeout("not-an-awaitable", 0.0)
+            self.assertIsNone(latency_mod._ACTIVE_MEMORY_HOOK_BUDGET.get())
+
+        self.assertEqual(0, started)
+        self.assertFalse(
+            any("was never awaited" in str(item.message) for item in caught),
+            f"unexpected unawaited coroutine warning: {[str(item.message) for item in caught]}",
+        )
+
+    async def test_same_tick_task_exception_and_outer_cancellation_leaves_no_unretrieved_exception(
+        self,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        unhandled: list[dict[str, Any]] = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, ctx: unhandled.append(ctx))
+        try:
+            ready = asyncio.Event()
+
+            async def fail_on_resume() -> None:
+                await ready.wait()
+                raise RuntimeError("same-tick failure")
+
+            outer = asyncio.create_task(
+                await_with_memory_hook_budget(fail_on_resume(), 1.0)
+            )
+            await asyncio.sleep(0)
+            ready.set()
+            outer.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await outer
+            await asyncio.sleep(0)
+            gc.collect()
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+        self.assertEqual([], unhandled, f"unexpected unhandled loop exceptions: {unhandled}")
+        self.assertIsNone(latency_mod._ACTIVE_MEMORY_HOOK_BUDGET.get())
 
 
 if __name__ == "__main__":
