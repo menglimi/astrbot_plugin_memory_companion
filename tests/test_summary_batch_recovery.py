@@ -293,6 +293,90 @@ class SummaryBatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, len(provider.calls))
         self.assertEqual('completed', self.batches()[0]['state'])
 
+    async def test_non_transient_failure_waits_for_backoff_then_resumes(self):
+        self.config["memory_summary"]["retry_backoff_seconds"] = 60
+        event_id = await self.event()
+        provider = Provider(["not json at all", self.payload(event_id)])
+        self.use(provider)
+        started = datetime.now(timezone.utc)
+
+        self.assertEqual("", await self.service.maybe_summarize_session(self.ctx))
+
+        batch = self.batches()[0]
+        self.assertEqual(1, len(provider.calls))
+        self.assertEqual(("retry_pending", 1, "", None),
+                         (batch["state"], batch["automatic_calls"], batch["lease_token"], batch["lease_expires_at"]))
+        self.assertTrue(batch["last_error"].startswith("repair:"))
+        self.assertGreaterEqual(datetime.fromisoformat(batch["next_retry_at"]), started + timedelta(seconds=59))
+        self.assertFalse((await self.service.store.get_timeline_by_ids([event_id]))[event_id]["summarized_at"])
+        self.assertEqual("", await self.service.maybe_summarize_session(self.ctx))
+        self.assertEqual(1, len(provider.calls))
+
+        with self.service.store._lock, self.service.store._transaction_sync():
+            self.service.store._conn.execute(
+                "UPDATE summary_batches SET next_retry_at=? WHERE id=?",
+                ((started - timedelta(seconds=1)).isoformat(timespec="seconds"), batch["id"]),
+            )
+        self.assertTrue(await self.service.maybe_summarize_session(self.ctx))
+        self.assertEqual(2, len(provider.calls))
+        self.assertIn("validation_errors", provider.calls[1]["prompt"])
+        self.assertEqual(("completed", 2), (self.batches()[0]["state"], self.batches()[0]["automatic_calls"]))
+
+    async def test_non_transient_backoff_grows_until_batch_budget_is_exhausted(self):
+        self.config["memory_summary"]["retry_backoff_seconds"] = 60
+        event_id = await self.event()
+        provider = Provider(["not json at all"] * 3)
+        self.use(provider)
+
+        for expected_calls in range(1, 4):
+            started = datetime.now(timezone.utc)
+            self.assertEqual("", await self.service.maybe_summarize_session(self.ctx))
+            batch = self.batches()[0]
+            self.assertEqual(expected_calls, len(provider.calls))
+            self.assertEqual(expected_calls, batch["automatic_calls"])
+            self.assertEqual(("", None), (batch["lease_token"], batch["lease_expires_at"]))
+            self.assertTrue(batch["last_error"].startswith("repair:"))
+            if expected_calls > 1:
+                self.assertIn("validation_errors", provider.calls[expected_calls - 1]["prompt"])
+            if expected_calls < 3:
+                self.assertEqual("retry_pending", batch["state"])
+                self.assertGreaterEqual(
+                    datetime.fromisoformat(batch["next_retry_at"]),
+                    started + timedelta(seconds=60 * 2 ** (expected_calls - 1) - 1),
+                )
+                with self.service.store._lock, self.service.store._transaction_sync():
+                    self.service.store._conn.execute(
+                        "UPDATE summary_batches SET next_retry_at=? WHERE id=?",
+                        ((started - timedelta(seconds=1)).isoformat(timespec="seconds"), batch["id"]),
+                    )
+
+        self.assertEqual("quarantined", self.batches()[0]["state"])
+        self.assertFalse((await self.service.store.get_timeline_by_ids([event_id]))[event_id]["summarized_at"])
+        self.assertEqual(0, self.service.store._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+
+    async def test_zero_backoff_keeps_immediate_provider_retry(self):
+        event_id = await self.event()
+        provider = Provider(["not json at all", self.payload(event_id)])
+        self.use(provider)
+
+        self.assertTrue(await self.service.maybe_summarize_session(self.ctx))
+
+        self.assertEqual(2, len(provider.calls))
+        self.assertIn("validation_errors", provider.calls[1]["prompt"])
+        self.assertEqual(2, self.batches()[0]["automatic_calls"])
+
+    async def test_manual_retry_is_bounded_without_automatic_backoff(self):
+        self.config["memory_summary"]["retry_backoff_seconds"] = 60
+        event_id = await self.event()
+        provider = Provider(["not json at all", self.payload(event_id)])
+        self.use(provider)
+
+        self.assertTrue(await self.service.maybe_summarize_session(self.ctx, force=True))
+
+        self.assertEqual(2, len(provider.calls))
+        self.assertIn("validation_errors", provider.calls[1]["prompt"])
+        self.assertEqual(0, self.batches()[0]["automatic_calls"])
+
     async def test_request_max_retries_is_configurable(self):
         """R14：单次请求重试次数不再是写死的 1，而是读 memory_summary.request_max_retries。"""
         self.config['memory_summary']['request_max_retries'] = 4
