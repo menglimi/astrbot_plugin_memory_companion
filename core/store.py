@@ -74,6 +74,82 @@ _ACL_UNSET = object()
 _RECORD_LIGHT_CACHE_MAX_ENTRIES = 16384
 
 
+class _RecordLightCacheEntry:
+    """Cached immutable row template with per-max-chars embedding text hashes."""
+
+    __slots__ = (
+        "updated_at",
+        "raw_metadata",
+        "raw_tags",
+        "template",
+        "revision",
+        "embedding_hashes",
+    )
+
+    def __init__(
+        self,
+        updated_at: Any,
+        raw_metadata: Any,
+        raw_tags: Any,
+        template: MemoryRecord,
+        revision: str,
+    ) -> None:
+        self.updated_at = updated_at
+        self.raw_metadata = raw_metadata
+        self.raw_tags = raw_tags
+        self.template = template
+        self.revision = revision
+        self.embedding_hashes: dict[int, str] | None = None
+
+
+def _row_scalar_fields_match(row: Any, template: MemoryRecord) -> bool:
+    """Return whether all non-counter columns of ``row`` still match ``template``."""
+    subject = template.subject
+    obj = template.object
+    return (
+        row_value(row, "content", "") == template.content
+        and row_value(row, "visibility", "internal") == template.visibility
+        and row_value(row, "lifecycle", "raw_event") == template.lifecycle
+        and row_value(row, "validity_status", "active") == template.validity_status
+        and row_value(row, "valid_from", "") == template.valid_from
+        and row_value(row, "valid_to", "") == template.valid_to
+        and row_value(row, "review_status", "auto") == template.review_status
+        and row_value(row, "evidence", "") == template.evidence
+        and row_value(row, "memory_type", "observation") == template.memory_type
+        and row_value(row, "scope", "unknown") == template.scope
+        and row_value(row, "session_id", "") == template.session_id
+        and row_value(row, "platform", "") == template.platform
+        and row_value(row, "message_id", "") == template.message_id
+        and row_value(row, "group_id", "") == template.group_id
+        and row_value(row, "sayability", "indirect") == template.sayability
+        and row_value(row, "reality_level", "imported_summary") == template.reality_level
+        and row_value(row, "owner_bot_id", "") == template.owner_bot_id
+        and row_value(row, "subject_person_id", "") == template.subject_person_id
+        and row_value(row, "identity_assurance", "") == template.identity_assurance
+        and row_value(row, "durability", "normal") == template.durability
+        and row_value(row, "sensitivity", "private") == template.sensitivity
+        and row_value(row, "canonical_key", "") == template.canonical_key
+        and row_value(row, "created_at", "") == template.created_at
+        and row_value(row, "occurred_at", "") == template.occurred_at
+        and row_value(row, "source_plugin", "memory_companion") == template.source_plugin
+        and row_value(row, "import_batch_id", "") == template.import_batch_id
+        and row_value(row, "content_fingerprint", "") == template.content_fingerprint
+        and row_value(row, "supersedes_id", "") == template.supersedes_id
+        and row_value(row, "subject_kind", "user") == subject.kind
+        and row_value(row, "subject_id", "") == subject.id
+        and row_value(row, "subject_name", "") == subject.name
+        and row_value(row, "subject_role", "unknown") == subject.role
+        and row_value(row, "object_kind", "user") == obj.kind
+        and row_value(row, "object_id", "") == obj.id
+        and row_value(row, "object_name", "") == obj.name
+        and row_value(row, "object_role", "unknown") == obj.role
+        and float(row_value(row, "confidence", 0.5) or 0.0) == template.confidence
+        and float(row_value(row, "importance", 0.3) or 0.0) == template.importance
+        and float(row_value(row, "salience", 0.3) or 0.0) == template.salience
+        and int(row_value(row, "merged_count", 1) or 1) == template.merged_count
+    )
+
+
 class MemoryStoreUnavailableError(sqlite3.OperationalError):
     """The memory database cannot be opened for writing.
 
@@ -484,6 +560,8 @@ class MemoryStore(SummaryBatchStore):
         ] = {}
         self._vector_search_lock = threading.RLock()
         self._vector_search_cache: dict[tuple, Any] = {}
+        self._vector_corpus_cache: dict[tuple, Any] = {}
+        self._vector_cache_sync_sig: Any = None
         self._vector_warmup_lock = threading.Lock()
         self._vector_warmup_tasks: dict[tuple, tuple[asyncio.Task[Any], threading.Event]] = {}
         self._acl_feature_override_cache: dict[
@@ -529,6 +607,7 @@ class MemoryStore(SummaryBatchStore):
         connection.execute("PRAGMA busy_timeout=3000")
         if not self._read_only:
             connection.execute("PRAGMA wal_autocheckpoint=500")
+            connection.execute("PRAGMA synchronous=NORMAL")
         return connection
 
     def _open_dedicated_read_connection(self) -> sqlite3.Connection:
@@ -567,10 +646,16 @@ class MemoryStore(SummaryBatchStore):
         connection, which is already opened with mode=ro.
         """
         if self._read_only:
+            if self._closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
             return self._conn
+        if self._closed:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
         conn = self._read_conn
         if conn is None:
             with self._read_lock:
+                if self._closed:
+                    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
                 conn = self._read_conn
                 if conn is None:
                     conn = self._open_dedicated_read_connection()
@@ -579,15 +664,23 @@ class MemoryStore(SummaryBatchStore):
 
     def _read_connection_for_bundle(self) -> tuple[sqlite3.Connection, threading.RLock]:
         if self._read_only:
+            if self._closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
             return self._conn, self._lock
         return self._ensure_read_connection(), self._read_lock
 
     def _ensure_timeline_read_connection(self) -> sqlite3.Connection:
         if self._read_only:
+            if self._closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
             return self._conn
+        if self._closed:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
         conn = self._timeline_read_conn
         if conn is None:
             with self._timeline_read_lock:
+                if self._closed:
+                    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
                 conn = self._timeline_read_conn
                 if conn is None:
                     conn = self._open_dedicated_read_connection()
@@ -596,15 +689,23 @@ class MemoryStore(SummaryBatchStore):
 
     def _timeline_read_connection(self) -> tuple[sqlite3.Connection, threading.RLock]:
         if self._read_only:
+            if self._closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
             return self._conn, self._lock
         return self._ensure_timeline_read_connection(), self._timeline_read_lock
 
     def _ensure_vector_read_connection(self) -> sqlite3.Connection:
         if self._read_only:
+            if self._closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
             return self._conn
+        if self._closed:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
         conn = self._vector_read_conn
         if conn is None:
             with self._vector_read_lock:
+                if self._closed:
+                    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
                 conn = self._vector_read_conn
                 if conn is None:
                     conn = self._open_dedicated_read_connection()
@@ -622,8 +723,49 @@ class MemoryStore(SummaryBatchStore):
         stores keep reusing the main connection, which is already ``mode=ro``.
         """
         if self._read_only:
+            if self._closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
             return self._conn, self._lock
         return self._ensure_vector_read_connection(), self._vector_read_lock
+
+    @contextmanager
+    def _read_conn_sync(self):
+        """Yield a non-blocking dedicated read connection off ``self._lock``.
+
+        Falls back to ``self._conn`` under ``self._lock`` when opened with
+        ``read_only=True`` or when ``self._conn`` holds an uncommitted
+        transaction accessible without blocking on another writer's ``self._lock``.
+        Falls back to ``_timeline_read_connection`` when ``_read_lock`` is busy.
+        """
+        if self._read_only:
+            with self._lock:
+                if self._closed:
+                    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+                yield self._conn
+            return
+        if self._closed:
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+        if self._lock.acquire(blocking=False):
+            try:
+                if self._closed:
+                    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+                if self._conn.in_transaction:
+                    yield self._conn
+                    return
+            finally:
+                self._lock.release()
+        if self._read_lock.acquire(blocking=False):
+            try:
+                conn, _lock = self._read_connection_for_bundle()
+                yield conn
+            finally:
+                self._read_lock.release()
+            return
+        tl_conn, tl_lock = self._timeline_read_connection()
+        with tl_lock:
+            if self._closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+            yield tl_conn
 
     @staticmethod
     def _is_database_path_error(error: BaseException) -> bool:
@@ -1220,6 +1362,7 @@ class MemoryStore(SummaryBatchStore):
             return
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self.last_schema_backup_path = self._backup_before_schema_upgrade_sync()
             self._conn.executescript(
@@ -1778,6 +1921,7 @@ class MemoryStore(SummaryBatchStore):
             self._ensure_knowledge_trgm_sync()
             self._remove_legacy_redaction_tracking_triggers_sync()
             self._ensure_retrieval_revision_sync()
+            self._ensure_vector_corpus_delta_sync()
             self._ensure_source_query_indexes_sync()
             from .source_watches import initialize as initialize_life_source_watches
             initialize_life_source_watches(self._conn)
@@ -2647,6 +2791,125 @@ class MemoryStore(SummaryBatchStore):
             AFTER DELETE ON knowledge_edges
             BEGIN
                 UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            """
+        )
+
+    def _ensure_vector_corpus_delta_sync(self) -> None:
+        """Create trigger-backed delta log for incremental VectorCorpus synchronization.
+
+        Only ``memories`` semantic columns (matching ``retrieval_revision``) and
+        ``memory_embeddings`` record into ``vector_corpus_changes`` and bump
+        ``vector_corpus_revision``. Knowledge-graph and counter-only updates leave
+        the corpus revision untouched, while ACL tables bump ``acl_revision`` so
+        per-window selection caches invalidate without rescanning vectors.
+        """
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS vector_corpus_revision (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                revision INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT OR IGNORE INTO vector_corpus_revision(singleton, revision) VALUES(1, 0);
+
+            CREATE TABLE IF NOT EXISTS vector_corpus_changes (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS acl_revision (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                revision INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT OR IGNORE INTO acl_revision(singleton, revision) VALUES(1, 0);
+
+            CREATE TRIGGER IF NOT EXISTS trg_memories_vector_corpus_insert
+            AFTER INSERT ON memories
+            BEGIN
+                INSERT INTO vector_corpus_changes(memory_id) VALUES(NEW.id);
+                UPDATE vector_corpus_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_memories_vector_corpus_delete
+            AFTER DELETE ON memories
+            BEGIN
+                INSERT INTO vector_corpus_changes(memory_id) VALUES(OLD.id);
+                UPDATE vector_corpus_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            DROP TRIGGER IF EXISTS trg_memories_vector_corpus_update;
+            CREATE TRIGGER IF NOT EXISTS trg_memories_vector_corpus_update
+            AFTER UPDATE OF
+                memory_type, subject_kind, subject_id, subject_name, subject_role,
+                object_kind, object_id, object_name, object_role, scope, session_id,
+                subject_person_id, identity_assurance,
+                platform, message_id, group_id, visibility, sayability, reality_level,
+                lifecycle, content, evidence, confidence, importance, review_status,
+                tags, metadata, created_at, updated_at, occurred_at, source_plugin,
+                import_batch_id, content_fingerprint, merged_count, supersedes_id,
+                owner_bot_id, validity_status, valid_from, valid_to, salience,
+                durability, sensitivity, canonical_key
+            ON memories
+            BEGIN
+                INSERT INTO vector_corpus_changes(memory_id)
+                SELECT OLD.id WHERE OLD.id != NEW.id;
+                INSERT INTO vector_corpus_changes(memory_id) VALUES(NEW.id);
+                UPDATE vector_corpus_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_embeddings_vector_corpus_insert
+            AFTER INSERT ON memory_embeddings
+            BEGIN
+                INSERT INTO vector_corpus_changes(memory_id) VALUES(NEW.memory_id);
+                UPDATE vector_corpus_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_embeddings_vector_corpus_update
+            AFTER UPDATE ON memory_embeddings
+            BEGIN
+                INSERT INTO vector_corpus_changes(memory_id)
+                SELECT OLD.memory_id WHERE OLD.memory_id != NEW.memory_id;
+                INSERT INTO vector_corpus_changes(memory_id) VALUES(NEW.memory_id);
+                UPDATE vector_corpus_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_embeddings_vector_corpus_delete
+            AFTER DELETE ON memory_embeddings
+            BEGIN
+                INSERT INTO vector_corpus_changes(memory_id) VALUES(OLD.memory_id);
+                UPDATE vector_corpus_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_acl_rules_acl_revision_insert
+            AFTER INSERT ON memory_acl_rules
+            BEGIN
+                UPDATE acl_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_acl_rules_acl_revision_update
+            AFTER UPDATE ON memory_acl_rules
+            BEGIN
+                UPDATE acl_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_acl_rules_acl_revision_delete
+            AFTER DELETE ON memory_acl_rules
+            BEGIN
+                UPDATE acl_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_acl_policies_acl_revision_insert
+            AFTER INSERT ON memory_acl_policies
+            BEGIN
+                UPDATE acl_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_acl_policies_acl_revision_update
+            AFTER UPDATE ON memory_acl_policies
+            BEGIN
+                UPDATE acl_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_acl_policies_acl_revision_delete
+            AFTER DELETE ON memory_acl_policies
+            BEGIN
+                UPDATE acl_revision SET revision = revision + 1 WHERE singleton = 1;
             END;
             """
         )
@@ -4265,6 +4528,13 @@ class MemoryStore(SummaryBatchStore):
             self._conn.close()
             self._closed = True
             self._vector_search_cache.clear()
+            self._vector_corpus_cache.clear()
+            self._vector_cache_sync_sig = None
+        light_lock = getattr(self, "_record_light_cache_lock", None)
+        light_cache = self.__dict__.get("_record_light_cache")
+        if light_lock is not None and light_cache is not None:
+            with light_lock:
+                light_cache.clear()
         with self._read_lock:
             if self._read_conn is not None:
                 try:
@@ -7767,8 +8037,8 @@ class MemoryStore(SummaryBatchStore):
         entity_id = clean_text(getattr(entity, "id", ""), 120) or "unknown"
         kind = clean_text(getattr(entity, "kind", "user"), 40) or "user"
         platform = clean_text(platform, 40)
-        with self._lock:
-            row = self._conn.execute(
+        with self._read_conn_sync() as conn:
+            row = conn.execute(
                 "SELECT profile FROM identities "
                 "WHERE platform=? AND entity_kind=? AND entity_id=? "
                 "ORDER BY updated_at DESC LIMIT 1",
@@ -7996,14 +8266,15 @@ class MemoryStore(SummaryBatchStore):
         platform = clean_text(platform, 40)
         bot_id = clean_text(bot_id, 120)
         placeholders = ",".join("?" for _ in ids)
-        rows = self._conn.execute(
-            f"""
-            SELECT user_id, bot_id, platform, weight
-            FROM person_weights
-            WHERE user_id IN ({placeholders})
-            """,
-            ids,
-        ).fetchall()
+        with self._read_conn_sync() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT user_id, bot_id, platform, weight
+                FROM person_weights
+                WHERE user_id IN ({placeholders})
+                """,
+                ids,
+            ).fetchall()
         result: dict[str, float] = {}
         for row in rows:
             if platform and clean_text(row["platform"], 40) not in {"", platform}:
@@ -9463,8 +9734,8 @@ class MemoryStore(SummaryBatchStore):
             match_clauses.append(f"({like_sql})")
             match_params.extend(self._like_pattern(term) for term in like_terms)
         match_where = " OR ".join(match_clauses) or "1=0"
-        with self._lock:
-            matched = self._conn.execute(
+        with self._read_conn_sync() as conn:
+            matched = conn.execute(
                 f"""
                 SELECT n.id, n.label
                 FROM knowledge_nodes n
@@ -9479,7 +9750,7 @@ class MemoryStore(SummaryBatchStore):
             if not matched_ids:
                 return labels[:limit]
             placeholders = ",".join("?" for _ in matched_ids)
-            related = self._conn.execute(
+            related = conn.execute(
                 f"""
                 SELECT DISTINCT n.label
                 FROM knowledge_edges e
@@ -11097,8 +11368,8 @@ class MemoryStore(SummaryBatchStore):
         if bot_clause:
             where += bot_clause
             params.extend(bot_params)
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_conn_sync() as conn:
+            rows = conn.execute(
                 f"""
                 SELECT *
                 FROM timeline
@@ -11321,12 +11592,12 @@ class MemoryStore(SummaryBatchStore):
         if not ids:
             return {}
         rows: list[Any] = []
-        with self._lock:
+        with self._read_conn_sync() as conn:
             for index in range(0, len(ids), 500):
                 chunk = ids[index:index + 500]
                 placeholders = ",".join("?" for _ in chunk)
                 rows.extend(
-                    self._conn.execute(
+                    conn.execute(
                         f"SELECT * FROM timeline WHERE id IN ({placeholders})",
                         chunk,
                     ).fetchall()
@@ -11376,10 +11647,10 @@ class MemoryStore(SummaryBatchStore):
             where += bot_clause
             params.extend(bot_params)
         event_time_sql = _timeline_time_sql()
-        with self._lock:
+        with self._read_conn_sync() as conn:
             cursor = None
             if clean_text(after_timeline_id, 160):
-                cursor = self._conn.execute(
+                cursor = conn.execute(
                     "SELECT occurred_at, created_at, id FROM timeline WHERE id=? AND session_id=?"
                     + bot_clause,
                     (clean_text(after_timeline_id, 160), clean_text(session_id, 200), owner_bot)
@@ -11399,11 +11670,11 @@ class MemoryStore(SummaryBatchStore):
                         clean_text(cursor["id"], 160),
                     ]
                 )
-            total = self._conn.execute(
+            total = conn.execute(
                 f"SELECT COUNT(*) FROM timeline WHERE {where}",
                 params,
             ).fetchone()[0]
-            first = self._conn.execute(
+            first = conn.execute(
                 f"""
                 SELECT occurred_at
                 FROM timeline
@@ -11413,7 +11684,7 @@ class MemoryStore(SummaryBatchStore):
                 """,
                 params,
             ).fetchone()
-            rows = self._conn.execute(
+            rows = conn.execute(
                 f"""
                 SELECT *
                 FROM timeline
@@ -11451,8 +11722,8 @@ class MemoryStore(SummaryBatchStore):
         return await asyncio.to_thread(self._get_summary_failure_sync, session_id)
 
     def _get_summary_failure_sync(self, session_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._conn.execute(
+        with self._read_conn_sync() as conn:
+            row = conn.execute(
                 "SELECT * FROM summary_failures WHERE session_id=?",
                 (clean_text(session_id, 200),),
             ).fetchone()
@@ -11787,8 +12058,8 @@ class MemoryStore(SummaryBatchStore):
         if session_id:
             where += " AND session_id=?"
             params.append(session_id)
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_conn_sync() as conn:
+            rows = conn.execute(
                 f"""
                 SELECT * FROM injection_logs
                 WHERE {where}
@@ -12371,15 +12642,23 @@ class MemoryStore(SummaryBatchStore):
             include_pending,
         )
 
-    def _cached_from_row_light(self, row: Any, *, revision: str = "") -> MemoryRecord:
-        """Parse a stored row via ``MemoryRecord.from_row_light`` with bounded memoization.
+    def _cached_from_row_light(
+        self,
+        row: Any,
+        *,
+        revision: str = "",
+        copy: bool = True,
+    ) -> MemoryRecord:
+        """Parse a stored row via ``MemoryRecord.from_row_light`` with incremental memoization.
 
-        Candidate-bundle reads repeatedly deserialize thousands of unchanged rows
-        whose large ``metadata`` JSON dominates ``parse_ms``.  Cached template
-        records are cleared whenever ``retrieval_revision`` changes and verified
-        per row against ``(updated_at, raw_metadata, raw_tags)``; non-trigger
-        counter/access columns are refreshed from ``row`` and ``metadata``/``tags``
-        are shallow-copied so caller mutations never pollute the cache.
+        Candidate-bundle and vector-scan reads repeatedly deserialize thousands of
+        unchanged rows whose large ``metadata`` JSON dominates ``parse_ms``.
+        Entries are retained across ``retrieval_revision`` increments and verified
+        per row against ``(updated_at, raw_metadata, raw_tags)`` (plus scalar
+        non-counter columns when the revision changed or is empty).  Read-only
+        hot paths may pass ``copy=False`` when they never mutate ``metadata`` or
+        ``tags``; callers using the default ``copy=True`` receive shallow copies
+        so mutations never pollute the cache.
         """
         row_id = str(row_value(row, "id", "") or "")
         if not row_id:
@@ -12399,39 +12678,121 @@ class MemoryStore(SummaryBatchStore):
             if cache is None:
                 cache = {}
                 self._record_light_cache = cache
-                self._record_light_cache_revision = ""
-            if rev and rev != self._record_light_cache_revision:
-                cache.clear()
-                self._record_light_cache_revision = rev
-            observed_rev = self._record_light_cache_revision
             entry = cache.get(row_id)
             if (
                 entry is not None
-                and entry[0] == updated_at
-                and entry[1] == raw_metadata
-                and entry[2] == raw_tags
+                and entry.updated_at == updated_at
+                and entry.raw_metadata == raw_metadata
+                and entry.raw_tags == raw_tags
             ):
-                template_record = entry[3]
-                return replace(
-                    template_record,
-                    reinforcement_score=float(row_value(row, "reinforcement_score", 0.0) or 0.0),
-                    injection_count=int(row_value(row, "injection_count", 0) or 0),
-                    last_injected_at=row_value(row, "last_injected_at", ""),
-                    last_accessed_at=row_value(row, "last_accessed_at", ""),
-                    access_count=int(row_value(row, "access_count", 0) or 0),
-                    metadata=dict(template_record.metadata),
-                    tags=list(template_record.tags),
-                )
+                template_record = entry.template
+                if (rev and entry.revision == rev) or _row_scalar_fields_match(row, template_record):
+                    if rev and entry.revision != rev:
+                        entry.revision = rev
+                    reinforcement = float(row_value(row, "reinforcement_score", 0.0) or 0.0)
+                    injection_count = int(row_value(row, "injection_count", 0) or 0)
+                    last_injected_at = row_value(row, "last_injected_at", "")
+                    last_accessed_at = row_value(row, "last_accessed_at", "")
+                    access_count = int(row_value(row, "access_count", 0) or 0)
+                    if not copy:
+                        if (
+                            reinforcement == template_record.reinforcement_score
+                            and injection_count == template_record.injection_count
+                            and last_injected_at == template_record.last_injected_at
+                            and last_accessed_at == template_record.last_accessed_at
+                            and access_count == template_record.access_count
+                        ):
+                            return template_record
+                        return replace(
+                            template_record,
+                            reinforcement_score=reinforcement,
+                            injection_count=injection_count,
+                            last_injected_at=last_injected_at,
+                            last_accessed_at=last_accessed_at,
+                            access_count=access_count,
+                        )
+                    return replace(
+                        template_record,
+                        reinforcement_score=reinforcement,
+                        injection_count=injection_count,
+                        last_injected_at=last_injected_at,
+                        last_accessed_at=last_accessed_at,
+                        access_count=access_count,
+                        metadata=dict(template_record.metadata),
+                        tags=list(template_record.tags),
+                    )
 
         rec = MemoryRecord.from_row_light(row)
-        template = replace(rec, metadata=dict(rec.metadata), tags=list(rec.tags))
+        template = replace(rec, metadata=dict(rec.metadata), tags=list(rec.tags)) if copy else rec
         with lock:
             cache = self.__dict__.get("_record_light_cache")
-            if cache is not None and self._record_light_cache_revision == observed_rev:
+            if cache is not None:
                 if row_id not in cache and len(cache) >= _RECORD_LIGHT_CACHE_MAX_ENTRIES:
                     cache.pop(next(iter(cache)))
-                cache[row_id] = (updated_at, raw_metadata, raw_tags, template)
+                cache[row_id] = _RecordLightCacheEntry(
+                    updated_at,
+                    raw_metadata,
+                    raw_tags,
+                    template,
+                    rev,
+                )
         return rec
+
+    def _cached_embedding_text_hash(
+        self,
+        memory: MemoryRecord,
+        *,
+        max_chars: int = 1200,
+        revision: str = "",
+    ) -> str:
+        """Return ``memory_embedding_text_hash`` memoized on the immutable row cache entry."""
+        try:
+            limit = max(200, int(max_chars or 1200))
+        except (TypeError, ValueError):
+            limit = 1200
+
+        row_id = memory.id
+        if not row_id:
+            return memory_embedding_text_hash(memory, max_chars=limit)
+
+        lock = getattr(self, "_record_light_cache_lock", None)
+        cache = self.__dict__.get("_record_light_cache")
+        rev = str(revision or "")
+
+        def _entry_matches(entry: _RecordLightCacheEntry) -> bool:
+            template = entry.template
+            if template is memory:
+                return True
+            return bool(
+                rev
+                and entry.revision == rev
+                and template.updated_at == memory.updated_at
+                and template.content == memory.content
+                and template.evidence == memory.evidence
+                and template.memory_type == memory.memory_type
+                and template.scope == memory.scope
+                and template.visibility == memory.visibility
+                and (template.tags is memory.tags or template.tags == memory.tags)
+                and (template.metadata is memory.metadata or template.metadata == memory.metadata)
+            )
+
+        if lock is not None and cache is not None:
+            with lock:
+                entry = cache.get(row_id)
+                if entry is not None and _entry_matches(entry) and entry.embedding_hashes is not None:
+                    cached_hash = entry.embedding_hashes.get(limit)
+                    if cached_hash is not None:
+                        return cached_hash
+
+        digest = memory_embedding_text_hash(memory, max_chars=limit)
+        if lock is not None and cache is not None:
+            with lock:
+                entry = cache.get(row_id)
+                if entry is not None and _entry_matches(entry):
+                    if entry.embedding_hashes is None:
+                        entry.embedding_hashes = {}
+                    entry.embedding_hashes[limit] = digest
+        return digest
 
     def _list_retrieval_candidate_bundle_sync(
         self,
@@ -12548,14 +12909,22 @@ class MemoryStore(SummaryBatchStore):
         try:
             return conn.execute(
                 f"""
+                WITH matched AS (
+                    SELECT m.rowid AS _rid,
+                           bm25(memory_fts) AS _rank,
+                           m.importance AS _imp,
+                           {_memory_time_sql('m')} AS _ts
+                    FROM memory_fts
+                    JOIN memories m ON m.id = memory_fts.memory_id
+                    WHERE memory_fts MATCH ?
+                      AND {where}
+                    ORDER BY _rank, _imp DESC, _ts DESC
+                    LIMIT ?
+                )
                 SELECT m.*
-                FROM memory_fts
-                JOIN memories m ON m.id = memory_fts.memory_id
-                WHERE memory_fts MATCH ?
-                  AND {where}
-                ORDER BY bm25(memory_fts), m.importance DESC,
-                         {_memory_time_sql('m')} DESC
-                LIMIT ?
+                FROM matched
+                JOIN memories m ON m.rowid = matched._rid
+                ORDER BY matched._rank, matched._imp DESC, matched._ts DESC
                 """,
                 params + [max(1, int(limit or 1))],
             ).fetchall()
@@ -12632,38 +13001,47 @@ class MemoryStore(SummaryBatchStore):
         if not include_pending:
             where += " AND review_status != 'pending'"
 
+        # Short columns first, large 2.3KB ``metadata`` JSON last so matching rows
+        # short-circuit before scanning ``metadata``; two-phase CTE avoids
+        # sorting full 49-column rows inside SQLite's temp B-tree.
         columns = [
             "content",
-            "evidence",
-            "tags",
-            "metadata",
-            "subject_id",
             "subject_name",
-            "object_id",
             "object_name",
+            "tags",
+            "evidence",
+            "subject_id",
+            "object_id",
             "session_id",
             "group_id",
+            "metadata",
         ]
-        term_clauses: list[str] = []
-        for term in cleaned_terms:
-            like = self._like_pattern(term)
-            term_clauses.append(
-                "(" + " OR ".join(f"{column} LIKE ? ESCAPE '\\'" for column in columns) + ")"
+        likes = [self._like_pattern(term) for term in cleaned_terms]
+        col_clauses: list[str] = []
+        for column in columns:
+            col_clauses.append(
+                "(" + " OR ".join(f"{column} LIKE ? ESCAPE '\\'" for _ in likes) + ")"
             )
-            params.extend([like] * len(columns))
-        where += " AND (" + " OR ".join(term_clauses) + ")"
+            params.extend(likes)
+        where += " AND (" + " OR ".join(col_clauses) + ")"
 
         return conn.execute(
             f"""
-            SELECT *
-            FROM memories
-            WHERE {where}
-            ORDER BY
-                CASE WHEN session_id != '' THEN 0 ELSE 1 END,
-                importance DESC,
-                occurred_at DESC,
-                created_at DESC
-            LIMIT ?
+            WITH matched AS (
+                SELECT rowid AS _rid,
+                       CASE WHEN session_id != '' THEN 0 ELSE 1 END AS _s,
+                       importance AS _imp,
+                       occurred_at AS _occ,
+                       created_at AS _cre
+                FROM memories
+                WHERE {where}
+                ORDER BY _s, _imp DESC, _occ DESC, _cre DESC
+                LIMIT ?
+            )
+            SELECT m.*
+            FROM matched
+            JOIN memories m ON m.rowid = matched._rid
+            ORDER BY matched._s, matched._imp DESC, matched._occ DESC, matched._cre DESC
             """,
             params + [max(1, int(limit or 1))],
         ).fetchall()
@@ -13557,8 +13935,8 @@ class MemoryStore(SummaryBatchStore):
         if effect:
             where += " AND effect=?"
             params.append(self._normalize_acl_effect(effect))
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_conn_sync() as conn:
+            rows = conn.execute(
                 f"""
                 SELECT * FROM memory_acl_rules
                 WHERE {where}
@@ -13683,8 +14061,8 @@ class MemoryStore(SummaryBatchStore):
         return await asyncio.to_thread(self._list_acl_policies_sync)
 
     def _list_acl_policies_sync(self) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._conn.execute("SELECT * FROM memory_acl_policies").fetchall()
+        with self._read_conn_sync() as conn:
+            rows = conn.execute("SELECT * FROM memory_acl_policies").fetchall()
         return [self._acl_policy_from_row(row) for row in rows]
 
     async def upsert_acl_policy(
@@ -13860,8 +14238,8 @@ class MemoryStore(SummaryBatchStore):
         if not ids:
             return {}
         placeholders = ",".join("?" for _ in ids)
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_conn_sync() as conn:
+            rows = conn.execute(
                 f"SELECT * FROM memories WHERE id IN ({placeholders})",
                 ids,
             ).fetchall()
@@ -15470,8 +15848,8 @@ class MemoryStore(SummaryBatchStore):
         """Sessions whose raw timeline never became memory, oldest backlog first."""
 
         def read():
-            with self._lock:
-                rows = self._conn.execute(
+            with self._read_conn_sync() as conn:
+                rows = conn.execute(
                     """
                     SELECT session_id,
                            COALESCE(MAX(scope), '') AS scope,
@@ -15559,6 +15937,18 @@ class MemoryStore(SummaryBatchStore):
                         result = {}
                         self._delete_many_by_ids("injection_logs", "id", ids, result)
                         deleted["injection_logs"] = result.get("injection_logs", 0)
+                try:
+                    self._conn.execute(
+                        """
+                        DELETE FROM vector_corpus_changes
+                        WHERE seq <= (
+                            SELECT COALESCE(MAX(seq), 0) - 8192
+                            FROM vector_corpus_changes
+                        )
+                        """
+                    )
+                except sqlite3.OperationalError:
+                    pass
         return deleted
 
     async def archive_stale_pending_memories(self, cutoff_at: str, limit: int = 500) -> int:
@@ -15799,6 +16189,37 @@ class MemoryStore(SummaryBatchStore):
             cancelled.set()
             raise
 
+    def _spawn_vector_warmup_task(
+        self,
+        warmup_key: tuple,
+        coro_factory: Callable[[threading.Event], Any],
+    ) -> bool:
+        """Register and start one single-flight vector warmup task if not closing."""
+        if self._closing or self._closed:
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        cancel_event = threading.Event()
+
+        def _cleanup(done_task: asyncio.Task[Any]) -> None:
+            with self._vector_warmup_lock:
+                current = self._vector_warmup_tasks.get(warmup_key)
+                if current is not None and current[0] is done_task:
+                    self._vector_warmup_tasks.pop(warmup_key, None)
+
+        with self._vector_warmup_lock:
+            if self._closing or self._closed:
+                return False
+            existing = self._vector_warmup_tasks.get(warmup_key)
+            if existing is not None and not existing[0].done():
+                return False
+            task = loop.create_task(coro_factory(cancel_event))
+            self._vector_warmup_tasks[warmup_key] = (task, cancel_event)
+            task.add_done_callback(_cleanup)
+        return True
+
     def schedule_vector_snapshot_warmup(
         self,
         *,
@@ -15817,10 +16238,6 @@ class MemoryStore(SummaryBatchStore):
     ) -> bool:
         """Schedule a detached single-flight vector snapshot build after a cold-miss cancel."""
         if self._closing or self._closed or not query:
-            return False
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
             return False
 
         cache_key = (
@@ -15842,11 +16259,10 @@ class MemoryStore(SummaryBatchStore):
             finally:
                 self._vector_search_lock.release()
 
-        cancel_event = threading.Event()
         query_copy = list(query)
         safe_top_k = max(1, int(top_k or 1))
 
-        async def _run_warmup() -> None:
+        async def _run_warmup(cancel_event: threading.Event) -> None:
             from .vector_search import search_embeddings_sync
 
             try:
@@ -15876,22 +16292,97 @@ class MemoryStore(SummaryBatchStore):
                     exc,
                 )
 
-        def _cleanup(done_task: asyncio.Task[Any]) -> None:
-            with self._vector_warmup_lock:
-                current = self._vector_warmup_tasks.get(warmup_key)
-                if current is not None and current[0] is done_task:
-                    self._vector_warmup_tasks.pop(warmup_key, None)
+        return self._spawn_vector_warmup_task(warmup_key, _run_warmup)
 
-        with self._vector_warmup_lock:
-            if self._closing or self._closed:
-                return False
-            existing = self._vector_warmup_tasks.get(warmup_key)
-            if existing is not None and not existing[0].done():
-                return False
-            task = loop.create_task(_run_warmup())
-            self._vector_warmup_tasks[warmup_key] = (task, cancel_event)
-            task.add_done_callback(_cleanup)
-        return True
+    async def prewarm_vector_corpus(
+        self,
+        *,
+        provider_id: str = "",
+        dimension: int = 0,
+        include_pending: bool = False,
+        batch_size: int = 1200,
+        max_text_chars: int = 1200,
+        cancelled: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        """Warm ``_record_light_cache`` and the shared ``VectorCorpus`` off-loop."""
+        cancel_event = cancelled if cancelled is not None else threading.Event()
+        try:
+            return await self._run_recoverable_database_operation(
+                self._prewarm_vector_corpus_sync,
+                provider_id,
+                dimension,
+                include_pending,
+                batch_size,
+                max_text_chars,
+                cancel_event,
+            )
+        except asyncio.CancelledError:
+            cancel_event.set()
+            raise
+
+    def _prewarm_vector_corpus_sync(
+        self,
+        provider_id: str,
+        dimension: int,
+        include_pending: bool,
+        batch_size: int,
+        max_text_chars: int,
+        cancelled: threading.Event,
+    ) -> dict[str, Any]:
+        from .vector_search import prewarm_vector_corpus_sync
+
+        return prewarm_vector_corpus_sync(
+            self,
+            provider_id=clean_text(provider_id, 160),
+            dimension=max(0, int(dimension or 0)),
+            include_pending=bool(include_pending),
+            batch_size=max(1, int(batch_size or 1200)),
+            max_text_chars=max(200, int(max_text_chars or 1200)),
+            cancelled=cancelled,
+        )
+
+    def schedule_startup_vector_corpus_warmup(
+        self,
+        *,
+        provider_id: str = "",
+        dimension: int = 0,
+        include_pending: bool = False,
+        batch_size: int = 1200,
+        max_text_chars: int = 1200,
+        settle_seconds: float = 0.5,
+    ) -> bool:
+        """Schedule a non-blocking, cancellable background prewarm for the shared corpus."""
+        norm_provider = clean_text(provider_id, 160)
+        norm_max_chars = max(200, int(max_text_chars or 1200))
+        norm_batch = max(1, int(batch_size or 1200))
+        norm_dim = max(0, int(dimension or 0))
+        delay = max(0.0, float(settle_seconds or 0.0))
+        warmup_key = ("__startup_corpus__", norm_provider, bool(include_pending), norm_max_chars)
+
+        async def _run_corpus_warmup(cancel_event: threading.Event) -> None:
+            try:
+                if delay > 0.0:
+                    await asyncio.sleep(delay)
+                if cancel_event.is_set() or self._closing or self._closed:
+                    return
+                await self.prewarm_vector_corpus(
+                    provider_id=norm_provider,
+                    dimension=norm_dim,
+                    include_pending=bool(include_pending),
+                    batch_size=norm_batch,
+                    max_text_chars=norm_max_chars,
+                    cancelled=cancel_event,
+                )
+            except asyncio.CancelledError:
+                cancel_event.set()
+                raise
+            except Exception as exc:
+                logger.debug(
+                    "[MemoryStore] startup vector corpus warmup skipped/failed: %s",
+                    exc,
+                )
+
+        return self._spawn_vector_warmup_task(warmup_key, _run_corpus_warmup)
 
     async def list_embedding_candidate_rows(
         self,
@@ -16174,10 +16665,27 @@ class MemoryStore(SummaryBatchStore):
         return await self._run_recoverable_database_operation(self._memory_revision_sync)
 
     def _memory_revision_sync(self) -> str:
-        with self._lock:
-            row = self._conn.execute(
+        with self._read_conn_sync() as conn:
+            row = conn.execute(
                 "SELECT revision FROM retrieval_revision WHERE singleton=1"
             ).fetchone()
+        if not row:
+            return "0"
+        return str(int(row["revision"] or 0))
+
+    async def acl_revision(self) -> str:
+        return await self._run_recoverable_database_operation(self._acl_revision_sync)
+
+    def _acl_revision_sync(self) -> str:
+        with self._read_conn_sync() as conn:
+            try:
+                row = conn.execute(
+                    "SELECT revision FROM acl_revision WHERE singleton=1"
+                ).fetchone()
+            except sqlite3.OperationalError:
+                row = conn.execute(
+                    "SELECT revision FROM retrieval_revision WHERE singleton=1"
+                ).fetchone()
         if not row:
             return "0"
         return str(int(row["revision"] or 0))
@@ -16612,8 +17120,8 @@ class MemoryStore(SummaryBatchStore):
             params.append(clean_text(session_id, 220))
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         params.append(max(1, min(500, int(limit or 50))))
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_conn_sync() as conn:
+            rows = conn.execute(
                 f"SELECT * FROM emotion_events{where} ORDER BY occurred_at DESC, revision DESC LIMIT ?",
                 params,
             ).fetchall()

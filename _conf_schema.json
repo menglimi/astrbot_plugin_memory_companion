@@ -1164,6 +1164,38 @@
           "max": 8192,
           "step": 64
         }
+      },
+      "startup_vector_warmup_enabled": {
+        "description": "启动时后台预热向量语料库",
+        "hint": "默认开启。插件启动或重载后在后台线程异步预热记忆轻量行缓存与归一化向量语料库（不发起任何 Embedding API 调用），显著降低首轮群聊/私聊的冷启动超时概率。",
+        "type": "bool",
+        "default": true
+      },
+      "rerank_failure_cooldown_threshold": {
+        "description": "重排连续失败熔断阈值",
+        "hint": "重排模型连续发生超时或请求异常达到该次数后，临时进入冷却期并直接回退本地排序，避免每轮重复等待超时；设为 0 可关闭熔断。",
+        "type": "int",
+        "default": 2,
+        "min": 0,
+        "max": 10,
+        "slider": {
+          "min": 0,
+          "max": 10,
+          "step": 1
+        }
+      },
+      "rerank_failure_cooldown_seconds": {
+        "description": "重排熔断冷却秒数",
+        "hint": "触发重排熔断后跳过重排请求的时间窗口（秒），到期后放行单次探针尝试恢复，成功即解除熔断。",
+        "type": "float",
+        "default": 60.0,
+        "min": 5.0,
+        "max": 600.0,
+        "slider": {
+          "min": 5.0,
+          "max": 600.0,
+          "step": 5.0
+        }
       }
     }
   },

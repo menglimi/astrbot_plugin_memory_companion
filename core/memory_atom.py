@@ -21,13 +21,7 @@ def row_value(row: Any, key: str, default: Any = None) -> Any:
 
     if row is None:
         return default
-    try:
-        keys = row.keys()
-    except (AttributeError, TypeError):
-        keys = None
-    if keys is not None and key not in keys:
-        return default
-    if isinstance(row, Mapping):
+    if isinstance(row, dict):
         return row.get(key, default)
     try:
         return row[key]

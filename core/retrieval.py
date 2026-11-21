@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from functools import lru_cache
 import inspect
 import math
 import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
 from typing import Any
 
 from .identity import session_target_id
@@ -16,7 +18,7 @@ from .latency import (
     bounded_model_call_timeout_ms,
     exclude_model_call_wait,
 )
-from .memory_lifecycle import apply_lifecycle_score, evaluate_memory_lifecycle
+from .memory_lifecycle import LifecycleScore, apply_lifecycle_score, evaluate_memory_lifecycle
 from .models import (
     MemoryRecord,
     SearchResult,
@@ -35,6 +37,123 @@ from .visibility import VisibilityPolicy
 
 _MMR_WHITESPACE_RE = re.compile(r"\s+")
 _MMR_LATIN_TOKEN_RE = re.compile(r"[a-z0-9_]{2,}")
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+@lru_cache(maxsize=512)
+def _ascii_word_pattern(term: str) -> re.Pattern[str]:
+    return re.compile(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])")
+
+
+@dataclass(slots=True)
+class _BreakerState:
+    consecutive_failures: int = 0
+    open_until: float = 0.0
+    half_open_in_flight: bool = False
+
+
+class RerankCircuitBreaker:
+    """Thread-safe per-provider circuit breaker for failing/timing-out rerank providers.
+
+    Tracks consecutive transport/timeout/provider exceptions across per-turn
+    ``RetrievalEngine`` instances. Once ``failure_threshold`` consecutive failures
+    occur, subsequent requests skip the rerank call for ``cooldown_seconds`` with
+    reason ``rerank_circuit_open``, then allow a single half-open probe.
+    """
+
+    @staticmethod
+    def _normalize_threshold(value: Any) -> int:
+        if isinstance(value, bool):
+            return 0
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    @staticmethod
+    def _normalize_cooldown(value: Any) -> float:
+        if isinstance(value, bool):
+            return 0.0
+        try:
+            cooldown = float(value or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        if not math.isfinite(cooldown) or cooldown <= 0.0:
+            return 0.0
+        return cooldown
+
+    def __init__(
+        self,
+        *,
+        failure_threshold: int = 2,
+        cooldown_seconds: float = 60.0,
+    ) -> None:
+        self._lock = threading.Lock()
+        self.failure_threshold = self._normalize_threshold(failure_threshold)
+        self.cooldown_seconds = self._normalize_cooldown(cooldown_seconds)
+        self._states: dict[str, _BreakerState] = {}
+
+    def configure(self, *, failure_threshold: int, cooldown_seconds: float) -> None:
+        """Update breaker thresholds dynamically without dropping active state."""
+        with self._lock:
+            self.failure_threshold = self._normalize_threshold(failure_threshold)
+            self.cooldown_seconds = self._normalize_cooldown(cooldown_seconds)
+            if self.failure_threshold <= 0 or self.cooldown_seconds <= 0.0:
+                self._states.clear()
+
+    def allow_request(self, provider_id: str, *, now: float | None = None) -> tuple[bool, bool]:
+        """Return ``(allowed, is_half_open_probe)`` for ``provider_id``."""
+        key = clean_text(provider_id, 160) or "<auto>"
+        current = time.monotonic() if now is None else float(now)
+        with self._lock:
+            if self.failure_threshold <= 0 or self.cooldown_seconds <= 0.0:
+                return True, False
+            state = self._states.get(key)
+            if state is None or state.open_until <= 0.0:
+                return True, False
+            if current < state.open_until:
+                return False, False
+            if state.half_open_in_flight:
+                return False, False
+            state.half_open_in_flight = True
+            return True, True
+
+    def record_success(self, provider_id: str) -> None:
+        """Reset failure count and close the circuit after a successful response."""
+        key = clean_text(provider_id, 160) or "<auto>"
+        with self._lock:
+            self._states.pop(key, None)
+
+    def record_failure(
+        self,
+        provider_id: str,
+        *,
+        is_probe: bool = False,
+        now: float | None = None,
+    ) -> None:
+        """Record a transport/timeout/provider exception and trip cooldown when needed."""
+        key = clean_text(provider_id, 160) or "<auto>"
+        current = time.monotonic() if now is None else float(now)
+        with self._lock:
+            if self.failure_threshold <= 0 or self.cooldown_seconds <= 0.0:
+                self._states.pop(key, None)
+                return
+            state = self._states.get(key)
+            if state is None:
+                state = _BreakerState()
+                self._states[key] = state
+            state.half_open_in_flight = False
+            state.consecutive_failures += 1
+            if is_probe or state.consecutive_failures >= self.failure_threshold:
+                state.open_until = current + self.cooldown_seconds
+
+    def release_probe(self, provider_id: str) -> None:
+        """Release an aborted half-open probe without counting cancellation as a failure."""
+        key = clean_text(provider_id, 160) or "<auto>"
+        with self._lock:
+            state = self._states.get(key)
+            if state is not None:
+                state.half_open_in_flight = False
 
 
 class RetrievalEngine:
@@ -54,8 +173,10 @@ class RetrievalEngine:
         rerank_candidate_multiplier: int = 5,
         rerank_candidate_limit: int = 32,
         rerank_timeout_ms: int = MAX_MODEL_CALL_TIMEOUT_MS,
+        rerank_circuit_breaker: RerankCircuitBreaker | None = None,
         latency_budget_ms: int = 0,
         query_vector_cache_ttl_seconds: float = 0.0,
+        query_vector_cache: dict[Any, tuple[float, list[float]]] | None = None,
         embedding_provider: Any = None,
         embedding_provider_id: str = "",
         embedding_enabled: bool = False,
@@ -92,6 +213,7 @@ class RetrievalEngine:
         self.rerank_candidate_multiplier = max(1, int(rerank_candidate_multiplier or 5))
         self.rerank_candidate_limit = max(1, int(rerank_candidate_limit or 32))
         self.rerank_timeout_ms = bounded_model_call_timeout_ms(rerank_timeout_ms)
+        self.rerank_circuit_breaker = rerank_circuit_breaker
         # A latency budget is spent on optional model calls, never on results.
         # Lowering top_k to go faster removes exactly the context this plugin
         # exists to supply, so the speed has to come from somewhere else.
@@ -100,7 +222,9 @@ class RetrievalEngine:
         self.query_vector_cache_ttl_seconds = max(
             0.0, float(query_vector_cache_ttl_seconds or 0.0)
         )
-        self._query_vector_cache: dict[str, tuple[float, list[float]]] = {}
+        self._query_vector_cache: dict[Any, tuple[float, list[float]]] = (
+            query_vector_cache if query_vector_cache is not None else {}
+        )
         self.embedding_provider = embedding_provider
         self.embedding_provider_id = clean_text(embedding_provider_id, 160)
         self.embedding_enabled = bool(embedding_enabled)
@@ -600,10 +724,35 @@ class RetrievalEngine:
                 **self._rank_path_info,
             }
             return ranked
+        breaker = getattr(self, "rerank_circuit_breaker", None)
+        provider_key = self.rerank_provider_id or "<auto>"
+        is_probe = False
+        if breaker is not None:
+            allowed, is_probe = breaker.allow_request(provider_key)
+            if not allowed:
+                self.last_path_info = {
+                    "mode": self.retrieval_mode,
+                    "path": "fallback_basic",
+                    "provider_id": self.rerank_provider_id,
+                    "reason": "rerank_circuit_open",
+                    "candidate_count": len(ranked),
+                    "rerank_pool": len(rerank_pool),
+                    "rerank_filtered": filtered_count,
+                    **request_shape,
+                    **self._rank_path_info,
+                }
+                return ranked
+        probe_settled = False
         try:
             rerank_resp = await self._call_rerank_provider(query_text, documents)
             reranked = self._apply_rerank_response(rerank_resp, rerank_pool)
+            if breaker is not None:
+                breaker.record_success(provider_key)
+                probe_settled = True
         except Exception as error:
+            if breaker is not None:
+                breaker.record_failure(provider_key, is_probe=is_probe)
+                probe_settled = True
             self.last_path_info = {
                 "mode": self.retrieval_mode,
                 "path": "fallback_basic",
@@ -618,6 +767,9 @@ class RetrievalEngine:
                 **self._rank_path_info,
             }
             return ranked
+        finally:
+            if breaker is not None and is_probe and not probe_settled:
+                breaker.release_probe(provider_key)
 
         if not reranked:
             self.last_path_info = {
@@ -966,7 +1118,7 @@ class RetrievalEngine:
             success = True
             return resp
         except Exception as exc:
-            error = str(exc)
+            error = clean_text(str(exc), 200) or type(exc).__name__
             raise
         finally:
             elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
@@ -1541,6 +1693,19 @@ class RetrievalEngine:
                 bundle_error_type = type(error).__name__
                 return None
 
+        acl_revision_before: str | None = None
+        if self.policy.enable_acl_rules:
+            if self.embedding_enabled:
+                acl_rev_fn = getattr(self.store, "acl_revision", None)
+                mem_rev_fn = getattr(self.store, "memory_revision", None)
+                if callable(acl_rev_fn):
+                    acl_revision_before = await acl_rev_fn()
+                elif callable(mem_rev_fn):
+                    acl_revision_before = await mem_rev_fn()
+            acl_state = await self._acl_state()
+        else:
+            acl_state = self._empty_acl_state()
+
         # A local read failure must not restart the concurrent model request.
         # Keep its one bounded attempt and fall back only the failed source.
         bundle, vector_result = await asyncio.gather(
@@ -1550,6 +1715,8 @@ class RetrievalEngine:
                 ctx,
                 include_pending=include_pending,
                 time_intent=time_intent,
+                acl_state=acl_state,
+                acl_revision=acl_revision_before,
             ),
         )
         if bundle is not None:
@@ -1626,7 +1793,6 @@ class RetrievalEngine:
                 "keyword_candidates": len(keyword_candidates),
             }
         )
-        acl_state = await self._acl_state() if self.policy.enable_acl_rules else self._empty_acl_state()
         block_profile_retrieval = self._query_blocks_profile_retrieval(query)
         # 召回不再只看「像不像」：谁在她心里重，谁的旧事就更容易被想起。
         person_strengths: dict[str, float] = {}
@@ -1756,16 +1922,17 @@ class RetrievalEngine:
             vector_candidates,
             time_window_candidates,
         )
-        searchable: list[tuple[MemoryRecord, str]] = []
+        searchable: list[tuple[MemoryRecord, str, LifecycleScore]] = []
         prefiltered: dict[str, int] = {}
         time_filtered = 0
+        now_utc = datetime.now(timezone.utc)
         for memory in candidates:
             memory_type = clean_text(getattr(memory, "memory_type", ""), 80).lower()
             visibility_reason, prefilter_reason = self._search_visibility_reason(
                 memory, ctx, acl_state
             )
             if visibility_reason:
-                lifecycle = evaluate_memory_lifecycle(memory, ctx)
+                lifecycle = evaluate_memory_lifecycle(memory, ctx, now=now_utc)
                 if not lifecycle.eligible:
                     key = clean_text(lifecycle.reason or "lifecycle_ineligible", 180)
                     prefiltered[key] = prefiltered.get(key, 0) + 1
@@ -1781,7 +1948,7 @@ class RetrievalEngine:
                 ):
                     time_filtered += 1
                     continue
-                searchable.append((memory, visibility_reason))
+                searchable.append((memory, visibility_reason, lifecycle))
             else:
                 key = clean_text(prefilter_reason or "not_visible", 180)
                 prefiltered[key] = prefiltered.get(key, 0) + 1
@@ -1798,11 +1965,11 @@ class RetrievalEngine:
         }
         term_pool = [
             memory
-            for memory, _reason in searchable
+            for memory, _reason, _lc in searchable
             if clean_text(memory.id, 120) in query_aware_ids
         ]
         if not term_pool:
-            term_pool = [memory for memory, _reason in searchable]
+            term_pool = [memory for memory, _reason, _lc in searchable]
         term_stats, average_doc_len = self._term_document_stats(term_pool, expanded_terms)
         route_families_by_id = {
             memory_id: self._route_families(sources)
@@ -1826,7 +1993,7 @@ class RetrievalEngine:
                     "content": "",
                 }
             )
-        for memory, visibility_reason in searchable:
+        for memory, visibility_reason, lifecycle in searchable:
             memory_id = clean_text(memory.id, 120)
             subject = getattr(memory, "subject", None)
             subject_strength = 0.0
@@ -1845,6 +2012,7 @@ class RetrievalEngine:
                 route_families=route_families_by_id.get(memory_id, frozenset()),
                 person_strength=subject_strength,
                 average_doc_len=average_doc_len,
+                lifecycle=lifecycle,
             )
             if score <= 0:
                 if len(blocked) < 40:
@@ -1880,6 +2048,8 @@ class RetrievalEngine:
         *,
         include_pending: bool,
         time_intent: TimeIntent | None = None,
+        acl_state: dict[str, object] | None = None,
+        acl_revision: str | None = None,
     ) -> tuple[list[MemoryRecord], dict[str, float], dict[str, Any]]:
         info: dict[str, Any] = {
             "embedding_enabled": bool(self.embedding_enabled),
@@ -1924,33 +2094,80 @@ class RetrievalEngine:
             self.policy.hide_pending_review, self.policy.include_raw_events,
             self.policy.enable_acl_rules, self.policy.admin_read_all,
             self.private_topology_enabled, self.group_topology_enabled,
-            (time_intent.start_at, time_intent.end_at) if time_intent and time_intent.active else None,
         )
+        ref_filter = None
+        post_filter = None
+        if time_intent is not None and time_intent.active:
+            w_start_dt = self._parse_time(time_intent.start_at)
+            w_end_dt = self._parse_time(time_intent.end_at)
+            if w_start_dt is not None and w_end_dt is not None:
+                w_start_ts = (w_start_dt - _EPOCH).total_seconds()
+                w_end_ts = (w_end_dt - _EPOCH).total_seconds()
+
+                def ref_filter(ref: Any) -> bool:
+                    return any(
+                        start < w_end_ts and end > w_start_ts
+                        for start, end in ref.time_ranges
+                    )
+
+                def post_filter(memory: MemoryRecord) -> bool:
+                    return self._memory_overlaps_time_window(memory, time_intent)
+
         # A data/ACL race retries once with current authorization and the same
         # query vector. No second provider request, no importance-based fallback.
+        acl_rev_fn = getattr(self.store, "acl_revision", None)
         for attempt in range(2):
             try:
                 revision = await self.store.memory_revision()
-                acl_state = await self._acl_state() if self.policy.enable_acl_rules else self._empty_acl_state()
+                reuse_acl = False
+                if attempt == 0 and acl_state is not None:
+                    if not self.policy.enable_acl_rules:
+                        reuse_acl = True
+                    elif acl_revision is not None:
+                        current_acl_rev = (
+                            await acl_rev_fn() if callable(acl_rev_fn) else revision
+                        )
+                        reuse_acl = current_acl_rev == acl_revision
+                if reuse_acl:
+                    current_acl_state = acl_state
+                else:
+                    current_acl_state = (
+                        await self._acl_state()
+                        if self.policy.enable_acl_rules
+                        else self._empty_acl_state()
+                    )
+                    if acl_state is not None:
+                        acl_state.clear()
+                        acl_state.update(current_acl_state)
                 selection_time = datetime.now(timezone.utc)
 
                 def eligible(memory: MemoryRecord) -> bool:
-                    visible, blocked = self._search_visibility_reason(memory, ctx, acl_state)
+                    visible, blocked = self._search_visibility_reason(memory, ctx, current_acl_state)
                     return bool(
                         visible and not blocked
                         and evaluate_memory_lifecycle(memory, ctx, now=selection_time).eligible
-                        and (not time_intent or not time_intent.active
-                             or self._memory_overlaps_time_window(memory, time_intent))
                     )
 
                 try:
+                    search_kwargs: dict[str, Any] = {
+                        "provider_id": self.embedding_provider_id,
+                        "query": query_vector,
+                        "expected_revision": revision,
+                        "authorization_key": authorization_key,
+                        "eligible": eligible,
+                        "include_pending": include_pending,
+                        "top_k": self.embedding_top_k,
+                        "threshold": self.embedding_score_threshold,
+                        "batch_size": self.embedding_candidate_limit,
+                        "max_text_chars": self.embedding_max_text_chars,
+                        "selection_time": selection_time.timestamp(),
+                        "excluded_memory_types": PROFILE_MEMORY_TYPES if block_profile else frozenset(),
+                    }
+                    if ref_filter is not None:
+                        search_kwargs["ref_filter"] = ref_filter
+                        search_kwargs["post_filter"] = post_filter
                     memories, scores, diagnostics = await self.store.search_memory_embeddings(
-                        provider_id=self.embedding_provider_id, query=query_vector,
-                        expected_revision=revision, authorization_key=authorization_key, eligible=eligible,
-                        include_pending=include_pending, top_k=self.embedding_top_k,
-                        threshold=self.embedding_score_threshold, batch_size=self.embedding_candidate_limit,
-                        max_text_chars=self.embedding_max_text_chars, selection_time=selection_time.timestamp(),
-                        excluded_memory_types=PROFILE_MEMORY_TYPES if block_profile else frozenset(),
+                        **search_kwargs
                     )
                 except asyncio.CancelledError:
                     if not getattr(self.store, "_closing", False) and not getattr(self.store, "_closed", False):
@@ -2000,19 +2217,21 @@ class RetrievalEngine:
         """A repeated question should not pay for a second embedding call."""
         if self.query_vector_cache_ttl_seconds <= 0 or not text:
             return []
-        entry = self._query_vector_cache.get(text)
+        cache_key = (self.embedding_provider_id, text)
+        entry = self._query_vector_cache.get(cache_key)
         if entry is None:
             return []
         stored_at, vector = entry
         if time.monotonic() - stored_at > self.query_vector_cache_ttl_seconds:
-            self._query_vector_cache.pop(text, None)
+            self._query_vector_cache.pop(cache_key, None)
             return []
         return list(vector)
 
     def _store_query_vector(self, text: str, vector: list[float]) -> None:
         if self.query_vector_cache_ttl_seconds <= 0 or not text or not vector:
             return
-        self._query_vector_cache[text] = (time.monotonic(), list(vector))
+        cache_key = (self.embedding_provider_id, text)
+        self._query_vector_cache[cache_key] = (time.monotonic(), list(vector))
         if len(self._query_vector_cache) > 64:
             oldest = min(self._query_vector_cache.items(), key=lambda item: item[1][0])[0]
             self._query_vector_cache.pop(oldest, None)
@@ -3442,19 +3661,19 @@ class RetrievalEngine:
         同一个 term 在 df 统计与 BM25 打分里用两种数法。
         """
 
-        if not haystack or not term:
+        if not haystack or not term or term not in haystack:
             return 0
         if cls._ASCII_WORD_RE.fullmatch(term):
-            pattern = rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])"
-            return len(re.findall(pattern, haystack))
+            return len(_ascii_word_pattern(term).findall(haystack))
         count = 0
         start = 0
+        term_len = len(term)
         while True:
             index = haystack.find(term, start)
             if index < 0:
                 return count
             count += 1
-            start = index + len(term)
+            start = index + term_len
 
     def _term_document_stats(
         self, memories: list[MemoryRecord], terms: list[str]
@@ -3472,7 +3691,7 @@ class RetrievalEngine:
         total_length = 0
         for memory in memories:
             haystack = self._haystack(memory)
-            total_length += len(re.sub(r"\s+", "", haystack))
+            total_length += len("".join(haystack.split()))
             for term in terms:
                 if self._term_frequency(haystack, term) > 0:
                     dfs[term] += 1
@@ -3570,12 +3789,15 @@ class RetrievalEngine:
         route_families: frozenset[str] = frozenset(),
         person_strength: float = 0.0,
         average_doc_len: float = 0.0,
+        lifecycle: LifecycleScore | None = None,
     ) -> tuple[float, str]:
         haystack = self._haystack(memory)
-        compact_haystack = re.sub(r"\s+", "", haystack)
-        term_hits = sum(
-            1 for term in terms if term and self._term_frequency(haystack, term) > 0
-        )
+        compact_haystack = "".join(haystack.split())
+        term_freqs = [
+            self._term_frequency(haystack, term) if term else 0
+            for term in terms
+        ]
+        term_hits = sum(1 for freq in term_freqs if freq > 0)
         exact_phrases = [str(item) for item in profile.get("exact_phrases", []) if str(item)]
         exact_hit = any(phrase in compact_haystack for phrase in exact_phrases)
         profile_hit = self._profile_query_matches_memory(
@@ -3613,12 +3835,10 @@ class RetrievalEngine:
             length_norm = 1.0 - self.bm25_b + self.bm25_b * (
                 document_length / max(1.0, average_length)
             )
-            for term in terms:
-                if not term:
+            for term, freq_int in zip(terms, term_freqs):
+                if freq_int <= 0:
                     continue
-                freq = float(self._term_frequency(haystack, term))
-                if freq <= 0:
-                    continue
+                freq = float(freq_int)
                 idf = term_stats.get(term, 0.0)
                 bm25 += idf * ((freq * (self.bm25_k1 + 1.0)) / (freq + self.bm25_k1 * length_norm))
             lexical = (0.42 if exact_hit or profile_hit else 0.24) + min(
@@ -3669,7 +3889,7 @@ class RetrievalEngine:
         score = lexical + scope_bonus + memory.importance * importance_weight + memory.confidence * 0.25 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus + route_bonus + rrf_bonus + person_bonus
         # R2：删掉 "if not terms: importance * 0.8" 的兜底分支。无词查询只剩
         # 向量/多路召回证据才可能走到这里，importance 只按弱证据权重 0.28 计。
-        lifecycle = evaluate_memory_lifecycle(memory, ctx)
+        lifecycle = lifecycle if lifecycle is not None else evaluate_memory_lifecycle(memory, ctx)
         score = apply_lifecycle_score(score, lifecycle)
         # relax：proactive_message（主动消息原文）类记忆评分降权（默认 1.0 不降权，行为与历史版本一致）。
         if self.proactive_message_score_penalty < 1.0 and clean_text(memory.memory_type, 120).lower() == "proactive_message":
