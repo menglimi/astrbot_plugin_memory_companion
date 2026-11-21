@@ -10,6 +10,7 @@ import sys
 import tempfile
 import types
 import unittest
+from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -243,6 +244,140 @@ class PeoplePageApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(expected, response.payload["ui_style"], value)
 
 
+def _extract_css_rules(css_text: str) -> list[tuple[str, str]]:
+    """提取 CSS 规则（含 @media 内的嵌套规则），返回 [(selector, body), ...]。"""
+    cleaned = re.sub(r"/\*.*?\*/", "", css_text, flags=re.S)
+    rules: list[tuple[str, str]] = []
+
+    def _walk(source: str) -> None:
+        index = 0
+        length = len(source)
+        while index < length:
+            brace = source.find("{", index)
+            if brace == -1:
+                break
+            header = source[index:brace].strip()
+            depth = 1
+            cursor = brace + 1
+            while cursor < length and depth > 0:
+                ch = source[cursor]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                cursor += 1
+            body = source[brace + 1 : cursor - 1].strip()
+            if header.startswith("@"):
+                _walk(body)
+            elif header:
+                for selector in header.split(","):
+                    trimmed = selector.strip()
+                    if trimmed:
+                        rules.append((trimmed, body))
+            index = cursor
+
+    _walk(cleaned)
+    return rules
+
+
+def _match_css_compound(
+    compound: str, node: tuple[str, str, set[str]]
+) -> tuple[bool, set[str]]:
+    """匹配单个 CSS 复合选择器，返回 (是否命中, 伪类集合)。"""
+    if "::" in compound or "[" in compound:
+        return False, set()
+    tag, elem_id, classes = node
+    parts = compound.split(":")
+    base = parts[0]
+    pseudos = {part for part in parts[1:] if part}
+    if not base or "root" in pseudos:
+        return False, set()
+    if base == "*":
+        return True, pseudos
+    for token in re.findall(r"[#.][^#.]+|^[^#.]+", base):
+        if token.startswith("#"):
+            if elem_id != token[1:]:
+                return False, set()
+        elif token.startswith("."):
+            if token[1:] not in classes:
+                return False, set()
+        elif tag != token.lower():
+            return False, set()
+    return True, pseudos
+
+
+def _css_selector_matches_chain(
+    selector: str, chain: list[tuple[str, str, set[str]]]
+) -> tuple[bool, set[str]]:
+    """判断 CSS 选择器（支持后代与直接子代 >）是否命中目标 DOM 祖先链。"""
+    normalized = re.sub(r"\s*>\s*", " > ", selector.strip())
+    raw_tokens = normalized.split()
+    if not raw_tokens or not chain:
+        return False, set()
+
+    steps: list[tuple[str | None, str]] = []
+    combinator: str | None = None
+    for token in raw_tokens:
+        if token == ">":
+            combinator = ">"
+        elif token in {"+", "~"}:
+            return False, set()
+        else:
+            steps.append((combinator, token))
+            combinator = " "
+
+    matched_target, target_pseudos = _match_css_compound(steps[-1][1], chain[-1])
+    if not matched_target:
+        return False, set()
+
+    def _match_prev(step_idx: int, node_idx: int) -> bool:
+        if step_idx < 0:
+            return True
+        if node_idx < 0:
+            return False
+        comb = steps[step_idx + 1][0]
+        comp = steps[step_idx][1]
+        if comb == ">":
+            ok, _ = _match_css_compound(comp, chain[node_idx])
+            return ok and _match_prev(step_idx - 1, node_idx - 1)
+        for ancestor_idx in range(node_idx, -1, -1):
+            ok, _ = _match_css_compound(comp, chain[ancestor_idx])
+            if ok and _match_prev(step_idx - 1, ancestor_idx - 1):
+                return True
+        return False
+
+    if _match_prev(len(steps) - 2, len(chain) - 2):
+        return True, target_pseudos
+    return False, set()
+
+
+class _DrawerStructureParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stack: list[tuple[str, str, set[str]]] = []
+        self.close_chain: list[tuple[str, str, set[str]]] | None = None
+        self.drawer_body_chain: list[tuple[str, str, set[str]]] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr_map = dict(attrs)
+        elem_id = attr_map.get("id") or ""
+        classes = set((attr_map.get("class") or "").split())
+        tag_lower = tag.lower()
+        self.stack.append((tag_lower, elem_id, classes))
+        if elem_id == "close" and "close" in classes:
+            self.close_chain = list(self.stack)
+        if elem_id == "drawerBody":
+            self.drawer_body_chain = list(self.stack)
+        if tag_lower in {"meta", "link", "input", "br", "hr", "img"}:
+            self.stack.pop()
+
+    def handle_endtag(self, tag: str) -> None:
+        tag_lower = tag.lower()
+        while self.stack:
+            if self.stack.pop()[0] == tag_lower:
+                break
+
+
 class PeoplePanelAssetsTests(unittest.TestCase):
     def test_entry_page_routes_to_all_three_panels(self) -> None:
         source = (PAGES / "index.html").read_text(encoding="utf-8")
@@ -292,6 +427,72 @@ class PeoplePanelAssetsTests(unittest.TestCase):
             self.assertIn(route, paths)
             self.assertIn(route, exposure)
             self.assertEqual("internal", exposure[route]["exposure"])
+
+    def test_people_close_button_selector_does_not_collide_with_close_band_chip(
+        self,
+    ) -> None:
+        html = (PAGES / "people.html").read_text(encoding="utf-8")
+        css = (PAGES / "people.css").read_text(encoding="utf-8")
+
+        parser = _DrawerStructureParser()
+        parser.feed(html)
+        self.assertIsNotNone(parser.close_chain)
+        self.assertIsNotNone(parser.drawer_body_chain)
+        assert parser.close_chain is not None
+        assert parser.drawer_body_chain is not None
+        # 关闭按钮与内容容器都挂在 <aside id="drawer" class="drawer"> 直接子级。
+        self.assertEqual(("aside", "drawer", {"drawer"}), parser.close_chain[-2])
+        self.assertEqual(("aside", "drawer", {"drawer"}), parser.drawer_body_chain[-2])
+
+        rules = _extract_css_rules(css)
+
+        def matched_bodies(
+            chain: list[tuple[str, str, set[str]]],
+        ) -> tuple[str, str]:
+            base_parts: list[str] = []
+            hover_parts: list[str] = []
+            for selector, body in rules:
+                matched, pseudos = _css_selector_matches_chain(selector, chain)
+                if not matched:
+                    continue
+                if not pseudos:
+                    base_parts.append(body)
+                elif "hover" in pseudos:
+                    hover_parts.append(body)
+            return "\n".join(base_parts), "\n".join(hover_parts)
+
+        # 1) 抽屉关闭按钮仍完整命中定位、圆形尺寸与 hover 高亮样式。
+        close_base, close_hover = matched_bodies(parser.close_chain)
+        self.assertIn("position: absolute", close_base)
+        self.assertIn("border-radius: 50%", close_base)
+        self.assertIn("width: 34px", close_base)
+        self.assertIn("border-color: var(--accent)", close_hover)
+
+        # 2) 「亲近的人」徽章（.chip.band.close）无论在人卡内还是抽屉详情内，
+        #    都只能命中徽章样式，不能被抽屉关闭按钮规则污染。
+        card_close_badge = [
+            ("section", "grid", {"grid"}),
+            ("button", "", {"card"}),
+            ("div", "", {"chips"}),
+            ("span", "", {"chip", "band", "close"}),
+        ]
+        drawer_close_badge = parser.drawer_body_chain + [
+            ("div", "", {"chips"}),
+            ("span", "", {"chip", "band", "close"}),
+        ]
+        for label, badge_chain in (
+            ("card", card_close_badge),
+            ("drawer", drawer_close_badge),
+        ):
+            with self.subTest(location=label):
+                badge_base, badge_hover = matched_bodies(badge_chain)
+                self.assertIn("#9fe1bd", badge_base)
+                self.assertIn("#0e1a12", badge_base)
+                self.assertIn("border-radius: 999px", badge_base)
+                self.assertNotIn("position: absolute", badge_base)
+                self.assertNotIn("border-radius: 50%", badge_base)
+                self.assertNotIn("font-size: 20px", badge_base)
+                self.assertNotIn("border-color: var(--accent)", badge_hover)
 
     def test_schema_defaults_open_on_people_panel(self) -> None:
         schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
