@@ -11983,6 +11983,44 @@ class MemoryCompanionService:
         preview_terms = "、".join(list(current_terms)[:8])
         return f"standalone_request_no_recent_overlap terms={preview_terms}"
 
+    @staticmethod
+    def _message_has_long_term_recall_cue(text: str) -> bool:
+        """Return whether the text carries an explicit past/long-term recall cue."""
+        compact = re.sub(r"\s+", "", clean_text(text, 800)).lower()
+        if not compact:
+            return False
+        markers = (
+            "之前",
+            "以前",
+            "那次",
+            "当时",
+            "当年",
+            "上次",
+            "还记得",
+            "记不记得",
+            "还记不记得",
+            "想起之前",
+            "往事",
+            "过去",
+            "回忆",
+            "沿用",
+            "老样子",
+            "按我喜欢",
+            "按我的",
+            "我的偏好",
+            "我喜欢的",
+            "我常用",
+            "我的设定",
+            "我的人设",
+            "我叫什么",
+            "你知道我",
+            "我们说过",
+            "remember",
+            "lasttime",
+            "asbefore",
+        )
+        return any(marker in compact for marker in markers)
+
     def _memory_route_decision(
         self,
         ctx: SessionContext,
@@ -11998,7 +12036,11 @@ class MemoryCompanionService:
         recent_context_request = self._message_requests_recent_context(text)
         temporal_request = self._message_requests_temporal_aggregate(text) or (time_intent.active and time_intent.summary_like)
         explicit_memory = (
-            (self._message_is_contextual_memory_request(text) and not vague_recent_followup and not recent_context_request)
+            (
+                self._message_is_contextual_memory_request(text)
+                and not vague_recent_followup
+                and (not recent_context_request or self._message_has_long_term_recall_cue(text))
+            )
             or temporal_request
         )
         personalized_context = self._message_requests_personalized_context(text)
@@ -15023,6 +15065,13 @@ class MemoryCompanionService:
                     policy = clean_text(metadata.get("mention_policy"), 60)
                     if policy != "avoid_unless_asked":
                         metadata = dict(metadata)
+                        if not metadata.get("_scene_gated"):
+                            if "mention_policy" in metadata:
+                                metadata["_persisted_mention_policy"] = metadata["mention_policy"]
+                                metadata.pop("_persisted_mention_policy_missing", None)
+                            else:
+                                metadata["_persisted_mention_policy_missing"] = True
+                                metadata.pop("_persisted_mention_policy", None)
                         metadata["mention_policy"] = "tone_only"
                         metadata["_scene_gated"] = True
                         try:
