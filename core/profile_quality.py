@@ -224,19 +224,26 @@ _BOUNDARY_RE = re.compile(r"^(?:我|咱|俺)(?:不喜欢别人|讨厌别人|不�
 _AVOID_RE = re.compile(r"^(?:请)?(?:别问我|不要问我|不想聊)(?P<value>.*)$")
 
 
+_SOURCE_HSPACE_RE = re.compile(r"[\t\f\v ]+")
+_SOURCE_NL_SPACE_RE = re.compile(r" *\n *")
+
+
 def _source_text(value: Any, limit: int = 1800) -> str:
     if value is None:
         return ""
     source = str(value).replace("\r\n", "\n").replace("\r", "\n").replace("\u3000", " ")
-    source = re.sub(r"[\t\f\v ]+", " ", source)
-    source = re.sub(r" *\n *", "\n", source)
+    source = _SOURCE_HSPACE_RE.sub(" ", source)
+    source = _SOURCE_NL_SPACE_RE.sub("\n", source)
     return source[:limit].strip()
 
 
 def _clean_text(value: Any, limit: int = 240) -> str:
-    text = "" if value is None else str(value)
-    text = re.sub(r"\s+", " ", text.replace("\u3000", " ")).strip()
-    return text[:limit]
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else str(value)
+    if not text:
+        return ""
+    return " ".join(text.split())[:limit]
 
 
 def _strip_matching_quotes(value: str) -> str:

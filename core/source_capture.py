@@ -103,14 +103,16 @@ class SourceCapture:
         with store._lock:
             self.installation = self.db.execute("SELECT value FROM capture_runtime WHERE key='installation'").fetchone()[0]
             self._digest_key = bytes.fromhex(self.db.execute("SELECT value FROM capture_runtime WHERE key='digest_key'").fetchone()[0])
+            row = self.db.execute("SELECT value FROM capture_runtime WHERE key='source_capture_enabled'").fetchone()
+        self._source_capture_enabled = (
+            self.default_enabled
+            if row is None
+            else str(row[0]).strip().lower() in {'1', 'true', 'yes', 'on'}
+        )
 
     def source_capture_enabled(self):
-        """Read the effective switch: config default unless an explicit override was written."""
-        with self.store._lock:
-            row = self.db.execute("SELECT value FROM capture_runtime WHERE key='source_capture_enabled'").fetchone()
-        if row is None:
-            return self.default_enabled
-        return str(row[0]).strip().lower() in {'1', 'true', 'yes', 'on'}
+        """Read the effective switch from the in-process cache."""
+        return self._source_capture_enabled
 
     def set_source_capture_enabled(self, enabled, *, actor=''):
         """Persist an explicit on/off override so the switch is writable at runtime."""
@@ -120,12 +122,18 @@ class SourceCapture:
             self.db.execute("INSERT OR REPLACE INTO capture_runtime VALUES ('source_capture_enabled',?)", (value,))
             self.db.execute("INSERT OR REPLACE INTO capture_runtime VALUES ('source_capture_enabled_by',?)", (str(actor or '')[:120],))
             self.db.execute("INSERT OR REPLACE INTO capture_runtime VALUES ('source_capture_enabled_at',?)", (stamp,))
+            self._source_capture_enabled = bool(enabled)
         return {'enabled': bool(enabled), 'actor': str(actor or '')[:120], 'updated_at': stamp}
 
     def source_capture_switch(self):
         with self.store._lock:
             rows = dict(self.db.execute("SELECT key,value FROM capture_runtime WHERE key IN ('source_capture_enabled','source_capture_enabled_by','source_capture_enabled_at')").fetchall())
-        return {'enabled': self.source_capture_enabled(), 'explicit': 'source_capture_enabled' in rows,
+        self._source_capture_enabled = (
+            str(rows['source_capture_enabled']).strip().lower() in {'1', 'true', 'yes', 'on'}
+            if 'source_capture_enabled' in rows
+            else self.default_enabled
+        )
+        return {'enabled': self._source_capture_enabled, 'explicit': 'source_capture_enabled' in rows,
                 'actor': rows.get('source_capture_enabled_by', ''), 'updated_at': rows.get('source_capture_enabled_at', '')}
 
     def activate(self, generation):

@@ -1,16 +1,32 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import json
+import math
 import re
 from typing import Any
 
 from .identity import maybe_await
+from .latency import await_with_timeout, exclude_model_call_wait
 from .models import clean_text
 
 
 class ReplyChainResolver:
     """Resolve quoted-message chains without depending on another plugin."""
+
+    DEFAULT_GET_MSG_TIMEOUT_SECONDS = 2.0
+
+    def __init__(self, *, get_msg_timeout_seconds: float = DEFAULT_GET_MSG_TIMEOUT_SECONDS) -> None:
+        try:
+            timeout = float(get_msg_timeout_seconds)
+        except (TypeError, ValueError):
+            timeout = self.DEFAULT_GET_MSG_TIMEOUT_SECONDS
+        self.get_msg_timeout_seconds = (
+            max(0.05, min(timeout, 10.0))
+            if math.isfinite(timeout) and timeout > 0
+            else self.DEFAULT_GET_MSG_TIMEOUT_SECONDS
+        )
 
     CACHE_ATTRS = (
         "memory_companion_reply_chain",
@@ -258,7 +274,13 @@ class ReplyChainResolver:
             attempts.insert(0, int(message_id))
         for value in attempts:
             try:
-                result = await maybe_await(call_action("get_msg", message_id=value))
+                async with exclude_model_call_wait():
+                    result = await await_with_timeout(
+                        maybe_await(call_action("get_msg", message_id=value)),
+                        self.get_msg_timeout_seconds,
+                    )
+            except asyncio.TimeoutError:
+                return None
             except Exception:
                 result = None
             if result:
