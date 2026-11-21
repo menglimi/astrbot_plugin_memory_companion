@@ -282,7 +282,8 @@ class MemoryCompanionPlugin(Star):
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         """LLM 请求前钩子：注入记忆上下文，支持可配置的熔断预算。
 
-        插件自身处理预算最多为 1 秒，不含记忆 Provider 的模型调用等待。
+        预算只覆盖插件自身工作（默认 1 秒，上限 3 秒），不含记忆 Provider 的
+        模型调用等待。
         """
         if getattr(self, "_terminated", False) or getattr(self, "_init_failed", False):
             return

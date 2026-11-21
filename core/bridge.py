@@ -1914,7 +1914,7 @@ class MemoryCompanionBridge:
                       direction=row['direction'],message=row['native_id'] if row['direction']=='incoming' else 'delivery:'+ticket)
         authorize = lambda: (self._is_valid_private_companion_capability(producer_capability)
                              and work.allowed(scope) and delivery.export(ticket) is not None)
-        return capture.submit(identity, dict(body=payload["body"], media=payload["media"],
+        return await capture.submit(identity, dict(body=payload["body"], media=payload["media"],
                               source_message_at=payload.get("source_message_at", ""), observed_at=payload["observed_at"],
                               evidence=row["evidence"], raw_body_digest=payload.get("raw_body_digest", "")), authorize=authorize)
 

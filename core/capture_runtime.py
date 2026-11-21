@@ -4,10 +4,25 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import json
+import logging
 import secrets
 
 from .models import SessionContext, utc_now
 from .source_capture import SourceCapture, digest
+
+logger = logging.getLogger("astrbot_plugin_memory_companion.capture_runtime")
+
+
+async def _in_thread(function, *args, **kwargs):
+    """Run one synchronous store write unit outside the event loop.
+
+    Every capture write path takes the store's threading lock and opens its own
+    ``BEGIN IMMEDIATE`` transaction, so the work is pure blocking I/O: running it
+    on the loop thread would stall every other session for as long as SQLite
+    needs to commit. Only plain values cross the thread boundary — the callables
+    passed in are closed over service state and never touch the event loop.
+    """
+    return await asyncio.to_thread(function, *args, **kwargs)
 
 
 class CaptureRuntime:
@@ -62,7 +77,7 @@ class CaptureRuntime:
         if old is not None:
             return old
         s=self.service
-        if not self.source_capture_enabled():
+        if not await _in_thread(self.source_capture_enabled):
             return None
         if (not s.config.bool('memory_capture.reliable_sources_enabled',True)
                 or getattr(event,'private_companion_req036_denied',False)
@@ -88,11 +103,11 @@ class CaptureRuntime:
         except (TypeError,ValueError,OverflowError,OSError):
             message_at=''
         try:
-            prepared=self.store.prepare(identity,body=body,source_message_at=message_at,observed_at=utc_now())
+            prepared=await _in_thread(self.store.prepare,identity,body=body,source_message_at=message_at,observed_at=utc_now())
             authorize=lambda: self.allowed(identity)
-            result=self.store.stage(prepared,generation=self.generation,authorize=authorize)
+            result=await _in_thread(self.store.stage,prepared,generation=self.generation,authorize=authorize)
             if result['status'] in {'staged','uncertain','retry_due'}:
-                result=self.store.commit(prepared['operation'],generation=self.generation,authorize=authorize)
+                result=await _in_thread(self.store.commit,prepared['operation'],generation=self.generation,authorize=authorize)
             setattr(event,'_memory_capture_receipt',result)
             self.wake.set()
             return result
@@ -105,14 +120,14 @@ class CaptureRuntime:
         self.wake.set()
         return result
 
-    def submit(self, identity, request, *, authorize=lambda: True):
+    async def submit(self, identity, request, *, authorize=lambda: True):
         if not self.allowed(identity) or not authorize():
             return {'status':'excluded','reason':'capture_disabled'}
-        prepared=self.store.prepare(identity,**request)
+        prepared=await _in_thread(self.store.prepare,identity,**request)
         check=lambda: self.allowed(identity) and authorize()
-        result=self.store.stage(prepared,generation=self.generation,authorize=check)
+        result=await _in_thread(self.store.stage,prepared,generation=self.generation,authorize=check)
         if result['status'] in {'staged','uncertain','retry_due'}:
-            result=self.store.commit(prepared['operation'],generation=self.generation,authorize=check)
+            result=await _in_thread(self.store.commit,prepared['operation'],generation=self.generation,authorize=check)
         if result.get('status')=='committed' and identity['direction']=='outgoing' and hasattr(self.service,'_summary_workers'):
             ctx=SessionContext(scope=identity['scope'],session_id=identity['session'],platform=identity['platform'],
                                bot_id=identity['bot'],persona_id=identity['persona'],
@@ -131,22 +146,42 @@ class CaptureRuntime:
         while not getattr(self.service,'_closing',False):
             self.wake.clear()
             try:
-                self.store.purge_expired()
+                await _in_thread(self.store.purge_expired)
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 self.last_error=type(exc).__name__
-            rows=self.store.due()
+            try:
+                rows=await _in_thread(self.store.due)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.last_error=type(exc).__name__
+                logger.debug('[MemoryCompanion] 读取待重试采集队列失败: error=%s', exc)
+                rows=[]
             for row in rows:
                 try:
                     payload=json.loads(row['envelope']); identity=payload['identity']
                     if not self.allowed(identity):
-                        self.store.exclude_pending(row['operation'])
+                        await _in_thread(self.store.exclude_pending,row['operation'])
                     else:
-                        self.store.commit(row['operation'],generation=self.generation,authorize=lambda: self.allowed(identity))
+                        await _in_thread(self.store.commit,row['operation'],generation=self.generation,
+                                         authorize=lambda: self.allowed(identity))
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     self.last_error=type(exc).__name__
-                    self.store.retry(row['operation'],self.generation)
+                    try:
+                        await _in_thread(self.store.retry,row['operation'],self.generation)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as retry_exc:
+                        self.last_error=type(retry_exc).__name__
+                        logger.warning(
+                            '[MemoryCompanion] 采集重试记账失败: operation=%s error=%s',
+                            row.get('operation', '') if isinstance(row, dict) else '',
+                            retry_exc,
+                        )
             if len(rows)>=8:
                 await asyncio.sleep(0)
                 continue

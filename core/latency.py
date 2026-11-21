@@ -7,7 +7,9 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 
-MAX_MEMORY_HOOK_BUDGET_SECONDS = 1.0
+MIN_MEMORY_HOOK_BUDGET_SECONDS = 0.1
+MAX_MEMORY_HOOK_BUDGET_SECONDS = 3.0
+DEFAULT_MEMORY_HOOK_BUDGET_SECONDS = 1.0
 MAX_MODEL_CALL_TIMEOUT_MS = 2000
 
 
@@ -129,13 +131,25 @@ async def await_with_memory_hook_budget(awaitable: Any, timeout_seconds: float) 
 
 
 def bounded_memory_hook_budget_seconds(value: Any) -> float:
+    """Clamp a configured hook budget into the supported range.
+
+    Booleans and values that are missing, non-finite or not positive fall back
+    to the default, while positive values are clamped to ``[0.1, 3.0]``. The
+    upper cap stops a local failure from holding a reply for long; the default
+    stays at one second, which is what the local work actually needs.
+    """
+    if isinstance(value, bool):
+        return DEFAULT_MEMORY_HOOK_BUDGET_SECONDS
     try:
         configured = float(value)
     except (TypeError, ValueError, OverflowError):
-        return MAX_MEMORY_HOOK_BUDGET_SECONDS
+        return DEFAULT_MEMORY_HOOK_BUDGET_SECONDS
     if not math.isfinite(configured) or configured <= 0:
-        return MAX_MEMORY_HOOK_BUDGET_SECONDS
-    return min(configured, MAX_MEMORY_HOOK_BUDGET_SECONDS)
+        return DEFAULT_MEMORY_HOOK_BUDGET_SECONDS
+    return max(
+        MIN_MEMORY_HOOK_BUDGET_SECONDS,
+        min(configured, MAX_MEMORY_HOOK_BUDGET_SECONDS),
+    )
 
 
 def bounded_model_call_timeout_ms(value: Any) -> int:

@@ -18,8 +18,10 @@ ROOT = bootstrap_package()
 
 from astrbot_plugin_memory_companion.core.models import MemoryRecord, SearchResult
 from astrbot_plugin_memory_companion.core.latency import (
+    DEFAULT_MEMORY_HOOK_BUDGET_SECONDS,
     MAX_MEMORY_HOOK_BUDGET_SECONDS,
     MAX_MODEL_CALL_TIMEOUT_MS,
+    MIN_MEMORY_HOOK_BUDGET_SECONDS,
     await_with_memory_hook_budget,
     bounded_memory_hook_budget_seconds,
     bounded_model_call_timeout_ms,
@@ -43,9 +45,11 @@ def _result(memory_id: str, content: str, score: float) -> SearchResult:
 
 class RerankInputValidationTests(unittest.IsolatedAsyncioTestCase):
     def test_latency_budgets_cannot_exceed_the_configured_caps(self) -> None:
-        self.assertEqual(1.0, bounded_memory_hook_budget_seconds(5.0))
+        self.assertEqual(MAX_MEMORY_HOOK_BUDGET_SECONDS, bounded_memory_hook_budget_seconds(5.0))
+        self.assertEqual(2.5, bounded_memory_hook_budget_seconds(2.5))
         self.assertEqual(0.25, bounded_memory_hook_budget_seconds(0.25))
-        self.assertEqual(MAX_MEMORY_HOOK_BUDGET_SECONDS, bounded_memory_hook_budget_seconds(0))
+        self.assertEqual(MIN_MEMORY_HOOK_BUDGET_SECONDS, bounded_memory_hook_budget_seconds(0.01))
+        self.assertEqual(DEFAULT_MEMORY_HOOK_BUDGET_SECONDS, bounded_memory_hook_budget_seconds(0))
         self.assertEqual(800, bounded_model_call_timeout_ms(800))
         self.assertEqual(MAX_MODEL_CALL_TIMEOUT_MS, bounded_model_call_timeout_ms(9000))
         self.assertEqual(MAX_MODEL_CALL_TIMEOUT_MS, bounded_model_call_timeout_ms(0))

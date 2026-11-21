@@ -86,6 +86,7 @@ from .injection import (
     TEMPORAL_INJECTION_CHARS,
     InjectionComposer,
 )
+from .json_persistence import BackgroundJsonWriter, plain_json_copy
 from .local_time import bind_timezone_provider, local_tz, timezone_name
 from .migration_livingmemory import LivingMemoryMigrator
 from .models import (
@@ -351,6 +352,10 @@ class _HookStageTimer:
 
 class MemoryCompanionService:
     _SCOPE_CONTROL_FEATURES = frozenset({"capture", "recall", "topology"})
+    # Token statistics are rewritten at most this often; the document grows to
+    # several megabytes, so an unbounded write per provider call would dominate
+    # the hook budget. Shutdown paths flush dirty state via _close_json_writers.
+    _TOKEN_USAGE_SAVE_INTERVAL_SECONDS = 30.0
     # How often the worker thread compares the stored revision and rebuilds the
     # in-process ACL projection.  The hot read never touches the database, so a
     # missed write-path update self-heals within one interval.
@@ -1191,6 +1196,9 @@ class MemoryCompanionService:
         )
 
     async def handle_llm_request(self, event: Any, req: Any) -> None:
+        # Clear per-turn retrieval telemetry so skipped or cancelled turns do
+        # not inherit the previous turn's _last_retrieval_path_info.
+        self._last_retrieval_path_info = None
         remove_temp_text(req, MEMORY_COMPANION_INJECTION_HEADER, MEMORY_COMPANION_INJECTION_FOOTER)
         self._mark_memory_companion_injection_state(event, req, injected=False, conversation_memory=False, slot_map={})
         if bool(getattr(event, "private_companion_req036_denied", False)):
@@ -1215,8 +1223,11 @@ class MemoryCompanionService:
                 raise
 
         self._ensure_lifecycle_maintenance_dispatcher()
+        stage_timer.mark("ensure_lifecycle")
         self._ensure_wal_checkpoint_loop()
+        stage_timer.mark("ensure_wal")
         self._ensure_acl_projection_reconcile_loop()
+        stage_timer.mark("ensure_acl")
         ctx = await await_hook_stage(
             self.identity.resolve_event_context(event), "identity"
         )
@@ -1229,6 +1240,7 @@ class MemoryCompanionService:
             if source_receipt and source_receipt.get("status") == "committed" and source_receipt.get("source_state") == "current":
                 from .source_evidence import remember_source_reads
                 remember_source_reads(event, ctx, [source_receipt])
+            stage_timer.mark("capture_incoming")
         self._sanitize_session_context_message_text(ctx)
         self._apply_companion_relationship_projection(ctx, event=event, req=req)
         self._apply_companion_expression_decision(ctx, event=event, req=req)
@@ -1240,6 +1252,7 @@ class MemoryCompanionService:
                 getattr(ctx, "session_id", ""),
                 exc,
             )
+        stage_timer.mark("context_projection")
         self._ensure_reconstruction_turn_token(event, ctx)
         self._apply_private_companion_preferred_address(ctx, req=req, event=event)
         if self._private_companion_internal_generation_event(event):
@@ -1262,6 +1275,7 @@ class MemoryCompanionService:
         stage_timer.mark("decorate")
 
         capture_enabled = self._scope_feature_enabled(ctx, "capture")
+        stage_timer.mark("scope_gate")
         # note_identity（身份双写）已移入 _capture_async 后台执行，不阻塞请求关键路径。
         stage_timer.mark("note_identity")
         reply_chain = await await_hook_stage(
@@ -4824,20 +4838,54 @@ class MemoryCompanionService:
             return {}
 
     def _save_token_usage(self, *, force: bool = False) -> None:
+        """Persist the token statistics without blocking the event loop.
+
+        The document reaches roughly megabytes, so ``json.dumps(indent=2)`` alone
+        costs tens of milliseconds. Updates during the throttle interval still
+        mark the writer dirty so shutdown flushes them; otherwise updates are
+        coalesced into a background write and ``force`` publishes synchronously.
+        """
+        if force:
+            self._token_usage_writer.flush()
+            return
+        self._token_usage_writer.mark_dirty()
         now_ts = time.time()
-        if not force and now_ts - self._token_usage_last_save_at < 30:
+        if now_ts - self._token_usage_last_save_at < self._TOKEN_USAGE_SAVE_INTERVAL_SECONDS:
             return
         self._token_usage_last_save_at = now_ts
-        try:
-            self.data_dir.mkdir(parents=True, exist_ok=True)
-            tmp_path = self.token_usage_path.with_suffix(self.token_usage_path.suffix + ".tmp")
-            tmp_path.write_text(
-                json.dumps(self._token_usage if isinstance(self._token_usage, dict) else {}, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+        self._token_usage_writer.request()
+
+    def _token_usage_snapshot(self) -> Any:
+        usage = self._token_usage if isinstance(self._token_usage, dict) else {}
+        return plain_json_copy(usage)
+
+    @property
+    def _token_usage_writer(self) -> BackgroundJsonWriter:
+        writer = self.__dict__.get("_token_usage_writer_instance")
+        if writer is None:
+            writer = BackgroundJsonWriter(
+                path=lambda: self.token_usage_path,
+                snapshot=self._token_usage_snapshot,
+                serialise=lambda document: json.dumps(document, ensure_ascii=False, indent=2),
+                spawn=lambda coro: self._spawn_persistence_task(coro, label="token-usage-save"),
+                label="Token 统计",
             )
-            tmp_path.replace(self.token_usage_path)
-        except Exception as exc:
-            logger.debug("[MemoryCompanion] Token 统计保存失败: %s", exc)
+            self._token_usage_writer_instance = writer
+        return writer
+
+    @property
+    def _relationship_phase_writer(self) -> BackgroundJsonWriter:
+        writer = self.__dict__.get("_relationship_phase_writer_instance")
+        if writer is None:
+            writer = BackgroundJsonWriter(
+                path=lambda: self._RELATIONSHIP_PHASE_FILE,
+                snapshot=self._relationship_phase_snapshot,
+                serialise=json_dumps,
+                spawn=lambda coro: self._spawn_persistence_task(coro, label="relationship-phase-save"),
+                label="关系阶段状态",
+            )
+            self._relationship_phase_writer_instance = writer
+        return writer
 
     def token_usage_summary(self) -> dict[str, Any]:
         usage = self._token_usage if isinstance(self._token_usage, dict) else {}
@@ -5105,6 +5153,62 @@ class MemoryCompanionService:
         del recent[:-240]
         store["updated_at"] = now_dt.strftime("%Y-%m-%d %H:%M:%S")
         self._save_token_usage()
+
+    def _spawn_persistence_task(
+        self,
+        coro: Any,
+        *,
+        label: str,
+    ) -> asyncio.Task[Any] | None:
+        """Spawn an off-loop JSON persistence drain task regardless of startup grace."""
+        if getattr(self, "_closing", False) or getattr(self, "_closed", False):
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            return None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            return None
+        try:
+            task = loop.create_task(coro, name=f"memory_companion:{label}")
+        except RuntimeError:
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+            return None
+        tasks = getattr(self, "_background_tasks", None)
+        if not isinstance(tasks, set):
+            tasks = set()
+            self._background_tasks = tasks
+        tasks.add(task)
+
+        def _done(done_task: asyncio.Task[Any]) -> None:
+            tasks.discard(done_task)
+            if done_task.cancelled():
+                return
+            try:
+                exc = done_task.exception()
+            except Exception as error:
+                logger.warning(
+                    "[MemoryCompanion] 持久化任务状态读取失败: %s error=%s",
+                    label,
+                    error,
+                )
+                return
+            if exc:
+                logger.warning(
+                    "[MemoryCompanion] 持久化任务异常: %s error=%s",
+                    label,
+                    exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+
+        task.add_done_callback(_done)
+        return task
 
     def _spawn_background(
         self,
@@ -9627,7 +9731,10 @@ class MemoryCompanionService:
         result["historical_chat_archives"] = await asyncio.to_thread(self.chat_importer.clear_archives)
         result["historical_relationship_observations"] = relationship_observations
         self._relationship_phase_state.clear()
-        self._save_relationship_phase_state()
+        self._cleanup_relationship_phase_state(force=True)
+        # A destructive action must be durable before it returns, otherwise a
+        # deferred write queued earlier could land after the caller saw success.
+        await self._relationship_phase_writer.flush_async()
         self._emotional_event_queue.clear()
         self._retrieval_result_cache.clear()
         self._reconstruction_states.clear()
@@ -9698,7 +9805,10 @@ class MemoryCompanionService:
         for key, state in list(self._relationship_phase_state.items()):
             if key in legacy_keys or identity_matches(state.get("_identity") if isinstance(state, dict) else None):
                 self._relationship_phase_state.pop(key, None)
-        self._save_relationship_phase_state()
+        self._cleanup_relationship_phase_state()
+        # Scoped deletion is destructive and synchronous: publish it here so the
+        # caller never observes success while an older snapshot is still queued.
+        self._relationship_phase_writer.flush()
 
         for session_id in list(self._emotional_event_queue):
             normalized = normalize_session_context_fields(session_id=session_id, scope="unknown")
@@ -11363,6 +11473,8 @@ class MemoryCompanionService:
             )
         else:
             self._mark_memory_companion_injection_state(event, req, injected=False, conversation_memory=False, slot_map=slot_map)
+        if stage_timer:
+            stage_timer.mark("publish")
         if not published:
             reason = self._memory_companion_injection_payload(req).get("reason_code")
             if reason:
@@ -11385,6 +11497,7 @@ class MemoryCompanionService:
             )
         if stage_timer:
             stage_timer.mark("compose_log")
+
     async def _validate_reply_memory_refs(
         self, ctx: SessionContext, refs: list[dict[str, str]], slot_map: dict[str, list[Any]],
         *, timeline_reads: list[dict[str, str]] | None = None,
@@ -14761,17 +14874,22 @@ class MemoryCompanionService:
                 self._relationship_phase_state.pop(key, None)
 
     def _save_relationship_phase_state(self) -> None:
+        """Persist relationship phases without serialising on the event loop.
+
+        The document is small today but bounded at ``_RELATIONSHIP_PHASE_STATE_MAX``
+        entries, so a write can grow into a multi-megabyte serialisation. Updates
+        are coalesced into a background write; ``flush_relationship_phase_state``
+        or shutdown flushes make the newest snapshot durable.
+        """
         self._cleanup_relationship_phase_state()
-        temp_path = self._RELATIONSHIP_PHASE_FILE.with_suffix(self._RELATIONSHIP_PHASE_FILE.suffix + ".tmp")
-        try:
-            temp_path.write_text(json_dumps(self._relationship_phase_state), encoding="utf-8")
-            temp_path.replace(self._RELATIONSHIP_PHASE_FILE)
-        except Exception as exc:
-            logger.warning("[MemoryCompanion] 关系阶段状态保存失败: %s", exc)
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        self._relationship_phase_writer.request()
+
+    async def flush_relationship_phase_state(self) -> None:
+        """Make the newest relationship snapshot durable without blocking the loop."""
+        await self._relationship_phase_writer.flush_async()
+
+    def _relationship_phase_snapshot(self) -> Any:
+        return plain_json_copy(self._relationship_phase_state)
 
     def _get_relationship_phase(self, ctx: SessionContext) -> dict[str, Any]:
         identity = self._phase_identity(ctx)
@@ -15101,13 +15219,38 @@ class MemoryCompanionService:
         self._summary_pending.clear()
         self._summary_pending_contexts.clear()
         self._summary_pending_reasons.clear()
-        self._save_token_usage(force=True)
+        self._close_json_writers()
         try:
             self._close_store_sync()
         except Exception as exc:
             logger.warning("[MemoryCompanion] 关闭记忆库连接失败: %s", exc, exc_info=True)
         finally:
             self._closed = True
+
+    def _existing_json_writers(self) -> tuple[BackgroundJsonWriter, ...]:
+        """Return only already-instantiated writers so shutdown never writes empty state."""
+        writers: list[BackgroundJsonWriter] = []
+        for attr in ("_token_usage_writer_instance", "_relationship_phase_writer_instance"):
+            writer = self.__dict__.get(attr)
+            if isinstance(writer, BackgroundJsonWriter):
+                writers.append(writer)
+        return tuple(writers)
+
+    def _close_json_writers(self) -> None:
+        """Synchronously flush any dirty instantiated JSON writers and seal them."""
+        for writer in self._existing_json_writers():
+            try:
+                writer.close()
+            except Exception as exc:
+                logger.warning("[MemoryCompanion] 关闭 JSON 持久化失败: %s", exc)
+
+    async def _aclose_json_writers(self) -> None:
+        """Asynchronously flush any dirty instantiated JSON writers and seal them."""
+        for writer in self._existing_json_writers():
+            try:
+                await writer.aclose()
+            except Exception as exc:
+                logger.warning("[MemoryCompanion] 关闭 JSON 持久化失败: %s", exc)
 
     def _close_store_sync(self) -> None:
         with self._database_init_lock:
@@ -15172,7 +15315,7 @@ class MemoryCompanionService:
         self._summary_pending.clear()
         self._summary_pending_contexts.clear()
         self._summary_pending_reasons.clear()
-        self._save_token_usage(force=True)
+        await self._aclose_json_writers()
         try:
             await asyncio.to_thread(self._close_store_sync)
         except Exception as exc:
