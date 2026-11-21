@@ -166,6 +166,41 @@ class MessageCaptureGateTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(0, self.timeline_count(service, "qq:GroupMessage:g1"))
 
+    async def test_host_conversation_is_only_loaded_for_eligible_group_messages(self) -> None:
+        conversation_memory = {"capture_group_messages": False}
+        service = self.make_service({"conversation_memory": conversation_memory})
+        conversation_manager = SimpleNamespace(
+            get_curr_conversation_id=AsyncMock(return_value="conversation-1"),
+            get_conversation=AsyncMock(return_value=SimpleNamespace(persona_id="persona-1")),
+        )
+        service.context = SimpleNamespace(
+            conversation_manager=conversation_manager,
+            persona_manager=SimpleNamespace(
+                resolve_selected_persona=lambda **kwargs: (kwargs["conversation_persona_id"], None),
+            ),
+        )
+        service.reply_chain.resolve = AsyncMock(return_value=[])
+        service.portraits.capture_user_message = AsyncMock()
+
+        event = self.fake_event([At("b1"), Plain("你好")], message_str="你好")
+        event.unified_msg_origin = "qq:GroupMessage:g1"
+        event.get_sender_id = lambda: "u1"
+        await service.handle_group_message(event)
+        conversation_manager.get_curr_conversation_id.assert_not_awaited()
+
+        conversation_memory["capture_group_messages"] = True
+        event.get_messages = lambda: [Plain("你好")]
+        await service.handle_group_message(event)
+        conversation_manager.get_curr_conversation_id.assert_not_awaited()
+
+        event.get_messages = lambda: [At("b1"), Plain("你好")]
+        await service.handle_group_message(event)
+        conversation_manager.get_conversation.assert_awaited_once_with(
+            "qq:GroupMessage:g1", "conversation-1"
+        )
+        captured_ctx = service.portraits.capture_user_message.await_args.args[0]
+        self.assertEqual("persona-1", captured_ctx.persona_id)
+
     async def test_group_capture_all_messages_when_engagement_gate_disabled(self) -> None:
         service = self.make_service(
             {

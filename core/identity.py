@@ -193,7 +193,9 @@ class IdentityResolver:
         # it empty when no persona applies.
         self.persona_id_fallback = persona_id_fallback
 
-    async def resolve_event_context(self, event: Any) -> SessionContext:
+    async def resolve_event_context(
+        self, event: Any, *, resolve_persona: bool = True
+    ) -> SessionContext:
         session_id = clean_text(getattr(event, "unified_msg_origin", "") or "", 200)
         platform = await self._call(event, "get_platform_name")
         if not platform and session_id and ":" in session_id:
@@ -233,20 +235,7 @@ class IdentityResolver:
                 bot_id = await maybe_await(self.bot_id_fallback(event))
             except Exception:
                 bot_id = ""
-        persona_id = clean_text(
-            getattr(event, "private_companion_persona_id", "")
-            or getattr(event, "persona_id", ""),
-            96,
-        )
-        if not persona_id and callable(self.persona_id_fallback):
-            # See the __init__ note: mirror the persona the write path stamps so
-            # persona-tagged memories stay retrievable.
-            try:
-                persona_id = clean_text(
-                    await maybe_await(self.persona_id_fallback(event)), 96
-                )
-            except Exception:
-                persona_id = ""
+        persona_id = await self.resolve_persona_id(event) if resolve_persona else ""
         text = await self._message_text(event)
         message_id = self._message_id(event)
 
@@ -285,6 +274,19 @@ class IdentityResolver:
             message_id=clean_text(message_id, 120),
             message_text=clean_text(text, 2000),
         )
+
+    async def resolve_persona_id(self, event: Any) -> str:
+        persona_id = clean_text(
+            getattr(event, "private_companion_persona_id", "")
+            or getattr(event, "persona_id", ""),
+            96,
+        )
+        if persona_id or not callable(self.persona_id_fallback):
+            return persona_id
+        try:
+            return clean_text(await maybe_await(self.persona_id_fallback(event)), 96)
+        except Exception:
+            return ""
 
     async def _call(self, event: Any, name: str) -> str:
         func = getattr(event, name, None)

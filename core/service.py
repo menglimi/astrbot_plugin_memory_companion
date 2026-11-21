@@ -1800,7 +1800,8 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             return
         if self._private_companion_internal_generation_event(event):
             return
-        ctx = await self.identity.resolve_event_context(event)
+        # 宿主人格回退可能读取整段会话，等消息通过采集门槛再解析。
+        ctx = await self.identity.resolve_event_context(event, resolve_persona=False)
         self._sanitize_session_context_message_text(ctx)
         if not self._message_capture_allowed(ctx, event):
             return
@@ -1810,6 +1811,8 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             return
         if ctx.bot_id and ctx.user_id and ctx.bot_id == ctx.user_id:
             return
+        if not ctx.persona_id:
+            ctx.persona_id = await self.identity.resolve_persona_id(event)
         await self.note_identity(ctx)
         reply_chain = await self._reply_chain_for_event(event)
         record = self.classifier.from_user_message(ctx)
