@@ -289,9 +289,36 @@ class DedupeOrderTests(unittest.TestCase):
 class InjectionBudgetPriorityTests(unittest.TestCase):
     """R10：预算按相关度优先分配，低分槽位不能先占预算挤掉高分条目。"""
 
-    def test_higher_ranked_item_wins_tight_budget(self) -> None:
-        composer = InjectionComposer()
-        low = SearchResult(
+    # 预算不能写死：分节骨架（<tag> + 提示语 + </tag>）和单条记忆行长度都
+    # 随生产提示语演进而变。历史上 open_loops 提示语从 20 字扩到 66 字后，
+    # 写死的 inner_limit=240 就再也装不下任何一条记忆（骨架 122 + 分隔 1 +
+    # 最短记忆行 147 = 270 > 240），测试于是变成在断言「预算不足」而不是
+    # 「优先级正确」。这里改为先量出渲染一条记忆真正需要的字符数，再据此
+    # 设置预算，让用例只考察优先级本身。
+
+    @staticmethod
+    def _required_chars(composer: InjectionComposer, slot_sections, results) -> int:
+        """渲染这些候选实际需要的字符数（骨架 + 记忆行，含分隔符）。"""
+        included: list[str] = []
+        lines = composer._build_grouped_memory_lines(
+            results,
+            slot_sections=slot_sections,
+            compact=False,
+            base_lines=["base"],
+            closing_lines=["close"],
+            inner_limit=10_000,
+            included_memory_ids=included,
+        )
+        # 渲染顺序按 score 重排，这里只关心「全都装得下」。
+        if sorted(included) != sorted(item.memory.id for item in results):
+            raise AssertionError(
+                f"generous budget should keep every row, got {included}"
+            )
+        return len("\n".join(["base", *lines, "close"]))
+
+    @staticmethod
+    def _low_item() -> SearchResult:
+        return SearchResult(
             memory=_memory(
                 "low",
                 "未完成的约定" * 6,
@@ -301,18 +328,33 @@ class InjectionBudgetPriorityTests(unittest.TestCase):
             ),
             score=0.9,
         )
-        high = SearchResult(
+
+    @staticmethod
+    def _high_item() -> SearchResult:
+        return SearchResult(
             memory=_memory("high", "用户叫小王", memory_type="user_profile", importance=0.9),
             score=0.95,
         )
+
+    def test_higher_ranked_item_wins_tight_budget(self) -> None:
+        composer = InjectionComposer()
+        low, high = self._low_item(), self._high_item()
+        sections = [("open_loop", [low]), ("memory", [high])]
+        budget = max(
+            self._required_chars(composer, [("open_loop", [low])], [low]),
+            self._required_chars(composer, [("memory", [high])], [high]),
+        )
+        # 紧预算：单独一条放得下，两条一起放不下。
+        self.assertLess(budget, self._required_chars(composer, sections, [low, high]))
+
         included: list[str] = []
         lines = composer._build_grouped_memory_lines(
             [low, high],
-            slot_sections=[("open_loop", [low]), ("memory", [high])],
+            slot_sections=sections,
             compact=False,
             base_lines=["base"],
             closing_lines=["close"],
-            inner_limit=240,
+            inner_limit=budget,
             included_memory_ids=included,
         )
         self.assertEqual(["high"], included)
@@ -322,27 +364,40 @@ class InjectionBudgetPriorityTests(unittest.TestCase):
 
     def test_low_item_still_fits_alone(self) -> None:
         composer = InjectionComposer()
-        low = SearchResult(
-            memory=_memory(
-                "low",
-                "未完成的约定" * 6,
-                memory_type="open_loop",
-                metadata={"open_loop_weight": 0.9},
-                importance=0.1,
-            ),
-            score=0.9,
-        )
+        low = self._low_item()
+        sections = [("open_loop", [low])]
+        budget = self._required_chars(composer, sections, [low])
+
         included: list[str] = []
         composer._build_grouped_memory_lines(
             [low],
-            slot_sections=[("open_loop", [low])],
+            slot_sections=sections,
             compact=False,
             base_lines=["base"],
             closing_lines=["close"],
-            inner_limit=240,
+            inner_limit=budget,
             included_memory_ids=included,
         )
         self.assertEqual(["low"], included)
+
+    def test_budget_one_char_short_drops_the_item(self) -> None:
+        """预算边界必须真的生效：少 1 个字符就装不下，证明上面的用例贴近边界。"""
+        composer = InjectionComposer()
+        low = self._low_item()
+        sections = [("open_loop", [low])]
+        budget = self._required_chars(composer, sections, [low])
+
+        included: list[str] = []
+        composer._build_grouped_memory_lines(
+            [low],
+            slot_sections=sections,
+            compact=False,
+            base_lines=["base"],
+            closing_lines=["close"],
+            inner_limit=budget - 1,
+            included_memory_ids=included,
+        )
+        self.assertEqual([], included)
 
 
 class InjectionTelemetryTests(unittest.TestCase):

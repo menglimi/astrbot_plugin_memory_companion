@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .identity import canonical_user_id, session_target_id
+from .identity import canonical_user_id, identity_merge_enabled, session_target_id
 from .models import MemoryRecord, SessionContext, normalize_explicit_person_binding
 
 
@@ -13,12 +13,40 @@ def _clean_id(value: str | None) -> str:
     return (value or "").strip()
 
 
+def _specific_bot_ids(memory: MemoryRecord) -> set[str]:
+    """Bot instances this row is explicitly attributed to.
+
+    An empty result means the row is *unattributed*: legacy imports often carry
+    no bot column at all, so the row cannot be pinned to another bot either. A
+    ``self`` placeholder, or an owner id that merely repeats the platform name,
+    is not an attribution.
+    """
+    metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+    owner_bot_id = _clean_id(metadata.get("owner_bot_id"))
+    platform_id = _clean_id(memory.platform)
+    if owner_bot_id and platform_id and owner_bot_id.casefold() == platform_id.casefold():
+        owner_bot_id = ""
+    bot_entity_ids = {
+        _clean_id(entity.id)
+        for entity in (memory.subject, memory.object)
+        if getattr(entity, "kind", "") == "bot" and _clean_id(getattr(entity, "id", ""))
+    }
+    specific_bot_ids = {bot_id for bot_id in bot_entity_ids if bot_id != "self"}
+    if owner_bot_id and owner_bot_id != "self":
+        specific_bot_ids.add(owner_bot_id)
+    return specific_bot_ids
+
+
 def _platform_family(value: str | None) -> str:
     """Normalize adapter/product names without merging unrelated platforms."""
     platform = _clean_id(value).casefold()
     if platform in {"", "unknown", "default"}:
         return ""
-    if platform in {"qq", "qqbot", "aiocqhttp", "onebot", "napcat", "go-cqhttp"}:
+    # ``onebot_qq`` is the same QQ transport under its OneBot v11 name; a
+    # renamed adapter must not read as a different platform.
+    if platform in {
+        "qq", "qqbot", "aiocqhttp", "onebot", "onebot_qq", "napcat", "go-cqhttp",
+    }:
         return "qq"
     return platform
 
@@ -103,6 +131,8 @@ class VisibilityPolicy:
                 return False, "strict_session_mismatch"
         if self.admin_read_all:
             return True, "admin_search"
+        if not self.platform_identity_allows(memory, ctx):
+            return False, "other_platform"
         if memory.visibility == "bot_self":
             owner_ok, owner_reason = self._bot_owner_visible(memory, ctx)
             if not owner_ok:
@@ -116,11 +146,6 @@ class VisibilityPolicy:
             owner_ok, owner_reason = self._bot_owner_visible(memory, ctx)
             if not owner_ok:
                 return False, owner_reason
-            # A session id is the strongest ownership signal.  Imported rows
-            # may carry a legacy platform prefix (usually ``default``), so
-            # do not let that placeholder hide an otherwise identical window.
-            if memory.session_id and memory.session_id == ctx.session_id:
-                return True, "same_private_session"
             memory_person_id, _memory_assurance = normalize_explicit_person_binding(
                 memory.subject_person_id,
                 memory.identity_assurance,
@@ -131,30 +156,19 @@ class VisibilityPolicy:
             )
             if memory_person_id and context_person_id and memory_person_id != context_person_id:
                 return False, "other_person"
-            memory_platform = _platform_family(memory.platform)
-            current_platform = _platform_family(ctx.platform)
             if ctx.scope != "private":
-                if memory_platform and current_platform and memory_platform != current_platform:
-                    return False, "other_platform"
                 return False, "private_pair_not_current_private"
+            if memory.scope == "private" and memory.session_id and memory.session_id == ctx.session_id:
+                return True, "same_private_session"
             # 同一个人优先于平台判断：QQ 与飞书归一后，
             # 记忆不该因为 platform 字段不同而互相不可见。
+            memory_platform = _platform_family(memory.platform)
+            current_platform = _platform_family(ctx.platform)
             ids = {memory.subject.id, memory.object.id}
             if ctx.user_id and ctx.user_id in ids:
-                if memory_platform and current_platform and memory_platform != current_platform:
-                    memory_user = session_target_id(memory.session_id, "private")
-                    current_user = session_target_id(ctx.session_id, "private")
-                    if not (
-                        memory_user and current_user and memory_user != current_user
-                        and canonical_user_id(memory_user) == ctx.user_id
-                        and canonical_user_id(current_user) == ctx.user_id
-                    ):
-                        return False, "other_platform"
                 if memory_platform and current_platform:
                     return True, "same_private_user"
                 return True, "same_private_user_legacy_platform"
-            if memory_platform and current_platform and memory_platform != current_platform:
-                return False, "other_platform"
             if ctx.user_id and session_target_id(memory.session_id, "private") == ctx.user_id:
                 return True, "same_private_session_target"
             return False, "other_private_pair"
@@ -198,21 +212,71 @@ class VisibilityPolicy:
             and memory_assurance == context_assurance == "explicit_linked"
         )
 
+    @staticmethod
+    def same_private_window(memory: MemoryRecord, ctx: SessionContext) -> bool:
+        """Whether an un-attributed legacy row belongs to the reader's window.
+
+        A matching ``session_id`` is strong ownership evidence, but the string is
+        copied verbatim from the host adapter: a migrated row can keep an old
+        window string while its ``platform`` column names a different adapter.
+        Accepting the bare match therefore let a row from another platform answer
+        for this one.
+
+        This narrower form only covers the documented compatibility case: the row
+        keeps no bot attribution at all, so it cannot be attributed to another bot
+        either, and prefilter-era imports did store a stale platform next to a live
+        window. A row that names its bot is not covered — there the platform column
+        is provenance, and a contradiction is a real contradiction.
+        """
+        if not memory.session_id or memory.session_id != ctx.session_id:
+            return False
+        if memory.scope != "private" or ctx.scope != "private":
+            return False
+        if memory.visibility != "private_pair":
+            # shareable / group_public rows are cross-reader by construction and
+            # must not borrow an identity from the window text.
+            return False
+        return not _specific_bot_ids(memory)
+
+    def platform_identity_allows(self, memory: MemoryRecord, ctx: SessionContext) -> bool:
+        """Whether a platform difference is backed by explicit identity evidence.
+
+        Every platform gate in the plugin asks this one question, so the answer
+        cannot drift between the retrieval filter and the policy again. A
+        difference is accepted only when it is *proven* to be the same person:
+
+        * the platform columns agree, or one side is a placeholder
+          (``default``/empty/unknown) that names no platform at all;
+        * the row carries the same explicit person binding as the reader; or
+        * account merging is on and the two *different* session targets
+          canonicalize to the same person. Two identical ids prove nothing — that
+          is the window talking, not an identity merge; or
+        * the row is an un-attributed legacy row in the reader's own window
+          (see ``same_private_window``).
+        """
+        self_platform = _platform_family(getattr(memory, "platform", ""))
+        current_platform = _platform_family(getattr(ctx, "platform", ""))
+        if not self_platform or not current_platform or self_platform == current_platform:
+            return True
+        if self.explicit_person_link_matches(memory, ctx):
+            return True
+        if self.same_private_window(memory, ctx):
+            return True
+        if memory.scope != "private" or ctx.scope != "private" or not identity_merge_enabled():
+            return False
+        reader = canonical_user_id(_clean_id(ctx.user_id))
+        memory_target = session_target_id(memory.session_id, "private")
+        current_target = session_target_id(ctx.session_id, "private")
+        if not reader or not memory_target or not current_target:
+            return False
+        return bool(
+            memory_target != current_target
+            and canonical_user_id(memory_target) == reader == canonical_user_id(current_target)
+        )
+
     def _bot_owner_visible(self, memory: MemoryRecord, ctx: SessionContext) -> tuple[bool, str]:
         """Keep bot-perspective group memories tied to the bot that produced them."""
-        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
-        owner_bot_id = _clean_id(metadata.get("owner_bot_id"))
-        platform_id = _clean_id(memory.platform)
-        if owner_bot_id and platform_id and owner_bot_id.casefold() == platform_id.casefold():
-            owner_bot_id = ""
-        bot_entity_ids = {
-            _clean_id(entity.id)
-            for entity in (memory.subject, memory.object)
-            if getattr(entity, "kind", "") == "bot" and _clean_id(getattr(entity, "id", ""))
-        }
-        specific_bot_ids = {bot_id for bot_id in bot_entity_ids if bot_id != "self"}
-        if owner_bot_id and owner_bot_id != "self":
-            specific_bot_ids.add(owner_bot_id)
+        specific_bot_ids = _specific_bot_ids(memory)
         if not specific_bot_ids:
             if self._is_legacy_group_conversation_summary(memory) and _clean_id(ctx.bot_id):
                 return False, "ambiguous_bot_owner"
@@ -220,7 +284,7 @@ class VisibilityPolicy:
         current_bot_id = _clean_id(ctx.bot_id)
         if not current_bot_id:
             return False, "owner_bot_context_missing"
-        if current_bot_id and current_bot_id in specific_bot_ids:
+        if current_bot_id in specific_bot_ids:
             return True, "same_bot_owner"
         return False, "other_bot_owner"
 
