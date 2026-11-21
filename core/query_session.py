@@ -730,11 +730,13 @@ def offer_query_tool(service: Any, req: Any, ctx: Any, event: Any) -> None:
                     "properties": deepcopy(legacy["properties"]), "anyOf": [legacy, batch],
                 })
                 item.parameters["properties"]["action"]["enum"].append("range_batch")
-                item.description += (
+                range_batch_desc = (
                     " range_batch 按消息观察时间正序连续读取 [start_at,end_at)，使用服务配置的字节/消息/片段预算。"
                     "next_batch_cursor 只传 cursor 续读，长正文保留偏移。已找到的部分不等于整个范围；"
                     "coverage 分别说明遍历、实际展示和未证明的事件覆盖，按问题需要补查即可。"
                 )
+                if range_batch_desc not in item.description:
+                    item.description += range_batch_desc
                 event._memory_source_query_v2 = True
                 event._memory_source_query_v2_key = service._reconstruction_budget_key(event, ctx)
         if item.name == "memory_companion_sources" and "query_note" in item.parameters.get("properties", {}):

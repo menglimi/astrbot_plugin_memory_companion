@@ -357,9 +357,11 @@ def entity_for_current_target(ctx: SessionContext) -> EntityRef:
 
 
 def looks_like_command(text: str) -> bool:
-    stripped = text.strip()
+    stripped = (text or "").strip()
     if not stripped:
-        return True
+        # Empty/whitespace-only text (e.g. bare @-mentions or media/quoted-only
+        # turns after segment stripping) is not a slash command.
+        return False
 
     def _strip_leading_message_decorations(value: str) -> str:
         current = value.strip()

@@ -548,7 +548,9 @@ class ActiveReconstructionTests(unittest.IsolatedAsyncioTestCase):
         ordinary.message_text = "你好呀"
         ordinary_req = SimpleNamespace(system_prompt="原始提示")
         service._apply_reconstruction_contract(ordinary_req, ordinary)
+        self.assertEqual(1, ordinary_req.system_prompt.count("<MemoryCompanion-Recall-Guidance>"))
         self.assertNotIn("MemoryCompanion-Reconstruction-Contract", ordinary_req.system_prompt)
+        self.assertEqual([], getattr(ordinary_req, "extra_user_content_parts", []))
 
         recall = self.private_context()
         recall_req = SimpleNamespace(
@@ -559,13 +561,17 @@ class ActiveReconstructionTests(unittest.IsolatedAsyncioTestCase):
             service._apply_reconstruction_contract(recall_req, recall)
             service._apply_reconstruction_contract(recall_req, recall)
 
-        self.assertEqual(1, recall_req.system_prompt.count("<MemoryCompanion-Reconstruction-Contract>"))
+        self.assertEqual(ordinary_req.system_prompt, recall_req.system_prompt)
+        self.assertEqual(1, recall_req.system_prompt.count("<MemoryCompanion-Recall-Guidance>"))
+        self.assertNotIn("<MemoryCompanion-Reconstruction-Contract>", recall_req.system_prompt)
         turn_state = "\n".join(
             getattr(part, "text", "")
             for part in getattr(recall_req, "extra_user_content_parts", [])
-        )
-        self.assertIn("正常检索已选出 2 条", recall_req.system_prompt + turn_state)
-        self.assertIn("实际注入条数：未确认", recall_req.system_prompt + turn_state)
+        ) + str(getattr(recall_req, "prompt", "") or "")
+        self.assertEqual(1, turn_state.count("<MemoryCompanion-Reconstruction-Turn-State>"))
+        self.assertIn("正常检索已选出 2 条", turn_state)
+        self.assertIn("实际注入条数：未确认", turn_state)
+        self.assertNotIn("正常检索已选出 2 条", recall_req.system_prompt)
         self.assertIn("获得足够证据后立即停止", recall_req.system_prompt)
 
     def test_reconstruction_prompt_separates_selected_and_injected_counts(self):
@@ -660,8 +666,9 @@ class ActiveReconstructionTests(unittest.IsolatedAsyncioTestCase):
             service._apply_reconstruction_contract(recall_req, recall)
 
         self.assertEqual(
-            1, recall_req.system_prompt.count("<MemoryCompanion-Reconstruction-Contract>")
+            1, recall_req.system_prompt.count("<MemoryCompanion-Recall-Guidance>")
         )
+        self.assertNotIn("<MemoryCompanion-Reconstruction-Contract>", recall_req.system_prompt)
         self.assertIn("获得足够证据后立即停止", recall_req.system_prompt)
         self.assertNotIn("正常检索已选出 2 条", recall_req.system_prompt)
 
@@ -716,16 +723,25 @@ class ActiveReconstructionTests(unittest.IsolatedAsyncioTestCase):
         ]))
         ctx.message_text = "你好呀"
         service._apply_reconstruction_contract(req, ctx)
+        ordinary_prompt = req.system_prompt
         self.assertIn("<MemoryCompanion-Recall-Guidance>", req.system_prompt)
         self.assertNotIn("<MemoryCompanion-Reconstruction-Contract>", req.system_prompt)
+        self.assertEqual([], getattr(req, "extra_user_content_parts", []))
         ctx.message_text = "你还记得上次是哪一天吗？"
         service._apply_reconstruction_contract(req, ctx)
-        self.assertIn("<MemoryCompanion-Reconstruction-Contract>", req.system_prompt)
-        self.assertNotIn("<MemoryCompanion-Recall-Guidance>", req.system_prompt)
+        self.assertEqual(ordinary_prompt, req.system_prompt)
+        self.assertIn("<MemoryCompanion-Recall-Guidance>", req.system_prompt)
+        self.assertNotIn("<MemoryCompanion-Reconstruction-Contract>", req.system_prompt)
+        turn_parts = "\n".join(
+            getattr(part, "text", "")
+            for part in getattr(req, "extra_user_content_parts", [])
+        )
+        self.assertIn("<MemoryCompanion-Reconstruction-Turn-State>", turn_parts)
         ctx.message_text = "你好呀"
         req.func_tool.tools[0].active = False
         service._apply_reconstruction_contract(req, ctx)
         self.assertEqual("原始提示", req.system_prompt.strip())
+        self.assertEqual([], getattr(req, "extra_user_content_parts", []))
         self.assertFalse(req.func_tool.tools[0].active)
 
     def test_guidance_respects_reconstruction_switches(self) -> None:
