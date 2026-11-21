@@ -109,10 +109,11 @@ class SummaryAutoDrainBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, self.provider.calls)
         self.assertFalse(any("自动消化完成" in line for line in logs))
         await self.assert_pending(ids)
-        deferred = next(batch for batch in self.batches() if batch["id"] != spent)
-        self.assertEqual(0, deferred["automatic_calls"])
-        self.assertEqual(self.service.store.BUDGET_RETRY_REASON, deferred["retry_reason"])
-        self.assertNotIn(deferred["state"], {"completed", "no_memory", "quarantined"})
+        # Recovery admission keeps originals unassigned until capacity exists.
+        self.assertEqual([spent], [batch["id"] for batch in self.batches()])
+        self.assertEqual(0, self.service.store._conn.execute(
+            "SELECT COUNT(*) FROM summary_batch_events WHERE event_id IN (?,?)", ids
+        ).fetchone()[0])
         self.assertEqual(1, self.service.store._conn.execute(
             "SELECT COUNT(*) FROM summary_batch_calls"
         ).fetchone()[0])
@@ -125,12 +126,34 @@ class SummaryAutoDrainBudgetTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(0, self.provider.calls)
             self.assertFalse(any("自动消化完成" in line for line in logs))
             await self.assert_pending(ids)
-            self.assertEqual(0, self.batches()[0]["automatic_calls"])
+            self.assertEqual([], self.batches())
+            self.assertEqual(0, self.service.store._conn.execute(
+                "SELECT COUNT(*) FROM summary_batch_calls"
+            ).fetchone()[0])
         finally:
             self.service._summary_call_semaphore.release()
         self.assertTrue(await self.service.maybe_summarize_session(self.ctx, allow_aged_backlog=True))
         self.assertEqual(1, self.provider.calls)
         self.assertEqual("completed", self.batches()[0]["state"])
+
+    async def test_aged_drain_cannot_bypass_paused_or_restarted_trial_admission(self):
+        from astrbot_plugin_memory_companion.core.summary_admission import SummaryAdmission
+
+        ids = await self.seed()
+        await self.service.pause_summary_admission()
+        for mode in ("paused", "trial"):
+            self.service._summary_admission.save(mode=mode, batches=[])
+            self.service._summary_admission = SummaryAdmission(self.service._summary_admission.path)
+            await self.run_round()
+            self.assertEqual("", await self.service.maybe_summarize_session(
+                self.ctx, allow_aged_backlog=True,
+            ))
+            self.assertEqual(0, self.provider.calls)
+            self.assertEqual([], self.batches())
+            await self.assert_pending(ids)
+        self.assertEqual(0, self.service.store._conn.execute(
+            "SELECT COUNT(*) FROM summary_batch_calls"
+        ).fetchone()[0])
 
     async def test_old_work_keeps_summary_disable_switch(self):
         ids = await self.seed()

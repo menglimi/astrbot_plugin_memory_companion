@@ -1214,6 +1214,59 @@ function applyMode(mode) {
 /* ============================================================
    视图：总览
    ============================================================ */
+function summaryWaitDuration(seconds) {
+  const value = Math.max(0, int(seconds));
+  if (value === 0) return "无";
+  if (value < 60) return "不足 1 分钟";
+  if (value >= 86400) return Math.floor(value / 86400) + " 天 " + Math.floor(value % 86400 / 3600) + " 小时";
+  if (value >= 3600) return Math.floor(value / 3600) + " 小时 " + Math.floor(value % 3600 / 60) + " 分钟";
+  return Math.floor(value / 60) + " 分钟";
+}
+
+function summaryWaitTone(key) {
+  if (key === "identity" || key === "retry" || key === "paused" || key === "disabled") return "warn";
+  if (key === "call_limit") return "danger";
+  if (key === "running") return "ok";
+  return "fact";
+}
+
+function summaryRecoveryCard(status) {
+  if (!status || typeof status !== "object") {
+    return card("记忆整理进度", "只读状态", emptyState("状态暂不可用", "请使用已登录的管理员面板刷新。"), "", "recovery-card");
+  }
+  const waits = status.waits || {};
+  const originals = status.unbatched || {};
+  const progress = status.progress || {};
+  const labels = status.wait_labels || {};
+  const rows = Object.keys(labels).filter((key) => int(waits[key]) > 0).map((key) =>
+    '<div class="row"><div class="row-main"><div class="row-title" title="' + esc(labels[key]) + '">' + esc(labels[key]) +
+    '</div></div><div class="row-meta">' + badge(fmtInt(waits[key]) + " 批", summaryWaitTone(key)) + "</div></div>"
+  ).join("");
+  const originalWaits = Object.keys(labels).filter((key) => int((originals.waits || {})[key]) > 0)
+    .map((key) => labels[key] + " " + fmtInt(originals.waits[key]) + " 个窗口").join(" · ");
+  const mode = !status.summary_enabled ? "自动总结已关闭"
+    : status.admission !== "normal" ? "已暂停常规整理"
+    : !status.recovery_enabled ? "后台恢复已关闭，聊天仍可触发整理"
+    : status.dispatcher_state === "degraded" ? "后台恢复已开启（调度器异常）"
+    : "后台恢复已开启";
+  return card("记忆整理进度", mode,
+    '<div class="pill-row">' +
+      badge("待处理 " + fmtInt(status.pending_batches) + " 批", "accent") +
+      badge("最老等待 " + summaryWaitDuration(status.oldest_wait_seconds), "fact") +
+      badge("每会话每小时 " + fmtInt((status.limits || {}).calls_per_session_hour) + " 次") +
+      badge("全局并发 " + fmtInt((status.limits || {}).global_concurrency)) +
+    '</div><div class="row-list">' + (rows || emptyState("没有有效待处理批次", "空白历史行不计入积压。")) + '</div>' +
+    '<p class="section-note">未分批原文 ' + fmtInt(originals.events) + " 条；下一轮达到条件且身份有效 " +
+      fmtInt(originals.eligible_events) + " 条（" + fmtInt(originals.eligible_windows) + " 个窗口）。这些原文尚未计入批次。" +
+      (originalWaits ? " 当前：" + esc(originalWaits) + "。" : "") + '</p>' +
+    '<p class="section-note">正式会话记忆 ' + fmtInt(progress.adopted_memories) + " 条 · 待审候选 " +
+      fmtInt(progress.review_candidates) + " 条 · 已处理批次 " + fmtInt(progress.completed_batches) +
+      " 批 · 无新增记忆 " + fmtInt(progress.no_memory_batches) + " 批 · 隔离批次 " +
+      fmtInt(progress.quarantined_batches) + ' 批。</p>' +
+    '<p class="section-note">可以尝试整理表示队列条件已满足；模型是否可用会在实际整理时检查。查看状态不会发起模型调用或通过候选。</p>',
+    "", "recovery-card");
+}
+
 function renderCinemaOverview(data) {
   const stats = data.stats || {};
   const memories = Array.isArray(data.memories) ? data.memories : [];
@@ -1266,7 +1319,7 @@ function renderCinemaOverview(data) {
     '<div class="terminal-feed" id="terminalFeed">' + (recordButtons || emptyState("暂无记录", "连接后会在这里展开记忆流。")) + '</div>' +
     '<div class="terminal-controls"><div class="terminal-counter"><span>ARCHIVE / SELECT</span><strong><b id="terminalSelectedNumber">01</b><i>/</i><b>' + String(Math.max(records.length, 1)).padStart(2, "0") + '</b></strong></div><div class="terminal-arrows"><button type="button" data-terminal-prev aria-label="上一个记忆">↑</button><button type="button" data-terminal-next aria-label="下一个记忆">↓</button></div><div class="terminal-column"><button type="button" data-terminal-column-prev aria-label="上一记忆通道">←</button><span><small>MEMORY CHANNEL</small><b id="terminalChannel">ALL RECORDS</b></span><button type="button" data-terminal-column-next aria-label="下一记忆通道">→</button></div><span class="terminal-hint"><kbd>←</kbd><kbd>→</kbd> 通道 <span>/</span> <kbd>↑</kbd><kbd>↓</kbd> 档案 <span>/</span> <kbd>ENTER</kbd> 读取</span></div>' +
     '<div class="terminal-marquee"><span>ARCHIVE CHANNEL CONNECTED</span><i>●</i><span>PERSONAL CONTEXT READY</span><i>●</i><span>RECALL ENGINE STANDBY</span><i>●</i><span>ARCHIVE CHANNEL CONNECTED</span></div>' +
-    '</section>';
+    '</section>' + summaryRecoveryCard(data.recovery);
 }
 
 defineView("overview", {
@@ -1275,7 +1328,7 @@ defineView("overview", {
   eyebrow: "Overview",
   hint: "记忆库规模、范围分布与联动状态的整体快照",
   async load() {
-    const [statsPayload, buckets, core, caps, coord, memories, personal, injectionLogs, botsPayload] = await Promise.all([
+    const [statsPayload, buckets, core, caps, coord, memories, personal, injectionLogs, botsPayload, recoveryPayload] = await Promise.all([
       apiGet("/stats"),
       apiTry(() => apiGet("/buckets?limit=160"), { buckets: [] }),
       apiTry(() => apiGet("/core-memory"), { blocks: [] }),
@@ -1286,12 +1339,14 @@ defineView("overview", {
       apiTry(() => apiGet("/companion/personal-memory?limit=1"), null),
       apiTry(() => apiGet("/logs?limit=12"), { items: [] }),
       apiTry(() => apiGet("/bots"), { bots: [] }),
+      apiTry(() => apiGet("/maintenance/summary_status"), null),
     ]);
     const stats = (statsPayload && statsPayload.stats) || {};
     state.stats = stats;
     state.buckets = Array.isArray(buckets.buckets) ? buckets.buckets : [];
     return {
       stats,
+      recovery: recoveryPayload && recoveryPayload.status,
       buckets: state.buckets,
       core: core.blocks || [],
       caps,
@@ -1306,7 +1361,8 @@ defineView("overview", {
     if (state.mode === "cinema") return renderCinemaOverview(data);
     const stats = data.stats || {};
     const byScope = stats.by_scope || {};
-    const progress = stats.summary_progress || {};
+    const recovery = data.recovery && typeof data.recovery === "object" ? data.recovery : null;
+    const recoveryProgress = recovery && recovery.progress && typeof recovery.progress === "object" ? recovery.progress : null;
     const storageMb = (int(stats.memory_storage_bytes) / 1048576).toFixed(1);
     const privateCount = int(byScope.private);
     const groupCount = int(byScope.group);
@@ -1318,11 +1374,11 @@ defineView("overview", {
       kpi("用户档案", fmtInt(stats.identities), "已识别身份", "relation", "inspect", "tag", "profile"),
       kpi("核心记忆", fmtInt((data.core || []).length), "强制注入块", "gold", "core", "star"),
       kpi("开放线程", fmtInt(stats.open_threads), "跨窗口续接", "fact", "navigate", "link"),
-      kpi("原文已记录", fmtInt(progress.raw_events), "原始会话事件", "group", "inspect", "library"),
-      kpi("会话记忆已生成", fmtInt(progress.conversation_memories), "不含待审核候选", "fact", "inspect", "chat"),
-      kpi("待处理批次", fmtInt(progress.pending_batches), "正常排队等总结 · 不是错误", "accent", "queue", "clock"),
-      kpi("待修复批次", fmtInt(progress.quarantined_batches), "总结失败被隔离 · 冻结原文 " + fmtInt(progress.frozen_events) + " 条", "gold", "quarantine", "shield"),
-      kpi("已处理，无新增记忆", fmtInt(progress.no_memory_batches), "原文保留，不重复总结", "private", "processed", "box"),
+      kpi("原文已记录", recoveryProgress ? fmtInt(recoveryProgress.raw_events) : "—", "不含空白历史行", "group", "inspect", "library"),
+      kpi("正式会话记忆", recoveryProgress ? fmtInt(recoveryProgress.adopted_memories) : "—", "待审候选另列", "fact", "inspect", "chat"),
+      kpi("待处理批次", recovery ? fmtInt(recovery.pending_batches) : "—", "等待原因见整理进度", "accent", "queue", "clock"),
+      kpi("待修复批次", recoveryProgress ? fmtInt(recoveryProgress.quarantined_batches) : "—", "总结失败被隔离", "gold", "quarantine", "shield"),
+      kpi("已处理，无新增记忆", recoveryProgress ? fmtInt(recoveryProgress.no_memory_batches) : "—", "原文保留，不重复总结", "private", "processed", "box"),
     ].join("");
 
     const entries = [
@@ -1532,6 +1588,7 @@ defineView("overview", {
       "</div>" +
       botCard +
       drainCard +
+      summaryRecoveryCard(recovery) +
       '<div class="grid g4">' +
         kpi("稳定记忆", fmtInt(stats.stable_memories), "lifecycle=stable_memory", "fact", "inspect", "heart") +
         kpi("时间线事件", fmtInt(stats.timeline_events), "结构化事件流", "group", "navigate", "clock") +
@@ -3411,7 +3468,7 @@ const BATCH_TAB_META = {
   pending: {
     title: "排队处理",
     eyebrow: "Queue · Pending",
-    hint: "正常排队等后台总结的批次，只读；总结失败的会进入「待修复」",
+    hint: "排队等待整理的批次，只读；具体等待原因见整理进度，总结失败的会进入「待修复」",
   },
   processed: {
     title: "已处理批次",
@@ -3429,10 +3486,11 @@ const batchesView = (fixedTab, viewId, getOffset, setOffset) => {
     eyebrow: meta.eyebrow,
     hint: meta.hint,
     async load() {
-      return apiTry(
-        () => apiGet("/maintenance/summary_batches?state=" + fixedTab + "&limit=" + QUARANTINE_PAGE_SIZE + "&offset=" + getOffset()),
-        { total: 0, legacy_failures: 0, batches: [] }
-      );
+      const [batches, recovery] = await Promise.all([
+        apiTry(() => apiGet("/maintenance/summary_batches?state=" + fixedTab + "&limit=" + QUARANTINE_PAGE_SIZE + "&offset=" + getOffset()), { total: 0, legacy_failures: 0, batches: [] }),
+        fixedTab === "pending" ? apiTry(() => apiGet("/maintenance/summary_status"), null) : null,
+      ]);
+      return { ...batches, recovery: recovery && recovery.status };
     },
     render(data) {
       const total = int(data.total);
@@ -3459,7 +3517,7 @@ const batchesView = (fixedTab, viewId, getOffset, setOffset) => {
         : '<div class="tool-actions" style="margin-bottom:12px">' +
           '<span class="kpi-foot" style="align-self:center">' +
           (fixedTab === "pending"
-            ? "这些批次在正常排队等总结，不需要处理；失败的会进「待修复」。"
+            ? "请结合整理进度查看等待原因；身份缺失或冲突的批次不会自动调用模型。"
             : "这些批次已经处理完，仅供查阅；失败的会进「待修复」。") +
           "</span>" +
           '<button class="btn is-sm" type="button" id="qRefreshBtn">刷新</button>' +
@@ -3505,17 +3563,18 @@ const batchesView = (fixedTab, viewId, getOffset, setOffset) => {
         : isRepair
           ? emptyState("没有待修复批次", "被隔离的总结批次会出现在这里，可逐条或整批重新排队 / 放弃。")
           : fixedTab === "pending"
-            ? emptyState("没有排队中的批次", "所有批次都已总结完，或正由后台处理。")
+            ? emptyState("没有排队中的批次", "未分批原文另见整理进度，不能据此判断所有原文已处理。")
             : emptyState("没有已处理批次", "总结完成的批次会出现在这里。");
 
       return (
         '<div class="grid">' +
+        (fixedTab === "pending" ? summaryRecoveryCard(data.recovery) : "") +
         card(
           meta.title,
           isRepair
             ? "隔离批次持有其原文事件，释放后事件才会重新进入总结流程"
             : fixedTab === "pending"
-              ? "正常排队等后台总结的批次，只读；总结失败的会进入「待修复」"
+              ? "排队等待整理的批次，只读；具体等待原因见上方整理进度，总结失败的会进入「待修复」"
               : "已完成的总结批次，仅供查阅",
           summary + bulk + rows + pager
         ) +

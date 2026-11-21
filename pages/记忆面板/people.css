@@ -65,6 +65,22 @@ main { padding: 8px clamp(18px, 4vw, 48px) 64px; }
 .summary { color: var(--dim); font-size: 13px; margin: 4px 2px 18px; }
 .summary b { color: var(--text); font-weight: 600; }
 
+.recovery {
+  margin: -6px 0 18px;
+  padding: 10px 14px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: var(--bg-soft);
+  color: var(--dim);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.recovery summary { cursor: pointer; color: var(--dim); list-style-position: inside; }
+.recovery summary b { color: var(--text); font-weight: 600; }
+.recovery[open] summary { margin-bottom: 8px; }
+.recovery p { margin: 6px 0 0; }
+.recovery a { color: var(--accent); }
+
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
