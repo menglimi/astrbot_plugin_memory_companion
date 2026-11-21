@@ -14,6 +14,10 @@ except ImportError:
 
 ROOT = bootstrap_package()
 
+from astrbot_plugin_memory_companion.core.latency import (
+    DEFAULT_MODEL_CALL_TIMEOUT_MS,
+    MAX_CONFIGURED_MODEL_CALL_TIMEOUT_MS,
+)
 from astrbot_plugin_memory_companion.core.service import MemoryCompanionService
 
 
@@ -40,8 +44,12 @@ class EmbeddingTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(await loop_work)
         await asyncio.sleep(0.1)
-        service.config.raw["retrieval"]["embedding_timeout_ms"] = 9000
-        self.assertEqual(2000, service._embedding_timeout_ms())
+        service.config.raw["retrieval"]["embedding_timeout_ms"] = 5000
+        self.assertEqual(5000, service._embedding_timeout_ms())
+        service.config.raw["retrieval"]["embedding_timeout_ms"] = 20000
+        self.assertEqual(MAX_CONFIGURED_MODEL_CALL_TIMEOUT_MS, service._embedding_timeout_ms())
+        service.config.raw["retrieval"]["embedding_timeout_ms"] = 0
+        self.assertEqual(DEFAULT_MODEL_CALL_TIMEOUT_MS, service._embedding_timeout_ms())
 
 
 if __name__ == "__main__":
