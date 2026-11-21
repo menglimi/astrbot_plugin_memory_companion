@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import yaml
+
 from . import test_summary_admission as admission_tests
 from .test_panel_guard import PluginPageApi, page_api_module, make_request, _fake_jsonify
 
@@ -205,15 +207,17 @@ process.stdout.write(JSON.stringify(vm.runInContext(`({
 
     async def test_panel_recovery_guards_styles_and_people_banner(self):
         from pathlib import Path
-        pages = Path(__file__).resolve().parents[1] / "pages" / "记忆面板"
+        root = Path(__file__).resolve().parents[1]
+        version = yaml.safe_load((root / "metadata.yaml").read_text(encoding="utf-8"))["version"]
+        pages = root / "pages" / "记忆面板"
         app_css = (pages / "app.css").read_text(encoding="utf-8")
         legacy_html = (pages / "legacy.html").read_text(encoding="utf-8")
         people_html = (pages / "people.html").read_text(encoding="utf-8")
         people_css = (pages / "people.css").read_text(encoding="utf-8")
         people_js = (pages / "people.js").read_text(encoding="utf-8")
 
-        self.assertIn("./app.css?v=2.6.6-summary-status", legacy_html)
-        self.assertIn("./people.css?v=2.6.6-summary-status", people_html)
+        self.assertIn(f'href="./app.css?v={version}"', legacy_html)
+        self.assertIn(f'href="./people.css?v={version}"', people_html)
         self.assertIn('<details id="recovery" class="recovery" hidden></details>', people_html)
         self.assertIn(".recovery-card .pill-row", app_css)
         self.assertIn(".section-note {", app_css)
