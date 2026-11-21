@@ -12567,6 +12567,62 @@ class MemoryStore(SummaryBatchStore):
             ).fetchall()
         return [MemoryRecord.from_row(row) for row in rows]
 
+    async def read_authorized_linked_memories(self, authorization, *, limit=8):
+        """Exact native sessions + bot + persona; one predicate for rows/counts.
+
+        The caller must validate the host lease before and after this await.
+        No aliases, identity rewriting, group expansion or fallback search.
+        """
+        return await self._run_recoverable_database_operation(
+            self._read_authorized_linked_memories_sync, authorization, limit)
+
+    def _read_authorized_linked_memories_sync(self, authorization, limit):
+        members = authorization.get("members", [])
+        persona = authorization.get("persona_id")
+        reader = authorization.get("reader_user_id")
+        if (authorization.get("schema") != "companion.linked-memory-read.v1"
+                or not isinstance(persona, str) or not persona or not reader
+                or not isinstance(members, list) or not 1 <= len(members) <= 16):
+            raise ValueError("invalid authorized memory scope")
+        from .linked_memory_scope import member_predicate
+        clauses, params = [], []
+        for member in members:
+            session = member["session_id"]
+            scope, target = parse_scope_from_session(session)
+            if (scope != "private" or not target or not member["native_account_id"]
+                    or not member["bot_id"] or not member["account_id"]
+                    or not session.startswith(member["platform"] + ":")):
+                raise ValueError("incomplete native private route")
+            clause, values = member_predicate(member, persona, reader)
+            clauses.append(clause)
+            params.extend(values)
+        validity, validity_params = validity_where_clause(valid_at=utc_now())
+        where = ("m.scope='private' AND m.visibility IN ('private_pair','shareable') "
+                 "AND m.review_status!='pending' AND m.lifecycle='stable_memory' "
+                 "AND (" + " OR ".join(clauses) + ") AND " + validity)
+        params.extend(validity_params)
+        safe_limit = max(0, min(20, int(limit)))
+        with self._lock:
+            revision = self._memory_revision_sync()
+            source_revision = self._source_revision_sync()
+            rows = self._conn.execute("SELECT m.* FROM memories m WHERE " + where +
+                " ORDER BY m.occurred_at DESC, m.created_at DESC, m.id DESC LIMIT ?", [*params, safe_limit]).fetchall()
+            counts = self._conn.execute("SELECT m.memory_type,COUNT(*) AS n FROM memories m WHERE " +
+                where + " GROUP BY m.memory_type", params).fetchall()
+            if (self._memory_revision_sync() != revision or self._source_revision_sync() != source_revision):
+                raise RuntimeError("memory_summary_snapshot_changed")
+        records = [MemoryRecord.from_row(row) for row in rows]
+        provenance = {}
+        for record in records:
+            member = next(m for m in members if m["session_id"] == record.session_id)
+            identity = member.get("memory_identity", {})
+            provenance[record.id] = {"user_id": member["native_account_id"],
+                "owner_bot_id": identity.get("owner_bot_id", member["account_id"]),
+                "original_owner_bot_id": record.owner_bot_id}
+        return {"records": records, "provenance": provenance,
+                "type_counts": {row["memory_type"]: int(row["n"]) for row in counts},
+                "memory_revision": int(revision), "source_revision": source_revision}
+
     async def read_user_memory_summary_records(
         self,
         user_id: str,
