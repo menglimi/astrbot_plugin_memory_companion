@@ -76,7 +76,9 @@ class SummaryStatusMethods:
                 reason = 'call_limit'
             elif hourly > 0 and snapshot['budgets'].get(context.session_id, 0) >= hourly:
                 reason = 'hourly_budget'
-            elif not batch['due']:
+            elif not batch['due'] and not (
+                hourly == 0 and batch['retry_reason'] == self.store.BUDGET_RETRY_REASON
+            ):
                 reason = 'hourly_budget' if batch['retry_reason'] == self.store.BUDGET_RETRY_REASON else 'retry'
             else:
                 reason = admission_reason(context)
