@@ -178,6 +178,7 @@ ASSERTION_MEMORY_TYPE = "assertion"
 
 MAX_ASSERTIONS_PER_BATCH = 6
 MAX_ASSERTION_VALUE_CHARS = 120
+SITUATIONAL_ASSERTION_TTL_DAYS = 5
 
 
 def normalize_predicate(raw: Any) -> str:
@@ -322,6 +323,37 @@ def assertion_is_promotable(
     )[0]
 
 
+def assertion_is_short_term_visible(
+    assertion: dict[str, Any],
+    evidence: list[str] | None = None,
+) -> bool:
+    """Allow grounded near-term situational claims (e.g. today's schedule) to be
+    immediately recallable with a short TTL instead of burying them in pending.
+
+    Single-value identity/profile slots (residence, occupation, birthday, etc.)
+    and unsafe shapes (role-play, reported speech, third-person mismatch, and
+    fleeting mood filler) remain pending candidates.
+    """
+    if not assertion:
+        return False
+    if assertion.get("durability") != "situational":
+        return False
+    if not assertion.get("refs"):
+        return False
+    if len(assertion.get("value", "")) < 4:
+        return False
+    dimension = clean_text(assertion.get("dimension"), 40).lower()
+    if not dimension or dimension not in ASSERTION_DIMENSIONS or dimension in SINGLE_VALUE_DIMENSIONS:
+        return False
+    ok, reason = claim_is_personal_fact(
+        assertion.get("subject", ""), assertion.get("value", ""), evidence
+    )
+    if ok:
+        return True
+    # Near-term schedule items naturally use plan/intent wording ("晚上准备去饭局").
+    return dimension == "schedule" and reason == "intent"
+
+
 __all__ = [
     "ASSERTION_DIMENSIONS",
     "ASSERTION_MEMORY_TYPE",
@@ -329,7 +361,9 @@ __all__ = [
     "MAX_ASSERTIONS_PER_BATCH",
     "MULTI_VALUE_DIMENSIONS",
     "SINGLE_VALUE_DIMENSIONS",
+    "SITUATIONAL_ASSERTION_TTL_DAYS",
     "assertion_is_promotable",
+    "assertion_is_short_term_visible",
     "cardinality_for",
     "claim_is_personal_fact",
     "clean_assertion_value",

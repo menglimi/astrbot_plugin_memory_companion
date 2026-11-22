@@ -101,10 +101,43 @@ class SourceQuery:
         return value
 
 
-def source_visible(ctx: Any, row: dict[str, Any], metadata: dict[str, Any]) -> bool:
+def _authorized_group_read_policy(
+    ctx: Any,
+    group_policy: dict[str, Any] | None,
+) -> tuple[bool, frozenset[str], frozenset[str]] | None:
+    if (
+        not isinstance(group_policy, dict)
+        or not group_policy.get("enabled")
+        or getattr(ctx, "scope", "") != "private"
+        or getattr(ctx, "strict_session_only", False)
+    ):
+        return None
+    allow_all = bool(group_policy.get("allow_all_groups"))
+    allowed = frozenset(
+        clean_text(item, 120)
+        for item in (group_policy.get("allowed_groups") or ())
+        if clean_text(item, 120)
+    )
+    denied = frozenset(
+        clean_text(item, 120)
+        for item in (group_policy.get("denied_groups") or ())
+        if clean_text(item, 120)
+    )
+    effective_allowed = allowed - denied
+    if not allow_all and not effective_allowed:
+        return None
+    return allow_all, effective_allowed, denied
+
+
+def source_visible(
+    ctx: Any,
+    row: dict[str, Any],
+    metadata: dict[str, Any],
+    *,
+    group_policy: dict[str, Any] | None = None,
+) -> bool:
     """Never derive raw-source authority from a parent summary or supplied ID."""
     if (ctx.scope not in {"private", "group"} or not ctx.session_id
-            or row.get("scope") != ctx.scope or row.get("session_id") != ctx.session_id
             or row.get("event_type") not in {"user_message", "bot_response"}):
         return False
     owner = clean_text(metadata.get("owner_bot_id"), 120)
@@ -119,21 +152,43 @@ def source_visible(ctx: Any, row: dict[str, Any], metadata: dict[str, Any]) -> b
     persona_id = clean_text(metadata.get("persona_id"), 96)
     if persona_id not in {"", "legacy"} and persona_id != clean_text(ctx.persona_id, 96):
         return False
-    if row.get("event_type") == "bot_response" and row.get("subject_id") != owner:
+    if row.get("scope") == ctx.scope and row.get("session_id") == ctx.session_id:
+        if row.get("event_type") == "bot_response" and row.get("subject_id") != owner:
+            return False
+        if ctx.scope == "private":
+            if not ctx.user_id or row.get("object_id") != ctx.user_id:
+                return False
+            if row.get("event_type") == "user_message" and row.get("subject_id") != ctx.user_id:
+                return False
+            if clean_text(metadata.get("participant_user_id"), 120) not in {"", ctx.user_id}:
+                return False
+        elif not ctx.group_id or row.get("object_id") != ctx.group_id:
+            return False
+        return True
+    # Private chat with explicit group visibility / ACL authorization may read
+    # ONLY the current speaker's own messages from authorized groups; never
+    # expose another group member's messages or bot replies.
+    policy = _authorized_group_read_policy(ctx, group_policy)
+    if policy is None:
         return False
-    if ctx.scope == "private":
-        if not ctx.user_id or row.get("object_id") != ctx.user_id:
-            return False
-        if row.get("event_type") == "user_message" and row.get("subject_id") != ctx.user_id:
-            return False
-        if clean_text(metadata.get("participant_user_id"), 120) not in {"", ctx.user_id}:
-            return False
-    elif not ctx.group_id or row.get("object_id") != ctx.group_id:
+    allow_all, allowed_groups, denied_groups = policy
+    if row.get("scope") != "group" or row.get("event_type") != "user_message":
         return False
-    return True
+    if not ctx.user_id or row.get("subject_id") != ctx.user_id:
+        return False
+    if clean_text(metadata.get("participant_user_id"), 120) not in {"", ctx.user_id}:
+        return False
+    row_group_id = clean_text(row.get("object_id"), 120)
+    if not row_group_id or row_group_id in denied_groups:
+        return False
+    return allow_all or row_group_id in allowed_groups
 
 
-def source_partition(ctx: Any) -> tuple[str, list[str]]:
+def source_partition(
+    ctx: Any,
+    *,
+    group_policy: dict[str, Any] | None = None,
+) -> tuple[str, list[str]]:
     """SQL equivalent of source_visible, applied before page/candidate limits."""
     if ctx.scope not in {"private", "group"} or not all((ctx.session_id, ctx.bot_id, ctx.platform)) or ctx.bot_id == "self":
         raise SourceQueryError("source_scope_unavailable")
@@ -144,20 +199,59 @@ def source_partition(ctx: Any) -> tuple[str, list[str]]:
     meta = "CASE WHEN json_valid(t.metadata) THEN t.metadata ELSE '{}' END"
     def field(name: str) -> str:
         return f"COALESCE(json_extract({meta}, '$.{name}'), '')"
-    clauses = [
-        "t.scope=?", "t.session_id=?", "t.object_id=?",
-        "t.event_type IN ('user_message','bot_response')",
-        f"{field('owner_bot_id')}=?", f"{field('platform')}=?",
-        # Empty and ``legacy`` personas predate runtime persona resolution.
+    policy = _authorized_group_read_policy(ctx, group_policy)
+    if policy is None:
+        clauses = [
+            "t.scope=?", "t.session_id=?", "t.object_id=?",
+            "t.event_type IN ('user_message','bot_response')",
+            f"{field('owner_bot_id')}=?", f"{field('platform')}=?",
+            # Empty and ``legacy`` personas predate runtime persona resolution.
+            f"{field('persona_id')} IN ('', 'legacy', ?)",
+            f"{field('bot_id')} IN ('',?)",
+            "(t.event_type!='bot_response' OR t.subject_id=?)",
+        ]
+        params = [ctx.scope, ctx.session_id, target, ctx.bot_id, ctx.platform, ctx.persona_id, ctx.bot_id, ctx.bot_id]
+        if ctx.scope == "private":
+            clauses.extend(["(t.event_type!='user_message' OR t.subject_id=?)", f"{field('participant_user_id')} IN ('',?)"])
+            params.extend([ctx.user_id, ctx.user_id])
+        return " AND ".join(clauses), params
+    allow_all, allowed_groups, denied_groups = policy
+    common_clauses = [
+        f"{field('owner_bot_id')}=?",
+        f"{field('platform')}=?",
         f"{field('persona_id')} IN ('', 'legacy', ?)",
         f"{field('bot_id')} IN ('',?)",
-        "(t.event_type!='bot_response' OR t.subject_id=?)",
     ]
-    params = [ctx.scope, ctx.session_id, target, ctx.bot_id, ctx.platform, ctx.persona_id, ctx.bot_id, ctx.bot_id]
-    if ctx.scope == "private":
-        clauses.extend(["(t.event_type!='user_message' OR t.subject_id=?)", f"{field('participant_user_id')} IN ('',?)"])
-        params.extend([ctx.user_id, ctx.user_id])
-    return " AND ".join(clauses), params
+    params = [ctx.bot_id, ctx.platform, ctx.persona_id, ctx.bot_id]
+    private_branch = (
+        "(t.scope='private' AND t.session_id=? AND t.object_id=? "
+        "AND t.event_type IN ('user_message','bot_response') "
+        "AND (t.event_type!='bot_response' OR t.subject_id=?) "
+        "AND (t.event_type!='user_message' OR t.subject_id=?) "
+        f"AND {field('participant_user_id')} IN ('',?))"
+    )
+    params.extend([ctx.session_id, ctx.user_id, ctx.bot_id, ctx.user_id, ctx.user_id])
+    group_conditions = [
+        "t.scope='group'",
+        "t.event_type='user_message'",
+        "t.subject_id=?",
+        f"{field('participant_user_id')} IN ('',?)",
+        "t.object_id!=''",
+    ]
+    params.extend([ctx.user_id, ctx.user_id])
+    if allow_all:
+        if denied_groups:
+            ordered_denied = sorted(denied_groups)
+            marks = ",".join("?" for _ in ordered_denied)
+            group_conditions.append(f"t.object_id NOT IN ({marks})")
+            params.extend(ordered_denied)
+    else:
+        ordered_allowed = sorted(allowed_groups)
+        marks = ",".join("?" for _ in ordered_allowed)
+        group_conditions.append(f"t.object_id IN ({marks})")
+        params.extend(ordered_allowed)
+    group_branch = "(" + " AND ".join(group_conditions) + ")"
+    return " AND ".join([*common_clauses, f"({private_branch} OR {group_branch})"]), params
 
 
 async def query_sources(service: Any, event: Any, *, cursor: str = "", limit: int = 0, **parameters: Any) -> dict[str, Any]:
@@ -174,7 +268,12 @@ async def query_sources(service: Any, event: Any, *, cursor: str = "", limit: in
         ctx = service._normalized_session_context(await query_context(service, event))
         if not service._scope_feature_enabled(ctx, "recall"):
             raise SourceQueryError("scope_recall_disabled")
-        source_partition(ctx)  # Reject unknown authority before querying.
+        group_policy = (
+            await service._authorized_private_group_read_policy(ctx)
+            if ctx.scope == "private" and hasattr(service, "_authorized_private_group_read_policy")
+            else None
+        )
+        source_partition(ctx, group_policy=group_policy)  # Reject unknown authority before querying.
         cursor = _text(cursor, 160)
         turn_key = service._reconstruction_budget_key(event, ctx)
         previous = None
@@ -195,7 +294,9 @@ async def query_sources(service: Any, event: Any, *, cursor: str = "", limit: in
                 raise SourceQueryError("invalid_limit")
             page_limit = service._reconstruction_per_step_limit(limit)
         signature = stable_fingerprint("source_query", cursor or json.dumps(query.as_dict(), sort_keys=True), page_limit)
-        budget = await service._reserve_reconstruction_step(event, ctx, signature)
+        budget = await service._reserve_reconstruction_step(
+            event, ctx, signature, allow_source_fallback=True,
+        )
         if not budget["accepted"]:
             raise SourceQueryError(budget["error"])
         # Cursor pages cannot refresh this deadline. Different queries still
@@ -208,6 +309,7 @@ async def query_sources(service: Any, event: Any, *, cursor: str = "", limit: in
             ctx, query, limit=page_limit,
             boundary=previous["boundary"] if previous else None,
             expected_revision=previous["source_revision"] if previous else None,
+            group_policy=group_policy,
         )
         if time.monotonic() > expires_at or not service._scope_feature_enabled(ctx, "recall"):
             raise SourceQueryError("source_query_expired_or_disabled")
@@ -215,6 +317,7 @@ async def query_sources(service: Any, event: Any, *, cursor: str = "", limit: in
             raise SourceQueryError("source_changed_retry")
         sources = [value for row in page["rows"] if (value := service._serialize_navigation_source(
             ctx, row, excerpt_offset=query.excerpt_offset, terms=query.terms,
+            group_policy=group_policy,
         ))]
         cursors: dict[str, str] = {}
         async with service._reconstruction_lock:

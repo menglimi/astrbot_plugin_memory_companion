@@ -298,16 +298,76 @@ class SourceCapture:
             else:
                 self.db.execute("UPDATE capture_operations SET state='held' WHERE operation=?", (operation,))
             return {'status': 'conflict', 'operation': operation, 'reason': 'source_revision_changed'}
-        timeline_id = existing['timeline_id'] if existing else 'tl_' + key
-        metadata = dict(
-            platform=identity['platform'], owner_bot_id=identity['bot'], bot_id=identity['bot'],
-            persona_id=identity['persona'], message_id=identity['message'], capture_profile=PROFILE,
-            capture_truncated=False, source_key=key, capture_revision=payload['revision'],
-            source_message_at=payload['source_message_at'], observed_at=payload['observed_at'],
-            delivery_evidence=payload['evidence'], media=payload['media'],
-            redaction=payload['redaction'], capture_processing=payload['processing'],
-        )
         kind = 'user_message' if identity['direction'] == 'incoming' else 'bot_response'
+        adopted_row = None
+        if existing is None and identity['message'] and not identity['message'].startswith('observed:'):
+            adopted_row = self.db.execute(
+                '''SELECT id, metadata FROM timeline
+                   WHERE event_type=?
+                     AND session_id=?
+                     AND subject_id=?
+                     AND object_id=?
+                     AND message_id=?
+                     AND (bot_id='' OR bot_id=?)
+                     AND COALESCE(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.platform') ELSE '' END, '') IN ('', ?)
+                     AND COALESCE(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.persona_id') ELSE '' END, '') IN ('', 'legacy', ?)
+                     AND id NOT IN (SELECT timeline_id FROM capture_sources)
+                   ORDER BY created_at ASC, id ASC
+                   LIMIT 1''',
+                (
+                    kind,
+                    identity['session'],
+                    identity['speaker'],
+                    identity['audience'],
+                    identity['message'],
+                    identity['bot'],
+                    identity['platform'],
+                    identity['persona'],
+                ),
+            ).fetchone()
+        timeline_id = (
+            existing['timeline_id']
+            if existing
+            else (str(adopted_row['id']) if adopted_row is not None else 'tl_' + key)
+        )
+        preserved_observer_meta: dict = {}
+        if adopted_row is not None:
+            try:
+                raw_meta = json.loads(adopted_row['metadata'] or '{}')
+            except Exception:
+                raw_meta = {}
+            if isinstance(raw_meta, dict):
+                for keep_key in (
+                    'sender_name', 'participant_user_id', 'participant_user_name',
+                    'source', 'conversation_memory', 'reply_chain',
+                ):
+                    if keep_key in raw_meta and raw_meta[keep_key] not in ('', None):
+                        preserved_observer_meta[keep_key] = raw_meta[keep_key]
+        default_participant_id = (
+            identity['speaker']
+            if identity['scope'] == 'group' and identity['direction'] == 'incoming'
+            else (identity['audience'] if identity['scope'] == 'private' else '')
+        )
+        metadata = {
+            **preserved_observer_meta,
+            'platform': identity['platform'],
+            'owner_bot_id': identity['bot'],
+            'bot_id': identity['bot'],
+            'persona_id': identity['persona'],
+            'message_id': identity['message'],
+            'capture_profile': PROFILE,
+            'capture_truncated': False,
+            'source_key': key,
+            'capture_revision': payload['revision'],
+            'source_message_at': payload['source_message_at'],
+            'observed_at': payload['observed_at'],
+            'delivery_evidence': payload['evidence'],
+            'media': payload['media'],
+            'redaction': payload['redaction'],
+            'capture_processing': payload['processing'],
+        }
+        if default_participant_id and not metadata.get('participant_user_id'):
+            metadata['participant_user_id'] = default_participant_id
         params = dict(
             source_id=timeline_id, event_type=kind, scope=identity['scope'], session_id=identity['session'],
             subject_id=identity['speaker'], object_id=identity['audience'], message_id=identity['message'], metadata=metadata,
@@ -325,15 +385,22 @@ class SourceCapture:
         when = payload['source_message_at'] or payload['observed_at']
         if existing:
             self.db.execute(
-                'UPDATE timeline SET content=?,metadata=?,occurred_at=?,summarized_at=? WHERE id=?',
-                (payload['body'], encoded(metadata), when, '', timeline_id),
+                'UPDATE timeline SET content=?,metadata=?,occurred_at=?,summarized_at=?,bot_id=? WHERE id=?',
+                (payload['body'], encoded(metadata), when, '', identity['bot'], timeline_id),
+            )
+        elif adopted_row is not None:
+            # Consolidate the observer row in-place instead of inserting a duplicate
+            # timeline row for the same platform + session + message.
+            self.db.execute(
+                'UPDATE timeline SET content=?,metadata=?,dedupe_key=?,occurred_at=?,bot_id=? WHERE id=?',
+                (payload['body'], encoded(metadata), 'cap:' + key, when, identity['bot'], timeline_id),
             )
         else:
             self.db.execute(
                 '''INSERT INTO timeline(id,event_type,session_id,scope,subject_id,object_id,content,
-                    metadata,message_id,dedupe_key,occurred_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    metadata,message_id,dedupe_key,occurred_at,created_at,bot_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                 (timeline_id, kind, identity['session'], identity['scope'], identity['speaker'], identity['audience'],
-                 payload['body'], encoded(metadata), identity['message'], 'cap:' + key, when, utc_now()),
+                 payload['body'], encoded(metadata), identity['message'], 'cap:' + key, when, utc_now(), identity['bot']),
             )
         actual = self.db.execute('SELECT * FROM timeline WHERE id=?', (timeline_id,)).fetchone()
         if not actual:

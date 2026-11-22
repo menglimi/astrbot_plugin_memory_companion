@@ -105,7 +105,12 @@ async def query_range_batch(service: Any, event: Any, *, cursor: str = "", limit
         ctx = service._normalized_session_context(await query_context(service, event))
         if not service._scope_feature_enabled(ctx, "recall"):
             raise SourceQueryError("scope_recall_disabled")
-        source_partition(ctx)
+        group_policy = (
+            await service._authorized_private_group_read_policy(ctx)
+            if ctx.scope == "private" and hasattr(service, "_authorized_private_group_read_policy")
+            else None
+        )
+        source_partition(ctx, group_policy=group_policy)
         if (not service.config.bool("memory_tools.enable_source_query_v2", False)
                 or not binding_matches(service, event, ctx)):
             raise SourceQueryError("source_query_v2_not_offered")
@@ -123,7 +128,9 @@ async def query_range_batch(service: Any, event: Any, *, cursor: str = "", limit
         limits = previous["limits"] if previous else _limits(service)
         query = {"action": "range_batch", "start_at": start, "end_at": end}
         signature = stable_fingerprint("source_range_batch", cursor or json_dumps(query), json_dumps(limits))
-        budget = await service._reserve_reconstruction_step(event, ctx, signature)
+        budget = await service._reserve_reconstruction_step(
+            event, ctx, signature, allow_source_fallback=True,
+        )
         if not budget["accepted"]:
             raise SourceQueryError(budget["error"])
         expires_at = previous["expires_at"] if previous else started + 120.0
@@ -137,6 +144,7 @@ async def query_range_batch(service: Any, event: Any, *, cursor: str = "", limit
             ctx, start_at=start, end_at=end, limit=limits["max_messages"],
             boundary=previous["boundary"] if previous else None,
             expected_revision=previous["source_revision"] if previous else None,
+            group_policy=group_policy,
         )
         next_cursor = "srcb_" + secrets.token_urlsafe(24)
         totals = dict(previous["totals"]) if previous else {
@@ -202,8 +210,14 @@ async def query_range_batch(service: Any, event: Any, *, cursor: str = "", limit
             position = [row["source_sort_time"], row["created_at"], row["id"]]
             if (row["source_content_chars"] or 0) > 262144 or (row["source_metadata_chars"] or 0) > 65536:
                 raise SourceQueryError("source_processing_budget_exceeded")
-            text = service._navigation_source_text(ctx, row)
-            template = service._serialize_navigation_source(ctx, row, prepared_text=text) if text else None
+            text = service._navigation_source_text(ctx, row, group_policy=group_policy)
+            template = (
+                service._serialize_navigation_source(
+                    ctx, row, prepared_text=text, group_policy=group_policy,
+                )
+                if text
+                else None
+            )
             visited = offset > 0
             if template is None:
                 suppressed += 1

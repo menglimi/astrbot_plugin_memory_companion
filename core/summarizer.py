@@ -290,10 +290,76 @@ class MemorySummarizer:
         """Citation findings that downgrade the memory instead of rejecting it."""
         return list(payload.get("_validation_warnings") or [])
 
+    def style_warnings(self, payload: dict[str, Any]) -> list[str]:
+        """Advisory style notices that never bury a grounded summary in pending."""
+        return list(payload.get("_style_warnings") or [])
+
+    def repairable_style_warnings(self, payload: dict[str, Any]) -> list[str]:
+        """Style notices that merit at most one lightweight repair pass."""
+        return list(payload.get("_repairable_style_warnings") or [])
+
     def summary_quality(self, payload: dict[str, Any]) -> str:
         if self.validation_errors(payload) or payload.get("_quality_warnings"):
             return "low"
         return "no_memory" if payload.get("outcome") == "no_memory" else "normal"
+
+    _GENERIC_PERSON_PLACEHOLDERS = ("某用户", "某人", "某群成员", "用户说", "对方说", "有人")
+    _GENERIC_SPEAKER_LABELS = frozenset(
+        {"未知", "用户", "群成员", "某人", "某用户", "某群成员", "bot", "self", "unknown"}
+    )
+    _COLLECTIVE_MEMBER_RE = re.compile(r"(?<!某)群成员")
+
+    @classmethod
+    def _has_explicit_participant_mention(
+        cls,
+        summary: str,
+        rows: list[dict[str, Any]],
+    ) -> bool:
+        folded_summary = clean_text(summary, 2000).casefold()
+        if not folded_summary:
+            return False
+        for row in rows:
+            event_type = clean_text(row.get("event_type"), 40)
+            subject_id = clean_text(row.get("subject_id"), 120)
+            if event_type == "bot_response" or subject_id.casefold() == "self":
+                continue
+            raw_metadata = row.get("metadata")
+            metadata = raw_metadata if isinstance(raw_metadata, dict) else json_loads(raw_metadata, {})
+            metadata = metadata if isinstance(metadata, dict) else {}
+            candidates = (
+                clean_text(metadata.get("sender_name"), 120),
+                clean_text(metadata.get("participant_user_name"), 120),
+                clean_text(row.get("subject_name"), 120),
+                subject_id,
+            )
+            for ident in candidates:
+                folded = ident.casefold()
+                if not folded or folded in cls._GENERIC_SPEAKER_LABELS:
+                    continue
+                if folded in folded_summary:
+                    return True
+        return False
+
+    @classmethod
+    def _detect_generic_person_style_warning(
+        cls,
+        summary: str,
+        rows: list[dict[str, Any]],
+    ) -> str:
+        if not summary:
+            return ""
+        raw_corpus = "\n".join(clean_text(row.get("content"), 700) for row in rows)
+        has_anonymous = any(
+            term in summary and term not in raw_corpus
+            for term in cls._GENERIC_PERSON_PLACEHOLDERS
+        )
+        has_collective_without_identity = bool(
+            cls._COLLECTIVE_MEMBER_RE.search(summary)
+            and not cls._has_explicit_participant_mention(summary, rows)
+        )
+        if has_anonymous or has_collective_without_identity:
+            return "摘要正文含泛指人物，建议改用原文昵称或稳定 ID"
+        return ""
 
     def _transcript_lines_and_rows(
         self,
@@ -604,7 +670,14 @@ class MemorySummarizer:
         # ``_validation_warnings`` and downgrades the memory to an evidence
         # candidate instead of discarding the conversation.
         errors: list[str] = list(self_fact_errors)
-        warnings: list[str] = list(self_fact_warnings) + list(assertion_warnings)
+        warnings: list[str] = list(self_fact_warnings)
+        style_warnings: list[str] = []
+        repairable_style_warnings: list[str] = []
+        for item in assertion_warnings:
+            if "超出每批上限" in item:
+                style_warnings.append(item)
+            else:
+                warnings.append(item)
         raw_facts = payload.get("key_facts") or payload.get("facts") or []
         raw_facts = raw_facts if isinstance(raw_facts, list) else [raw_facts]
         if len(raw_facts) > len(key_facts_with_refs):
@@ -640,8 +713,10 @@ class MemorySummarizer:
             cited = [row for row in rows if clean_text(row.get("id"), 160) in refs]
             if cited and self.citation_check(summary, cited)[0] == "unsupported":
                 warnings.append("摘要正文与所引用消息缺乏对应")
-        if any(term in summary for term in ("某用户", "某人", "有人", "用户说", "对方说", "群成员", "某群成员")):
-            warnings.append("摘要正文含泛指人物，建议改用原文昵称或稳定 ID")
+        generic_person_warning = self._detect_generic_person_style_warning(summary, rows)
+        if generic_person_warning:
+            style_warnings.append(generic_person_warning)
+            repairable_style_warnings.append(generic_person_warning)
         if payload.get("outcome") == "no_memory" and set(refs) != valid_ids:
             errors.append("no_memory 需要确认本次所有已阅读消息均无新增记忆价值")
         if injection_event_ids:
@@ -657,9 +732,13 @@ class MemorySummarizer:
             or canonical_injection_sanitized
             or persona_injection_sanitized
         )
+        deduped_warnings = list(dict.fromkeys(warnings))
+        deduped_style = list(dict.fromkeys(style_warnings))
         payload["_validation_errors"] = errors
-        payload["_quality_warnings"] = list(dict.fromkeys(warnings))
-        payload["_validation_warnings"] = list(dict.fromkeys(warnings))
+        payload["_quality_warnings"] = deduped_warnings
+        payload["_style_warnings"] = deduped_style
+        payload["_repairable_style_warnings"] = list(dict.fromkeys(repairable_style_warnings))
+        payload["_validation_warnings"] = list(dict.fromkeys([*deduped_warnings, *deduped_style]))
         payload["summary_refs"] = refs
         payload["no_memory_reason"] = clean_text(payload.get("no_memory_reason"), 500)
         payload.update(
