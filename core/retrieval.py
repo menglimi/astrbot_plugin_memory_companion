@@ -2219,13 +2219,23 @@ class RetrievalEngine:
             return []
         cache_key = (self.embedding_provider_id, text)
         entry = self._query_vector_cache.get(cache_key)
-        if entry is None:
-            return []
-        stored_at, vector = entry
-        if time.monotonic() - stored_at > self.query_vector_cache_ttl_seconds:
+        if entry is not None:
+            stored_at, vector = entry
+            if time.monotonic() - stored_at <= self.query_vector_cache_ttl_seconds:
+                return list(vector)
             self._query_vector_cache.pop(cache_key, None)
-            return []
-        return list(vector)
+        from .vector_search import get_shared_query_embedding
+
+        shared = get_shared_query_embedding(
+            self.embedding_provider,
+            self.embedding_provider_id,
+            text,
+            self.query_vector_cache_ttl_seconds,
+        )
+        if shared:
+            self._query_vector_cache[cache_key] = (time.monotonic(), list(shared))
+            return shared
+        return []
 
     def _store_query_vector(self, text: str, vector: list[float]) -> None:
         if self.query_vector_cache_ttl_seconds <= 0 or not text or not vector:
@@ -2235,6 +2245,14 @@ class RetrievalEngine:
         if len(self._query_vector_cache) > 64:
             oldest = min(self._query_vector_cache.items(), key=lambda item: item[1][0])[0]
             self._query_vector_cache.pop(oldest, None)
+        from .vector_search import put_shared_query_embedding
+
+        put_shared_query_embedding(
+            self.embedding_provider,
+            self.embedding_provider_id,
+            text,
+            vector,
+        )
 
     async def _call_embedding_provider(self, text: str) -> list[float]:
         provider = self.embedding_provider
@@ -2303,7 +2321,9 @@ class RetrievalEngine:
                 except TypeError:
                     payload = await maybe_wait(get_embeddings_batch, [text])
                 success = True
-                return self._first_vector(payload)
+                vector = self._first_vector(payload)
+                self._store_query_vector(text, vector)
+                return vector
             return []
         except Exception as exc:
             error = self._describe_exception(exc)

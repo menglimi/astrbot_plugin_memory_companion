@@ -89,6 +89,9 @@ def initialize(db):
         db.execute('ALTER TABLE capture_chunks ADD COLUMN created_at REAL NOT NULL DEFAULT 0')
     if 'expires_at' not in columns:
         db.execute('ALTER TABLE capture_chunks ADD COLUMN expires_at REAL NOT NULL DEFAULT 0')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_capture_chunks_expires ON capture_chunks(expires_at) WHERE expires_at>0')
+    db.execute("CREATE INDEX IF NOT EXISTS idx_capture_operations_pending ON capture_operations(state) WHERE envelope!='{}'")
+    db.execute('CREATE INDEX IF NOT EXISTS idx_capture_operations_created ON capture_operations(state, created)')
     db.execute("INSERT OR IGNORE INTO capture_runtime VALUES ('installation',?)", (secrets.token_hex(24),))
     db.execute("INSERT OR IGNORE INTO capture_runtime VALUES ('digest_key',?)", (secrets.token_hex(32),))
     db.commit()
@@ -238,6 +241,15 @@ class SourceCapture:
     def purge_expired(self, now=None):
         """Delete retained bodies past their expiry; timeline projections stay untouched."""
         deadline = time.time() if now is None else float(now)
+        read_ctx = getattr(self.store, '_read_conn_sync', None)
+        if callable(read_ctx):
+            with read_ctx() as conn:
+                has_expired = conn.execute(
+                    'SELECT 1 FROM capture_chunks WHERE expires_at>0 AND expires_at<=? LIMIT 1',
+                    (deadline,),
+                ).fetchone()
+            if has_expired is None:
+                return {'deleted_chunks': 0, 'sources': 0, 'at': deadline}
         with self.store._lock, self.store._transaction_sync():
             rows = self.db.execute('SELECT source_key,count(*) AS n FROM capture_chunks '
                                    'WHERE expires_at>0 AND expires_at<=? GROUP BY source_key', (deadline,)).fetchall()
@@ -245,6 +257,25 @@ class SourceCapture:
             if deleted:
                 self.db.execute('DELETE FROM capture_chunks WHERE expires_at>0 AND expires_at<=?', (deadline,))
         return {'deleted_chunks': deleted, 'sources': len(rows), 'at': deadline}
+
+    def prune_completed_operations(self, *, older_than_seconds=7 * 86400, limit=2000, now=None):
+        """Remove aged terminal capture_operations receipts to prevent unbounded growth."""
+        cutoff = (time.time() if now is None else float(now)) - max(3600.0, float(older_than_seconds or (7 * 86400)))
+        safe_limit = max(1, int(limit or 2000))
+        with self.store._lock, self.store._transaction_sync():
+            cur = self.db.execute(
+                """DELETE FROM capture_operations
+                   WHERE operation IN (
+                       SELECT operation FROM capture_operations
+                       WHERE state IN ('committed', 'excluded', 'expired')
+                         AND envelope='{}'
+                         AND created < ?
+                       ORDER BY created ASC
+                       LIMIT ?
+                   )""",
+                (cutoff, safe_limit),
+            )
+            return max(0, int(cur.rowcount or 0))
 
     def stage(self, prepared, *, generation, authorize=lambda: True, expires=None):
         operation, key, ph = (prepared[k] for k in ('operation', 'source_key', 'payload_digest'))
@@ -513,6 +544,10 @@ class SourceCapture:
             self.db.execute("UPDATE capture_operations SET state='excluded',envelope='{}' WHERE operation=? AND state!='committed'",(operation,))
 
     def due(self, limit=8):
+        read_ctx = getattr(self.store, '_read_conn_sync', None)
+        if callable(read_ctx):
+            with read_ctx() as conn:
+                return [dict(r) for r in conn.execute("SELECT * FROM capture_operations WHERE state IN ('staged','uncertain','retry_due') AND due<=? ORDER BY due,operation LIMIT ?", (time.time(), min(limit, 32)))]
         with self.store._lock:
             return [dict(r) for r in self.db.execute("SELECT * FROM capture_operations WHERE state IN ('staged','uncertain','retry_due') AND due<=? ORDER BY due,operation LIMIT ?", (time.time(), min(limit,32)))]
 

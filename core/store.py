@@ -74,13 +74,24 @@ _ACL_UNSET = object()
 _RECORD_LIGHT_CACHE_MAX_ENTRIES = 16384
 
 
+def _text_fingerprint(value: Any) -> tuple[int, bytes]:
+    """Return a tiny (byte_len, blake2b_16) fingerprint to avoid pinning multi-KB JSON strings in RAM."""
+    if isinstance(value, bytes):
+        raw = value
+    elif isinstance(value, str):
+        raw = value.encode("utf-8", errors="surrogatepass")
+    else:
+        raw = str(value or "").encode("utf-8", errors="surrogatepass")
+    return len(raw), hashlib.blake2b(raw, digest_size=16).digest()
+
+
 class _RecordLightCacheEntry:
     """Cached immutable row template with per-max-chars embedding text hashes."""
 
     __slots__ = (
         "updated_at",
-        "raw_metadata",
-        "raw_tags",
+        "metadata_digest",
+        "tags_digest",
         "template",
         "revision",
         "embedding_hashes",
@@ -89,17 +100,94 @@ class _RecordLightCacheEntry:
     def __init__(
         self,
         updated_at: Any,
-        raw_metadata: Any,
-        raw_tags: Any,
+        metadata_digest: tuple[int, bytes],
+        tags_digest: tuple[int, bytes],
         template: MemoryRecord,
         revision: str,
     ) -> None:
         self.updated_at = updated_at
-        self.raw_metadata = raw_metadata
-        self.raw_tags = raw_tags
+        self.metadata_digest = metadata_digest
+        self.tags_digest = tags_digest
         self.template = template
         self.revision = revision
         self.embedding_hashes: dict[int, str] | None = None
+
+
+_DETECTED_TOTAL_MEMORY_MB_CACHE: int | None = None
+_DETECTED_TOTAL_MEMORY_PROBED = False
+
+
+def _detect_total_memory_mb() -> int | None:
+    """Best-effort stdlib detection of host physical RAM in MiB for adaptive SQLite PRAGMAs."""
+    global _DETECTED_TOTAL_MEMORY_MB_CACHE, _DETECTED_TOTAL_MEMORY_PROBED
+    if _DETECTED_TOTAL_MEMORY_PROBED:
+        return _DETECTED_TOTAL_MEMORY_MB_CACHE
+    _DETECTED_TOTAL_MEMORY_PROBED = True
+    detected: int | None = None
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = _MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                detected = max(1, int(status.ullTotalPhys // (1024 * 1024)))
+        elif os.path.exists("/proc/meminfo"):
+            with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    if line.startswith("MemTotal:"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            detected = max(1, int(parts[1]) // 1024)
+                        break
+        elif hasattr(os, "sysconf"):
+            pages = os.sysconf("SC_PHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            if isinstance(pages, int) and isinstance(page_size, int) and pages > 0 and page_size > 0:
+                detected = max(1, int((pages * page_size) // (1024 * 1024)))
+    except Exception:
+        detected = None
+    _DETECTED_TOTAL_MEMORY_MB_CACHE = detected
+    return detected
+
+
+def _sqlite_connection_pragmas(
+    *,
+    role: str = "main",
+    total_memory_mb: int | None = None,
+) -> dict[str, Any]:
+    """Return memory-adaptive SQLite cache_size / temp_store / mmap_size PRAGMAs.
+
+    On 1-2 GiB VPS hosts (<= 2560 MiB RAM), disable mmap (prevents OS page-cache
+    thrashing) and bound page cache to 8 MiB per connection. On larger hosts,
+    keep a modest 16 MiB cache and 64 MiB mmap so multi-connection RSS stays lean.
+    """
+    ram_mb = _detect_total_memory_mb() if total_memory_mb is None else total_memory_mb
+    low_memory = ram_mb is not None and ram_mb <= 2560
+    if low_memory:
+        return {
+            "cache_size": -8192,
+            "temp_store": "MEMORY",
+            "mmap_size": 0,
+        }
+    return {
+        "cache_size": -16384,
+        "temp_store": "MEMORY",
+        "mmap_size": 67108864,
+    }
 
 
 def _row_scalar_fields_match(row: Any, template: MemoryRecord) -> bool:
@@ -252,9 +340,46 @@ class SharedTextCache:
             return len(self._entries)
 
 
-# 向量二进制格式常量：little-endian float64 打包，
-# 相比 JSON 文本列可减少约 60% 存储体积并省去 json 解析开销。
-_EMBEDDING_VECTOR_FMT = "<d"
+# 向量二进制格式常量：默认 little-endian float32（标准精度，比旧版 float64 省 50%），
+# 可选 float16（半精度省流，省 75%），自动兼容读取历史 float64 / float32 / float16 / JSON。
+DEFAULT_VECTOR_PRECISION = "float32"
+SUPPORTED_VECTOR_PRECISIONS = ("float32", "float16")
+_VECTOR_PRECISION_SPEC: dict[str, tuple[str, int]] = {
+    "float16": ("e", 2),
+    "float32": ("f", 4),
+    "float64": ("d", 8),
+}
+_EMBEDDING_VECTOR_FMT = "<f"
+
+
+def normalize_vector_precision(value: Any, *, allow_float64: bool = False) -> str:
+    """Normalize configured vector storage precision into ``float32`` or ``float16``."""
+    raw = str(value or "").strip().lower()
+    if raw in {"float16", "f16", "fp16", "half", "16"}:
+        return "float16"
+    if raw in {"float32", "f32", "fp32", "single", "32"}:
+        return "float32"
+    if allow_float64 and raw in {"float64", "f64", "fp64", "double", "64"}:
+        return "float64"
+    return DEFAULT_VECTOR_PRECISION
+
+
+def vector_precision_element_bytes(precision: Any) -> int:
+    normalized = normalize_vector_precision(precision, allow_float64=True)
+    return _VECTOR_PRECISION_SPEC[normalized][1]
+
+
+def detect_embedding_blob_precision(byte_length: int, dimension: int) -> str:
+    """Infer BLOB precision from ``byte_length`` and ``dimension``."""
+    if dimension <= 0 or byte_length <= 0:
+        return ""
+    if byte_length == dimension * 4:
+        return "float32"
+    if byte_length == dimension * 2:
+        return "float16"
+    if byte_length == dimension * 8:
+        return "float64"
+    return ""
 
 # H2：分量要按真实证据算，不是按关键词猜。
 # 取样上限与情绪事件窗口保证一次刷新不会把整张表读进来，
@@ -280,22 +405,48 @@ PERSON_WEIGHT_POSITIVE_EVENTS = frozenset(
 )
 
 
-def _pack_embedding_vector(values: list[float]) -> bytes:
-    """把向量序列化为二进制 bytes（兼容旧 JSON 文本读取）。"""
+def _pack_embedding_vector(values: list[float], *, precision: str = DEFAULT_VECTOR_PRECISION) -> bytes:
+    """把向量按指定精度（float32 / float16 / float64）序列化为二进制 bytes。"""
     floats = [float(item) for item in values if isinstance(item, (int, float))]
     if not floats:
         return b""
-    return struct.pack(f"<{len(floats)}d", *floats)
+    norm_precision = normalize_vector_precision(precision, allow_float64=True)
+    fmt_char, _ = _VECTOR_PRECISION_SPEC[norm_precision]
+    if norm_precision == "float16":
+        # Cosine similarity is scale-invariant: if finite components exceed float16
+        # dynamic range (~65504), rescale by max abs so we never overflow finite vectors to inf.
+        if all(math.isfinite(v) for v in floats):
+            max_abs = max((abs(v) for v in floats), default=0.0)
+            if max_abs > 60000.0:
+                floats = [v / max_abs for v in floats]
+        try:
+            return struct.pack(f"<{len(floats)}e", *floats)
+        except OverflowError:
+            clamped = [max(-65504.0, min(65504.0, v)) if math.isfinite(v) else v for v in floats]
+            return struct.pack(f"<{len(clamped)}e", *clamped)
+    return struct.pack(f"<{len(floats)}{fmt_char}", *floats)
 
 
-def _unpack_embedding_vector(raw: Any) -> list[float]:
-    """按二进制格式解析向量；若是旧 JSON 文本则回退 json 解析。"""
+def _unpack_embedding_vector(raw: Any, *, dimension: int = 0) -> list[float]:
+    """自动识别 float64 / float32 / float16 二进制或历史 JSON 文本并反序列化为 float 列表。"""
     if isinstance(raw, (bytes, bytearray, memoryview)):
         payload = bytes(raw)
-        count = len(payload) // 8
-        if count <= 0:
+        if not payload:
             return []
-        return list(struct.unpack(f"<{count}d", payload[: count * 8]))
+        if dimension > 0:
+            detected = detect_embedding_blob_precision(len(payload), dimension)
+            if not detected:
+                return []
+            fmt_char, _ = _VECTOR_PRECISION_SPEC[detected]
+            return list(struct.unpack(f"<{dimension}{fmt_char}", payload))
+        # Legacy dimension-less caller fallback: prefer float32, else float16.
+        if len(payload) % 4 == 0:
+            count = len(payload) // 4
+            return list(struct.unpack(f"<{count}f", payload))
+        if len(payload) % 2 == 0:
+            count = len(payload) // 2
+            return list(struct.unpack(f"<{count}e", payload))
+        return []
     if isinstance(raw, str) and raw:
         payload = json_loads(raw, [])
         if isinstance(payload, list):
@@ -485,13 +636,20 @@ class MemoryStore(SummaryBatchStore):
         has to remember to splice into its own ``WHERE`` clause, which is why
         list-style queries silently drifted away from recall queries.  The
         view carries the same rule at the data entry point instead, and is
-        recreated from the code predicate so the two can never disagree.
+        recreated only when its stored SQL differs from the code predicate.
         """
-        self._conn.execute(f"DROP VIEW IF EXISTS {self.RECALLABLE_MEMORY_VIEW}")
-        self._conn.execute(
+        expected_sql = (
             f"CREATE VIEW {self.RECALLABLE_MEMORY_VIEW} AS "
             f"SELECT * FROM memories WHERE {self._recallable_memory_sql()}"
         )
+        existing = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='view' AND name=?",
+            (self.RECALLABLE_MEMORY_VIEW,),
+        ).fetchone()
+        if existing is not None and str(existing["sql"] or "").strip() == expected_sql:
+            return
+        self._conn.execute(f"DROP VIEW IF EXISTS {self.RECALLABLE_MEMORY_VIEW}")
+        self._conn.execute(expected_sql)
 
     PROFILE_SINGLE_VALUE_DIMENSIONS = frozenset(
         {
@@ -537,6 +695,10 @@ class MemoryStore(SummaryBatchStore):
         # 向量快照缓存的字节预算。None = 用 core.vector_search.CACHE_BYTES 默认值；
         # service 启动时按 retrieval_advanced.vector_snapshot_cache_mb 注入。
         self.vector_snapshot_cache_bytes: int | None = None
+        # 向量存储与内存精度：float32（标准精度，默认）或 float16（半精度省流）。
+        self.vector_storage_precision: str = DEFAULT_VECTOR_PRECISION
+        # FTS5 是否使用 rowid=memories.rowid 绑定模式（v2 contentless/rowid 架构）。
+        self._fts_uses_rowid: bool = True
         # S4：is_archive_ref 生成列是否可用。None = 还没探测（只读库打不开迁移），
         # False 时谓词退回旧的 lower(content) LIKE，老库/只读快照仍可查询。
         self._archive_ref_column_available: bool | None = None
@@ -590,6 +752,18 @@ class MemoryStore(SummaryBatchStore):
         self._schema_ready = False
         self.last_schema_backup_path = ""
 
+    def _apply_memory_pragmas(self, connection: sqlite3.Connection, *, role: str) -> None:
+        pragmas = _sqlite_connection_pragmas(role=role)
+        for statement in (
+            f"PRAGMA cache_size={int(pragmas['cache_size'])}",
+            f"PRAGMA temp_store={pragmas['temp_store']}",
+            f"PRAGMA mmap_size={int(pragmas['mmap_size'])}",
+        ):
+            try:
+                connection.execute(statement)
+            except sqlite3.OperationalError:
+                pass
+
     def _open_connection(self) -> sqlite3.Connection:
         database = str(self.db_path)
         uri = False
@@ -608,15 +782,15 @@ class MemoryStore(SummaryBatchStore):
         if not self._read_only:
             connection.execute("PRAGMA wal_autocheckpoint=500")
             connection.execute("PRAGMA synchronous=NORMAL")
+        self._apply_memory_pragmas(connection, role="main")
         return connection
 
     def _open_dedicated_read_connection(self) -> sqlite3.Connection:
         """Open one worker-thread-shared read-only connection.
 
         Every dedicated reader (candidate bundle, timeline, vector scan) is a
-        plain ``mode=ro`` handle with the same settings; only the owning
-        attribute and its lock differ. Keeping the open code in one place makes
-        that invariant impossible to break by editing a single copy.
+        plain ``mode=ro`` handle with memory-adaptive cache/temp/mmap settings;
+        only the owning attribute and its lock differ.
         """
         conn = sqlite3.connect(
             f"{self.db_path.resolve().as_uri()}?mode=ro",
@@ -626,15 +800,7 @@ class MemoryStore(SummaryBatchStore):
         )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=3000")
-        for pragma in (
-            "PRAGMA cache_size=-65536",
-            "PRAGMA temp_store=MEMORY",
-            "PRAGMA mmap_size=268435456",
-        ):
-            try:
-                conn.execute(pragma)
-            except sqlite3.OperationalError:
-                pass
+        self._apply_memory_pragmas(conn, role="read")
         return conn
 
     def _ensure_read_connection(self) -> sqlite3.Connection:
@@ -1349,10 +1515,14 @@ class MemoryStore(SummaryBatchStore):
                     raise sqlite3.DatabaseError(
                         "memory database schema is missing the memories table"
                     )
-                self._fts_enabled = bool(
-                    self._conn.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_fts'"
-                    ).fetchone()
+                fts_row = self._conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_fts'"
+                ).fetchone()
+                self._fts_enabled = bool(fts_row)
+                self._fts_uses_rowid = (
+                    "memory_id" not in str(fts_row["sql"] or "").lower()
+                    if fts_row is not None
+                    else True
                 )
                 self._source_fts_enabled = bool(self._conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='timeline_source_fts'"
@@ -1361,6 +1531,12 @@ class MemoryStore(SummaryBatchStore):
                 self._memory_archive_ref_available_sync()
             return
         with self._lock:
+            try:
+                page_count = int(self._conn.execute("PRAGMA page_count").fetchone()[0] or 0)
+                if page_count == 0:
+                    self._conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+            except sqlite3.OperationalError:
+                pass
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
@@ -1448,8 +1624,6 @@ class MemoryStore(SummaryBatchStore):
                 -- _ensure_memory_timeline_ref_column_sync 在补列之后建（见 initialize）。
                 CREATE INDEX IF NOT EXISTS idx_memories_reality
                     ON memories(reality_level, memory_type, occurred_at);
-                CREATE INDEX IF NOT EXISTS idx_memories_content
-                    ON memories(content);
 
                 CREATE TABLE IF NOT EXISTS identities (
                     id TEXT PRIMARY KEY,
@@ -1959,15 +2133,22 @@ class MemoryStore(SummaryBatchStore):
                 "CREATE INDEX IF NOT EXISTS idx_timeline_summary ON timeline(session_id, summarized_at, occurred_at)"
             )
             self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_timeline_unsummarized "
+                "ON timeline(session_id, scope, occurred_at, created_at) WHERE summarized_at=''"
+            )
+            self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_timeline_scope_recent ON timeline(scope, occurred_at DESC)"
             )
+            self._conn.execute("DROP INDEX IF EXISTS idx_timeline_subject_recent")
+            self._conn.execute("DROP INDEX IF EXISTS idx_timeline_object_recent")
+            self._conn.execute("DROP INDEX IF EXISTS idx_memories_content")
             self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_timeline_subject_recent "
-                "ON timeline(scope, session_id, subject_id, occurred_at DESC, created_at DESC)"
+                "CREATE INDEX IF NOT EXISTS idx_memories_type_lifecycle "
+                "ON memories(memory_type, lifecycle, review_status)"
             )
             self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_timeline_object_recent "
-                "ON timeline(scope, session_id, object_id, occurred_at DESC, created_at DESC)"
+                "CREATE INDEX IF NOT EXISTS idx_knowledge_nodes_updated "
+                "ON knowledge_nodes(updated_at DESC, id, label, scope, session_id, group_id)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_timeline_retention ON timeline(occurred_at, created_at) WHERE summarized_at!=''"
@@ -2057,9 +2238,10 @@ class MemoryStore(SummaryBatchStore):
                 "CREATE INDEX IF NOT EXISTS idx_knowledge_edges_source_memory "
                 "ON knowledge_edges(source_memory_id)"
             )
-            # c3: 仅按 session_id 过滤 emotion 事件时现有索引（前缀 bot_id）无法命中
+            # c3: 仅按 session_id 过滤 emotion 事件时现有索引（前缀 bot_id）无法命中；
+            #     修复与上方 idx_emotion_events_session 的重名碰撞。
             self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_emotion_events_session "
+                "CREATE INDEX IF NOT EXISTS idx_emotion_events_session_only "
                 "ON emotion_events(session_id, occurred_at DESC)"
             )
             # c4: timeline 仅按 session_id（无 scope）过滤时无索引命中；
@@ -2076,6 +2258,18 @@ class MemoryStore(SummaryBatchStore):
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_timeline_scope_event_time "
                 f"ON timeline(scope, {event_time_sql}, created_at, id)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_timeline_subject_event_time "
+                f"ON timeline(scope, session_id, subject_id, {event_time_sql} DESC, created_at DESC, id DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_timeline_object_event_time "
+                f"ON timeline(scope, session_id, object_id, {event_time_sql} DESC, created_at DESC, id DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_timeline_cross_window_subject "
+                f"ON timeline(scope, subject_id, event_type, {event_time_sql} DESC, created_at DESC, id DESC)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at)"
@@ -2151,6 +2345,10 @@ class MemoryStore(SummaryBatchStore):
             self._ensure_memory_timeline_ref_column_sync()
             self._refresh_memories_stats_if_needed_sync(pre_memory_indexes)
             self._refresh_timeline_stats_if_needed_sync(pre_timeline_indexes)
+            try:
+                self._conn.execute("PRAGMA optimize")
+            except sqlite3.OperationalError:
+                pass
             self._redact_existing_sensitive_rows_sync()
             self._cleanup_placeholder_memory_indexes_sync()
             self._conn.execute(
@@ -2240,6 +2438,9 @@ class MemoryStore(SummaryBatchStore):
             {
                 "idx_timeline_session_event_time",
                 "idx_timeline_scope_event_time",
+                "idx_timeline_subject_event_time",
+                "idx_timeline_object_event_time",
+                "idx_timeline_unsummarized",
             },
         )
 
@@ -2251,28 +2452,46 @@ class MemoryStore(SummaryBatchStore):
         FTS/vector entries is sufficient to keep ordinary recall clean and is
         safe to repeat during startup.
         """
-        rows = self._conn.execute(
-            f"SELECT id FROM memories WHERE NOT ({self._recallable_memory_sql()})"
-        ).fetchall()
-        memory_ids = [clean_text(row["id"], 120) for row in rows if clean_text(row["id"], 120)]
-        if not memory_ids:
+        if self._memory_archive_ref_available_sync():
+            rows = self._conn.execute(
+                "SELECT rowid AS _rid, id FROM memories "
+                "WHERE is_archive_ref=1 OR source_plugin='bot_personal_bridge'"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                f"SELECT rowid AS _rid, id FROM memories WHERE NOT ({self._recallable_memory_sql()})"
+            ).fetchall()
+        pairs = [
+            (int(row["_rid"]), clean_text(row["id"], 120))
+            for row in rows
+            if clean_text(row["id"], 120)
+        ]
+        if not pairs:
             return 0
         deleted = 0
-        for index in range(0, len(memory_ids), 500):
-            chunk = memory_ids[index : index + 500]
-            marks = ",".join("?" for _ in chunk)
+        for index in range(0, len(pairs), 500):
+            chunk = pairs[index : index + 500]
+            chunk_ids = [mid for _rid, mid in chunk]
+            chunk_rids = [rid for rid, _mid in chunk]
+            marks = ",".join("?" for _ in chunk_ids)
             deleted += int(
                 self._conn.execute(
                     f"DELETE FROM memory_embeddings WHERE memory_id IN ({marks})",
-                    chunk,
+                    chunk_ids,
                 ).rowcount
                 or 0
             )
             if self._fts_enabled:
-                self._conn.execute(
-                    f"DELETE FROM memory_fts WHERE memory_id IN ({marks})",
-                    chunk,
-                )
+                if self._fts_uses_rowid:
+                    self._conn.execute(
+                        f"DELETE FROM memory_fts WHERE rowid IN ({marks})",
+                        chunk_rids,
+                    )
+                else:
+                    self._conn.execute(
+                        f"DELETE FROM memory_fts WHERE memory_id IN ({marks})",
+                        chunk_ids,
+                    )
         return deleted
 
     def _backup_before_schema_upgrade_sync(self) -> str:
@@ -2761,36 +2980,49 @@ class MemoryStore(SummaryBatchStore):
                 UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
             END;
 
-            CREATE TRIGGER IF NOT EXISTS trg_knowledge_nodes_retrieval_revision_insert
+            CREATE TABLE IF NOT EXISTS knowledge_revision (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                revision INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT OR IGNORE INTO knowledge_revision(singleton, revision) VALUES(1, 0);
+
+            DROP TRIGGER IF EXISTS trg_knowledge_nodes_retrieval_revision_insert;
+            DROP TRIGGER IF EXISTS trg_knowledge_nodes_retrieval_revision_update;
+            DROP TRIGGER IF EXISTS trg_knowledge_nodes_retrieval_revision_delete;
+            DROP TRIGGER IF EXISTS trg_knowledge_edges_retrieval_revision_insert;
+            DROP TRIGGER IF EXISTS trg_knowledge_edges_retrieval_revision_update;
+            DROP TRIGGER IF EXISTS trg_knowledge_edges_retrieval_revision_delete;
+
+            CREATE TRIGGER IF NOT EXISTS trg_knowledge_nodes_knowledge_revision_insert
             AFTER INSERT ON knowledge_nodes
             BEGIN
-                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+                UPDATE knowledge_revision SET revision = revision + 1 WHERE singleton = 1;
             END;
-            CREATE TRIGGER IF NOT EXISTS trg_knowledge_nodes_retrieval_revision_update
+            CREATE TRIGGER IF NOT EXISTS trg_knowledge_nodes_knowledge_revision_update
             AFTER UPDATE ON knowledge_nodes
             BEGIN
-                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+                UPDATE knowledge_revision SET revision = revision + 1 WHERE singleton = 1;
             END;
-            CREATE TRIGGER IF NOT EXISTS trg_knowledge_nodes_retrieval_revision_delete
+            CREATE TRIGGER IF NOT EXISTS trg_knowledge_nodes_knowledge_revision_delete
             AFTER DELETE ON knowledge_nodes
             BEGIN
-                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+                UPDATE knowledge_revision SET revision = revision + 1 WHERE singleton = 1;
             END;
 
-            CREATE TRIGGER IF NOT EXISTS trg_knowledge_edges_retrieval_revision_insert
+            CREATE TRIGGER IF NOT EXISTS trg_knowledge_edges_knowledge_revision_insert
             AFTER INSERT ON knowledge_edges
             BEGIN
-                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+                UPDATE knowledge_revision SET revision = revision + 1 WHERE singleton = 1;
             END;
-            CREATE TRIGGER IF NOT EXISTS trg_knowledge_edges_retrieval_revision_update
+            CREATE TRIGGER IF NOT EXISTS trg_knowledge_edges_knowledge_revision_update
             AFTER UPDATE ON knowledge_edges
             BEGIN
-                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+                UPDATE knowledge_revision SET revision = revision + 1 WHERE singleton = 1;
             END;
-            CREATE TRIGGER IF NOT EXISTS trg_knowledge_edges_retrieval_revision_delete
+            CREATE TRIGGER IF NOT EXISTS trg_knowledge_edges_knowledge_revision_delete
             AFTER DELETE ON knowledge_edges
             BEGIN
-                UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
+                UPDATE knowledge_revision SET revision = revision + 1 WHERE singleton = 1;
             END;
             """
         )
@@ -2967,15 +3199,49 @@ class MemoryStore(SummaryBatchStore):
                 raise
             self._source_fts_enabled = False
 
-    def _ensure_memory_fts_sync(self) -> None:
+    MEMORY_FTS_SCHEMA_VERSION = "contentless-rowid-v2"
+
+    def _create_memory_fts_table_sync(self) -> None:
+        """Create rowid-keyed contentless FTS5 table (fallback to regular rowid FTS5 on SQLite < 3.43)."""
         try:
             self._conn.execute(
                 """
                 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
-                USING fts5(search_text, memory_id UNINDEXED, tokenize='unicode61')
+                USING fts5(search_text, content='', contentless_delete=1, tokenize='unicode61')
                 """
             )
+        except sqlite3.OperationalError as exc:
+            if "contentless_delete" not in str(exc).lower():
+                raise
+            self._conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts
+                USING fts5(search_text, tokenize='unicode61')
+                """
+            )
+
+    def _ensure_memory_fts_sync(self) -> None:
+        try:
+            existing = self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_fts'"
+            ).fetchone()
+            marker = self._conn.execute(
+                "SELECT value FROM schema_metadata WHERE key='memory_fts_schema_version'"
+            ).fetchone()
+            existing_sql = str(existing["sql"] or "").lower() if existing is not None else ""
+            migrated = False
+            if (
+                existing is None
+                or "memory_id" in existing_sql
+                or marker is None
+                or clean_text(marker["value"], 64) != self.MEMORY_FTS_SCHEMA_VERSION
+            ):
+                if existing is not None:
+                    self._conn.execute("DROP TABLE IF EXISTS memory_fts")
+                self._create_memory_fts_table_sync()
+                migrated = True
             self._fts_enabled = True
+            self._fts_uses_rowid = True
             # Placeholder rows remain available to the dedicated Bot Personal
             # bridge, but are intentionally absent from the recall index.
             memory_count = int(
@@ -2985,8 +3251,15 @@ class MemoryStore(SummaryBatchStore):
                 or 0
             )
             fts_count = int(self._conn.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0] or 0)
-            if memory_count != fts_count:
+            if migrated or memory_count != fts_count:
                 self._rebuild_memory_fts_sync()
+            if migrated:
+                self._conn.execute(
+                    """INSERT INTO schema_metadata(key,value,updated_at)
+                       VALUES('memory_fts_schema_version',?,?)
+                       ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+                    (self.MEMORY_FTS_SCHEMA_VERSION, utc_now()),
+                )
         except sqlite3.Error:
             self._fts_enabled = False
 
@@ -3045,13 +3318,25 @@ class MemoryStore(SummaryBatchStore):
         if not self._fts_enabled:
             return 0
         self._conn.execute("DELETE FROM memory_fts")
-        rows = self._conn.execute(
-            f"SELECT * FROM memories WHERE {self._recallable_memory_sql()}"
-        ).fetchall()
+        cursor = self._conn.execute(
+            f"SELECT rowid AS _fts_rowid, * FROM memories WHERE {self._recallable_memory_sql()}"
+        )
         count = 0
-        for row in rows:
-            self._upsert_memory_fts_row(row)
-            count += 1
+        while True:
+            rows = cursor.fetchmany(500)
+            if not rows:
+                break
+            batch: list[tuple[int, str]] = []
+            for row in rows:
+                search_text = self._memory_fts_text(row)
+                if search_text:
+                    batch.append((int(row["_fts_rowid"]), search_text))
+            if batch:
+                self._conn.executemany(
+                    "INSERT INTO memory_fts(rowid, search_text) VALUES(?, ?)",
+                    batch,
+                )
+                count += len(batch)
         return count
 
     async def rebuild_memory_indexes(self) -> dict[str, Any]:
@@ -3065,31 +3350,55 @@ class MemoryStore(SummaryBatchStore):
             self._conn.commit()
             return {"fts_enabled": self._fts_enabled, "fts_rebuilt": rebuilt}
 
+    def _memory_rowid_sync(self, memory_id: str) -> int | None:
+        row = self._conn.execute(
+            "SELECT rowid FROM memories WHERE id=?",
+            (memory_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return int(row[0])
+
     def _upsert_memory_fts_row(self, row: sqlite3.Row | None) -> None:
         if not self._fts_enabled or row is None:
             return
         memory_id = clean_text(row["id"], 120)
         if not memory_id:
             return
+        rowid: int | None = None
+        for key in ("_fts_rowid", "rowid"):
+            val = row_value(row, key, None)
+            if isinstance(val, int) and val > 0:
+                rowid = val
+                break
+        if rowid is None:
+            rowid = self._memory_rowid_sync(memory_id)
+        if rowid is None:
+            return
         # Do not index storage-only Bot Personal archive references.  This
         # also removes stale entries when an existing row changes source.
         if is_memory_placeholder(MemoryRecord.from_row_light(row)):
-            self._conn.execute("DELETE FROM memory_fts WHERE memory_id=?", (memory_id,))
+            self._conn.execute("DELETE FROM memory_fts WHERE rowid=?", (rowid,))
             return
         search_text = self._memory_fts_text(row)
-        self._conn.execute("DELETE FROM memory_fts WHERE memory_id=?", (memory_id,))
+        self._conn.execute("DELETE FROM memory_fts WHERE rowid=?", (rowid,))
         if search_text:
             self._conn.execute(
-                "INSERT INTO memory_fts(memory_id, search_text) VALUES(?, ?)",
-                (memory_id, search_text),
+                "INSERT INTO memory_fts(rowid, search_text) VALUES(?, ?)",
+                (rowid, search_text),
             )
 
-    def _delete_memory_fts_row(self, memory_id: str) -> None:
+    def _delete_memory_fts_row(self, memory_id: str, *, rowid: int | None = None) -> None:
         if not self._fts_enabled:
             return
-        memory_id = clean_text(memory_id, 120)
-        if memory_id:
-            self._conn.execute("DELETE FROM memory_fts WHERE memory_id=?", (memory_id,))
+        target_rowid = rowid
+        if target_rowid is None:
+            memory_id = clean_text(memory_id, 120)
+            if not memory_id:
+                return
+            target_rowid = self._memory_rowid_sync(memory_id)
+        if target_rowid is not None:
+            self._conn.execute("DELETE FROM memory_fts WHERE rowid=?", (int(target_rowid),))
 
     def _memory_fts_text(self, row: sqlite3.Row) -> str:
         if is_memory_placeholder(MemoryRecord.from_row_light(row)):
@@ -6060,7 +6369,8 @@ class MemoryStore(SummaryBatchStore):
             raw_vector = snapshot.get("vector")
             # 二进制向量转回 JSON 文本，保证快照可 json 序列化且恢复路径兼容
             if isinstance(raw_vector, (bytes, bytearray, memoryview)):
-                snapshot["vector"] = json_dumps(_unpack_embedding_vector(raw_vector))
+                dim = int(snapshot.get("dimension") or 0)
+                snapshot["vector"] = json_dumps(_unpack_embedding_vector(raw_vector, dimension=dim))
             embedding_snapshots.append(snapshot)
         return {
             "record_kind": "memory",
@@ -8825,10 +9135,10 @@ class MemoryStore(SummaryBatchStore):
         self, user_ids: list[str]
     ) -> dict[str, dict[str, Any]]:
         cards: dict[str, dict[str, Any]] = {}
-        with self._lock:
+        with self._read_conn_sync() as conn:
             for chunk in self._chunk_ids(user_ids):
                 placeholders = ",".join("?" for _ in chunk)
-                rows = self._conn.execute(
+                rows = conn.execute(
                     "SELECT entity_id, display_name, aliases, profile FROM identities "
                     f"WHERE entity_kind='user' AND entity_id IN ({placeholders}) "
                     "ORDER BY updated_at DESC",
@@ -8863,10 +9173,10 @@ class MemoryStore(SummaryBatchStore):
         self, user_ids: list[str]
     ) -> dict[tuple[str, str], dict[str, Any]]:
         stats: dict[tuple[str, str], dict[str, Any]] = {}
-        with self._lock:
+        with self._read_conn_sync() as conn:
             for chunk in self._chunk_ids(user_ids):
                 placeholders = ",".join("?" for _ in chunk)
-                rows = self._conn.execute(
+                rows = conn.execute(
                     f"""
                     SELECT subject_id AS user_id,
                            COALESCE(owner_bot_id, '') AS bot_id,
@@ -8908,8 +9218,8 @@ class MemoryStore(SummaryBatchStore):
                 " AND (COALESCE(owner_bot_id, '')=? OR COALESCE(owner_bot_id, '')='')"
             )
             params.append(bot_id)
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_conn_sync() as conn:
+            rows = conn.execute(
                 f"""
                 SELECT id, content, memory_type, importance, durability, metadata,
                        tags, scope, occurred_at, created_at
@@ -8942,7 +9252,7 @@ class MemoryStore(SummaryBatchStore):
         except (TypeError, ValueError):
             offset = 0
         sort = clean_text(sort, 20) or "weight"
-        with self._lock:
+        with self._read_conn_sync() as conn:
             sql = (
                 "SELECT bot_id, platform, user_id, weight, correction, band, source, "
                 "updated_at FROM person_weights"
@@ -8952,7 +9262,7 @@ class MemoryStore(SummaryBatchStore):
                 sql += " WHERE bot_id=?"
                 params.append(bot_id)
             sql += " ORDER BY weight DESC, updated_at DESC LIMIT 4000"
-            rows = [dict(row) for row in self._conn.execute(sql, params).fetchall()]
+            rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
         if not rows:
             return {"items": [], "total": 0, "bots": [], "state": "empty"}
         user_ids = sorted(
@@ -9713,38 +10023,66 @@ class MemoryStore(SummaryBatchStore):
         if group_id:
             scope_filter += " AND (n.group_id='' OR n.group_id=?)"
             params.append(group_id)
-        match_clauses: list[str] = []
-        match_params: list[Any] = []
+        safe_limit = max(1, int(limit))
+        trgm_query = ""
         like_terms = cleaned_terms
         if self._knowledge_trgm_enabled:
             # Trigram substring match equals LIKE '%term%' for terms with
-            # >=3 alphanumeric characters. Terms containing punctuation keep
-            # the exact LIKE path because the trigram tokenizer splits tokens
-            # on non-alphanumeric characters.
+            # >=3 alphanumeric characters. Terms containing punctuation or <3
+            # chars (e.g. 2-char CJK words) stay on a separate UNION branch so
+            # ``OR LIKE`` never disables the trigram virtual table scan.
             long_terms = [term for term in cleaned_terms if len(term) >= 3 and term.isalnum()]
             like_terms = [term for term in cleaned_terms if term not in long_terms]
             if long_terms:
                 trgm_query = " OR ".join(self._quote_fts_term(term) for term in long_terms)
-                match_clauses.append(
-                    "n.rowid IN (SELECT rowid FROM knowledge_label_trgm WHERE knowledge_label_trgm MATCH ?)"
+        branches: list[str] = []
+        branch_params: list[Any] = []
+        if trgm_query:
+            branches.append(
+                f"""
+                SELECT id, label, updated_at FROM (
+                    SELECT n.id, n.label, n.updated_at
+                    FROM knowledge_nodes n
+                    WHERE n.rowid IN (
+                        SELECT rowid FROM knowledge_label_trgm WHERE knowledge_label_trgm MATCH ?
+                    ) {scope_filter}
+                    ORDER BY n.updated_at DESC
+                    LIMIT ?
                 )
-                match_params.append(trgm_query)
+                """
+            )
+            branch_params.extend([trgm_query, *params, safe_limit])
         if like_terms:
             like_sql = " OR ".join(["lower(n.label) LIKE ? ESCAPE '\\'" for _ in like_terms])
-            match_clauses.append(f"({like_sql})")
-            match_params.extend(self._like_pattern(term) for term in like_terms)
-        match_where = " OR ".join(match_clauses) or "1=0"
-        with self._read_conn_sync() as conn:
-            matched = conn.execute(
+            branches.append(
                 f"""
-                SELECT n.id, n.label
-                FROM knowledge_nodes n
-                WHERE ({match_where}) {scope_filter}
-                ORDER BY n.updated_at DESC
-                LIMIT ?
-                """,
-                match_params + params + [max(1, int(limit))],
-            ).fetchall()
+                SELECT id, label, updated_at FROM (
+                    SELECT n.id, n.label, n.updated_at
+                    FROM knowledge_nodes n
+                    WHERE ({like_sql}) {scope_filter}
+                    ORDER BY n.updated_at DESC
+                    LIMIT ?
+                )
+                """
+            )
+            branch_params.extend(self._like_pattern(term) for term in like_terms)
+            branch_params.extend([*params, safe_limit])
+        if not branches:
+            return []
+        with self._read_conn_sync() as conn:
+            if len(branches) == 1:
+                matched = conn.execute(branches[0], branch_params).fetchall()
+            else:
+                union_sql = " UNION ".join(branches)
+                matched = conn.execute(
+                    f"""
+                    SELECT id, label
+                    FROM ({union_sql})
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    [*branch_params, safe_limit],
+                ).fetchall()
             matched_ids = [str(row["id"]) for row in matched]
             labels = [clean_text(row["label"], 80) for row in matched]
             if not matched_ids:
@@ -12002,6 +12340,26 @@ class MemoryStore(SummaryBatchStore):
             bot_id,
         )
 
+    @staticmethod
+    def _compact_blocked_reasons(blocked_reasons: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        """Persist compact ID + reason summaries instead of 30 full rejected memory bodies."""
+        compact: list[dict[str, Any]] = []
+        for item in (blocked_reasons or [])[:30]:
+            if isinstance(item, dict):
+                mem_id = clean_text(item.get("id"), 120)
+                reason = clean_text(item.get("reason"), 120)
+                entry: dict[str, Any] = {"id": mem_id, "reason": reason}
+                if not mem_id:
+                    note = clean_text(item.get("content"), 60)
+                    if note:
+                        entry["content"] = note
+                compact.append(entry)
+            else:
+                reason = clean_text(item, 120)
+                if reason:
+                    compact.append({"id": "", "reason": reason})
+        return compact
+
     def _add_injection_log_sync(
         self,
         session_id: str,
@@ -12015,6 +12373,7 @@ class MemoryStore(SummaryBatchStore):
         bot_id: str = "",
     ) -> str:
         row_id = new_id("inj")
+        compact_blocked = self._compact_blocked_reasons(blocked_reasons)
         with self._lock:
             self._conn.execute(
                 """
@@ -12032,7 +12391,7 @@ class MemoryStore(SummaryBatchStore):
                     clean_text(scope, 40),
                     clean_text(redact_sensitive_text(query), 1000),
                     json_dumps(selected_memory_ids),
-                    json_dumps(redact_sensitive_value(blocked_reasons[:30])),
+                    json_dumps(redact_sensitive_value(compact_blocked)),
                     json_dumps(redact_sensitive_value(retrieval_info or {})),
                     max(0, int(injection_chars or 0)),
                     utc_now(),
@@ -12317,28 +12676,29 @@ class MemoryStore(SummaryBatchStore):
         )
         bot_placeholders = ",".join("?" for _ in bot_types)
         profile_placeholders = ",".join("?" for _ in profile_types)
+        owner_bot_expr = (
+            "CASE "
+            "WHEN owner_bot_id!='' THEN owner_bot_id "
+            "WHEN metadata LIKE '%\"owner_bot_id\"%' AND json_valid(metadata) "
+            "THEN COALESCE(CAST(json_extract(metadata, '$.owner_bot_id') AS TEXT), '') "
+            "ELSE '' END"
+        )
         clauses = [
-            """
+            f"""
             (
                 visibility='bot_self'
-                AND memory_type IN (BOT_TYPE_PLACEHOLDERS)
+                AND memory_type IN ({bot_placeholders})
                 AND (
                     scope!='private'
                     OR session_id=''
                     OR session_id=?
                     OR (? != '' AND (subject_id=? OR object_id=?))
                 )
-                AND (
-                    CASE
-                        WHEN json_valid(metadata)
-                        THEN COALESCE(CAST(json_extract(metadata, '$.owner_bot_id') AS TEXT), '')
-                        ELSE ''
-                    END
-                ) IN ('', 'self', ?)
+                AND ({owner_bot_expr}) IN ('', 'self', ?)
                 AND (subject_kind!='bot' OR subject_id IN ('', 'self', ?))
                 AND (object_kind!='bot' OR object_id IN ('', 'self', ?))
             )
-            """.replace("BOT_TYPE_PLACEHOLDERS", bot_placeholders)
+            """
         ]
         params: list[Any] = [
             *bot_types,
@@ -12358,13 +12718,7 @@ class MemoryStore(SummaryBatchStore):
                     AND visibility IN ('private_pair', 'shareable')
                     AND memory_type IN ({profile_placeholders})
                     AND (session_id=? OR subject_id=? OR object_id=?)
-                    AND (
-                        CASE
-                            WHEN json_valid(metadata)
-                            THEN COALESCE(CAST(json_extract(metadata, '$.owner_bot_id') AS TEXT), '')
-                            ELSE ''
-                        END
-                    ) IN ('', 'self', ?)
+                    AND ({owner_bot_expr}) IN ('', 'self', ?)
                     AND (subject_kind!='bot' OR subject_id IN ('', 'self', ?))
                     AND (object_kind!='bot' OR object_id IN ('', 'self', ?))
                 )
@@ -12379,13 +12733,9 @@ class MemoryStore(SummaryBatchStore):
                 return []
             where += " AND session_id=?"
             params.append(session_id)
-        uri = self.db_path.resolve().as_uri() + "?mode=ro"
-        with closing(sqlite3.connect(uri, uri=True, timeout=0.35, check_same_thread=False)) as connection:
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA query_only=ON")
-            connection.execute("PRAGMA busy_timeout=350")
-            type_count = max(1, len(bot_types) + (len(profile_types) if user_id else 0))
-            per_type_limit = max(2, min(12, (max(1, int(limit or 36)) + type_count - 1) // type_count))
+        type_count = max(1, len(bot_types) + (len(profile_types) if user_id else 0))
+        per_type_limit = max(2, min(12, (max(1, int(limit or 36)) + type_count - 1) // type_count))
+        with self._read_conn_sync() as connection:
             rows = connection.execute(
                 f"""
                 WITH ranked AS (
@@ -12667,6 +13017,8 @@ class MemoryStore(SummaryBatchStore):
         updated_at = row_value(row, "updated_at", "")
         raw_metadata = row_value(row, "metadata", "{}")
         raw_tags = row_value(row, "tags", "[]")
+        metadata_digest = _text_fingerprint(raw_metadata)
+        tags_digest = _text_fingerprint(raw_tags)
         rev = str(revision or "")
 
         lock = getattr(self, "_record_light_cache_lock", None)
@@ -12682,8 +13034,8 @@ class MemoryStore(SummaryBatchStore):
             if (
                 entry is not None
                 and entry.updated_at == updated_at
-                and entry.raw_metadata == raw_metadata
-                and entry.raw_tags == raw_tags
+                and entry.metadata_digest == metadata_digest
+                and entry.tags_digest == tags_digest
             ):
                 template_record = entry.template
                 if (rev and entry.revision == rev) or _row_scalar_fields_match(row, template_record):
@@ -12731,8 +13083,8 @@ class MemoryStore(SummaryBatchStore):
                     cache.pop(next(iter(cache)))
                 cache[row_id] = _RecordLightCacheEntry(
                     updated_at,
-                    raw_metadata,
-                    raw_tags,
+                    metadata_digest,
+                    tags_digest,
                     template,
                     rev,
                 )
@@ -12906,6 +13258,11 @@ class MemoryStore(SummaryBatchStore):
         params: list[Any] = [query]
         if not include_pending:
             where += " AND m.review_status != 'pending'"
+        join_clause = (
+            "JOIN memories m ON m.rowid = memory_fts.rowid"
+            if self._fts_uses_rowid
+            else "JOIN memories m ON m.id = memory_fts.memory_id"
+        )
         try:
             return conn.execute(
                 f"""
@@ -12915,7 +13272,7 @@ class MemoryStore(SummaryBatchStore):
                            m.importance AS _imp,
                            {_memory_time_sql('m')} AS _ts
                     FROM memory_fts
-                    JOIN memories m ON m.id = memory_fts.memory_id
+                    {join_clause}
                     WHERE memory_fts MATCH ?
                       AND {where}
                     ORDER BY _rank, _imp DESC, _ts DESC
@@ -12991,7 +13348,7 @@ class MemoryStore(SummaryBatchStore):
             text = clean_text(term, 80).lower()
             if text and text not in cleaned_terms:
                 cleaned_terms.append(text)
-            if len(cleaned_terms) >= 24:
+            if len(cleaned_terms) >= 12:
                 break
         if not cleaned_terms:
             return []
@@ -13001,9 +13358,9 @@ class MemoryStore(SummaryBatchStore):
         if not include_pending:
             where += " AND review_status != 'pending'"
 
-        # Short columns first, large 2.3KB ``metadata`` JSON last so matching rows
-        # short-circuit before scanning ``metadata``; two-phase CTE avoids
-        # sorting full 49-column rows inside SQLite's temp B-tree.
+        # Deliberately exclude multi-KB ``metadata`` JSON from LIKE fallback scans:
+        # searchable metadata fields are already indexed in ``memory_fts``, and
+        # running LIKE across 40+ MiB of overflow metadata pages stalls low-IOPS disks.
         columns = [
             "content",
             "subject_name",
@@ -13014,7 +13371,6 @@ class MemoryStore(SummaryBatchStore):
             "object_id",
             "session_id",
             "group_id",
-            "metadata",
         ]
         likes = [self._like_pattern(term) for term in cleaned_terms]
         col_clauses: list[str] = []
@@ -13533,8 +13889,9 @@ class MemoryStore(SummaryBatchStore):
         include_archive: bool = False,
     ) -> list[dict[str, Any]]:
         source = "memories" if include_archive else self.RECALLABLE_MEMORY_VIEW
-        with self._lock:
-            rows = self._conn.execute(
+        sep = "\x1f"
+        with self._read_conn_sync() as conn:
+            rows = conn.execute(
                 f"""
                 WITH normalized AS (
                     SELECT
@@ -13569,16 +13926,16 @@ class MemoryStore(SummaryBatchStore):
                         session_id AS sample_session_id,
                         group_id AS sample_group_id,
                         CASE
-                            WHEN json_valid(metadata)
+                            WHEN owner_bot_id NOT IN ('', 'self') THEN owner_bot_id
+                            WHEN metadata LIKE '%"owner_bot_id"%'
+                                 AND json_valid(metadata)
                                  AND COALESCE(CAST(json_extract(metadata, '$.owner_bot_id') AS TEXT), '') NOT IN ('', 'self')
                             THEN CAST(json_extract(metadata, '$.owner_bot_id') AS TEXT)
                             WHEN subject_kind='bot' AND subject_id NOT IN ('', 'self') THEN subject_id
                             WHEN object_kind='bot' AND object_id NOT IN ('', 'self') THEN object_id
                             ELSE ''
                         END AS sample_bot_id,
-                        review_status,
                         lifecycle,
-                        visibility,
                         CASE
                             WHEN lifecycle!='archived'
                                  AND visibility!='internal'
@@ -13591,52 +13948,32 @@ class MemoryStore(SummaryBatchStore):
                     FROM {source}
                     WHERE scope IN ('private', 'group')
                       AND review_status!='pending'
-                ), ranked AS (
-                    SELECT
-                        *,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY scope, target_id, sample_bot_id
-                            ORDER BY
-                                CASE
-                                    WHEN is_searchable=1 THEN 0
-                                    ELSE 1
-                                END ASC,
-                                sort_time DESC,
-                                sample_session_id DESC
-                        ) AS sample_rank,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY scope, target_id, sample_bot_id
-                            ORDER BY
-                                CASE WHEN target_name!='' THEN 0 ELSE 1 END ASC,
-                                sort_time DESC,
-                                sample_session_id DESC
-                        ) AS name_rank,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY scope, target_id, sample_bot_id
-                            ORDER BY sort_time DESC, sample_session_id DESC
-                        ) AS latest_rank
-                    FROM normalized
-                    WHERE target_id!=''
                 )
                 SELECT
                     scope,
                     target_id,
-                    MAX(CASE WHEN name_rank=1 THEN target_name ELSE '' END) AS target_name,
-                    MAX(CASE WHEN name_rank=1 THEN occurred_at ELSE '' END) AS name_latest_at,
-                    MAX(CASE WHEN name_rank=1 THEN sort_time ELSE 0 END) AS name_latest_sort,
-                    MAX(CASE WHEN sample_rank=1 THEN sample_session_id ELSE '' END) AS sample_session_id,
-                    MAX(CASE WHEN sample_rank=1 THEN sample_group_id ELSE '' END) AS sample_group_id,
                     sample_bot_id,
                     COUNT(*) AS memory_count,
                     SUM(CASE WHEN lifecycle='archived' THEN 1 ELSE 0 END) AS archived_count,
-                    SUM(
-                        is_searchable
-                    ) AS searchable_count,
-                    MAX(CASE WHEN sample_rank=1 AND is_searchable=1 THEN occurred_at ELSE '' END) AS active_latest_at,
+                    SUM(is_searchable) AS searchable_count,
                     MAX(CASE WHEN is_searchable=1 THEN sort_time ELSE 0 END) AS active_latest_sort,
-                    MAX(CASE WHEN latest_rank=1 THEN occurred_at ELSE '' END) AS latest_at,
-                    MAX(sort_time) AS latest_sort
-                FROM ranked
+                    MAX(sort_time) AS latest_sort,
+                    MAX(
+                        printf('%d' || char(31) || '%020.6f' || char(31) || '%s' || char(31) || '%s' || char(31) || '%s',
+                               is_searchable, sort_time, sample_session_id, sample_group_id, occurred_at)
+                    ) AS sample_pack,
+                    MAX(
+                        CASE WHEN target_name!='' THEN
+                            printf('%020.6f' || char(31) || '%s' || char(31) || '%s' || char(31) || '%s',
+                                   sort_time, sample_session_id, occurred_at, target_name)
+                        ELSE '' END
+                    ) AS name_pack,
+                    MAX(
+                        printf('%020.6f' || char(31) || '%s' || char(31) || '%s',
+                               sort_time, sample_session_id, occurred_at)
+                    ) AS latest_pack
+                FROM normalized
+                WHERE target_id!=''
                 GROUP BY scope, target_id, sample_bot_id
                 ORDER BY
                     scope ASC,
@@ -13649,6 +13986,31 @@ class MemoryStore(SummaryBatchStore):
             merged: dict[tuple[str, str], dict[str, Any]] = {}
             for raw in rows:
                 bucket = dict(raw)
+                sample_pack = str(bucket.pop("sample_pack", "") or "")
+                s_parts = sample_pack.split(sep, 4) if sample_pack else []
+                s_searchable = s_parts[0] == "1" if len(s_parts) >= 1 else False
+                bucket["sample_session_id"] = s_parts[2] if len(s_parts) >= 3 else ""
+                bucket["sample_group_id"] = s_parts[3] if len(s_parts) >= 4 else ""
+                bucket["active_latest_at"] = (s_parts[4] if len(s_parts) >= 5 else "") if s_searchable else ""
+
+                name_pack = str(bucket.pop("name_pack", "") or "")
+                if name_pack:
+                    n_parts = name_pack.split(sep, 3)
+                    try:
+                        bucket["name_latest_sort"] = float(n_parts[0])
+                    except (TypeError, ValueError):
+                        bucket["name_latest_sort"] = 0.0
+                    bucket["name_latest_at"] = n_parts[2] if len(n_parts) >= 3 else ""
+                    bucket["target_name"] = n_parts[3] if len(n_parts) >= 4 else ""
+                else:
+                    bucket["name_latest_sort"] = 0.0
+                    bucket["name_latest_at"] = ""
+                    bucket["target_name"] = ""
+
+                latest_pack = str(bucket.pop("latest_pack", "") or "")
+                l_parts = latest_pack.split(sep, 2) if latest_pack else []
+                bucket["latest_at"] = l_parts[2] if len(l_parts) >= 3 else ""
+
                 scope = clean_text(bucket.get("scope"), 40)
                 target_id = clean_text(bucket.get("target_id"), 200)
                 parsed_scope, parsed_target = parse_scope_from_session(target_id)
@@ -13772,6 +14134,7 @@ class MemoryStore(SummaryBatchStore):
             )
             if limit is not None:
                 buckets = buckets[: max(1, int(limit))]
+            resolved_names = self._resolve_bucket_target_names_batch_sync(conn, buckets)
             for bucket in buckets:
                 bucket.pop("active_latest_at", None)
                 bucket.pop("active_latest_sort", None)
@@ -13780,17 +14143,103 @@ class MemoryStore(SummaryBatchStore):
                     context.pop("active_latest_at", None)
                     context.pop("active_latest_sort", None)
                     context.pop("latest_sort", None)
-                bucket["target_name"] = self._resolve_bucket_target_name_sync(
-                    clean_text(bucket.get("scope"), 40),
-                    clean_text(bucket.get("target_id"), 160),
-                    clean_text(bucket.get("target_name"), 120),
+                b_scope = clean_text(bucket.get("scope"), 40)
+                b_tid = clean_text(bucket.get("target_id"), 160)
+                b_fb = self._clean_window_display_name(bucket.get("target_name"))
+                bucket["target_name"] = (
+                    b_fb
+                    if (b_fb and b_fb != b_tid)
+                    else resolved_names.get((b_scope, b_tid), b_fb)
                 )
                 bucket["target_kind"] = self._bucket_target_kind(
-                    clean_text(bucket.get("scope"), 40),
-                    clean_text(bucket.get("target_id"), 160),
+                    b_scope,
+                    b_tid,
                     clean_text(bucket.get("sample_session_id"), 200),
                 )
         return buckets
+
+    def _resolve_bucket_target_names_batch_sync(
+        self,
+        conn: sqlite3.Connection,
+        buckets: list[dict[str, Any]],
+    ) -> dict[tuple[str, str], str]:
+        """Batch-resolve missing bucket display names via identities & relationship_edges."""
+        need_groups: list[str] = []
+        need_users: list[str] = []
+        for bucket in buckets:
+            scope = clean_text(bucket.get("scope"), 40)
+            target_id = clean_text(bucket.get("target_id"), 160)
+            fallback = self._clean_window_display_name(bucket.get("target_name"))
+            if not target_id or (fallback and fallback != target_id):
+                continue
+            if scope == "group":
+                need_groups.append(target_id)
+            elif scope == "private":
+                need_users.append(target_id)
+        resolved: dict[tuple[str, str], str] = {}
+        for scope_name, entity_kind, id_list in (
+            ("group", "group", sorted(set(need_groups))),
+            ("private", "user", sorted(set(need_users))),
+        ):
+            if not id_list:
+                continue
+            for chunk in self._chunk_ids(id_list):
+                marks = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT entity_id, display_name
+                    FROM identities
+                    WHERE entity_kind=? AND entity_id IN ({marks}) AND display_name!=''
+                    ORDER BY confidence DESC, updated_at DESC
+                    """,
+                    [entity_kind, *chunk],
+                ).fetchall()
+                for row in rows:
+                    tid = clean_text(row["entity_id"], 160)
+                    if (scope_name, tid) in resolved:
+                        continue
+                    name = self._clean_window_display_name(row["display_name"])
+                    if name:
+                        resolved[(scope_name, tid)] = name
+            remaining = [tid for tid in id_list if (scope_name, tid) not in resolved]
+            if not remaining:
+                continue
+            for chunk in self._chunk_ids(remaining):
+                marks = ",".join("?" for _ in chunk)
+                if scope_name == "group":
+                    rows = conn.execute(
+                        f"""
+                        SELECT object_id AS tid, object_name AS name
+                        FROM relationship_edges
+                        WHERE object_kind='group' AND object_id IN ({marks}) AND object_name!=''
+                        ORDER BY confidence DESC, updated_at DESC
+                        """,
+                        chunk,
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        f"""
+                        SELECT tid, name FROM (
+                            SELECT subject_id AS tid, subject_name AS name, confidence, updated_at
+                            FROM relationship_edges
+                            WHERE subject_kind='user' AND subject_id IN ({marks}) AND subject_name!=''
+                            UNION ALL
+                            SELECT object_id AS tid, object_name AS name, confidence, updated_at
+                            FROM relationship_edges
+                            WHERE object_kind='user' AND object_id IN ({marks}) AND object_name!=''
+                        )
+                        ORDER BY confidence DESC, updated_at DESC
+                        """,
+                        [*chunk, *chunk],
+                    ).fetchall()
+                for row in rows:
+                    tid = clean_text(row["tid"], 160)
+                    if (scope_name, tid) in resolved:
+                        continue
+                    name = self._clean_window_display_name(row["name"])
+                    if name:
+                        resolved[(scope_name, tid)] = name
+        return resolved
 
     @staticmethod
     def _bucket_target_kind(scope: str, target_id: str, session_id: str = "") -> str:
@@ -15596,7 +16045,7 @@ class MemoryStore(SummaryBatchStore):
             for dup in duplicates:
                 rows = self._conn.execute(
                     """
-                    SELECT id, importance, confidence, merged_count, created_at
+                    SELECT rowid AS _dup_rowid, id, importance, confidence, merged_count, created_at
                     FROM memories
                     WHERE content_fingerprint=? AND lifecycle!='archived'
                     ORDER BY merged_count DESC, importance DESC, created_at ASC
@@ -15631,10 +16080,7 @@ class MemoryStore(SummaryBatchStore):
                         ),
                     )
                     if self._fts_enabled:
-                        self._conn.execute(
-                            "DELETE FROM memory_fts WHERE memory_id=?",
-                            (row["id"],),
-                        )
+                        self._delete_memory_fts_row(row["id"], rowid=int(row["_dup_rowid"]))
                     merged += 1
             if full_fingerprint_audit:
                 self._conn.execute(
@@ -16149,7 +16595,8 @@ class MemoryStore(SummaryBatchStore):
         if not memory_id or not provider_id or not text_hash or not values:
             return
         now = utc_now()
-        packed = _pack_embedding_vector(values)
+        precision = normalize_vector_precision(getattr(self, "vector_storage_precision", DEFAULT_VECTOR_PRECISION))
+        packed = _pack_embedding_vector(values, precision=precision)
         with self._lock:
             self._conn.execute(
                 """
@@ -16254,6 +16701,8 @@ class MemoryStore(SummaryBatchStore):
                     cached is not None
                     and cached.revision == expected_revision
                     and cached.valid_until > selection_time
+                    and getattr(cached, "precision", self.vector_storage_precision)
+                    == self.vector_storage_precision
                 ):
                     return False
             finally:
@@ -16421,12 +16870,13 @@ class MemoryStore(SummaryBatchStore):
         params: list[Any] = [provider_id]
         if not include_pending:
             where += " AND m.review_status != 'pending'"
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_conn_sync() as conn:
+            rows = conn.execute(
                 f"""
                 SELECT
                     m.*,
                     e.vector AS embedding_vector,
+                    e.dimension AS embedding_dimension,
                     e.text_hash AS embedding_text_hash
                 FROM memory_embeddings e
                 JOIN memories m ON m.id=e.memory_id
@@ -16439,7 +16889,10 @@ class MemoryStore(SummaryBatchStore):
         result: list[tuple[MemoryRecord, list[float], str]] = []
         for row in rows:
             vector = _normalize_embedding_vector_values(
-                _unpack_embedding_vector(row["embedding_vector"])
+                _unpack_embedding_vector(
+                    row["embedding_vector"],
+                    dimension=int(row["embedding_dimension"] or 0),
+                )
             )
             if not vector:
                 continue
@@ -16523,8 +16976,8 @@ class MemoryStore(SummaryBatchStore):
         # existing importance/time ordering brings recently changed memories into
         # the next backfill pass first.
         scan_limit = max(safe_limit, min(2000, safe_limit * 8))
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_conn_sync() as conn:
+            rows = conn.execute(
                 f"""
                 SELECT m.*
                     ,e.text_hash AS embedding_text_hash
@@ -16690,31 +17143,331 @@ class MemoryStore(SummaryBatchStore):
             return "0"
         return str(int(row["revision"] or 0))
 
-    def _stats_sync(self) -> dict[str, Any]:
+    async def knowledge_revision(self) -> str:
+        return await self._run_recoverable_database_operation(self._knowledge_revision_sync)
+
+    def _knowledge_revision_sync(self) -> str:
+        with self._read_conn_sync() as conn:
+            try:
+                row = conn.execute(
+                    "SELECT revision FROM knowledge_revision WHERE singleton=1"
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return "0"
+        if not row:
+            return "0"
+        return str(int(row["revision"] or 0))
+
+    async def owner_bot_counts(self) -> dict[str, int]:
+        return await self._run_recoverable_database_operation(self._owner_bot_counts_sync)
+
+    def _owner_bot_counts_sync(self) -> dict[str, int]:
+        with self._read_conn_sync() as conn:
+            return {
+                row["owner"] or "<empty>": int(row["count"] or 0)
+                for row in conn.execute(
+                    "SELECT owner_bot_id AS owner, COUNT(*) AS count FROM memories "
+                    "GROUP BY owner_bot_id ORDER BY count DESC LIMIT 20"
+                ).fetchall()
+            }
+
+    async def transcode_memory_embeddings(
+        self,
+        *,
+        target_precision: str = "",
+        batch_size: int = 400,
+        max_rows: int = 0,
+        purge_archived_orphans: bool = True,
+    ) -> dict[str, Any]:
+        """Smoothly transcode legacy float64/JSON embeddings to the configured precision."""
+        return await asyncio.to_thread(
+            self._transcode_memory_embeddings_sync,
+            target_precision,
+            batch_size,
+            max_rows,
+            purge_archived_orphans,
+        )
+
+    def _transcode_memory_embeddings_sync(
+        self,
+        target_precision: str = "",
+        batch_size: int = 400,
+        max_rows: int = 0,
+        purge_archived_orphans: bool = True,
+    ) -> dict[str, Any]:
+        precision = normalize_vector_precision(
+            target_precision or getattr(self, "vector_storage_precision", DEFAULT_VECTOR_PRECISION)
+        )
+        target_elem_bytes = vector_precision_element_bytes(precision)
+        safe_batch = max(16, min(2000, int(batch_size or 400)))
+        limit_rows = max(0, int(max_rows or 0))
+        purged_orphans = 0
+        if purge_archived_orphans:
+            with self._lock, self._transaction_sync():
+                cur = self._conn.execute(
+                    """
+                    DELETE FROM memory_embeddings
+                    WHERE memory_id NOT IN (
+                        SELECT id FROM memories WHERE lifecycle != 'archived'
+                    )
+                    """
+                )
+                purged_orphans = max(0, int(cur.rowcount or 0))
+        transcoded = 0
+        bytes_before = 0
+        bytes_after = 0
+        skipped_invalid = 0
+        last_rowid = 0
+        while limit_rows == 0 or transcoded < limit_rows:
+            take = safe_batch if limit_rows == 0 else min(safe_batch, limit_rows - transcoded)
+            with self._read_conn_sync() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT rowid AS _rid, memory_id, provider_id, dimension, vector
+                    FROM memory_embeddings
+                    WHERE rowid > ?
+                      AND dimension > 0
+                      AND (
+                          typeof(vector) != 'blob'
+                          OR length(vector) != dimension * ?
+                      )
+                    ORDER BY rowid ASC
+                    LIMIT ?
+                    """,
+                    (last_rowid, target_elem_bytes, take),
+                ).fetchall()
+            if not rows:
+                break
+            last_rowid = int(rows[-1]["_rid"])
+            updates: list[tuple[bytes, int, str, str]] = []
+            for row in rows:
+                dim = int(row["dimension"] or 0)
+                raw = row["vector"]
+                raw_len = len(raw) if isinstance(raw, (bytes, bytearray, memoryview)) else len(str(raw or "").encode("utf-8"))
+                values = _unpack_embedding_vector(raw, dimension=dim)
+                if not values or len(values) != dim:
+                    skipped_invalid += 1
+                    continue
+                packed = _pack_embedding_vector(values, precision=precision)
+                if not packed:
+                    skipped_invalid += 1
+                    continue
+                bytes_before += raw_len
+                bytes_after += len(packed)
+                updates.append((packed, dim, str(row["memory_id"]), str(row["provider_id"])))
+            if updates:
+                with self._lock, self._transaction_sync():
+                    self._conn.executemany(
+                        "UPDATE memory_embeddings SET vector=?, dimension=? WHERE memory_id=? AND provider_id=?",
+                        updates,
+                    )
+                transcoded += len(updates)
+            if len(rows) < take:
+                break
+            time.sleep(0)
+        return {
+            "target_precision": precision,
+            "transcoded": transcoded,
+            "purged_orphans": purged_orphans,
+            "skipped_invalid": skipped_invalid,
+            "bytes_before": bytes_before,
+            "bytes_after": bytes_after,
+            "bytes_saved": max(0, bytes_before - bytes_after),
+        }
+
+    async def database_health_snapshot(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self._database_health_snapshot_sync)
+
+    def _database_health_snapshot_sync(self) -> dict[str, Any]:
+        target_precision = normalize_vector_precision(
+            getattr(self, "vector_storage_precision", DEFAULT_VECTOR_PRECISION)
+        )
+        target_elem_bytes = vector_precision_element_bytes(target_precision)
+        files = self._database_file_snapshot()
+        with self._read_conn_sync() as conn:
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0] or 4096)
+            page_count = int(conn.execute("PRAGMA page_count").fetchone()[0] or 0)
+            freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0] or 0)
+            auto_vacuum = int(conn.execute("PRAGMA auto_vacuum").fetchone()[0] or 0)
+            journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0] or "")
+            emb_row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_rows,
+                    COALESCE(SUM(CASE WHEN typeof(vector)='blob' AND dimension>0 AND length(vector)=dimension*8 THEN 1 ELSE 0 END), 0) AS float64_rows,
+                    COALESCE(SUM(CASE WHEN typeof(vector)='blob' AND dimension>0 AND length(vector)=dimension*4 THEN 1 ELSE 0 END), 0) AS float32_rows,
+                    COALESCE(SUM(CASE WHEN typeof(vector)='blob' AND dimension>0 AND length(vector)=dimension*2 THEN 1 ELSE 0 END), 0) AS float16_rows,
+                    COALESCE(SUM(CASE WHEN typeof(vector)!='blob' THEN 1 ELSE 0 END), 0) AS json_rows,
+                    COALESCE(SUM(CASE WHEN typeof(vector)='blob' THEN length(vector) ELSE length(CAST(vector AS BLOB)) END), 0) AS vector_bytes,
+                    COALESCE(SUM(CASE WHEN dimension>0 THEN dimension * ? ELSE 0 END), 0) AS target_vector_bytes
+                FROM memory_embeddings
+                """,
+                (target_elem_bytes,),
+            ).fetchone()
+            archived_orphan_embeddings = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM memory_embeddings
+                    WHERE memory_id NOT IN (SELECT id FROM memories WHERE lifecycle != 'archived')
+                    """
+                ).fetchone()[0]
+                or 0
+            )
+            fts_meta = conn.execute(
+                "SELECT value FROM schema_metadata WHERE key='memory_fts_schema_version'"
+            ).fetchone()
+            has_legacy_content_index = bool(
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_memories_content'"
+                ).fetchone()
+            )
+        vector_bytes = int(emb_row["vector_bytes"] or 0) if emb_row else 0
+        target_vector_bytes = int(emb_row["target_vector_bytes"] or 0) if emb_row else 0
+        estimated_transcode_savings = max(0, vector_bytes - target_vector_bytes)
+        freelist_bytes = freelist_count * page_size
+        recommendations: list[str] = []
+        if emb_row and int(emb_row["float64_rows"] or 0) > 0:
+            recommendations.append(
+                f"检测到 {int(emb_row['float64_rows'])} 条旧版 float64 向量，执行一键瘦身可转为 {target_precision} 并预计节省约 {round(estimated_transcode_savings / (1024 * 1024), 1)} MiB。"
+            )
+        if archived_orphan_embeddings > 0:
+            recommendations.append(f"检测到 {archived_orphan_embeddings} 条已归档/孤儿记忆向量可安全清理。")
+        if auto_vacuum != 2:
+            recommendations.append("当前库尚未开启 incremental auto_vacuum，执行完整瘦身可开启并回收空闲页。")
+        if freelist_bytes >= 8 * 1024 * 1024:
+            recommendations.append(f"存在约 {round(freelist_bytes / (1024 * 1024), 1)} MiB 空闲页可回收。")
+        return {
+            "db_path": str(self.db_path),
+            "files": files,
+            "total_bytes": int(files.get("db_bytes", 0)) + int(files.get("wal_bytes", 0)) + int(files.get("shm_bytes", 0)),
+            "page_size": page_size,
+            "page_count": page_count,
+            "freelist_count": freelist_count,
+            "freelist_bytes": freelist_bytes,
+            "auto_vacuum": auto_vacuum,
+            "journal_mode": journal_mode,
+            "vector_precision": target_precision,
+            "embeddings": {
+                "total_rows": int(emb_row["total_rows"] or 0) if emb_row else 0,
+                "float64_rows": int(emb_row["float64_rows"] or 0) if emb_row else 0,
+                "float32_rows": int(emb_row["float32_rows"] or 0) if emb_row else 0,
+                "float16_rows": int(emb_row["float16_rows"] or 0) if emb_row else 0,
+                "json_rows": int(emb_row["json_rows"] or 0) if emb_row else 0,
+                "archived_orphan_rows": archived_orphan_embeddings,
+                "vector_bytes": vector_bytes,
+                "estimated_transcode_savings_bytes": estimated_transcode_savings,
+            },
+            "fts_schema_version": clean_text(fts_meta["value"], 64) if fts_meta else "legacy",
+            "fts_uses_rowid": bool(self._fts_uses_rowid),
+            "has_legacy_content_index": has_legacy_content_index,
+            "recommendations": recommendations,
+        }
+
+    async def optimize_and_shrink(
+        self,
+        *,
+        target_precision: str = "",
+        transcode_limit: int = 0,
+        vacuum_pages: int = 2000,
+        run_full_vacuum: bool = False,
+    ) -> dict[str, Any]:
+        """Run embedding precision transcode + incremental/full vacuum + PRAGMA optimize."""
+        return await asyncio.to_thread(
+            self._optimize_and_shrink_sync,
+            target_precision,
+            transcode_limit,
+            vacuum_pages,
+            run_full_vacuum,
+        )
+
+    def _optimize_and_shrink_sync(
+        self,
+        target_precision: str = "",
+        transcode_limit: int = 0,
+        vacuum_pages: int = 2000,
+        run_full_vacuum: bool = False,
+    ) -> dict[str, Any]:
+        before = self._database_file_snapshot()
+        before_total = int(before.get("db_bytes", 0)) + int(before.get("wal_bytes", 0)) + int(before.get("shm_bytes", 0))
+        transcode = self._transcode_memory_embeddings_sync(
+            target_precision=target_precision,
+            batch_size=500,
+            max_rows=transcode_limit,
+            purge_archived_orphans=True,
+        )
+        vacuum_mode = "none"
         with self._lock:
-            total = self._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-            pending = self._conn.execute("SELECT COUNT(*) FROM memories WHERE review_status='pending'").fetchone()[0]
-            stable = self._conn.execute("SELECT COUNT(*) FROM memories WHERE lifecycle='stable_memory'").fetchone()[0]
-            identities = self._conn.execute("SELECT COUNT(*) FROM identities").fetchone()[0]
-            timeline = self._conn.execute("SELECT COUNT(*) FROM timeline").fetchone()[0]
-            relationships = self._conn.execute("SELECT COUNT(*) FROM relationship_edges").fetchone()[0]
-            knowledge_nodes = self._conn.execute("SELECT COUNT(*) FROM knowledge_nodes").fetchone()[0]
-            knowledge_edges = self._conn.execute("SELECT COUNT(*) FROM knowledge_edges").fetchone()[0]
-            open_threads = self._conn.execute(
+            try:
+                self._conn.execute("PRAGMA optimize")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                auto_vacuum = int(self._conn.execute("PRAGMA auto_vacuum").fetchone()[0] or 0)
+            except sqlite3.OperationalError:
+                auto_vacuum = 0
+            if run_full_vacuum:
+                try:
+                    if auto_vacuum != 2:
+                        self._conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                    self._conn.execute("VACUUM")
+                    vacuum_mode = "full_vacuum_incremental_enabled"
+                except sqlite3.OperationalError as exc:
+                    vacuum_mode = f"full_vacuum_skipped:{clean_text(exc, 80)}"
+            elif auto_vacuum == 2 and vacuum_pages > 0:
+                try:
+                    self._conn.execute(f"PRAGMA incremental_vacuum({max(1, int(vacuum_pages))})")
+                    vacuum_mode = "incremental_vacuum"
+                except sqlite3.OperationalError as exc:
+                    vacuum_mode = f"incremental_vacuum_skipped:{clean_text(exc, 80)}"
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.OperationalError:
+                pass
+        after = self._database_file_snapshot()
+        after_total = int(after.get("db_bytes", 0)) + int(after.get("wal_bytes", 0)) + int(after.get("shm_bytes", 0))
+        return {
+            "ok": True,
+            "transcode": transcode,
+            "vacuum_mode": vacuum_mode,
+            "before_bytes": before_total,
+            "after_bytes": after_total,
+            "bytes_reclaimed": max(0, before_total - after_total),
+        }
+
+    def _stats_sync(self) -> dict[str, Any]:
+        with self._read_conn_sync() as conn:
+            mem_counts = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COALESCE(SUM(CASE WHEN review_status='pending' THEN 1 ELSE 0 END), 0) AS pending,
+                    COALESCE(SUM(CASE WHEN lifecycle='stable_memory' THEN 1 ELSE 0 END), 0) AS stable
+                FROM memories
+                """
+            ).fetchone()
+            total = int(mem_counts["total"] or 0) if mem_counts else 0
+            pending = int(mem_counts["pending"] or 0) if mem_counts else 0
+            stable = int(mem_counts["stable"] or 0) if mem_counts else 0
+            identities = conn.execute("SELECT COUNT(*) FROM identities").fetchone()[0]
+            timeline = conn.execute("SELECT COUNT(*) FROM timeline").fetchone()[0]
+            relationships = conn.execute("SELECT COUNT(*) FROM relationship_edges").fetchone()[0]
+            knowledge_nodes = conn.execute("SELECT COUNT(*) FROM knowledge_nodes").fetchone()[0]
+            knowledge_edges = conn.execute("SELECT COUNT(*) FROM knowledge_edges").fetchone()[0]
+            open_threads = conn.execute(
                 "SELECT COUNT(*) FROM cross_window_threads WHERE status='open'"
             ).fetchone()[0]
-            injection_logs = self._conn.execute("SELECT COUNT(*) FROM injection_logs").fetchone()[0]
-            acl_rules = self._conn.execute("SELECT COUNT(*) FROM memory_acl_rules WHERE enabled=1").fetchone()[0]
+            injection_logs = conn.execute("SELECT COUNT(*) FROM injection_logs").fetchone()[0]
+            acl_rules = conn.execute("SELECT COUNT(*) FROM memory_acl_rules WHERE enabled=1").fetchone()[0]
             by_scope = {
                 row["scope"]: row["count"]
-                for row in self._conn.execute("SELECT scope, COUNT(*) AS count FROM memories GROUP BY scope").fetchall()
+                for row in conn.execute("SELECT scope, COUNT(*) AS count FROM memories GROUP BY scope").fetchall()
             }
             # Rows owned by a different Bot are invisible to recall by design, so
             # an owner that drifted (a redeployed adapter, a second platform) used
             # to look like missing memory. Surface the split next to the counts.
             by_owner_bot = {
                 row["owner"] or "<empty>": row["count"]
-                for row in self._conn.execute(
+                for row in conn.execute(
                     "SELECT owner_bot_id AS owner, COUNT(*) AS count FROM memories "
                     "GROUP BY owner_bot_id ORDER BY count DESC LIMIT 20"
                 ).fetchall()

@@ -81,10 +81,13 @@ class ScopedStore:
         *,
         clock: Any = None,
         initialize: bool = True,
+        synchronous: str = "NORMAL",
     ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock if callable(clock) else time.time
+        sync_mode = str(synchronous or "NORMAL").strip().upper()
+        self._synchronous = sync_mode if sync_mode in {"OFF", "NORMAL", "FULL", "EXTRA"} else "NORMAL"
         self._lock = threading.RLock()
         # 复用连接：每次操作都 sqlite3.connect() + close() 会让机械盘上的
         # WAL/fsync 成本被放大数倍（见 issue #61），这里改成每线程一条长连接。
@@ -108,9 +111,21 @@ class ScopedStore:
             str(self.path), timeout=15.0, isolation_level=None, check_same_thread=False
         )
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=15000")
+        try:
+            if int(conn.execute("PRAGMA page_count").fetchone()[0] or 0) == 0:
+                conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        except sqlite3.OperationalError:
+            pass
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute(f"PRAGMA synchronous={self._synchronous}")
+        conn.execute("PRAGMA wal_autocheckpoint=500")
         conn.execute("PRAGMA secure_delete=ON")
+        for pragma in ("PRAGMA cache_size=-8192", "PRAGMA temp_store=MEMORY"):
+            try:
+                conn.execute(pragma)
+            except sqlite3.OperationalError:
+                pass
         return conn
 
     def _thread_connection(self) -> sqlite3.Connection:
@@ -207,6 +222,12 @@ class ScopedStore:
 
     def _initialize(self) -> None:
         with self._connection() as conn:
+            try:
+                page_count = int(conn.execute("PRAGMA page_count").fetchone()[0] or 0)
+                if page_count == 0:
+                    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+            except sqlite3.OperationalError:
+                pass
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS scoped_records (
@@ -233,6 +254,8 @@ class ScopedStore:
                     created_at REAL NOT NULL,
                     PRIMARY KEY(event_id, migration_epoch)
                 );
+                CREATE INDEX IF NOT EXISTS idx_scoped_operations_created
+                    ON scoped_operations(created_at);
                 CREATE TABLE IF NOT EXISTS scoped_epoch_state (
                     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                     migration_epoch TEXT NOT NULL,
@@ -273,6 +296,10 @@ class ScopedStore:
                 self._active_epoch = state["migration_epoch"]
                 self._active_policy_version = state["policy_version"]
                 self._epoch_revision = int(state["revision"])
+            try:
+                conn.execute("PRAGMA optimize")
+            except sqlite3.OperationalError:
+                pass
 
     def _authorize(self, context: NamespaceContext | None, record_kind: str, *, write: bool) -> None:
         if record_kind not in RECORD_KINDS:
@@ -932,12 +959,103 @@ class ScopedStore:
         self._truncate_wal()
         return result
 
-    def initialize(self) -> None:
+    def prune_expired_operations(
+        self,
+        *,
+        older_than_seconds: float = 14 * 86400.0,
+        limit: int = 20000,
+        vacuum_pages: int = 256,
+        run_full_vacuum: bool = False,
+    ) -> dict[str, Any]:
+        """Prune aged idempotency rows from ``scoped_operations`` and reclaim free pages."""
+        retention = max(60.0, float(older_than_seconds or (14 * 86400.0)))
+        cutoff = float(self._clock()) - retention
+        max_delete = max(0, int(limit or 0))
+        batch_size = 2000
+        deleted_total = 0
+        while max_delete == 0 or deleted_total < max_delete:
+            take = batch_size if max_delete == 0 else min(batch_size, max_delete - deleted_total)
+            with self._transaction() as conn:
+                cur = conn.execute(
+                    """DELETE FROM scoped_operations
+                       WHERE rowid IN (
+                           SELECT rowid FROM scoped_operations
+                           WHERE created_at < ?
+                           ORDER BY created_at ASC
+                           LIMIT ?
+                       )""",
+                    (cutoff, take),
+                )
+                removed = max(0, int(cur.rowcount or 0))
+            deleted_total += removed
+            if removed < take:
+                break
+        vacuumed = False
         with self._lock:
-            if self._initialized:
-                return
-            self._initialize()
-            self._initialized = True
+            with self._connection() as conn:
+                try:
+                    auto_vacuum = int(conn.execute("PRAGMA auto_vacuum").fetchone()[0] or 0)
+                except sqlite3.OperationalError:
+                    auto_vacuum = 0
+                if run_full_vacuum and (deleted_total > 0 or auto_vacuum != 2):
+                    try:
+                        if auto_vacuum != 2:
+                            conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                        conn.execute("VACUUM")
+                        vacuumed = True
+                    except sqlite3.OperationalError:
+                        pass
+                elif auto_vacuum == 2 and vacuum_pages > 0:
+                    try:
+                        conn.execute(f"PRAGMA incremental_vacuum({max(1, int(vacuum_pages))})")
+                        vacuumed = True
+                    except sqlite3.OperationalError:
+                        pass
+                try:
+                    conn.execute("PRAGMA optimize")
+                except sqlite3.OperationalError:
+                    pass
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.OperationalError:
+                    pass
+        return {
+            "deleted_operations": deleted_total,
+            "cutoff_ts": cutoff,
+            "vacuumed": vacuumed,
+        }
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Read-only storage metrics for ``req041_scoped.db``."""
+        db_bytes = self.path.stat().st_size if self.path.exists() else 0
+        wal_path = Path(f"{self.path}-wal")
+        shm_path = Path(f"{self.path}-shm")
+        wal_bytes = wal_path.stat().st_size if wal_path.exists() else 0
+        shm_bytes = shm_path.stat().st_size if shm_path.exists() else 0
+        with self._connection() as conn:
+            records = int(conn.execute("SELECT COUNT(*) FROM scoped_records").fetchone()[0] or 0)
+            operations = int(conn.execute("SELECT COUNT(*) FROM scoped_operations").fetchone()[0] or 0)
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0] or 4096)
+            page_count = int(conn.execute("PRAGMA page_count").fetchone()[0] or 0)
+            freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0] or 0)
+            auto_vacuum = int(conn.execute("PRAGMA auto_vacuum").fetchone()[0] or 0)
+            journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0] or "")
+        return {
+            "path": str(self.path),
+            "db_bytes": db_bytes,
+            "wal_bytes": wal_bytes,
+            "shm_bytes": shm_bytes,
+            "total_bytes": db_bytes + wal_bytes + shm_bytes,
+            "scoped_records": records,
+            "scoped_operations": operations,
+            "page_size": page_size,
+            "page_count": page_count,
+            "freelist_count": freelist_count,
+            "freelist_bytes": freelist_count * page_size,
+            "auto_vacuum": auto_vacuum,
+            "journal_mode": journal_mode,
+            "synchronous": self._synchronous,
+        }
 
 
 __all__ = [

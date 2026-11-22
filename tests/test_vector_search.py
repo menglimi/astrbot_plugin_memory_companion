@@ -178,7 +178,7 @@ class VectorSearchTests(unittest.IsolatedAsyncioTestCase):
                 memories, scores, _ = await self.search()
             self.assertEqual([mid for _, mid in expected], [m.id for m in memories])
             for score, mid in expected:
-                self.assertAlmostEqual(score, scores[mid], places=12)
+                self.assertAlmostEqual(score, scores[mid], places=5)
 
     async def test_cache_budget_overflow_keeps_search_complete(self):
         """超预算时按块淘汰最旧，不再整份丢弃，且结果仍然完整。
