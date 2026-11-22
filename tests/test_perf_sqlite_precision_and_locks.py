@@ -826,6 +826,290 @@ class ServiceScopedAndApiPerfTests(unittest.IsolatedAsyncioTestCase):
         finally:
             service.close()
 
+    async def test_transcode_limit_zero_skips_transcoding_and_sleep_maintenance_is_bounded(self) -> None:
+        dim = 16
+        service = MemoryCompanionService(
+            context=SimpleNamespace(),
+            config={"retrieval_advanced": {"vector_precision": "float16"}},
+            plugin_root=ROOT,
+            data_dir=self.tmp_dir,
+        )
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            vec = [0.25] * dim
+            raw_f64 = struct.pack(f"<{dim}d", *vec)
+            for idx in range(8):
+                rec = _make_record(f"tc-{idx}", content=f"转码边界记录 {idx}")
+                service.store._insert_memory_sync(rec)
+                with service.store._lock, service.store._conn:
+                    service.store._conn.execute(
+                        """INSERT INTO memory_embeddings(
+                               memory_id, provider_id, text_hash, dimension, vector, created_at, updated_at
+                           ) VALUES (?, 'test', ?, ?, ?, ?, ?)""",
+                        (rec.id, memory_embedding_text_hash(rec, max_chars=1200), dim, raw_f64, now, now),
+                    )
+
+            # max_rows=0 must transcode 0 rows (not unlimited).
+            zero_res = await service.store.transcode_memory_embeddings(
+                target_precision="float16", max_rows=0, purge_archived_orphans=False
+            )
+            self.assertEqual(0, zero_res["transcoded"])
+            f64_count = service.store._conn.execute(
+                "SELECT COUNT(*) FROM memory_embeddings WHERE length(vector)=?", (dim * 8,)
+            ).fetchone()[0]
+            self.assertEqual(8, f64_count)
+
+            # max_rows=3 must transcode strictly 3 rows.
+            bounded_res = await service.store.transcode_memory_embeddings(
+                target_precision="float16", max_rows=3, purge_archived_orphans=False
+            )
+            self.assertEqual(3, bounded_res["transcoded"])
+            f64_after_3 = service.store._conn.execute(
+                "SELECT COUNT(*) FROM memory_embeddings WHERE length(vector)=?", (dim * 8,)
+            ).fetchone()[0]
+            self.assertEqual(5, f64_after_3)
+
+            # optimize_and_shrink(transcode_limit=0) must skip transcoding completely.
+            skip_opt = await service.store.optimize_and_shrink(
+                target_precision="float16", transcode_limit=0, run_full_vacuum=False
+            )
+            self.assertTrue(skip_opt["transcode"]["skipped"])
+            self.assertEqual(0, skip_opt["transcode"]["transcoded"])
+            self.assertEqual(
+                5,
+                service.store._conn.execute(
+                    "SELECT COUNT(*) FROM memory_embeddings WHERE length(vector)=?", (dim * 8,)
+                ).fetchone()[0],
+            )
+
+            # POST /maintenance/db_optimize with transcode_limit=0 must also skip transcoding.
+            api = PluginPageApi(SimpleNamespace(service=service, context=SimpleNamespace()))
+            api._ok = lambda payload=None, status=200: (status, {"status": "ok", **(payload or {})})
+            api._err = lambda msg, status=400: (status, {"status": "error", "message": msg})
+            api._dashboard_admin_state = lambda: "allowed"
+            api._json = AsyncMock(return_value={"target_precision": "float16", "transcode_limit": 0})
+            status, body = await api.db_optimize()
+            self.assertEqual(200, status)
+            self.assertTrue(body["data"]["primary"]["transcode"]["skipped"])
+            self.assertEqual(0, body["data"]["primary"]["transcode"]["transcoded"])
+            self.assertEqual(
+                5,
+                service.store._conn.execute(
+                    "SELECT COUNT(*) FROM memory_embeddings WHERE length(vector)=?", (dim * 8,)
+                ).fetchone()[0],
+            )
+
+            # sleep_maintenance must NOT perform a second unbounded transcode via optimize_and_shrink(transcode_limit=0).
+            orig_transcode = service.store.transcode_memory_embeddings
+            transcode_calls: list[int | None] = []
+
+            async def _capped_transcode(*args, **kwargs):
+                transcode_calls.append(kwargs.get("max_rows"))
+                kwargs["max_rows"] = 2
+                return await orig_transcode(*args, **kwargs)
+
+            with patch.object(service.store, "transcode_memory_embeddings", side_effect=_capped_transcode):
+                sleep_state = await service.sleep_maintenance(reason="scheduled_natural_forgetting")
+            self.assertEqual([5000], transcode_calls)
+            self.assertEqual(2, sleep_state["embedding_transcode"]["transcoded"])
+            self.assertTrue(sleep_state["db_optimize"]["transcode"]["skipped"])
+            # 5 - 2 = 3 legacy float64 rows remain untouched (proving optimize_and_shrink didn't transcode them).
+            self.assertEqual(
+                3,
+                service.store._conn.execute(
+                    "SELECT COUNT(*) FROM memory_embeddings WHERE length(vector)=?", (dim * 8,)
+                ).fetchone()[0],
+            )
+        finally:
+            service.close()
+
+    async def test_concurrent_initialize_database_single_flight_capture_runtime(self) -> None:
+        from astrbot_plugin_memory_companion.core import capture_runtime as cr_mod
+
+        service = MemoryCompanionService(
+            context=SimpleNamespace(),
+            config={},
+            plugin_root=ROOT,
+            data_dir=self.tmp_dir,
+            defer_database_initialization=True,
+        )
+        orig_init = cr_mod.CaptureRuntime.__init__
+        init_count = 0
+        init_lock = threading.Lock()
+
+        def _slow_capture_init(cap_self, svc):
+            nonlocal init_count
+            with init_lock:
+                init_count += 1
+            time.sleep(0.05)
+            orig_init(cap_self, svc)
+
+        try:
+            with patch.object(cr_mod.CaptureRuntime, "__init__", _slow_capture_init):
+                results = await asyncio.gather(*(service.initialize_database() for _ in range(6)))
+            self.assertEqual([True] * 6, results)
+            self.assertEqual(1, init_count)
+            self.assertIsNotNone(service.capture)
+            # Active generation in DB must match service.capture.generation (fence must not raise).
+            service.capture.store.fence(service.capture.generation, lambda: True)
+        finally:
+            service.close()
+
+    async def test_knowledge_revision_invalidates_retrieval_result_cache_without_invalidating_vector_cache(self) -> None:
+        service = MemoryCompanionService(
+            context=SimpleNamespace(),
+            config={
+                "knowledge_graph": {"retrieval_expansion_enabled": True},
+                "retrieval": {"embedding_enabled": True, "embedding_provider_id": "test"},
+            },
+            plugin_root=ROOT,
+            data_dir=self.tmp_dir,
+        )
+        try:
+            rec = _make_record("kg-vec-1", content="京都抹茶甜品店攻略")
+            await service.store.insert_memory(rec)
+            await service.store.upsert_memory_embedding(
+                memory_id=rec.id,
+                provider_id="test",
+                text_hash=memory_embedding_text_hash(rec, max_chars=1200),
+                vector=[1.0, 0.0, 0.0, 0.0],
+            )
+            ctx = SessionContext(
+                scope="group",
+                platform="qq",
+                user_id="u1",
+                group_id="g1",
+                bot_id="b1",
+                persona_id="p1",
+                session_id="qq:GroupMessage:g1",
+            )
+            provider = SimpleNamespace(get_embedding=AsyncMock(return_value=[1.0, 0.0, 0.0, 0.0]))
+            engine = RetrievalEngine(
+                service.store,
+                VisibilityPolicy(),
+                embedding_enabled=True,
+                embedding_provider=provider,
+                embedding_provider_id="test",
+                embedding_top_k=4,
+                embedding_score_threshold=-1.0,
+                knowledge_graph_enabled=True,
+            )
+            _m1, _s1, info1 = await engine._embedding_candidate_memories("甜品", ctx, include_pending=False)
+            self.assertFalse(info1["embedding_cache_hit"])
+
+            key_kg_on_before = await service._retrieval_cache_key("search", "甜品", ctx, 6)
+            service.config.raw["knowledge_graph"]["retrieval_expansion_enabled"] = False
+            key_kg_off_before = await service._retrieval_cache_key("search", "甜品", ctx, 6)
+            service.config.raw["knowledge_graph"]["retrieval_expansion_enabled"] = True
+
+            # Write to knowledge graph -> invalidates retrieval result cache when KG is on, NOT vector cache!
+            await service.store.upsert_knowledge_node(node_type="topic", label="宇治抹茶")
+
+            key_kg_on_after = await service._retrieval_cache_key("search", "甜品", ctx, 6)
+            service.config.raw["knowledge_graph"]["retrieval_expansion_enabled"] = False
+            key_kg_off_after = await service._retrieval_cache_key("search", "甜品", ctx, 6)
+
+            self.assertNotEqual(key_kg_on_before, key_kg_on_after)
+            self.assertEqual(key_kg_off_before, key_kg_off_after)
+
+            _m2, _s2, info2 = await engine._embedding_candidate_memories("甜品", ctx, include_pending=False)
+            self.assertTrue(info2["embedding_cache_hit"])
+            self.assertEqual(0, info2["embedding_scanned_rows"])
+        finally:
+            service.close()
+
+    async def test_db_optimize_precision_override_does_not_mutate_store_precision_and_reports_notice(self) -> None:
+        dim = 16
+        service = MemoryCompanionService(
+            context=SimpleNamespace(),
+            config={"retrieval_advanced": {"vector_precision": "float32"}},
+            plugin_root=ROOT,
+            data_dir=self.tmp_dir,
+        )
+        try:
+            rec = _make_record("ov-1", content="精度覆写边界测试")
+            service.store._insert_memory_sync(rec)
+            now = datetime.now(timezone.utc).isoformat()
+            with service.store._lock, service.store._conn:
+                service.store._conn.execute(
+                    """INSERT INTO memory_embeddings(
+                           memory_id, provider_id, text_hash, dimension, vector, created_at, updated_at
+                       ) VALUES (?, 'test', ?, ?, ?, ?, ?)""",
+                    (
+                        rec.id,
+                        memory_embedding_text_hash(rec, max_chars=1200),
+                        dim,
+                        struct.pack(f"<{dim}d", *([0.5] * dim)),
+                        now,
+                        now,
+                    ),
+                )
+            self.assertEqual("float32", service.store.vector_storage_precision)
+
+            result = await service.optimize_and_shrink_database(
+                target_precision="float16",
+                transcode_limit=10,
+                run_full_vacuum=False,
+            )
+            self.assertEqual("float32", service.store.vector_storage_precision)
+            self.assertEqual("float16", result["target_precision"])
+            self.assertEqual("float32", result["configured_vector_precision"])
+            self.assertTrue(result["precision_override_temporary"])
+            self.assertIn("float16", result["notice"])
+            self.assertIn("float32", result["notice"])
+            self.assertEqual("float32", result["health"]["primary"]["vector_precision"])
+            self.assertEqual(1, result["primary"]["transcode"]["transcoded"])
+            blob_len = service.store._conn.execute(
+                "SELECT length(vector) FROM memory_embeddings WHERE memory_id='ov-1'"
+            ).fetchone()[0]
+            self.assertEqual(dim * 2, blob_len)
+        finally:
+            service.close()
+
+    async def test_full_vacuum_checks_rowid_bounds_and_rebuilds_fts_if_shifted(self) -> None:
+        store = MemoryStore(self.tmp_dir / "vacuum_fts.db")
+        store.initialize()
+        try:
+            rec = _make_record("vac-1", content="海风与咖啡香的下午")
+            await store.insert_memory(rec)
+            await store.add_timeline_event(
+                event_type="user_message",
+                session_id="qq:GroupMessage:g1",
+                scope="group",
+                subject_id="u1",
+                object_id="g1",
+                content="下午茶讨论海风咖啡馆",
+                metadata={"owner_bot_id": "b1"},
+            )
+            # Normal VACUUM when implicit rowids don't shift: fts_rebuilt is empty and FTS still works.
+            res_normal = await store.optimize_and_shrink(transcode_limit=0, run_full_vacuum=True)
+            self.assertEqual("full_vacuum_incremental_enabled", res_normal["vacuum_mode"])
+            self.assertEqual([], res_normal["fts_rebuilt"])
+            conn, lock = store._read_connection_for_bundle()
+            with lock:
+                self.assertEqual(["vac-1"], [r["id"] for r in store._fts_candidate_rows(conn, ["咖啡香"], 10, False)])
+
+            # Simulate a SQLite build where VACUUM shifts implicit rowids -> both FTS tables rebuild automatically.
+            orig_bounds = store._table_rowid_bounds_sync
+            call_counts: dict[str, int] = {}
+
+            def _shifted_bounds(table: str):
+                call_counts[table] = call_counts.get(table, 0) + 1
+                cnt, lo, hi = orig_bounds(table)
+                if call_counts[table] >= 2 and lo is not None and hi is not None:
+                    return (cnt, lo + 100, hi + 100)
+                return (cnt, lo, hi)
+
+            with patch.object(store, "_table_rowid_bounds_sync", side_effect=_shifted_bounds):
+                res_shifted = await store.optimize_and_shrink(transcode_limit=0, run_full_vacuum=True)
+            self.assertIn("memory_fts", res_shifted["fts_rebuilt"])
+            if store._source_fts_enabled:
+                self.assertIn("timeline_source_fts", res_shifted["fts_rebuilt"])
+            with lock:
+                self.assertEqual(["vac-1"], [r["id"] for r in store._fts_candidate_rows(conn, ["咖啡香"], 10, False)])
+        finally:
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

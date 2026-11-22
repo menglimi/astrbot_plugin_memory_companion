@@ -619,6 +619,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         self._database_init_lock = threading.Lock()
         self._database_initialized = False
         self._database_init_task: asyncio.Task[bool] | None = None
+        self._capture_init_task: asyncio.Task[Any] | None = None
         if not defer_database_initialization:
             try:
                 self._initialize_database_sync()
@@ -4525,6 +4526,17 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             revision = ""
         if not revision:
             return ""
+        knowledge_graph_enabled = self.config.bool(
+            "knowledge_graph.retrieval_expansion_enabled", True
+        )
+        knowledge_revision = ""
+        if knowledge_graph_enabled:
+            kg_rev_fn = getattr(self.store, "knowledge_revision", None)
+            if callable(kg_rev_fn):
+                try:
+                    knowledge_revision = await kg_rev_fn()
+                except Exception:
+                    knowledge_revision = ""
         time_payload = {}
         if time_intent is not None:
             time_payload = {
@@ -4561,7 +4573,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             "keyword_fallback_min_fts_candidates": self.config.int(
                 "retrieval.keyword_fallback_min_fts_candidates", 80
             ),
-            "knowledge_graph_enabled": self.config.bool("knowledge_graph.retrieval_expansion_enabled", True),
+            "knowledge_graph_enabled": knowledge_graph_enabled,
             "knowledge_graph_expansion_limit": self.config.int("knowledge_graph.expansion_limit", 12),
             "context_orchestration_enabled": self.config.bool("context_orchestration.enabled", True),
             "allow_self_timeline_everywhere": self.config.bool(
@@ -4597,6 +4609,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             "capped_slots": sorted(clean_text(slot, 60) for slot in (capped_slots or set()) if clean_text(slot, 60)),
             "config": config_payload,
             "revision": revision,
+            "knowledge_revision": knowledge_revision,
         }
         raw = json_dumps(payload)
         return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
@@ -10962,10 +10975,9 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         run_full_vacuum: bool = False,
     ) -> dict[str, Any]:
         """One-click database slimming: precision transcode, orphan cleanup, vacuum, PRAGMA optimize."""
-        precision = normalize_vector_precision(
-            target_precision or self._configured_vector_precision()
-        )
-        self.store.vector_storage_precision = precision
+        configured_precision = self._sync_store_vector_precision()
+        precision = normalize_vector_precision(target_precision or configured_precision)
+        override_temporary = precision != configured_precision
         primary_result = await self.store.optimize_and_shrink(
             target_precision=precision,
             transcode_limit=max(0, int(transcode_limit)),
@@ -10997,9 +11009,18 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             if token_pruned > 0:
                 self._save_token_usage(force=True)
         health = await self.database_health_snapshot()
+        notice = (
+            f"本次仅按 {precision} 执行一次性转码；当前配置的向量存储精度仍为 {configured_precision}，"
+            f"如需长期保持 {precision}，请在「检索进阶 → 向量存储精度」保存配置。"
+            if override_temporary
+            else ""
+        )
         return {
             "ok": True,
             "target_precision": precision,
+            "configured_vector_precision": configured_precision,
+            "precision_override_temporary": override_temporary,
+            "notice": notice,
             "primary": primary_result,
             "scoped_prune": scoped_prune,
             "capture_prune": capture_prune,
@@ -16615,6 +16636,18 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             self._database_initialized = True
             return True
 
+    def _initialize_capture_runtime_sync(self) -> Any:
+        with self._database_init_lock:
+            if getattr(self, "_closing", False) or getattr(self, "_closed", False):
+                return None
+            if self.capture is not None:
+                return self.capture
+            from .capture_runtime import CaptureRuntime
+
+            runtime = CaptureRuntime(self)
+            self.capture = runtime
+            return runtime
+
     async def initialize_database(self) -> bool:
         """Initialize or upgrade databases without blocking AstrBot's loop."""
         if self._closing or self._closed:
@@ -16632,8 +16665,14 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         if self._closing or self._closed:
             return False
         if self.capture is None:
-            from .capture_runtime import CaptureRuntime
-
-            self.capture = await asyncio.to_thread(CaptureRuntime, self)
+            capture_task = getattr(self, "_capture_init_task", None)
+            if capture_task is None or capture_task.done():
+                capture_task = asyncio.create_task(
+                    asyncio.to_thread(self._initialize_capture_runtime_sync)
+                )
+                self._capture_init_task = capture_task
+            await asyncio.shield(capture_task)
+        if self._closing or self._closed:
+            return False
         self._ensure_summary_recovery_dispatcher()
         return True

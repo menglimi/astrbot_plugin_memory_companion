@@ -17176,10 +17176,15 @@ class MemoryStore(SummaryBatchStore):
         *,
         target_precision: str = "",
         batch_size: int = 400,
-        max_rows: int = 0,
+        max_rows: int | None = None,
         purge_archived_orphans: bool = True,
     ) -> dict[str, Any]:
-        """Smoothly transcode legacy float64/JSON embeddings to the configured precision."""
+        """Smoothly transcode legacy float64/JSON embeddings to the configured precision.
+
+        ``max_rows=None`` or ``max_rows < 0`` processes all mismatched rows;
+        ``max_rows == 0`` skips transcoding (while still honoring ``purge_archived_orphans``);
+        ``max_rows > 0`` caps the number of transcoded rows.
+        """
         return await asyncio.to_thread(
             self._transcode_memory_embeddings_sync,
             target_precision,
@@ -17192,7 +17197,7 @@ class MemoryStore(SummaryBatchStore):
         self,
         target_precision: str = "",
         batch_size: int = 400,
-        max_rows: int = 0,
+        max_rows: int | None = None,
         purge_archived_orphans: bool = True,
     ) -> dict[str, Any]:
         precision = normalize_vector_precision(
@@ -17200,7 +17205,13 @@ class MemoryStore(SummaryBatchStore):
         )
         target_elem_bytes = vector_precision_element_bytes(precision)
         safe_batch = max(16, min(2000, int(batch_size or 400)))
-        limit_rows = max(0, int(max_rows or 0))
+        if max_rows is None:
+            unlimited = True
+            limit_rows = 0
+        else:
+            parsed_limit = int(max_rows)
+            unlimited = parsed_limit < 0
+            limit_rows = max(0, parsed_limit)
         purged_orphans = 0
         if purge_archived_orphans:
             with self._lock, self._transaction_sync():
@@ -17218,8 +17229,10 @@ class MemoryStore(SummaryBatchStore):
         bytes_after = 0
         skipped_invalid = 0
         last_rowid = 0
-        while limit_rows == 0 or transcoded < limit_rows:
-            take = safe_batch if limit_rows == 0 else min(safe_batch, limit_rows - transcoded)
+        while unlimited or transcoded < limit_rows:
+            take = safe_batch if unlimited else min(safe_batch, limit_rows - transcoded)
+            if take <= 0:
+                break
             with self._read_conn_sync() as conn:
                 rows = conn.execute(
                     """
@@ -17367,11 +17380,16 @@ class MemoryStore(SummaryBatchStore):
         self,
         *,
         target_precision: str = "",
-        transcode_limit: int = 0,
+        transcode_limit: int | None = 20000,
         vacuum_pages: int = 2000,
         run_full_vacuum: bool = False,
     ) -> dict[str, Any]:
-        """Run embedding precision transcode + incremental/full vacuum + PRAGMA optimize."""
+        """Run embedding precision transcode + incremental/full vacuum + PRAGMA optimize.
+
+        ``transcode_limit == 0`` skips embedding transcoding cleanly;
+        ``transcode_limit is None`` or ``< 0`` transcodes all mismatched rows;
+        ``transcode_limit > 0`` caps transcoded rows to that limit.
+        """
         return await asyncio.to_thread(
             self._optimize_and_shrink_sync,
             target_precision,
@@ -17380,22 +17398,46 @@ class MemoryStore(SummaryBatchStore):
             run_full_vacuum,
         )
 
+    def _table_rowid_bounds_sync(self, table: str) -> tuple[int, int | None, int | None]:
+        row = self._conn.execute(
+            f"SELECT COUNT(*), MIN(rowid), MAX(rowid) FROM {table}"
+        ).fetchone()
+        if row is None:
+            return (0, None, None)
+        return (int(row[0] or 0), row[1], row[2])
+
     def _optimize_and_shrink_sync(
         self,
         target_precision: str = "",
-        transcode_limit: int = 0,
+        transcode_limit: int | None = 20000,
         vacuum_pages: int = 2000,
         run_full_vacuum: bool = False,
     ) -> dict[str, Any]:
+        precision = normalize_vector_precision(
+            target_precision or getattr(self, "vector_storage_precision", DEFAULT_VECTOR_PRECISION)
+        )
         before = self._database_file_snapshot()
         before_total = int(before.get("db_bytes", 0)) + int(before.get("wal_bytes", 0)) + int(before.get("shm_bytes", 0))
-        transcode = self._transcode_memory_embeddings_sync(
-            target_precision=target_precision,
-            batch_size=500,
-            max_rows=transcode_limit,
-            purge_archived_orphans=True,
-        )
+        if transcode_limit is not None and int(transcode_limit) == 0:
+            transcode = {
+                "skipped": True,
+                "target_precision": precision,
+                "transcoded": 0,
+                "purged_orphans": 0,
+                "skipped_invalid": 0,
+                "bytes_before": 0,
+                "bytes_after": 0,
+                "bytes_saved": 0,
+            }
+        else:
+            transcode = self._transcode_memory_embeddings_sync(
+                target_precision=precision,
+                batch_size=500,
+                max_rows=transcode_limit,
+                purge_archived_orphans=True,
+            )
         vacuum_mode = "none"
+        fts_rebuilt: list[str] = []
         with self._lock:
             try:
                 self._conn.execute("PRAGMA optimize")
@@ -17406,6 +17448,16 @@ class MemoryStore(SummaryBatchStore):
             except sqlite3.OperationalError:
                 auto_vacuum = 0
             if run_full_vacuum:
+                mem_bounds_before: tuple[int, int | None, int | None] | None = None
+                tl_bounds_before: tuple[int, int | None, int | None] | None = None
+                try:
+                    if self._fts_enabled and self._fts_uses_rowid:
+                        mem_bounds_before = self._table_rowid_bounds_sync("memories")
+                    if self._source_fts_enabled:
+                        tl_bounds_before = self._table_rowid_bounds_sync("timeline")
+                except sqlite3.OperationalError:
+                    mem_bounds_before = None
+                    tl_bounds_before = None
                 try:
                     if auto_vacuum != 2:
                         self._conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
@@ -17413,6 +17465,27 @@ class MemoryStore(SummaryBatchStore):
                     vacuum_mode = "full_vacuum_incremental_enabled"
                 except sqlite3.OperationalError as exc:
                     vacuum_mode = f"full_vacuum_skipped:{clean_text(exc, 80)}"
+                else:
+                    # Guard implicit rowid-keyed FTS5 tables in case a SQLite build
+                    # compacts implicit rowids during VACUUM.
+                    if mem_bounds_before is not None:
+                        try:
+                            if self._table_rowid_bounds_sync("memories") != mem_bounds_before:
+                                self._rebuild_memory_fts_sync()
+                                self._conn.commit()
+                                fts_rebuilt.append("memory_fts")
+                        except sqlite3.OperationalError:
+                            pass
+                    if tl_bounds_before is not None:
+                        try:
+                            if self._table_rowid_bounds_sync("timeline") != tl_bounds_before:
+                                with self._transaction_sync():
+                                    self._conn.execute(
+                                        "INSERT INTO timeline_source_fts(timeline_source_fts) VALUES('rebuild')"
+                                    )
+                                fts_rebuilt.append("timeline_source_fts")
+                        except sqlite3.OperationalError:
+                            pass
             elif auto_vacuum == 2 and vacuum_pages > 0:
                 try:
                     self._conn.execute(f"PRAGMA incremental_vacuum({max(1, int(vacuum_pages))})")
@@ -17429,6 +17502,7 @@ class MemoryStore(SummaryBatchStore):
             "ok": True,
             "transcode": transcode,
             "vacuum_mode": vacuum_mode,
+            "fts_rebuilt": fts_rebuilt,
             "before_bytes": before_total,
             "after_bytes": after_total,
             "bytes_reclaimed": max(0, before_total - after_total),
