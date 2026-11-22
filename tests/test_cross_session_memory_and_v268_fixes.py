@@ -1294,6 +1294,335 @@ class CrossSessionMemoryAndV268FixesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("中午要辗转百来公里", src["sources"][0]["excerpt"])
         self.assertNotIn("秘密爬山", json.dumps(src, ensure_ascii=False))
 
+    async def test_topology_disabled_blocks_private_group_read_even_with_allow_group_public(self) -> None:
+        service = self.make_service(
+            {
+                "visibility": {
+                    "allow_group_public_in_private": True,
+                    "enable_acl_rules": True,
+                },
+                "scope_control": {
+                    "private_topology_enabled": False,
+                    "group_topology_enabled": True,
+                },
+            }
+        )
+        await service.store.upsert_acl_rule(
+            owner_scope="group",
+            owner_id="g_allow",
+            reader_scope="private",
+            reader_id="u_alice",
+            effect="allow",
+        )
+        await service.store.add_timeline_event(
+            event_type="user_message",
+            session_id="onebot_qq:GroupMessage:g_allow",
+            scope="group",
+            subject_id="u_alice",
+            object_id="g_allow",
+            content="拓扑关闭时绝不可跨窗读取的百来公里安排",
+            metadata=self._meta(bot_id="b_main", user_id="u_alice", sender_name="小思"),
+            occurred_at="2026-11-22T10:53:36+08:00",
+        )
+        private_ctx = SessionContext(
+            session_id="onebot_qq:FriendMessage:u_alice",
+            scope="private",
+            platform="onebot_qq",
+            user_id="u_alice",
+            user_name="小思",
+            bot_id="b_main",
+            persona_id="persona-main",
+            message_id="topo-turn-1",
+            message_text="今天中午有什么安排？",
+        )
+        day_intent = TimeIntent(
+            active=True,
+            label="今天",
+            source="test",
+            start_at="2026-11-22T00:00:00+08:00",
+            end_at="2026-11-23T00:00:00+08:00",
+            display_start="2026-11-22",
+            display_end="2026-11-22",
+        )
+        service.identity.resolve_event_context = AsyncMock(return_value=private_ctx)
+
+        # private_topology_enabled=False blocks both timeline slot and sources.
+        policy_priv_off = await service._authorized_private_group_read_policy(private_ctx)
+        self.assertFalse(policy_priv_off["enabled"])
+        slots_priv_off: dict = {}
+        await service._add_time_window_timeline_slot(private_ctx, slots_priv_off, day_intent)
+        self.assertEqual([], slots_priv_off.get("time_window_timeline", []))
+        res_priv_off = await service.tool_sources(SimpleNamespace(), terms=["百来公里"])
+        SOURCE_RESULT_VALIDATOR.validate(res_priv_off)
+        self.assertEqual([], res_priv_off["sources"])
+
+        # group_topology_enabled=False also blocks both.
+        service.config.raw["scope_control"]["private_topology_enabled"] = True
+        service.config.raw["scope_control"]["group_topology_enabled"] = False
+        private_ctx_2 = replace(private_ctx, message_id="topo-turn-2")
+        service.identity.resolve_event_context = AsyncMock(return_value=private_ctx_2)
+        policy_grp_off = await service._authorized_private_group_read_policy(private_ctx_2)
+        self.assertFalse(policy_grp_off["enabled"])
+        res_grp_off = await service.tool_sources(SimpleNamespace(), terms=["百来公里"])
+        SOURCE_RESULT_VALIDATOR.validate(res_grp_off)
+        self.assertEqual([], res_grp_off["sources"])
+
+    async def test_authorized_group_timeline_isolates_persona_and_legacy_owner_bot_id(self) -> None:
+        service = self.make_service(
+            {
+                "visibility": {
+                    "allow_group_public_in_private": True,
+                    "enable_acl_rules": True,
+                }
+            }
+        )
+        # Same user, same bot, same group, different personas + legacy other-bot row with empty bot_id column.
+        await service.store.add_timeline_event(
+            event_type="user_message",
+            session_id="onebot_qq:GroupMessage:g_iso",
+            scope="group",
+            subject_id="u_alice",
+            object_id="g_iso",
+            content="人格A可见的今日计划",
+            metadata=self._meta(bot_id="b_main", user_id="u_alice", persona_id="persona-A", sender_name="小思"),
+            occurred_at="2026-11-22T10:10:00+08:00",
+        )
+        await service.store.add_timeline_event(
+            event_type="user_message",
+            session_id="onebot_qq:GroupMessage:g_iso",
+            scope="group",
+            subject_id="u_alice",
+            object_id="g_iso",
+            content="人格B专属的机密计划",
+            metadata=self._meta(bot_id="b_main", user_id="u_alice", persona_id="persona-B", sender_name="小思"),
+            occurred_at="2026-11-22T10:20:00+08:00",
+        )
+        await service.store.add_timeline_event(
+            event_type="user_message",
+            session_id="onebot_qq:GroupMessage:g_iso",
+            scope="group",
+            subject_id="u_alice",
+            object_id="g_iso",
+            content="旧版无人格历史计划",
+            metadata=self._meta(bot_id="b_main", user_id="u_alice", persona_id="", sender_name="小思"),
+            occurred_at="2026-11-22T10:25:00+08:00",
+        )
+        foreign_id = await service.store.add_timeline_event(
+            event_type="user_message",
+            session_id="onebot_qq:GroupMessage:g_iso",
+            scope="group",
+            subject_id="u_alice",
+            object_id="g_iso",
+            content="他Bot历史行里的计划",
+            metadata=self._meta(bot_id="b_other", user_id="u_alice", persona_id="persona-A", sender_name="小思"),
+            occurred_at="2026-11-22T10:30:00+08:00",
+        )
+        # Simulate a legacy row whose timeline.bot_id column is empty while metadata.owner_bot_id names b_other.
+        with service.store._lock, service.store._transaction_sync():
+            service.store._conn.execute("UPDATE timeline SET bot_id='' WHERE id=?", (foreign_id,))
+
+        ctx_a = SessionContext(
+            session_id="onebot_qq:FriendMessage:u_alice",
+            scope="private",
+            platform="onebot_qq",
+            user_id="u_alice",
+            user_name="小思",
+            bot_id="b_main",
+            persona_id="persona-A",
+            message_id="iso-turn-1",
+            message_text="今天计划是什么？",
+        )
+        day_intent = TimeIntent(
+            active=True,
+            label="今天",
+            source="test",
+            start_at="2026-11-22T00:00:00+08:00",
+            end_at="2026-11-23T00:00:00+08:00",
+            display_start="2026-11-22",
+            display_end="2026-11-22",
+        )
+        slots: dict = {}
+        await service._add_time_window_timeline_slot(ctx_a, slots, day_intent)
+        joined = "\n".join(item.memory.content for item in slots.get("time_window_timeline", []))
+        self.assertIn("人格A可见的今日计划", joined)
+        self.assertIn("旧版无人格历史计划", joined)
+        self.assertNotIn("人格B专属的机密计划", joined)
+        self.assertNotIn("他Bot历史行里的计划", joined)
+
+    async def test_style_repair_returning_no_memory_falls_back_to_first_valid_summary(self) -> None:
+        service = self.make_service()
+        ctx = SessionContext(
+            session_id="onebot_qq:GroupMessage:g_nomem",
+            scope="group",
+            platform="onebot_qq",
+            user_id="u_alice",
+            user_name="小思",
+            group_id="g_nomem",
+            bot_id="b_main",
+            persona_id="persona-main",
+        )
+        ev_id = await service.store.add_timeline_event(
+            event_type="user_message",
+            session_id=ctx.session_id,
+            scope="group",
+            subject_id=ctx.user_id,
+            object_id=ctx.group_id,
+            content="中午要辗转百来公里，晚上还有个饭局",
+            metadata=self._meta(bot_id="b_main", user_id="u_alice", sender_name="小思"),
+            occurred_at="2026-11-22T10:53:36+08:00",
+        )
+        provider = _QueuedProvider(
+            [
+                {
+                    "outcome": "memory",
+                    "summary": "某人说中午要辗转百来公里，晚上还有个饭局。",
+                    "summary_refs": [ev_id],
+                    "key_facts": [],
+                },
+                {
+                    "outcome": "no_memory",
+                    "no_memory_reason": "复修误判为无需记录",
+                    "summary_refs": [ev_id],
+                    "key_facts": [],
+                },
+            ]
+        )
+
+        async def attempts(_ctx):
+            return [{"provider": provider, "provider_id": "test", "source": "primary"}]
+
+        service._summary_provider_attempts = attempts
+        memory_id = await service.maybe_summarize_session(ctx)
+        self.assertTrue(memory_id)
+        self.assertEqual(2, len(provider.calls))
+        record = await service.store.get_memory(memory_id)
+        self.assertIsNotNone(record)
+        self.assertEqual("auto", record.review_status)
+        self.assertEqual("stable_memory", record.lifecycle)
+        self.assertIn("百来公里", record.content)
+
+    async def test_reverse_order_dedupe_backfills_sender_name_and_case_insensitive_platform(self) -> None:
+        service = self.make_service()
+        # Reverse order: source-capture.v1 commits first (no sender_name), then observer runs.
+        ctx_rev = SessionContext(
+            session_id="onebot_qq:GroupMessage:g_rev",
+            scope="group",
+            platform="onebot_qq",
+            user_id="u_alice",
+            user_name="小思",
+            group_id="g_rev",
+            group_name="测试交流群",
+            bot_id="b_main",
+            persona_id="persona-main",
+            message_id="msg_rev_1",
+            message_text="反向顺序测试：今晚聚餐",
+        )
+        ev_rev = SimpleNamespace(
+            get_self_id=lambda: "b_main",
+            get_messages=lambda: [Plain(ctx_rev.message_text)],
+            message_obj=SimpleNamespace(
+                message_id="msg_rev_1",
+                message=[Plain(ctx_rev.message_text)],
+                timestamp=1795316016,
+            ),
+            message_str=ctx_rev.message_text,
+        )
+        service.identity.resolve_event_context = AsyncMock(return_value=ctx_rev)
+        service.identity.resolve_persona_id = AsyncMock(return_value="persona-main")
+        service._schedule_session_summary = lambda *args, **kwargs: None
+
+        receipt = await service.capture.incoming(ev_rev, ctx_rev)
+        self.assertEqual("committed", receipt["status"])
+        await service.handle_group_message(ev_rev)
+
+        rows = service.store._conn.execute(
+            "SELECT id, metadata FROM timeline WHERE session_id=? AND message_id=?",
+            (ctx_rev.session_id, "msg_rev_1"),
+        ).fetchall()
+        self.assertEqual(1, len(rows))
+        meta = json.loads(rows[0]["metadata"])
+        self.assertEqual("memory.source-capture.v1", meta["capture_profile"])
+        self.assertEqual("小思", meta["sender_name"])
+        self.assertEqual("小思", meta["participant_user_name"])
+
+        # Forward order with mixed-case platform ("OneBot_QQ" vs "onebot_qq") still consolidates into 1 row.
+        await service.store.add_timeline_event(
+            event_type="user_message",
+            session_id="onebot_qq:GroupMessage:g_rev",
+            scope="group",
+            subject_id="u_alice",
+            object_id="g_rev",
+            content="平台大小写测试",
+            metadata={
+                "owner_bot_id": "b_main",
+                "platform": "OneBot_QQ",
+                "persona_id": "persona-main",
+                "message_id": "msg_case_1",
+                "sender_name": "小思",
+            },
+        )
+        ctx_case = replace(ctx_rev, message_id="msg_case_1", message_text="平台大小写测试")
+        ev_case = SimpleNamespace(
+            message_obj=SimpleNamespace(
+                message_id="msg_case_1",
+                message=[Plain("平台大小写测试")],
+                timestamp=1795316100,
+            ),
+            message_str="平台大小写测试",
+        )
+        receipt_case = await service.capture.incoming(ev_case, ctx_case)
+        self.assertEqual("committed", receipt_case["status"])
+        case_count = service.store._conn.execute(
+            "SELECT COUNT(*) FROM timeline WHERE session_id=? AND message_id=?",
+            (ctx_rev.session_id, "msg_case_1"),
+        ).fetchone()[0]
+        self.assertEqual(1, case_count)
+
+    async def test_excluded_group_flood_does_not_starve_normal_group_cross_window(self) -> None:
+        service = self.make_service(
+            {
+                "conversation_memory_advanced": {
+                    "cross_window_group_to_group_enabled": True,
+                    "cross_window_excluded_groups": "g_black",
+                }
+            }
+        )
+        now = datetime.now(timezone.utc)
+        await service.store.add_timeline_event(
+            event_type="user_message",
+            session_id="onebot_qq:GroupMessage:g_normal",
+            scope="group",
+            subject_id="u1",
+            object_id="g_normal",
+            content="正常群里的关键跨群话题：明天发布新版本。",
+            metadata=self._meta(bot_id="b1", user_id="u1"),
+            occurred_at=(now - timedelta(minutes=15)).isoformat(timespec="seconds"),
+        )
+        # Flood 60 newer messages from the SAME user inside the blacklisted group (> LIMIT 48).
+        for i in range(60):
+            await service.store.add_timeline_event(
+                event_type="user_message",
+                session_id="onebot_qq:GroupMessage:g_black",
+                scope="group",
+                subject_id="u1",
+                object_id="g_black",
+                content=f"黑名单群刷屏消息 {i}",
+                metadata=self._meta(bot_id="b1", user_id="u1"),
+                occurred_at=(now - timedelta(seconds=300 - i)).isoformat(timespec="seconds"),
+            )
+        ctx = SessionContext(
+            session_id="onebot_qq:GroupMessage:g_dest",
+            scope="group",
+            platform="onebot_qq",
+            user_id="u1",
+            group_id="g_dest",
+            bot_id="b1",
+            message_text="继续说",
+        )
+        context = await service._recent_cross_window_context(ctx)
+        self.assertIn("明天发布新版本", context)
+        self.assertNotIn("黑名单群刷屏消息", context)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -309,7 +309,7 @@ class SourceCapture:
                      AND object_id=?
                      AND message_id=?
                      AND (bot_id='' OR bot_id=?)
-                     AND COALESCE(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.platform') ELSE '' END, '') IN ('', ?)
+                     AND LOWER(COALESCE(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.platform') ELSE '' END, '')) IN ('', LOWER(?))
                      AND COALESCE(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.persona_id') ELSE '' END, '') IN ('', 'legacy', ?)
                      AND id NOT IN (SELECT timeline_id FROM capture_sources)
                    ORDER BY created_at ASC, id ASC

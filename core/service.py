@@ -1820,7 +1820,16 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         record = self.classifier.from_user_message(ctx)
         if not record:
             return
-        if await self._timeline_already_has_message(ctx, "user_message"):
+        existing_id = await self._existing_timeline_message_id(ctx, "user_message")
+        if existing_id:
+            await self.store.backfill_timeline_display_metadata(
+                existing_id,
+                {
+                    "sender_name": ctx.user_name,
+                    **self._cross_window_event_metadata(ctx),
+                    **self._reply_chain_metadata(reply_chain),
+                },
+            )
             return
         event_metadata = await self._conversation_memory_metadata(ctx, source="group_conversation_observer")
         event_metadata.update(
@@ -7355,16 +7364,22 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                         content = self.summarizer.compose_memory_content(payload or {})
                         used_summary = attempt
                         if not errors:
-                            if (
-                                best_valid_payload is not None
-                                and self.summarizer.summary_quality(payload or {}) == "low"
+                            quality_now = self.summarizer.summary_quality(payload or {})
+                            if best_valid_payload is not None and (
+                                not content or quality_now != "normal"
                             ):
                                 payload = best_valid_payload
                                 used_summary = best_valid_attempt
                                 content = self.summarizer.compose_memory_content(payload)
                                 break
                             style_repair = self.summarizer.repairable_style_warnings(payload or {})
-                            if style_repair and not style_repair_attempted and round_calls < max_calls:
+                            if (
+                                style_repair
+                                and not style_repair_attempted
+                                and round_calls < max_calls
+                                and content
+                                and quality_now == "normal"
+                            ):
                                 best_valid_payload = payload
                                 best_valid_attempt = attempt
                                 style_repair_attempted = True
@@ -12971,11 +12986,12 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         allow_all = self.config.bool("visibility.allow_group_public_in_private", False)
         denied: set[str] = set(excluded)
         allowed: set[str] = set()
-        if (
-            self.config.bool("visibility.enable_acl_rules", True)
-            and self.config.bool("scope_control.private_topology_enabled", True)
-            and self.config.bool("scope_control.group_topology_enabled", True)
-        ):
+        if self.config.bool("visibility.enable_acl_rules", True):
+            if (
+                not self.config.bool("scope_control.private_topology_enabled", True)
+                or not self.config.bool("scope_control.group_topology_enabled", True)
+            ):
+                return empty
             rules = await self.store.list_acl_rules(
                 owner_scope="group",
                 reader_scope="private",
@@ -13043,6 +13059,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 bot_id=ctx.bot_id,
                 subject_id=current_user_id,
                 include_bot_responses=include_bot_responses,
+                excluded_group_ids=tuple(excluded_groups) if source_scope == "group" else (),
             )
             if not rows:
                 continue
@@ -15677,11 +15694,14 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                     limit=limit,
                     bot_id=ctx.bot_id,
                     platform=ctx.platform,
+                    persona_id=ctx.persona_id,
                     allow_all_groups=group_policy["allow_all_groups"],
                     allowed_group_ids=tuple(group_policy["allowed_groups"]),
                     denied_group_ids=tuple(group_policy["denied_groups"]),
                 )
                 sender_id = clean_text(ctx.user_id, 120)
+                current_bot_id = clean_text(ctx.bot_id, 120)
+                current_persona_id = clean_text(ctx.persona_id, 96)
                 merged_by_id: dict[str, dict[str, Any]] = {
                     clean_text(row.get("id"), 160): row
                     for row in rows
@@ -15700,6 +15720,17 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                     meta = meta if isinstance(meta, dict) else {}
                     participant_id = clean_text(meta.get("participant_user_id"), 120)
                     if participant_id and participant_id != sender_id:
+                        continue
+                    row_owner_bot = clean_text(meta.get("owner_bot_id"), 120)
+                    if row_owner_bot == "self":
+                        continue
+                    if current_bot_id and row_owner_bot and row_owner_bot != current_bot_id:
+                        continue
+                    row_meta_bot = clean_text(meta.get("bot_id"), 120)
+                    if current_bot_id and row_meta_bot and row_meta_bot != current_bot_id:
+                        continue
+                    row_persona = clean_text(meta.get("persona_id"), 96)
+                    if row_persona not in {"", "legacy", current_persona_id}:
                         continue
                     merged_by_id[row_id] = row
 

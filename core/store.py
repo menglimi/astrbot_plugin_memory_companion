@@ -9801,6 +9801,78 @@ class MemoryStore(SummaryBatchStore):
             occurred_at,
         )
 
+    _TIMELINE_DISPLAY_BACKFILL_KEYS = (
+        "sender_name",
+        "participant_user_id",
+        "participant_user_name",
+        "source_group_id",
+        "source_group_name",
+        "reply_chain",
+    )
+
+    def _backfill_timeline_display_metadata_in_tx(
+        self,
+        row_id: str,
+        raw_existing_meta: Any,
+        incoming_metadata: dict[str, Any],
+    ) -> bool:
+        """Fill missing display metadata on a deduplicated timeline row without touching capture fields."""
+        if not row_id or not isinstance(incoming_metadata, dict):
+            return False
+        existing_meta = (
+            dict(raw_existing_meta)
+            if isinstance(raw_existing_meta, dict)
+            else json_loads(raw_existing_meta, {})
+        )
+        if not isinstance(existing_meta, dict):
+            existing_meta = {}
+        changed = False
+        for key in self._TIMELINE_DISPLAY_BACKFILL_KEYS:
+            incoming_val = incoming_metadata.get(key)
+            if incoming_val in ("", None, [], {}):
+                continue
+            if existing_meta.get(key) in ("", None, [], {}):
+                existing_meta[key] = incoming_val
+                changed = True
+        if not changed:
+            return False
+        self._conn.execute(
+            "UPDATE timeline SET metadata=? WHERE id=?",
+            (json_dumps(redact_sensitive_value(existing_meta)), row_id),
+        )
+        return True
+
+    async def backfill_timeline_display_metadata(
+        self,
+        row_id: str,
+        incoming_metadata: dict[str, Any],
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._guard_operation_sync,
+            self._backfill_timeline_display_metadata_sync,
+            clean_text(row_id, 160),
+            incoming_metadata or {},
+        )
+
+    def _backfill_timeline_display_metadata_sync(
+        self,
+        row_id: str,
+        incoming_metadata: dict[str, Any],
+    ) -> bool:
+        if not row_id or not isinstance(incoming_metadata, dict):
+            return False
+        with self._lock:
+            with self._transaction_sync():
+                row = self._conn.execute(
+                    "SELECT metadata FROM timeline WHERE id=?",
+                    (row_id,),
+                ).fetchone()
+                if not row:
+                    return False
+                return self._backfill_timeline_display_metadata_in_tx(
+                    row_id, row["metadata"], incoming_metadata,
+                )
+
     def _add_timeline_event_sync(
         self,
         event_type: str,
@@ -9822,8 +9894,10 @@ class MemoryStore(SummaryBatchStore):
         event_type = clean_text(event_type, 80)
         session_id = clean_text(session_id, 200)
         subject_id = clean_text(subject_id, 120)
+        object_id_clean = clean_text(object_id, 120)
         message_id = clean_text(metadata.get("message_id"), 120)
         platform_key = clean_text(metadata.get("platform"), 80).lower()
+        persona_key = clean_text(metadata.get("persona_id"), 96)
         dedupe_key = (
             stable_fingerprint("timeline", event_type, platform_key, session_id, subject_id, message_id)
             if message_id
@@ -9833,7 +9907,7 @@ class MemoryStore(SummaryBatchStore):
             with self._transaction_sync():
                 from .message_sources import suppressed
                 if suppressed(self._conn, source_id=row_id, event_type=event_type, scope=clean_text(scope, 40),
-                              session_id=session_id, subject_id=subject_id, object_id=clean_text(object_id, 120),
+                              session_id=session_id, subject_id=subject_id, object_id=object_id_clean,
                               message_id=message_id, metadata=metadata):
                     return ""
                 if message_id:
@@ -9844,6 +9918,9 @@ class MemoryStore(SummaryBatchStore):
                         "message_id=?",
                     ]
                     match_params: list[Any] = [event_type, session_id, subject_id, message_id]
+                    if object_id_clean:
+                        match_clauses.append("object_id=?")
+                        match_params.append(object_id_clean)
                     if owner_bot_id:
                         match_clauses.append("(bot_id='' OR bot_id=?)")
                         match_params.append(owner_bot_id)
@@ -9853,12 +9930,22 @@ class MemoryStore(SummaryBatchStore):
                             "THEN json_extract(metadata, '$.platform') ELSE '' END, '')) IN ('', ?)"
                         )
                         match_params.append(platform_key)
+                    if persona_key and persona_key != "legacy":
+                        match_clauses.append(
+                            "COALESCE(CASE WHEN json_valid(metadata) "
+                            "THEN json_extract(metadata, '$.persona_id') ELSE '' END, '') IN ('', 'legacy', ?)"
+                        )
+                        match_params.append(persona_key)
                     existing_msg = self._conn.execute(
-                        f"SELECT id FROM timeline WHERE {' AND '.join(match_clauses)} LIMIT 1",
+                        f"SELECT id, metadata FROM timeline WHERE {' AND '.join(match_clauses)} LIMIT 1",
                         match_params,
                     ).fetchone()
                     if existing_msg:
-                        return clean_text(existing_msg["id"], 120)
+                        existing_id = clean_text(existing_msg["id"], 120)
+                        self._backfill_timeline_display_metadata_in_tx(
+                            existing_id, existing_msg["metadata"], metadata,
+                        )
+                        return existing_id
                 cur = self._conn.execute(
                     """
                     INSERT OR IGNORE INTO timeline(
@@ -11305,6 +11392,7 @@ class MemoryStore(SummaryBatchStore):
         bot_id: str = "",
         subject_id: str = "",
         include_bot_responses: bool = True,
+        excluded_group_ids: tuple[str, ...] = (),
     ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
             self._recent_cross_window_timeline_sync,
@@ -11315,6 +11403,7 @@ class MemoryStore(SummaryBatchStore):
             bot_id,
             subject_id,
             include_bot_responses,
+            excluded_group_ids,
         )
 
     def _recent_cross_window_timeline_sync(
@@ -11326,6 +11415,7 @@ class MemoryStore(SummaryBatchStore):
         bot_id: str = "",
         subject_id: str = "",
         include_bot_responses: bool = True,
+        excluded_group_ids: tuple[str, ...] = (),
     ) -> list[dict[str, Any]]:
         scope = clean_text(source_scope, 40)
         session_id = clean_text(current_session_id, 200)
@@ -11366,6 +11456,13 @@ class MemoryStore(SummaryBatchStore):
                 params.extend([target_subject, target_subject, target_subject])
         else:
             event_filter = "AND event_type IN ('user_message', 'bot_response')"
+        excluded_clause = ""
+        if scope == "group" and excluded_group_ids:
+            excluded = sorted({clean_text(g, 120) for g in excluded_group_ids if clean_text(g, 120)})
+            if excluded:
+                marks = ",".join("?" for _ in excluded)
+                excluded_clause = f" AND object_id NOT IN ({marks})"
+                params.extend(excluded)
         params.extend(bot_params)
         params.append(max(1, min(240, int(limit or 48))))
         conn, lock = self._timeline_read_connection()
@@ -11376,7 +11473,7 @@ class MemoryStore(SummaryBatchStore):
                 WHERE scope=?
                   AND session_id!=?
                   AND {event_time_sql} >= julianday(?)
-                  {event_filter}{bot_clause}
+                  {event_filter}{excluded_clause}{bot_clause}
                 ORDER BY {event_time_sql} DESC, created_at DESC, id DESC
                 LIMIT ?
                 """,
@@ -11455,6 +11552,7 @@ class MemoryStore(SummaryBatchStore):
         limit: int = 12,
         bot_id: str = "",
         platform: str = "",
+        persona_id: str = "",
         allow_all_groups: bool = False,
         allowed_group_ids: tuple[str, ...] = (),
         denied_group_ids: tuple[str, ...] = (),
@@ -11467,6 +11565,7 @@ class MemoryStore(SummaryBatchStore):
             limit,
             bot_id,
             platform,
+            persona_id,
             allow_all_groups,
             allowed_group_ids,
             denied_group_ids,
@@ -11480,6 +11579,7 @@ class MemoryStore(SummaryBatchStore):
         limit: int,
         bot_id: str = "",
         platform: str = "",
+        persona_id: str = "",
         allow_all_groups: bool = False,
         allowed_group_ids: tuple[str, ...] = (),
         denied_group_ids: tuple[str, ...] = (),
@@ -11497,6 +11597,9 @@ class MemoryStore(SummaryBatchStore):
         meta_expr = "CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END"
         participant_expr = f"COALESCE(json_extract({meta_expr}, '$.participant_user_id'), '')"
         platform_expr = f"LOWER(COALESCE(json_extract({meta_expr}, '$.platform'), ''))"
+        owner_bot_expr = f"COALESCE(json_extract({meta_expr}, '$.owner_bot_id'), '')"
+        meta_bot_expr = f"COALESCE(json_extract({meta_expr}, '$.bot_id'), '')"
+        persona_expr = f"COALESCE(json_extract({meta_expr}, '$.persona_id'), '')"
         clauses = [
             f"{event_time_sql} >= julianday(?)",
             f"{event_time_sql} < julianday(?)",
@@ -11504,6 +11607,7 @@ class MemoryStore(SummaryBatchStore):
             "event_type='user_message'",
             "subject_id=?",
             f"{participant_expr} IN ('', ?)",
+            f"{persona_expr} IN ('', 'legacy', ?)",
             "object_id!=''",
         ]
         params: list[Any] = [
@@ -11511,6 +11615,7 @@ class MemoryStore(SummaryBatchStore):
             clean_text(end_at, 80),
             sender,
             sender,
+            clean_text(persona_id, 96),
         ]
         if allow_all_groups:
             if denied:
@@ -11526,6 +11631,10 @@ class MemoryStore(SummaryBatchStore):
             clauses.append(f"{platform_expr} IN ('', ?)")
             params.append(plat)
         owner_bot = clean_text(bot_id, 120)
+        if owner_bot:
+            clauses.append(f"{owner_bot_expr} IN ('', ?)")
+            clauses.append(f"{meta_bot_expr} IN ('', ?)")
+            params.extend([owner_bot, owner_bot])
         bot_clause, bot_params = self._bot_scope_clause("bot_id", owner_bot)
         where = " AND ".join(clauses) + bot_clause
         params.extend(bot_params)
