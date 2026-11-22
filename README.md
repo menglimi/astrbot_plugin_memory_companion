@@ -8,7 +8,7 @@
 
 - 插件名：`astrbot_plugin_memory_companion`
 - 中文名：`我会牢牢记住你`
-- 版本：`2.6.7`
+- 版本：`2.6.8`
 - 适配平台：`aiocqhttp`
 - AstrBot 版本：`>=4.27,<5`
 - 编码要求：UTF-8

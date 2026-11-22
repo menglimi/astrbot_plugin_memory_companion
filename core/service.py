@@ -12816,13 +12816,18 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 return ""
             source_scope = "group"
             direction = "近期群聊到当前私聊"
+        elif ctx.scope == "group":
+            if (self._context_bool(ctx, "cross_window_private_to_group_enabled", True)
+                    and self._message_explicitly_shares_private_context(ctx.message_text)):
+                source_scope = "private"
+                direction = "经当前用户本轮明确授权，从近期私聊到当前群聊"
+            elif self._context_bool(ctx, "cross_window_group_to_group_enabled", True):
+                source_scope = "group"
+                direction = "同一用户近期在其他群的公开发言到当前群"
+            else:
+                return ""
         else:
-            source_scope = "private"
-            if not self._context_bool(ctx, "cross_window_private_to_group_enabled", True):
-                return ""
-            if not self._message_explicitly_shares_private_context(ctx.message_text):
-                return ""
-            direction = "经当前用户本轮明确授权，从近期私聊到当前群聊"
+            return ""
 
         ttl_minutes = max(1, min(24 * 60, self._context_int(ctx, "cross_window_recent_minutes", 30)))
         event_limit = max(1, min(12, self._context_int(ctx, "cross_window_recent_event_limit", 6)))
@@ -12852,6 +12857,10 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
 
             event_type = clean_text(row.get("event_type"), 40)
             subject_id = clean_text(row.get("subject_id"), 120)
+            if source_scope == "group" and ctx.scope == "group" and event_type == "bot_response":
+                # Group-to-group continuity carries only the same user's public
+                # words; the bot's own replies from another group stay there.
+                continue
             if event_type == "user_message":
                 if subject_id != current_user_id:
                     continue
