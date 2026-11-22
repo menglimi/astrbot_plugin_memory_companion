@@ -1,4 +1,2 @@
-# 运行期依赖：插件本体只依赖宿主 AstrBot。
-# numpy / jsonschema 是惰性可选件（core/vector_search.py、core/query_notes.py 缺失时会降级），
-# 不作为硬依赖；面板前端由宿主同源提供，没有额外运行期依赖。
-astrbot>=4.27
+# AstrBot 由宿主提供，兼容范围见 metadata.yaml 的 astrbot_version。
+# numpy 和 jsonschema 是可选依赖，缺失时插件会降级运行。

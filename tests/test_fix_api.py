@@ -19,6 +19,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import yaml
+from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 
 from astrbot.core.config.default import VERSION as ASTRBOT_VERSION
@@ -284,6 +285,16 @@ def test_metadata_version_string_untouched():
     )
     assert plugin_version is not None
     assert metadata["version"] == plugin_version.group(1)
+
+
+def test_plugin_requirements_leave_astrbot_to_the_host():
+    requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+    package_names = set()
+    for raw_line in requirements.splitlines():
+        line = re.split(r"\s+#", raw_line.strip(), maxsplit=1)[0]
+        if line and not line.startswith(("#", "-")):
+            package_names.add(Requirement(line).name.lower())
+    assert "astrbot" not in package_names
 
 
 # -------------------------------------------------------------------------- A14

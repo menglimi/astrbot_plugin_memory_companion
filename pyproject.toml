@@ -3,7 +3,6 @@ name = "astrbot_plugin_memory_companion"
 version = "2.6.8"
 description = "AstrBot 记忆伴侣插件：跨会话记忆、画像与页面控制台"
 requires-python = ">=3.10"
-dependencies = ["astrbot>=4.27"]
 
 # 这里只声明 pytest 配置，不声明构建后端：插件以源码目录直接安装进 AstrBot，
 # 不走 pip 分发。

@@ -25,12 +25,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       # 原生工具绑定与页面路由回归需要真实宿主 API；核心算法测试不调用外部模型。
-      # 用 astrbot>=4.27,<5 而不是钉死 4.27.3：用户实际跑的是 4.29.x，
-      # 固定小版本会让 CI 与真实环境长期脱节（审核报告 L9）。
+      # requirements-dev.txt 中的 AstrBot 版本范围与插件元数据一致。
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt "astrbot>=4.27,<5"
+          python -m pip install -r requirements-dev.txt
 
       # L13：发布物里混进 __pycache__/.pyc/data/ 曾经没人拦。
       # 这一步必须排在 compileall 之前：compileall 会生成 __pycache__，
