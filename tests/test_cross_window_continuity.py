@@ -113,6 +113,56 @@ class CrossWindowContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("其他群成员", context)
         self.assertNotIn("另一个 Bot", context)
 
+    async def test_group_to_group_keeps_only_the_same_user_public_words(self) -> None:
+        service = self.make_service()
+        now = datetime.now(timezone.utc)
+        await service.store.add_timeline_event(
+            event_type="user_message",
+            session_id="qq:GroupMessage:g1",
+            scope="group",
+            subject_id="u1",
+            object_id="g1",
+            content="她刚才说的那个方案真不怎么样。",
+            metadata=self.metadata(bot_id="b1", user_id="u1"),
+            occurred_at=(now - timedelta(minutes=3)).isoformat(timespec="seconds"),
+        )
+        await service.store.add_timeline_event(
+            event_type="bot_response",
+            session_id="qq:GroupMessage:g1",
+            scope="group",
+            subject_id="b1",
+            object_id="g1",
+            content="这是另一个群的 Bot 回复。",
+            metadata=self.metadata(bot_id="b1", user_id="u1"),
+            occurred_at=(now - timedelta(minutes=2)).isoformat(timespec="seconds"),
+        )
+        await service.store.add_timeline_event(
+            event_type="user_message",
+            session_id="qq:GroupMessage:g1",
+            scope="group",
+            subject_id="u2",
+            object_id="g1",
+            content="这是其他群成员说的话。",
+            metadata=self.metadata(bot_id="b1", user_id="u2"),
+            occurred_at=(now - timedelta(minutes=2)).isoformat(timespec="seconds"),
+        )
+        ctx = SessionContext(
+            session_id="qq:GroupMessage:g2",
+            scope="group",
+            platform="qq",
+            user_id="u1",
+            group_id="g2",
+            bot_id="b1",
+            message_text="我来了。",
+        )
+
+        context = await service._recent_cross_window_context(ctx)
+
+        self.assertIn("她刚才说的那个方案真不怎么样", context)
+        self.assertNotIn("另一个群的 Bot", context)
+        self.assertNotIn("其他群成员", context)
+        self.assertIn("其他群", context)
+
     async def test_expired_group_context_is_not_returned(self) -> None:
         service = self.make_service()
         await service.store.add_timeline_event(
