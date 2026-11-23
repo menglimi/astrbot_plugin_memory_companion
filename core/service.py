@@ -129,6 +129,7 @@ from .vector_search import bounded_cache_bytes
 from .source_query import query_sources, source_visible
 from .source_discovery import discover_sources as run_source_discovery
 from .source_evidence import record_source_read, message_source_version, remember_source_reads
+from .source_surface import aggregate_source_surface, source_surface_metadata
 from .source_semantic import (
     acknowledge_dirty as acknowledge_semantic_dirty,
     build_semantic_window,
@@ -2536,6 +2537,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 "memory_id": memory_id,
                 "message_id": clean_text(ctx.message_id, 120),
                 "memory_companion_injection_state": injection_state,
+                **source_surface_metadata(ctx.message_id, ctx.platform),
                 **self._cross_window_event_metadata(ctx),
             },
         )
@@ -2603,6 +2605,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         metadata: dict[str, Any] = {
             "source": clean_text(source, 80),
             "conversation_memory": True,
+            **source_surface_metadata(ctx.message_id, ctx.platform),
         }
         rows = recent_rows
         if rows is None:
@@ -7543,6 +7546,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 metadata={
                     "summary_batch_id": batch_id,
                     "summary_refs": payload.get("summary_refs", []),
+                    **aggregate_source_surface(rows),
                     "summary_event_count": len(rows),
                     "unsummarized_total": total,
                     "start_at": start_at,
@@ -7658,6 +7662,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             metadata={
                 "summary_batch_id": batch_id,
                 "summary_event_count": len(rows),
+                **aggregate_source_surface(rows),
                 "degraded_summary": True,
                 "summary_validation_error": clean_text(feedback, 1800),
                 "quality_warnings": list(
@@ -8624,6 +8629,40 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
     async def list_core_memory_blocks(self) -> list[MemoryRecord]:
         return await self.store.list_core_memories(limit=1000)
 
+    async def _core_source_surface_metadata(self, refs: Any) -> dict[str, Any]:
+        """Derive source_surface for a distilled core memory from its source refs.
+
+        ``refs`` are the ``memory_ref(record)`` dicts stored in
+        ``metadata["core_source_refs"]``. Only their ids are used: the referenced
+        records are re-read once and their own source_surface is summarised with the
+        same rules as summary records, so a core memory distilled from Minecraft chat
+        stays markable after the timeline rows are long gone. Lookup failures are
+        non-fatal - the core memory is still saved, just without the mark.
+        """
+        ids: list[str] = []
+        for ref in refs or ():
+            raw = ref.get("id") if isinstance(ref, Mapping) else ref
+            rid = clean_text(raw, 120)
+            if rid and rid not in ids:
+                ids.append(rid)
+        if not ids:
+            return {}
+        try:
+            records = await self.store.get_memories_by_ids(ids[:400])
+        except Exception:
+            logger.debug("core source surface lookup failed", exc_info=True)
+            return {}
+        rows = [
+            {
+                "id": memory_id,
+                "message_id": record.message_id,
+                "platform": record.platform,
+                "metadata": record.metadata,
+            }
+            for memory_id, record in (records or {}).items()
+        ]
+        return aggregate_source_surface(rows)
+
     async def save_core_memory_block(self, payload: dict[str, Any], *, auto_distilled: bool = False) -> dict[str, Any]:
         label = clean_text(payload.get("label"), 80)
         content = clean_text(payload.get("content"), 4000)
@@ -8708,6 +8747,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         if auto_distilled:
             metadata["managed_by"] = "auto_distillation"
             metadata["core_source_refs"] = payload["core_source_refs"]
+            metadata.update(await self._core_source_surface_metadata(payload["core_source_refs"]))
         record = MemoryRecord(
             id=memory_id,
             memory_type="core_memory",
@@ -9466,6 +9506,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 metadata={
                     "tool": "memory_companion_remember",
                     "note_type": note_type,
+                    **source_surface_metadata(ctx.message_id, ctx.platform),
                     "owner_bot_id": self._bot_subject_id(ctx),
                     **memory_proposal.as_metadata(),
                     "persona_id": ctx.persona_id,
