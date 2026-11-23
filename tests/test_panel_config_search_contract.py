@@ -186,6 +186,34 @@ class ModuleConfigAndGlobalSearchContractTests(unittest.TestCase):
         self.assertIn("-webkit-appearance: none;", self.app_css)
         self.assertIn("pointer-events: none;", self.app_css)
 
+        # 全站弹窗 / 抽屉遮罩 / 灯箱 / 高级项折叠框均具备双向平滑过渡与减少动效适配
+        self.assertIn(".config-advanced-body", self.app_css)
+        self.assertIn(".config-advanced[open] > summary::before", self.app_css)
+        self.assertIn(".config-advanced[open]:not(.is-closing) > summary::before", self.app_css)
+        self.assertIn(".scrim.is-open", self.app_css)
+        self.assertIn(".inline-confirm-overlay.is-open", self.app_css)
+        self.assertIn(".lightbox.is-open", self.app_css)
+        self.assertIn("function bindSmoothDetails(", self.app_js)
+        self.assertIn("function closeLightbox(", self.app_js)
+
+        # 关闭态抽屉必须真正不可见且不可点击，且 reduced-motion 不得把 .drawer 的 transform 覆写成 none
+        tail_css = self.app_css[self.app_css.rindex("/* ---------- 7.") :]
+        drawer_closed = re.search(r"^\.drawer\s*\{([^}]*)\}", tail_css, re.M)
+        self.assertIsNotNone(drawer_closed)
+        self.assertIn("visibility: hidden;", drawer_closed.group(1))
+        self.assertIn("pointer-events: none;", drawer_closed.group(1))
+        drawer_open = re.search(r"^\.drawer\.is-open\s*\{([^}]*)\}", tail_css, re.M)
+        self.assertIsNotNone(drawer_open)
+        self.assertIn("visibility: visible;", drawer_open.group(1))
+        self.assertIn("pointer-events: auto;", drawer_open.group(1))
+        rm_block = re.search(r"@media \(prefers-reduced-motion: reduce\)\s*\{([\s\S]*)\}\s*$", tail_css)
+        self.assertIsNotNone(rm_block)
+        # 校验 reduced-motion 中包含 transform: none 的规则只作用于居中弹窗/灯箱图，绝不包含 .drawer 或 summary::before
+        for rule_match in re.finditer(r"([^{}]+)\{([^}]*)\}", rm_block.group(1)):
+            if "transform: none" in rule_match.group(2):
+                self.assertNotIn(".drawer", rule_match.group(1))
+                self.assertNotIn("summary::before", rule_match.group(1))
+
         # 全局配置搜索弹窗桌面端舒展黄金尺寸，窄屏与矮屏优雅自适应
         dialog_rule = re.search(r"^\.cfg-search-dialog\s*\{([^}]*)\}", self.app_css, re.M)
         self.assertIsNotNone(dialog_rule)

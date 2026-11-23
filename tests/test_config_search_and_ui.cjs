@@ -78,6 +78,7 @@ function loadAppConfigRuntime() {
       body: { appendChild: () => {} },
     },
     requestAnimationFrame: (fn) => fn(),
+    prefersReducedMotion: () => false,
     state,
     NAV: [
       { id: "overview", label: "总览", icon: "gauge", views: ["overview"] },
@@ -121,7 +122,7 @@ function loadAppConfigRuntime() {
 
   vm.runInNewContext(
     slice +
-      "\nthis.__exports = { MODULE_LABELS, moduleLabel, moduleSubtitle, CONFIG_COMMON_KEYS, CONFIG_OPTION_LABELS, CONFIG_CHOICE_CARDS, orderedCommonKeys, renderChoiceCards, buildConfigSearchCatalog, runConfigSearchQuery, applyPendingConfigFocus, configSearchState, activateConfigSearchHit, openConfigSearch, closeConfigSearch };",
+      "\nthis.__exports = { MODULE_LABELS, moduleLabel, moduleSubtitle, CONFIG_COMMON_KEYS, CONFIG_OPTION_LABELS, CONFIG_CHOICE_CARDS, orderedCommonKeys, renderChoiceCards, buildConfigSearchCatalog, runConfigSearchQuery, applyPendingConfigFocus, configSearchState, activateConfigSearchHit, openConfigSearch, closeConfigSearch, bindSmoothDetails };",
     sandbox
   );
 
@@ -281,6 +282,7 @@ test("module config mount: choice cards update hidden input and support keyboard
     navigator: { platform: "Win32", userAgent: "Win64" },
     document: { activeElement: null, contains: () => true, querySelector: () => null, querySelectorAll: () => [], addEventListener: () => {}, body: { appendChild: () => {} } },
     requestAnimationFrame: (fn) => fn(),
+    prefersReducedMotion: () => false,
     state: state2,
     NAV: [],
     VIEWS: views2,
@@ -490,6 +492,7 @@ test("module config save: immediately syncs state.configSchema.values before mod
     navigator: { platform: "Win32", userAgent: "Win64" },
     document: { activeElement: null, contains: () => true, querySelector: () => null, querySelectorAll: () => [], addEventListener: () => {}, body: { appendChild: () => {} } },
     requestAnimationFrame: (fn) => fn(),
+    prefersReducedMotion: () => false,
     state,
     NAV: [],
     VIEWS: views,
@@ -560,6 +563,7 @@ test("config search modal: smooth open/close transition respects reduced motion 
     navigator: { platform: "Win32", userAgent: "Win64" },
     document: { activeElement: null, contains: () => true, addEventListener: () => {}, body: { appendChild: () => {} } },
     requestAnimationFrame: (fn) => fn(),
+    prefersReducedMotion: () => reducedMotion,
     state: { view: "overview", group: "overview", theme: "light", mode: "standard", configSchema: { schema: realSchema, values: {} }, configModule: "appearance" },
     NAV: [],
     VIEWS: {},
@@ -624,6 +628,228 @@ test("config search modal: smooth open/close transition respects reduced motion 
   sandbox.__api.closeConfigSearch();
   assert.equal(fakeModal.hidden, true);
   assert.equal(timers.length, beforeTimers);
+});
+
+test("config advanced collapsible: smooth bidirectional open/close clears inline height/overflow and cancels cleanly on jump", () => {
+  const appSource = fs.readFileSync(APP_JS_PATH, "utf8");
+  const sIdx = appSource.indexOf("/* ============================================================\r\n   视图：模块配置");
+  const sAlt = appSource.indexOf("/* ============================================================\n   视图：模块配置");
+  const start = sIdx >= 0 ? sIdx : sAlt;
+  const eIdx = appSource.indexOf("/* ============================================================\r\n   视图：权限拓扑");
+  const eAlt = appSource.indexOf("/* ============================================================\n   视图：权限拓扑");
+  const end = eIdx >= 0 ? eIdx : eAlt;
+
+  const timers = [];
+  let clickFn = null;
+  let currentRenderedHeight = 0;
+  const detailsClasses = new Set();
+  const bodyStyle = { height: "", opacity: "", overflow: "", transition: "" };
+  const fakeBody = {
+    style: bodyStyle,
+    scrollHeight: 320,
+    offsetHeight: 320,
+    getBoundingClientRect: () => ({ height: currentRenderedHeight }),
+  };
+  const fakeSummary = { addEventListener: (t, fn) => { if (t === "click") clickFn = fn; } };
+  const fakeDetails = {
+    open: false,
+    classList: {
+      add: (...cs) => cs.forEach((c) => detailsClasses.add(c)),
+      remove: (...cs) => cs.forEach((c) => detailsClasses.delete(c)),
+      contains: (c) => detailsClasses.has(c),
+    },
+    querySelector: (sel) => (sel.includes("summary") ? fakeSummary : fakeBody),
+  };
+
+  const sandbox = {
+    window: {
+      MemorySearchEngine: engine,
+      setTimeout: (fn, ms) => {
+        timers.push({ fn, ms, cleared: false });
+        return timers.length;
+      },
+      clearTimeout: (id) => {
+        if (id > 0 && timers[id - 1]) timers[id - 1].cleared = true;
+      },
+      matchMedia: () => ({ matches: false }),
+    },
+    navigator: { platform: "Win32", userAgent: "Win64" },
+    document: { activeElement: null, contains: () => true, addEventListener: () => {}, body: { appendChild: () => {} } },
+    requestAnimationFrame: (fn) => fn(),
+    prefersReducedMotion: () => false,
+    state: { view: "config", group: "settings", theme: "light", mode: "standard", configSchema: null, configModule: "retrieval_advanced" },
+    NAV: [],
+    VIEWS: {},
+    defineView: () => {},
+    $: () => null,
+    $$: (sel) => (sel === "details.config-advanced" ? [fakeDetails] : []),
+    esc: engine.escapeHtml,
+    compact: (v, f) => String(v ?? "").trim() || (f === undefined ? "" : f),
+    clip: (v) => String(v ?? ""),
+    fmtInt: (v) => String(v),
+    icon: () => "",
+    card: () => "",
+    emptyState: () => "",
+    apiGet: async () => ({}),
+    apiPost: async () => ({}),
+    withBusy: async (_t, fn) => fn(),
+    toast: () => {},
+    invalidatePool: () => {},
+    syncPalette: () => {},
+    go: async () => {},
+  };
+
+  vm.runInNewContext(appSource.slice(start, end) + "\nthis.__bind = bindSmoothDetails;", sandbox);
+  sandbox.__bind({});
+  assert.ok(typeof clickFn === "function");
+
+  // 1) 展开动画
+  let prevented = false;
+  clickFn({ preventDefault: () => { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(fakeDetails.open, true);
+  assert.equal(bodyStyle.height, "320px");
+  assert.equal(bodyStyle.opacity, "1");
+  assert.equal(timers.length, 1);
+  // 动画结束后必须清空 height 和 overflow，保证绝不裁切内容
+  timers[0].fn();
+  assert.equal(bodyStyle.height, "");
+  assert.equal(bodyStyle.overflow, "");
+
+  // 2) 收起动画中途（is-closing）再次点击：必须立即反向重开，而不是再次误关
+  currentRenderedHeight = 320;
+  clickFn({ preventDefault: () => {} });
+  assert.equal(fakeDetails.open, true, "收起退场期间暂保 open 以呈现平滑高度收缩");
+  assert.equal(detailsClasses.has("is-closing"), true);
+  assert.equal(bodyStyle.height, "0px");
+  assert.equal(bodyStyle.opacity, "0");
+
+  // 模拟收起至 140px 时用户立即再点展开
+  currentRenderedHeight = 140;
+  clickFn({ preventDefault: () => {} });
+  assert.equal(timers[1].cleared, true, "收起中途重开必须取消旧收起定时器");
+  assert.equal(detailsClasses.has("is-closing"), false, "收起中途重开必须移除 is-closing");
+  assert.equal(fakeDetails.open, true);
+  assert.equal(bodyStyle.height, "320px", "应从当前渲染高度平滑展开至目标 scrollHeight");
+  assert.equal(bodyStyle.opacity, "1");
+  timers[2].fn();
+  assert.equal(bodyStyle.height, "");
+  assert.equal(bodyStyle.overflow, "");
+
+  // 3) 完整收起流程
+  currentRenderedHeight = 320;
+  clickFn({ preventDefault: () => {} });
+  timers[3].fn();
+  assert.equal(fakeDetails.open, false);
+  assert.equal(bodyStyle.height, "");
+  assert.equal(bodyStyle.overflow, "");
+});
+
+test("drawer and confirmation dialog: blur/inert on drawer close and restore focus cleanly", async () => {
+  const appSource = fs.readFileSync(APP_JS_PATH, "utf8");
+  const start = appSource.indexOf("let toastTimer = 0;");
+  const end = appSource.indexOf("/* ------------------------------------------------------------\r\n   主题");
+  const endAlt = appSource.indexOf("/* ------------------------------------------------------------\n   主题");
+  const sliceEnd = end >= 0 ? end : endAlt;
+  assert.ok(start > 0 && sliceEnd > start);
+
+  const timers = [];
+  const drawerClasses = new Set();
+  const scrimClasses = new Set();
+  const drawerAttrs = { "aria-hidden": "true" };
+  let blurred = false;
+  let triggerFocused = false;
+  const triggerBtn = { focus: () => { triggerFocused = true; } };
+  const insideBtn = { blur: () => { blurred = true; } };
+  const fakeDrawer = {
+    inert: true,
+    classList: {
+      add: (c) => drawerClasses.add(c),
+      remove: (c) => drawerClasses.delete(c),
+      contains: (c) => drawerClasses.has(c),
+    },
+    setAttribute: (k, v) => { drawerAttrs[k] = v; },
+    contains: (el) => el === insideBtn,
+  };
+  const fakeScrim = {
+    hidden: true,
+    offsetWidth: 100,
+    classList: {
+      add: (c) => scrimClasses.add(c),
+      remove: (c) => scrimClasses.delete(c),
+    },
+  };
+  const docListeners = {};
+  const fakeDoc = {
+    activeElement: triggerBtn,
+    contains: () => true,
+    addEventListener: (t, fn) => { docListeners[t] = fn; },
+    removeEventListener: (t) => { delete docListeners[t]; },
+    createElement: () => {
+      const ovClasses = new Set();
+      const ov = {
+        className: "",
+        innerHTML: "",
+        offsetWidth: 420,
+        removed: false,
+        classList: {
+          add: (c) => ovClasses.add(c),
+          remove: (c) => ovClasses.delete(c),
+          contains: (c) => ovClasses.has(c),
+        },
+        addEventListener: () => {},
+        remove: function () { this.removed = true; },
+      };
+      return ov;
+    },
+    body: { appendChild: () => {} },
+  };
+  const nodes = {
+    "#drawer": fakeDrawer,
+    "#scrim": fakeScrim,
+    "#drawerEyebrow": { textContent: "" },
+    "#drawerTitle": { textContent: "" },
+    "#drawerBody": { innerHTML: "" },
+  };
+  const sandbox = {
+    window: {
+      setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+      clearTimeout: () => {},
+      matchMedia: () => ({ matches: false }),
+    },
+    document: fakeDoc,
+    requestAnimationFrame: (fn) => fn(),
+    $: (sel) => nodes[sel] || null,
+    esc: engine.escapeHtml,
+  };
+  vm.runInNewContext(
+    appSource.slice(start, sliceEnd) + "\nthis.__api = { openDrawer, closeDrawer, showInlineConfirmation };",
+    sandbox
+  );
+
+  // 打开抽屉：inert=false，记录焦点
+  sandbox.__api.openDrawer("记忆标题", "记忆详情", "<p>正文</p>");
+  assert.equal(fakeDrawer.inert, false);
+  assert.equal(drawerAttrs["aria-hidden"], "false");
+  assert.equal(fakeScrim.hidden, false);
+
+  // 关闭抽屉：若内部按钮有焦点必须先 blur，设 inert=true 并归还焦点
+  fakeDoc.activeElement = insideBtn;
+  sandbox.__api.closeDrawer();
+  assert.equal(blurred, true, "关闭抽屉设置 aria-hidden 前必须 blur 内部焦点");
+  assert.equal(fakeDrawer.inert, true);
+  assert.equal(drawerAttrs["aria-hidden"], "true");
+  assert.equal(triggerFocused, true, "关闭抽屉后应归还触发元素焦点");
+
+  // 确认弹窗：Escape 取消并归还焦点
+  let confirmTriggerFocused = false;
+  fakeDoc.activeElement = { focus: () => { confirmTriggerFocused = true; } };
+  const p = sandbox.__api.showInlineConfirmation("删除确认", "确定删除？", "删除");
+  assert.ok(typeof docListeners.keydown === "function");
+  docListeners.keydown({ key: "Escape", preventDefault: () => {} });
+  const res = await p;
+  assert.equal(res, false);
+  assert.equal(confirmTriggerFocused, true, "关闭确认弹窗后应归还触发元素焦点");
 });
 
 test("legacy.html loads search-engine.js?v=2.6.8 before app.js?v=2.6.8", () => {

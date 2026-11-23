@@ -491,7 +491,17 @@ const state = {
    提示 / 忙碌 / 抽屉
    ------------------------------------------------------------ */
 let toastTimer = 0;
+let scrimTimer = 0;
+let drawerLastFocus = null;
 let assemblyViewerTicket = 0;
+
+function prefersReducedMotion() {
+  try {
+    return Boolean(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  } catch (error) {
+    return false;
+  }
+}
 
 function toast(message, tone) {
   const node = $("#toast");
@@ -531,22 +541,69 @@ function setBusyText(text) {
 }
 
 function openDrawer(title, eyebrow, html) {
+  const drawer = $("#drawer");
+  const scrim = $("#scrim");
+  if (drawer && !drawer.classList.contains("is-open")) {
+    drawerLastFocus = document.activeElement;
+  }
   $("#drawerEyebrow").textContent = eyebrow || "记忆";
   $("#drawerTitle").textContent = title || "未选择";
   $("#drawerBody").innerHTML = html;
-  $("#drawer").classList.add("is-open");
-  $("#drawer").setAttribute("aria-hidden", "false");
-  $("#scrim").hidden = false;
+  window.clearTimeout(scrimTimer);
+  scrimTimer = 0;
+  if (scrim) {
+    scrim.hidden = false;
+    if (prefersReducedMotion()) {
+      scrim.classList.add("is-open");
+    } else {
+      void scrim.offsetWidth;
+      requestAnimationFrame(() => {
+        if (drawer && drawer.classList.contains("is-open")) scrim.classList.add("is-open");
+      });
+    }
+  }
+  if (drawer) {
+    drawer.inert = false;
+    drawer.classList.add("is-open");
+    drawer.setAttribute("aria-hidden", "false");
+  }
 }
 
 function closeDrawer() {
-  $("#drawer").classList.remove("is-open");
-  $("#drawer").setAttribute("aria-hidden", "true");
-  $("#scrim").hidden = true;
+  const drawer = $("#drawer");
+  const scrim = $("#scrim");
+  if (drawer) {
+    const active = document.activeElement;
+    if (active && typeof drawer.contains === "function" && drawer.contains(active) && typeof active.blur === "function") {
+      active.blur();
+    }
+    drawer.classList.remove("is-open");
+    drawer.setAttribute("aria-hidden", "true");
+    drawer.inert = true;
+  }
+  if (scrim) {
+    window.clearTimeout(scrimTimer);
+    scrimTimer = 0;
+    scrim.classList.remove("is-open");
+    if (prefersReducedMotion()) {
+      scrim.hidden = true;
+    } else {
+      scrimTimer = window.setTimeout(() => {
+        scrimTimer = 0;
+        if (!drawer || !drawer.classList.contains("is-open")) scrim.hidden = true;
+      }, 240);
+    }
+  }
+  const prev = drawerLastFocus;
+  drawerLastFocus = null;
+  if (prev && typeof prev.focus === "function" && document.contains(prev)) {
+    try { prev.focus({ preventScroll: true }); } catch (error) { /* 忽略 */ }
+  }
 }
 
 function showInlineConfirmation(title, message, confirmLabel) {
   return new Promise((resolve) => {
+    const prevFocus = document.activeElement;
     const overlay = document.createElement("div");
     overlay.className = "inline-confirm-overlay";
     overlay.innerHTML =
@@ -555,15 +612,42 @@ function showInlineConfirmation(title, message, confirmLabel) {
       '<p>' + esc(message || "确认继续此操作？") + "</p>" +
       '<div class="inline-confirm-actions"><button type="button" data-confirm-cancel>取消</button><button type="button" class="is-danger" data-confirm-ok>' +
       esc(confirmLabel || "继续") + "</button></div></section>";
+    let settled = false;
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        finish(false);
+      }
+    };
     const finish = (value) => {
-      overlay.remove();
+      if (settled) return;
+      settled = true;
+      document.removeEventListener("keydown", onKeyDown);
+      overlay.classList.remove("is-open");
+      if (prefersReducedMotion()) {
+        overlay.remove();
+      } else {
+        window.setTimeout(() => overlay.remove(), 180);
+      }
+      if (prevFocus && typeof prevFocus.focus === "function" && document.contains(prevFocus)) {
+        try { prevFocus.focus({ preventScroll: true }); } catch (error) { /* 忽略 */ }
+      }
       resolve(value);
     };
     overlay.addEventListener("click", (event) => {
       if (event.target === overlay || event.target.closest("[data-confirm-cancel]")) finish(false);
       if (event.target.closest("[data-confirm-ok]")) finish(true);
     });
+    document.addEventListener("keydown", onKeyDown);
     document.body.appendChild(overlay);
+    if (prefersReducedMotion()) {
+      overlay.classList.add("is-open");
+    } else {
+      void overlay.offsetWidth;
+      requestAnimationFrame(() => {
+        if (!settled) overlay.classList.add("is-open");
+      });
+    }
     const ok = $("[data-confirm-ok]", overlay);
     if (ok) ok.focus();
   });
@@ -2394,12 +2478,31 @@ async function hydratePersonalAlbumImages(root) {
   }));
 }
 
+function closeLightbox(box) {
+  if (!box || box.dataset.closing === "1") return;
+  box.dataset.closing = "1";
+  box.classList.remove("is-open");
+  if (prefersReducedMotion()) {
+    box.remove();
+  } else {
+    window.setTimeout(() => box.remove(), 180);
+  }
+}
+
 function openLightbox(src, caption) {
   const box = document.createElement("div");
   box.className = "lightbox";
   box.innerHTML = '<img src="' + esc(src) + '" alt="" /><div class="lightbox-cap">' + esc(caption || "") + "</div>";
-  box.addEventListener("click", () => box.remove());
+  box.addEventListener("click", () => closeLightbox(box));
   document.body.appendChild(box);
+  if (prefersReducedMotion()) {
+    box.classList.add("is-open");
+  } else {
+    void box.offsetWidth;
+    requestAnimationFrame(() => {
+      if (box.dataset.closing !== "1") box.classList.add("is-open");
+    });
+  }
 }
 
 /* ============================================================
@@ -4002,7 +4105,7 @@ defineView("config", {
           '<form id="configForm" class="config-form">' +
   (fields || (advancedFields ? "" : emptyState("该模块没有可配置项", ""))) +
   (advancedFields
-    ? '<details class="config-advanced"><summary>高级项（' + advancedKeys.length + " 个）· 一般不用改</summary>" + advancedFields + "</details>"
+    ? '<details class="config-advanced"><summary>高级项（' + advancedKeys.length + ' 个）· 一般不用改</summary><div class="config-advanced-body"><div class="config-advanced-inner">' + advancedFields + "</div></div></details>"
     : "") +
   "</form>",
           '<button class="btn is-primary is-sm" type="button" id="configSaveBtn">保存本模块</button>',
@@ -4097,6 +4200,8 @@ defineView("config", {
       });
     });
 
+    bindSmoothDetails(node);
+
     const activeNav = $(".config-nav button.is-active", node);
     if (activeNav && typeof activeNav.scrollIntoView === "function") {
       try { activeNav.scrollIntoView({ block: "nearest" }); } catch (error) { /* 忽略 */ }
@@ -4104,6 +4209,86 @@ defineView("config", {
     applyPendingConfigFocus(node);
   },
 });
+
+function bindSmoothDetails(rootNode) {
+  $$("details.config-advanced", rootNode).forEach((details) => {
+    const summary = details.querySelector(":scope > summary") || details.querySelector("summary");
+    const body = details.querySelector(":scope > .config-advanced-body") || details.querySelector(".config-advanced-body");
+    if (!summary || !body) return;
+    let animTimer = 0;
+    let animToken = 0;
+
+    const clearInline = () => {
+      body.style.height = "";
+      body.style.opacity = "";
+      body.style.overflow = "";
+      body.style.transition = "";
+      details.classList.remove("is-animating", "is-closing");
+    };
+
+    details.__cancelSmoothAnim = () => {
+      animToken += 1;
+      window.clearTimeout(animTimer);
+      animTimer = 0;
+      clearInline();
+    };
+
+    const renderedHeight = () => {
+      const rect = typeof body.getBoundingClientRect === "function" ? body.getBoundingClientRect() : null;
+      const h = rect && Number.isFinite(rect.height) ? rect.height : Number(body.offsetHeight);
+      return Number.isFinite(h) && h > 0 ? h : 0;
+    };
+
+    summary.addEventListener("click", (event) => {
+      if (prefersReducedMotion()) return;
+      event.preventDefault();
+      animToken += 1;
+      const token = animToken;
+      window.clearTimeout(animTimer);
+      animTimer = 0;
+
+      const shouldOpen = !details.open || details.classList.contains("is-closing");
+      if (shouldOpen) {
+        const wasOpen = Boolean(details.open);
+        const startHeight = wasOpen ? renderedHeight() : 0;
+        details.open = true;
+        details.classList.remove("is-closing");
+        details.classList.add("is-animating");
+        body.style.transition = "none";
+        body.style.overflow = "hidden";
+        body.style.height = startHeight + "px";
+        if (!wasOpen) body.style.opacity = "0";
+        void body.offsetHeight;
+        const targetHeight = body.scrollHeight;
+        body.style.transition = "height 0.24s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.2s cubic-bezier(0.22, 1, 0.36, 1)";
+        body.style.height = targetHeight + "px";
+        body.style.opacity = "1";
+        animTimer = window.setTimeout(() => {
+          if (token !== animToken) return;
+          animTimer = 0;
+          clearInline();
+        }, 260);
+      } else {
+        const startHeight = renderedHeight() || body.scrollHeight;
+        details.classList.add("is-animating", "is-closing");
+        body.style.transition = "none";
+        body.style.overflow = "hidden";
+        body.style.height = startHeight + "px";
+        body.style.opacity = "1";
+        void body.offsetHeight;
+        body.style.transition = "height 0.18s cubic-bezier(0.4, 0, 1, 1), opacity 0.15s cubic-bezier(0.4, 0, 1, 1)";
+        body.style.height = "0px";
+        body.style.opacity = "0";
+        animTimer = window.setTimeout(() => {
+          if (token !== animToken) return;
+          animTimer = 0;
+          details.open = false;
+          clearInline();
+        }, 190);
+      }
+    });
+  });
+}
 
 /* ============================================================
    全局配置搜索（Ctrl+K / Cmd+K / / 快捷键 + 侧栏入口）
@@ -4619,14 +4804,6 @@ function renderConfigSearchResults() {
     .join("");
 }
 
-function prefersReducedMotion() {
-  try {
-    return Boolean(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
-  } catch (error) {
-    return false;
-  }
-}
-
 function openConfigSearch(initialQuery) {
   const modal = ensureConfigSearchModal();
   window.clearTimeout(configSearchState.closeTimer);
@@ -4723,8 +4900,9 @@ function applyPendingConfigFocus(rootNode) {
   if (!fieldEl) return;
 
   const details = fieldEl.closest("details.config-advanced");
-  if (details && !details.open) {
-    details.open = true;
+  if (details) {
+    if (typeof details.__cancelSmoothAnim === "function") details.__cancelSmoothAnim();
+    if (!details.open) details.open = true;
   }
 
   let reducedMotion = false;
@@ -5319,6 +5497,8 @@ function bindShell() {
     applyTheme(state.theme === "dark" ? "light" : "dark");
   });
 
+  const drawerNode = $("#drawer");
+  if (drawerNode && !drawerNode.classList.contains("is-open")) drawerNode.inert = true;
   $("#drawerClose").addEventListener("click", closeDrawer);
   $("#scrim").addEventListener("click", closeDrawer);
   $("#assemblyViewerClose")?.addEventListener("click", closeAssemblyViewer);
@@ -5436,7 +5616,7 @@ function bindShell() {
     if (event.key === "Escape") {
       closeDrawer();
       const box = $(".lightbox");
-      if (box) box.remove();
+      if (box) closeLightbox(box);
     }
   });
 }

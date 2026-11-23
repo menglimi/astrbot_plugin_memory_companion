@@ -3341,7 +3341,7 @@ button.kpi.is-link:hover .kpi-go { opacity: 0.9; transform: none; }
   -webkit-backdrop-filter: blur(8px);
   opacity: 0;
   pointer-events: none;
-  transition: opacity 0.16s var(--ease);
+  transition: opacity 0.16s cubic-bezier(0.4, 0, 1, 1);
 }
 [data-theme="light"] .cfg-search-overlay {
   background: rgba(16, 24, 40, 0.32);
@@ -3349,6 +3349,7 @@ button.kpi.is-link:hover .kpi-go { opacity: 0.9; transform: none; }
 .cfg-search-overlay.is-open {
   opacity: 1;
   pointer-events: auto;
+  transition: opacity 0.18s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .cfg-search-dialog {
@@ -3363,12 +3364,13 @@ button.kpi.is-link:hover .kpi-go { opacity: 0.9; transform: none; }
   color: var(--text);
   box-shadow: var(--shadow), 0 0 0 1px var(--border);
   opacity: 0;
-  transform: translateY(-8px) scale(0.985);
-  transition: transform 0.18s var(--ease-out), opacity 0.16s var(--ease);
+  transform: translateY(-10px) scale(0.975);
+  transition: transform 0.16s cubic-bezier(0.4, 0, 1, 1), opacity 0.15s cubic-bezier(0.4, 0, 1, 1);
 }
 .cfg-search-overlay.is-open .cfg-search-dialog {
   opacity: 1;
   transform: none;
+  transition: transform 0.22s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.18s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .cfg-search-head {
@@ -3934,10 +3936,153 @@ html[data-ui-mode="cinema"] .cfg-search-tag.is-fuzzy {
   }
 }
 
+/* ---------- 7. 全站弹窗 / 抽屉 / 折叠框双向丝滑过渡 ---------- */
+:root {
+  --mc-ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --mc-ease-in: cubic-bezier(0.4, 0, 1, 1);
+}
+
+/* 模块切换卡片轻柔入场 */
+@keyframes cfg-card-in {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: none; }
+}
+.config-card {
+  animation: cfg-card-in 0.2s var(--mc-ease-out) both;
+}
+.cfg-choice-card:active:not(:disabled) {
+  transform: scale(0.99);
+}
+
+/* 「高级项」可折叠框双向展开/收起 + 箭头平滑旋转 */
+.config-advanced > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+  transition: opacity 0.18s var(--mc-ease-out), color 0.18s var(--mc-ease-out);
+}
+.config-advanced > summary:hover {
+  opacity: 0.96;
+}
+.config-advanced > summary::before {
+  content: "▸";
+  display: inline-block;
+  font-size: 11px;
+  line-height: 1;
+  transition: transform 0.22s var(--mc-ease-out);
+}
+.config-advanced[open] > summary::before {
+  content: "▸";
+}
+.config-advanced[open]:not(.is-closing) > summary::before {
+  transform: rotate(90deg);
+}
+.config-advanced-body {
+  will-change: height, opacity;
+}
+.config-advanced-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-top: 12px;
+}
+
+/* 抽屉与遮罩同步双向淡入淡出（关闭态彻底隐藏且不拦截焦点/点击） */
+.scrim {
+  animation: none;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s var(--mc-ease-in);
+}
+.scrim.is-open {
+  opacity: 1;
+  pointer-events: auto;
+  transition: opacity 0.22s var(--mc-ease-out);
+}
+.drawer {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: transform 0.28s var(--mc-ease-out), opacity 0.2s var(--mc-ease-in), visibility 0s linear 0.28s;
+}
+.drawer.is-open {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: none;
+  transition: transform 0.28s var(--mc-ease-out), opacity 0.22s var(--mc-ease-out), visibility 0s linear 0s;
+}
+
+/* 危险操作确认弹窗双向微缩放淡入淡出（退场 160ms < JS 180ms 零截断） */
+.inline-confirm-overlay {
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.16s var(--mc-ease-in);
+}
+.inline-confirm-overlay.is-open {
+  opacity: 1;
+  pointer-events: auto;
+  transition: opacity 0.18s var(--mc-ease-out);
+}
+.inline-confirm {
+  opacity: 0;
+  transform: translateY(10px) scale(0.965);
+  transition: transform 0.16s var(--mc-ease-in), opacity 0.15s var(--mc-ease-in);
+}
+.inline-confirm-overlay.is-open .inline-confirm {
+  opacity: 1;
+  transform: none;
+  transition: transform 0.22s var(--mc-ease-out), opacity 0.18s var(--mc-ease-out);
+}
+
+/* 相册大图灯箱双向淡入淡出（退场 160ms < JS 180ms 零截断） */
+.lightbox {
+  animation: none;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.16s var(--mc-ease-in);
+}
+.lightbox.is-open {
+  opacity: 1;
+  pointer-events: auto;
+  transition: opacity 0.2s var(--mc-ease-out);
+}
+.lightbox img {
+  opacity: 0;
+  transform: scale(0.95) translateY(8px);
+  transition: transform 0.16s var(--mc-ease-in), opacity 0.15s var(--mc-ease-in);
+}
+.lightbox.is-open img {
+  opacity: 1;
+  transform: none;
+  transition: transform 0.24s var(--mc-ease-out), opacity 0.2s var(--mc-ease-out);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .cfg-search-overlay,
-  .cfg-search-dialog {
+  .cfg-search-dialog,
+  .config-advanced > summary,
+  .config-advanced > summary::before,
+  .config-advanced-body,
+  .scrim,
+  .drawer,
+  .drawer.is-open,
+  .inline-confirm-overlay,
+  .inline-confirm,
+  .lightbox,
+  .lightbox img,
+  .cfg-choice-card {
     transition: none;
+  }
+  .cfg-search-dialog,
+  .inline-confirm,
+  .lightbox img {
     transform: none;
+  }
+  .config-card {
+    animation: none;
   }
 }
