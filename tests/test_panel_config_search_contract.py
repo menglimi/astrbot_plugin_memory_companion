@@ -181,6 +181,16 @@ class ModuleConfigAndGlobalSearchContractTests(unittest.TestCase):
         self.assertIn(".config-field:last-child.is-search-hit", self.app_css)
         self.assertIn("margin-bottom: -13px;", self.app_css)
 
+        # 全局配置搜索弹窗桌面端舒展黄金尺寸，窄屏与矮屏优雅自适应
+        dialog_rule = re.search(r"^\.cfg-search-dialog\s*\{([^}]*)\}", self.app_css, re.M)
+        self.assertIsNotNone(dialog_rule)
+        self.assertIn("width: min(840px, 90vw);", dialog_rule.group(1))
+        self.assertIn("max-height: min(78vh, 700px);", dialog_rule.group(1))
+        body_rule = re.search(r"^\.cfg-search-body\s*\{([^}]*)\}", self.app_css, re.M)
+        self.assertIsNotNone(body_rule)
+        self.assertIn("min-height: 360px;", body_rule.group(1))
+        self.assertIn("@media (max-height: 620px)", self.app_css)
+
         # cinema 终端模式弹窗底色/头部/页脚使用不透明档案纸底，避免 58% 半透明浑浊
         cinema_dialog = re.search(r'html\[data-ui-mode="cinema"\]\s+\.cfg-search-dialog\s*\{([^}]*)\}', self.app_css)
         self.assertIsNotNone(cinema_dialog)
