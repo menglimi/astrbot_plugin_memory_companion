@@ -17,12 +17,19 @@ from core.astrbot_compat import (
 from core.classifier import MemoryClassifier
 from core.forward_extractor import (
     FORWARD_FALLBACK_PLACEHOLDER,
+    ForwardCard,
+    ParsedForwards,
     SHARED_EXTRA_KEY,
     TIMELINE_FORWARD_MAX_CHARS,
     extract_forwards,
+    format_forward_capture_body,
     format_forward_timeline_text,
+    group_separate_card_entries,
+    strip_forward_digest_segments,
+    timeline_row_has_forward,
 )
 from core.models import SessionContext, json_loads
+from core.portrait import extract_explicit_candidates
 from core.service import MemoryCompanionService
 from core.summarizer import MemorySummarizer
 
@@ -839,3 +846,195 @@ async def test_astrbot_compat_preserves_forward_digest_and_strips_prompt_wrapper
     assert cleaned == "用户附言"
     assert "private_companion_forward_message_v1" not in cleaned
     assert "系统提示词包装" not in cleaned
+
+
+async def test_summarizer_and_stripper_handle_mixed_and_multicard_pure_forwards_without_false_correction():
+    two_cards = ParsedForwards(
+        cards=(
+            ForwardCard(forward_id="f1", node_count=1, summary_text="路人甲: 不对，你搞错了，我不是那个意思"),
+            ForwardCard(forward_id="f2", node_count=1, summary_text="路人乙: 今天来查岗看看进度"),
+        ),
+        total_nodes=2,
+    )
+    multi_body = format_forward_capture_body("", two_cards)
+    assert multi_body.startswith("[转发#1] [合并转发聊天记录")
+    assert strip_forward_digest_segments(multi_body) == ""
+    assert timeline_row_has_forward({"content": multi_body}, {}) is True
+
+    classifier = MemoryClassifier()
+    assert classifier.from_user_message(SessionContext(message_text=multi_body)) is None
+
+    summarizer = MemorySummarizer()
+    mixed_row = {
+        "id": "tl_mixed_corr",
+        "event_type": "user_message",
+        "scope": "private",
+        "subject_id": "u_alice",
+        "occurred_at": "2026-11-23T04:00:00+00:00",
+        "content": "你看群里他们吵架\n[合并转发聊天记录(2条)] 路人甲: 不对，你搞错了，我不是那个意思 | 路人乙: 今晚查岗",
+        "metadata": json.dumps({"sender_name": "Alice", "has_forward": True, "forward_only": False}, ensure_ascii=False),
+    }
+    multicard_capture_row = {
+        "id": "tl_multicard_cap",
+        "event_type": "user_message",
+        "scope": "private",
+        "subject_id": "u_alice",
+        "occurred_at": "2026-11-23T04:01:00+00:00",
+        "content": multi_body,
+        "metadata": json.dumps({"sender_name": "Alice", "media": [{"kind": "forward", "ref": "f1"}]}, ensure_ascii=False),
+    }
+    lines, consumed = summarizer._transcript_lines_and_rows([mixed_row, multicard_capture_row])
+    assert len(consumed) == 2
+    mixed_item = json.loads(lines[0])
+    multi_item = json.loads(lines[1])
+    assert mixed_item["turn_hint"] == "forwarded_chat_log"
+    assert multi_item["turn_hint"] == "forwarded_chat_log"
+
+
+async def test_portrait_classifier_and_contextual_anchors_strip_forwarded_third_party_speech(svc: MemoryCompanionService):
+    mixed_text = "你看下这段聊天\n[合并转发聊天记录(2条)]\n小王: 我平时不吃香菜\n我喜欢猫"
+    pure_text = "[合并转发聊天记录(2条)]\n我喜欢吃苹果。我讨厌香菜。以后叫我老王。"
+    assert extract_explicit_candidates(mixed_text) == []
+    assert extract_explicit_candidates(pure_text) == []
+    assert MemoryClassifier.profile_rejection_reason(pure_text) == ""
+
+    assert svc._looks_like_user_correction_text(
+        "你看群里聊的\n[合并转发聊天记录(1条)] 路人: 不对，不是这个，错了"
+    ) is False
+    assert svc._looks_like_user_correction_text(
+        "[转发#1] [合并转发聊天记录(1条)] 路人: 不对，其实是周三"
+    ) is False
+    assert svc._looks_like_user_correction_text(
+        "不对，我说的是周四\n[合并转发聊天记录(1条)] 路人: 好的"
+    ) is True
+
+    forward_rows = [
+        {
+            "event_type": "user_message",
+            "subject_id": "u_alice",
+            "content": "你看群里吵架\n[合并转发聊天记录(2条)] 路人甲: 不对，你记得上次去火星吗？错了！",
+        },
+        {
+            "event_type": "user_message",
+            "subject_id": "u_alice",
+            "content": "[转发#1] [合并转发聊天记录(1条)] 路人乙: 不是这个意思，你记得吗",
+        },
+    ]
+    turn_sig = SimpleNamespace(low_information=True, context_dependent=True)
+    assert svc._recent_context_supports_memory_expansion("嗯", forward_rows, turn_sig) is False
+    assert svc._contextual_anchor_row_indices(forward_rows) == set()
+    anchors = svc._contextual_query_anchors("嗯", forward_rows, limit=4)
+    assert "火星" not in anchors
+
+
+async def test_shared_cache_failed_flag_and_napcat_same_id_multicard_preservation(svc: MemoryCompanionService):
+    # 1) Shared cache failed=True must map to fallback=True.
+    failed_event = _FakeEvent(
+        message_str="",
+        components=[Forward(id="fwd_fail_1")],
+        message_id="msg_fail_1",
+        extras={
+            SHARED_EXTRA_KEY: {
+                "version": 1,
+                "source": "private_companion",
+                "cards": [
+                    {
+                        "forward_id": "fwd_fail_1",
+                        "message_id": "msg_fail_1",
+                        "node_count": 0,
+                        "truncated": False,
+                        "failed": True,
+                        "summary_text": "[合并转发聊天记录（未能拉取详情）]",
+                    }
+                ],
+                "combined_text": "[合并转发聊天记录（未能拉取详情）]",
+                "total_nodes": 0,
+                "truncated": False,
+            }
+        },
+    )
+    parsed_failed = await extract_forwards(failed_event)
+    assert parsed_failed is not None
+    assert parsed_failed.cards[0].fallback is True
+
+    # 2) NapCat multi-card sharing the same (message_id, forward_id) with distinct content must keep BOTH cards.
+    ts = datetime(2026, 11, 23, 3, 53, 25, tzinfo=timezone.utc).timestamp()
+    napcat_payload = {
+        "version": 1,
+        "source": "private_companion",
+        "cards": [
+            {
+                "forward_id": "fwd_nap_same",
+                "message_id": "msg_nap_1",
+                "node_count": 1,
+                "truncated": False,
+                "timestamp": datetime.fromtimestamp(ts, timezone.utc).isoformat(),
+                "summary_text": "同学甲: 第一张卡内容-周末去爬山",
+            },
+            {
+                "forward_id": "fwd_nap_same",
+                "message_id": "msg_nap_1",
+                "node_count": 1,
+                "truncated": False,
+                "timestamp": datetime.fromtimestamp(ts, timezone.utc).isoformat(),
+                "summary_text": "同学乙: 第二张卡内容-周一交报告",
+            },
+        ],
+        "combined_text": "同学甲: 第一张卡内容-周末去爬山\n同学乙: 第二张卡内容-周一交报告",
+        "total_nodes": 2,
+        "truncated": False,
+    }
+    agg_event = _FakeEvent(
+        message_str="这两张你都看下",
+        components=[Plain("这两张你都看下")],
+        message_id="msg_nap_followup",
+        timestamp=ts + 10,
+        extras={SHARED_EXTRA_KEY: napcat_payload},
+    )
+    parsed_nap = await extract_forwards(agg_event)
+    assert parsed_nap is not None
+    assert len(parsed_nap.cards) == 2
+
+    # CaptureRuntime merges both cards sharing msg_nap_1 into one message record without dropping card #2.
+    receipt = await svc.capture.incoming(agg_event)
+    assert receipt is not None and receipt["status"] == "committed"
+    all_receipts = getattr(agg_event, "_memory_capture_receipts", [])
+    assert len(all_receipts) == 2  # msg_nap_1 (merged 2 cards) + msg_nap_followup
+    nap_body = svc.capture.read_original(all_receipts[0]["source_key"])["body"]
+    assert "第一张卡内容-周末去爬山" in nap_body
+    assert "第二张卡内容-周一交报告" in nap_body
+
+    # Observer path also preserves both cards under msg_nap_1 on a fresh session.
+    obs_event = _FakeEvent(
+        message_str="这两张都看看",
+        components=[Plain("这两张都看看")],
+        message_id="msg_nap_obs_followup",
+        user_id="u_bob",
+        user_name="Bob",
+        timestamp=ts + 20,
+        extras={SHARED_EXTRA_KEY: napcat_payload},
+    )
+    await svc.handle_group_message(obs_event)
+    obs_rows = await svc.store.recent_timeline(
+        limit=10,
+        scope="private",
+        session_id="aiocqhttp:FriendMessage:u_bob",
+        entity_id="u_bob",
+    )
+    nap_obs = [r for r in obs_rows if r.get("message_id") == "msg_nap_1"]
+    assert len(nap_obs) == 1
+    assert "第一张卡内容-周末去爬山" in nap_obs[0]["content"]
+    assert "第二张卡内容-周一交报告" in nap_obs[0]["content"]
+    assert json_loads(nap_obs[0]["metadata"], {})["forward_count"] == 2
+
+    # 3) Empty message_id + duplicate forward_id with distinct content gets disambiguated deterministically.
+    empty_mid_groups = group_separate_card_entries(
+        [
+            ForwardCard(forward_id="fwd_empty_dup", message_id="", summary_text="内容A"),
+            ForwardCard(forward_id="fwd_empty_dup", message_id="", summary_text="内容B"),
+        ]
+    )
+    assert len(empty_mid_groups) == 2
+    assert empty_mid_groups[0][0] != empty_mid_groups[1][0]
+    assert empty_mid_groups[0][0].startswith("forward:fwd_empty_dup:")
+    assert empty_mid_groups[1][0].startswith("forward:fwd_empty_dup:")

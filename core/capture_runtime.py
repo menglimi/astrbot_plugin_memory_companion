@@ -16,6 +16,7 @@ from .forward_extractor import (
     extract_forwards,
     format_forward_capture_body,
     format_single_card_text,
+    group_separate_card_entries,
     split_distinct_card_entries,
 )
 
@@ -253,15 +254,26 @@ class CaptureRuntime:
         units: list[tuple[dict, str, str, list[dict[str, str]]]] = []
         seen_unit_ids: set[str] = set()
 
-        for idx, card in enumerate(separate_cards, start=1):
-            card_id = card.message_id or (f"forward:{card.forward_id}" if card.forward_id else f"forward:card:{idx}")
-            if card_id in seen_unit_ids:
+        for group_id, group_cards in group_separate_card_entries(separate_cards):
+            if group_id in seen_unit_ids:
                 continue
-            seen_unit_ids.add(card_id)
-            card_body = format_single_card_text(card, max_chars=DEFAULT_CARD_MAX_CHARS, single_line=False)
-            card_media = build_forward_media_refs([card])
-            card_ts = card.timestamp or message_at
-            units.append((self.identity(ctx, direction='incoming', message=card_id), card_body, card_ts, card_media))
+            seen_unit_ids.add(group_id)
+            if len(group_cards) == 1:
+                card = group_cards[0]
+                group_body = format_single_card_text(card, max_chars=DEFAULT_CARD_MAX_CHARS, single_line=False)
+                group_ts = card.timestamp or message_at
+            else:
+                group_parsed = ParsedForwards(
+                    version=parsed_forwards.version,
+                    source=parsed_forwards.source,
+                    cards=tuple(group_cards),
+                    total_nodes=sum(c.node_count for c in group_cards),
+                    truncated=any(c.truncated for c in group_cards),
+                )
+                group_body = format_forward_capture_body("", group_parsed)
+                group_ts = next((c.timestamp for c in group_cards if c.timestamp), "") or message_at
+            group_media = build_forward_media_refs(group_cards)
+            units.append((self.identity(ctx, direction='incoming', message=group_id), group_body, group_ts, group_media))
 
         if attached_cards:
             outer_id = explicit_id

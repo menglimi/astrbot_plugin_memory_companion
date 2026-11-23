@@ -142,7 +142,10 @@ class MemoryClassifier:
 
     @staticmethod
     def profile_rejection_reason(text: Any) -> str:
-        return profile_rejection_reason(text)
+        own_text = strip_forward_digest_segments(text)
+        if not own_text:
+            return ""
+        return profile_rejection_reason(own_text)
 
     def external_record(
         self,

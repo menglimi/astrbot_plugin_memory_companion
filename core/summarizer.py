@@ -9,7 +9,7 @@ from difflib import SequenceMatcher
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .forward_extractor import timeline_row_has_forward
+from .forward_extractor import strip_forward_digest_segments, timeline_row_has_forward
 from .local_time import local_tz, timezone_name
 from .models import clean_text, json_dumps, json_loads
 from .assertions import (
@@ -319,7 +319,11 @@ class MemorySummarizer:
             if not original_content:
                 continue
             content, injection_flag = self._sanitize_untrusted_content(original_content)
-            routine_marker = self._looks_like_routine_check_text(original_content)
+            has_forward = event_type != "bot_response" and timeline_row_has_forward(row, metadata)
+            own_original = strip_forward_digest_segments(original_content) if has_forward else original_content
+            own_content = strip_forward_digest_segments(content) if has_forward else content
+            forward_only = bool(has_forward and (metadata.get("forward_only") or not own_original.strip()))
+            routine_marker = bool(own_original.strip()) and self._looks_like_routine_check_text(own_original)
             item = {
                 "event_id": clean_text(row.get("id"), 160),
                 "speaker": speaker,
@@ -330,14 +334,6 @@ class MemorySummarizer:
                 "content": content,
                 "content_is_untrusted_chat_data": True,
             }
-            has_forward = event_type != "bot_response" and timeline_row_has_forward(row, metadata)
-            forward_only = bool(
-                has_forward
-                and (
-                    metadata.get("forward_only")
-                    or original_content.lstrip().startswith("[合并转发聊天记录")
-                )
-            )
             if has_forward:
                 item["has_forward"] = True
             if forward_only:
@@ -346,14 +342,14 @@ class MemorySummarizer:
                     "本条是用户转发/分享的外部合并转发聊天记录，不代表当前用户本人说过的话。"
                     "请记录为用户分享给角色的外部记录或话题背景，严禁把转发记录中第三方人物的话语、偏好或身份属性归属给当前用户本人。"
                 )
-            elif event_type != "bot_response" and self._looks_like_user_correction_text(content):
+            elif event_type != "bot_response" and own_content.strip() and self._looks_like_user_correction_text(own_content):
                 item["turn_hint"] = "user_correction"
                 item["summary_hint"] = "这是一条用户纠正，只能用于修正同一话题的前文；不要扩散到无关记忆。"
             elif routine_marker:
                 item["turn_hint"] = "routine_check_marker"
                 item["summary_hint"] = "这是例行检查/查岗开始信号；它本身是习惯线索，后续几轮更重要。"
                 routine_check_window = 6
-            elif routine_check_window > 0 and self._has_routine_check_detail_value(content):
+            elif routine_check_window > 0 and own_content.strip() and self._has_routine_check_detail_value(own_content):
                 item["turn_hint"] = "routine_check_detail"
                 item["summary_hint"] = "这是例行检查后的具体内容；需要保留检查对象、检查结果、异常、已处理事项或待办。"
             elif has_forward:

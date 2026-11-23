@@ -78,7 +78,9 @@ from .forward_extractor import (
     extract_forwards,
     format_forward_timeline_text,
     format_single_card_text,
+    group_separate_card_entries,
     split_distinct_card_entries,
+    strip_forward_digest_segments,
 )
 from .identity import IdentityResolver, canonical_user_id, looks_like_command, maybe_await, normalize_session_context_fields, session_target_id
 from .importance import ImportanceEvaluator
@@ -2878,25 +2880,40 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 self._schedule_source_semantic_maintenance(ctx, captured_id)
                 written_ids.append(captured_id)
 
-        for card in separate_cards:
-            card_msg_id = card.message_id or (f"forward:{card.forward_id}" if card.forward_id else "")
-            card_content = format_single_card_text(
-                card,
-                max_chars=TIMELINE_FORWARD_MAX_CHARS,
-                single_line=True,
-            )
+        for group_msg_id, group_cards in group_separate_card_entries(separate_cards):
+            if len(group_cards) == 1:
+                card = group_cards[0]
+                group_content = format_single_card_text(
+                    card,
+                    max_chars=TIMELINE_FORWARD_MAX_CHARS,
+                    single_line=True,
+                )
+                group_ts = card.timestamp
+            else:
+                group_parsed = ParsedForwards(
+                    version=parsed_forwards.version,
+                    source=parsed_forwards.source,
+                    cards=tuple(group_cards),
+                    total_nodes=sum(c.node_count for c in group_cards),
+                    truncated=any(c.truncated for c in group_cards),
+                )
+                group_content = format_forward_timeline_text(
+                    group_parsed,
+                    max_chars=TIMELINE_FORWARD_MAX_CHARS,
+                )
+                group_ts = next((c.timestamp for c in group_cards if c.timestamp), "")
             await write_entry(
-                entry_msg_id=card_msg_id,
-                content=card_content,
+                entry_msg_id=group_msg_id,
+                content=group_content,
                 forward_meta={
                     "has_forward": True,
-                    "forward_count": 1,
-                    "forward_node_count": card.node_count,
-                    "forward_ids": [card.forward_id] if card.forward_id else [],
+                    "forward_count": len(group_cards),
+                    "forward_node_count": sum(c.node_count for c in group_cards),
+                    "forward_ids": [c.forward_id for c in group_cards if c.forward_id],
                     "forward_only": True,
-                    "forward_truncated": bool(card.truncated),
+                    "forward_truncated": any(c.truncated for c in group_cards),
                 },
-                occurred_at=card.timestamp,
+                occurred_at=group_ts,
                 include_reply=False,
             )
 
@@ -13562,7 +13579,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         # Low-information follow-ups like "还有的吧" should only inherit a memory
         # search scene while that scene is still live in the newest turns.
         for row in (rows or [])[:3]:
-            text = clean_text(row.get("content"), 600)
+            text = clean_text(strip_forward_digest_segments(row.get("content")), 600)
             if not text:
                 continue
             speaker_is_user = clean_text(row.get("event_type"), 40) != "bot_response" and clean_text(row.get("subject_id"), 80) != "self"
@@ -13590,13 +13607,17 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         for index, row in enumerate(rows or []):
             if relevant_indices and index not in relevant_indices:
                 continue
-            text = clean_text(row.get("content"), 900)
-            if not text:
+            raw_text = clean_text(row.get("content"), 900)
+            if not raw_text:
                 continue
             event_type = clean_text(row.get("event_type"), 40)
             speaker_is_user = event_type != "bot_response" and clean_text(row.get("subject_id"), 80) != "self"
-            correction = speaker_is_user and self._looks_like_user_correction_text(text)
-            memory_request = speaker_is_user and self._message_is_contextual_memory_request(text)
+            own_text = clean_text(strip_forward_digest_segments(row.get("content")), 900) if speaker_is_user else raw_text
+            text = own_text if speaker_is_user else raw_text
+            if not text:
+                continue
+            correction = speaker_is_user and self._looks_like_user_correction_text(own_text)
+            memory_request = speaker_is_user and self._message_is_contextual_memory_request(own_text)
             if correction or memory_request:
                 newest_support_index = min(newest_support_index, index)
             recency = 1.0 / (1.0 + index * 0.18)
@@ -13661,7 +13682,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
     def _contextual_anchor_row_indices(self, rows: list[dict[str, Any]]) -> set[int]:
         support: set[int] = set()
         for index, row in enumerate(rows or []):
-            text = clean_text(row.get("content"), 800)
+            text = clean_text(strip_forward_digest_segments(row.get("content")), 800)
             if not text:
                 continue
             speaker_is_user = clean_text(row.get("event_type"), 40) != "bot_response" and clean_text(row.get("subject_id"), 80) != "self"
@@ -13896,7 +13917,8 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
 
     @staticmethod
     def _looks_like_user_correction_text(text: str) -> bool:
-        compact = re.sub(r"\s+", "", clean_text(text, 500)).lower()
+        own = strip_forward_digest_segments(text)
+        compact = re.sub(r"\s+", "", clean_text(own, 500)).lower()
         if not compact:
             return False
         correction_markers = (

@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import html
 import json
 import math
@@ -41,7 +42,8 @@ TIMELINE_FORWARD_MAX_CHARS = 1000
 CAPTURE_FORWARD_MAX_BYTES = 240 * 1024
 
 _CQ_CODE_RE = re.compile(r"\[CQ:([a-zA-Z0-9_]+)(?:,([^\]]*))?\]")
-_FORWARD_DIGEST_RE = re.compile(r"\[合并转发聊天记录[^\]]*\].*", re.DOTALL)
+_FORWARD_DIGEST_RE = re.compile(r"(?:\[转发#\d+\]\s*)?\[合并转发聊天记录[^\]]*\].*", re.DOTALL)
+_FORWARD_CONTENT_HEAD_RE = re.compile(r"^(?:\[转发#\d+\]\s*)?\[合并转发聊天记录")
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,23 +175,45 @@ def _component_data(item: Any) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _card_body_key(card: ForwardCard) -> str:
+    return clean_text(card.summary_text, 4000)
+
+
 def _dedupe_cards(cards: list[ForwardCard]) -> tuple[ForwardCard, ...]:
+    """Deduplicate identical or fallback cards while preserving distinct-content multi-cards.
+
+    Some OneBot implementations (e.g. NapCat) emit multiple distinct forward cards
+    inside a single message sharing the same ``(message_id, forward_id)`` pair.
+    Only merge cards with the same ``(msg_id, fwd_id)`` when their normalized body
+    is identical or when one side is a ``fallback`` placeholder.
+    """
     deduped: list[ForwardCard] = []
-    seen_keys: dict[tuple[str, str], int] = {}
+    indices_by_key: dict[tuple[str, str], list[int]] = {}
     for card in cards:
         msg_id = card.message_id
         fwd_id = card.forward_id
-        key: tuple[str, str] | None = None
-        if msg_id or fwd_id:
-            key = (msg_id, fwd_id)
-        if key is not None and key in seen_keys:
-            idx = seen_keys[key]
-            existing = deduped[idx]
-            if len(card.summary_text) > len(existing.summary_text) or (existing.fallback and not card.fallback):
-                deduped[idx] = card
-            continue
+        key: tuple[str, str] | None = (msg_id, fwd_id) if (msg_id or fwd_id) else None
+        if key is not None and key in indices_by_key:
+            card_body = _card_body_key(card)
+            merged = False
+            for idx in indices_by_key[key]:
+                existing = deduped[idx]
+                if _card_body_key(existing) == card_body:
+                    if existing.fallback and not card.fallback:
+                        deduped[idx] = card
+                    merged = True
+                    break
+                if existing.fallback and not card.fallback:
+                    deduped[idx] = card
+                    merged = True
+                    break
+                if card.fallback and not existing.fallback:
+                    merged = True
+                    break
+            if merged:
+                continue
         if key is not None:
-            seen_keys[key] = len(deduped)
+            indices_by_key.setdefault(key, []).append(len(deduped))
         deduped.append(card)
     return tuple(deduped)
 
@@ -250,7 +274,9 @@ def _normalize_cached_payload(raw: Any) -> ParsedForwards | None:
                 for u in (raw_imgs if isinstance(raw_imgs, (list, tuple)) else ())
                 if isinstance(u, str) and u.strip() and len(u.strip()) <= 1024
             )[:DEFAULT_MAX_IMAGE_URLS]
-            fallback = bool(item.get("fallback", False)) or (not summary and node_count == 0)
+            fallback = bool(item.get("fallback", False) or item.get("failed", False)) or (
+                not summary and node_count == 0
+            )
             if not summary:
                 summary = FORWARD_FALLBACK_PLACEHOLDER
             cards_list.append(
@@ -939,8 +965,11 @@ def build_forward_media_refs(cards: tuple[ForwardCard, ...] | list[ForwardCard])
     for idx, card in enumerate(cards, start=1):
         if len(refs) >= 32:
             break
-        ref = clean_text(card.forward_id or card.message_id or f"card_{idx}", 160)
-        if not ref or ref in seen:
+        base = clean_text(card.forward_id or card.message_id or f"card_{idx}", 148)
+        if not base:
+            continue
+        ref = base if base not in seen else f"{base}#{idx}"
+        if ref in seen:
             continue
         seen.add(ref)
         refs.append({"kind": "forward", "ref": ref})
@@ -973,10 +1002,56 @@ def split_distinct_card_entries(
     return separate, list(parsed.cards)
 
 
+def group_separate_card_entries(
+    cards: list[ForwardCard] | tuple[ForwardCard, ...],
+) -> list[tuple[str, list[ForwardCard]]]:
+    """Group ``separate_cards`` by message identity without losing multi-card messages.
+
+    - Cards sharing a non-empty ``message_id`` (e.g. a single NapCat message carrying
+      multiple distinct forward cards) merge into one grouped message record under
+      that ``message_id`` (keeping 1:1 ``message_id`` idempotency with zero card loss).
+    - Cards with an empty ``message_id`` get a deterministic ``forward:<id>`` key,
+      disambiguated by a content digest suffix when distinct cards share ``forward_id``.
+    """
+    grouped: list[tuple[str, list[ForwardCard]]] = []
+    by_msg_id: dict[str, int] = {}
+    empty_mid_fwd_counts: dict[str, int] = {}
+    for card in cards:
+        if not card.message_id and card.forward_id:
+            empty_mid_fwd_counts[card.forward_id] = empty_mid_fwd_counts.get(card.forward_id, 0) + 1
+
+    seen_empty_keys: set[str] = set()
+    for idx, card in enumerate(cards, start=1):
+        if card.message_id:
+            if card.message_id in by_msg_id:
+                grouped[by_msg_id[card.message_id]][1].append(card)
+            else:
+                by_msg_id[card.message_id] = len(grouped)
+                grouped.append((card.message_id, [card]))
+            continue
+
+        if card.forward_id:
+            if empty_mid_fwd_counts.get(card.forward_id, 0) > 1:
+                digest8 = hashlib.sha256(_card_body_key(card).encode("utf-8")).hexdigest()[:8]
+                unit_id = f"forward:{card.forward_id}:{digest8}"
+                if unit_id in seen_empty_keys:
+                    unit_id = f"forward:{card.forward_id}:{digest8}:{idx}"
+            else:
+                unit_id = f"forward:{card.forward_id}"
+        else:
+            digest8 = hashlib.sha256(_card_body_key(card).encode("utf-8")).hexdigest()[:8]
+            unit_id = f"forward:card:{idx}:{digest8}"
+        if unit_id in seen_empty_keys:
+            continue
+        seen_empty_keys.add(unit_id)
+        grouped.append((unit_id, [card]))
+    return grouped
+
+
 def strip_forward_digest_segments(text: Any) -> str:
-    """Strip ``[合并转发聊天记录...]`` projections before rule-based user profile extraction."""
+    """Strip ``[合并转发聊天记录...]`` (including ``[转发#N]``) projections before user-attribution checks."""
     raw = str(text or "")
-    if not raw or FORWARD_HEADER_PREFIX not in raw:
+    if not raw or (FORWARD_HEADER_PREFIX not in raw and "[转发#" not in raw):
         return raw
     return _FORWARD_DIGEST_RE.sub("", raw).strip()
 
@@ -992,4 +1067,4 @@ def timeline_row_has_forward(row: dict[str, Any], metadata: dict[str, Any] | Non
             if isinstance(item, dict) and str(item.get("kind") or "").strip().lower() == "forward":
                 return True
     content = str(row.get("content") or "").lstrip()
-    return content.startswith(FORWARD_HEADER_PREFIX)
+    return bool(_FORWARD_CONTENT_HEAD_RE.match(content))
