@@ -164,29 +164,91 @@ def _detect_total_memory_mb() -> int | None:
     return detected
 
 
+def _detect_cpu_count() -> int:
+    try:
+        count = os.cpu_count()
+        if isinstance(count, int) and count > 0:
+            return count
+    except Exception:
+        pass
+    return 2
+
+
+def _sqlite_hardware_tier(
+    *,
+    total_memory_mb: int | None = None,
+) -> str:
+    """Classify host memory into ``low`` / ``mid`` / ``high`` tuning tiers.
+
+    - ``low``  (<= 2.5 GiB): 1-2 GiB cloud VPS; prioritize lean RSS and zero swap.
+    - ``mid``  (2.5-10 GiB or unknown): 4-8 GiB machines; balanced cache & mmap.
+    - ``high`` (> 10 GiB): 16-32 GiB+ desktops/servers; maximize SQLite page cache,
+      mmap coverage, and parallel reader concurrency so large databases stay hot.
+    """
+    ram_mb = _detect_total_memory_mb() if total_memory_mb is None else total_memory_mb
+    if ram_mb is not None and ram_mb <= 2560:
+        return "low"
+    if ram_mb is not None and ram_mb > 10240:
+        return "high"
+    return "mid"
+
+
+def _read_pool_capacity(
+    *,
+    total_memory_mb: int | None = None,
+    cpu_count: int | None = None,
+) -> int:
+    """Return total concurrent read-only connections for the persistent LIFO pool."""
+    cpus = max(1, int(_detect_cpu_count() if cpu_count is None else cpu_count))
+    tier = _sqlite_hardware_tier(total_memory_mb=total_memory_mb)
+    if tier == "low":
+        return 2
+    if tier == "high":
+        return max(6, min(12, cpus))
+    return max(3, min(6, cpus))
+
+
 def _sqlite_connection_pragmas(
     *,
     role: str = "main",
     total_memory_mb: int | None = None,
+    cpu_count: int | None = None,
 ) -> dict[str, Any]:
-    """Return memory-adaptive SQLite cache_size / temp_store / mmap_size PRAGMAs.
+    """Return hardware-adaptive SQLite cache_size / temp_store / mmap_size PRAGMAs.
 
-    On 1-2 GiB VPS hosts (<= 2560 MiB RAM), disable mmap (prevents OS page-cache
-    thrashing) and bound page cache to 8 MiB per connection. On larger hosts,
-    keep a modest 16 MiB cache and 64 MiB mmap so multi-connection RSS stays lean.
+    Scales across three host memory tiers without crippling high-spec machines
+    or risking OOM/swap thrashing on 1-2 GiB cloud servers:
+    - Low  (<= 2.5 GiB):  8 MiB cache, mmap disabled (0), pool=2.
+    - Mid  (4-8 GiB):    32 MiB cache, 256 MiB mmap, pool=3-6.
+    - High (16 GiB+):    64 MiB cache, 512 MiB-1 GiB mmap, pool=6-12.
     """
     ram_mb = _detect_total_memory_mb() if total_memory_mb is None else total_memory_mb
-    low_memory = ram_mb is not None and ram_mb <= 2560
-    if low_memory:
+    tier = _sqlite_hardware_tier(total_memory_mb=ram_mb)
+    if tier == "low":
         return {
             "cache_size": -8192,
             "temp_store": "MEMORY",
             "mmap_size": 0,
+            "tier": "low",
+            "read_pool_size": _read_pool_capacity(total_memory_mb=ram_mb, cpu_count=cpu_count),
+        }
+    if tier == "high":
+        # >= 20 GiB hosts can safely map up to 1 GiB so ~850 MiB production DBs
+        # stay resident in OS page cache without ReadFile syscall churn.
+        mmap_bytes = 1073741824 if (ram_mb is not None and ram_mb >= 20480) else 536870912
+        return {
+            "cache_size": -65536,
+            "temp_store": "MEMORY",
+            "mmap_size": mmap_bytes,
+            "tier": "high",
+            "read_pool_size": _read_pool_capacity(total_memory_mb=ram_mb, cpu_count=cpu_count),
         }
     return {
-        "cache_size": -16384,
+        "cache_size": -32768,
         "temp_store": "MEMORY",
-        "mmap_size": 67108864,
+        "mmap_size": 268435456,
+        "tier": "mid",
+        "read_pool_size": _read_pool_capacity(total_memory_mb=ram_mb, cpu_count=cpu_count),
     }
 
 
@@ -683,6 +745,15 @@ class MemoryStore(SummaryBatchStore):
         # 不再排队等主连接写锁，对应 optimization_plan.md §6.1。
         self._read_conn: sqlite3.Connection | None = None
         self._read_lock = threading.RLock()
+        # 硬件自适应常驻 LIFO 只读连接池：低配 1-2G 保持 2 路瘦身，中高配扩展至 4-12 路，
+        # 面板并发 10+ GET 突发时零排队且完全不与主写锁或 live timeline/vector 读连接争抢。
+        self._read_pool_max: int = _read_pool_capacity()
+        self._read_pool_idle: list[sqlite3.Connection] = []
+        self._read_pool_all: set[sqlite3.Connection] = set()
+        self._read_pool_creating: int = 0
+        self._read_pool_cond = threading.Condition()
+        self._buckets_cache_lock = threading.Lock()
+        self._buckets_cache: dict[tuple[str, bool, bool], list[dict[str, Any]]] = {}
         # 近期时间线单独使用连接，避免与候选读取共用同一把线程锁。
         self._timeline_read_conn: sqlite3.Connection | None = None
         self._timeline_read_lock = threading.RLock()
@@ -894,16 +965,110 @@ class MemoryStore(SummaryBatchStore):
             return self._conn, self._lock
         return self._ensure_vector_read_connection(), self._vector_read_lock
 
+    def _acquire_pooled_read_conn_sync(self) -> sqlite3.Connection:
+        """Check out a warm read-only connection from the bounded LIFO overflow pool."""
+        extra_cap = max(1, int(getattr(self, "_read_pool_max", 2) or 2) - 1)
+        while True:
+            should_open = False
+            with self._read_pool_cond:
+                if self._closed:
+                    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+                if self._read_pool_idle:
+                    return self._read_pool_idle.pop()
+                if len(self._read_pool_all) + self._read_pool_creating < extra_cap:
+                    self._read_pool_creating += 1
+                    should_open = True
+                else:
+                    self._read_pool_cond.wait(timeout=0.05)
+                    continue
+            if should_open:
+                try:
+                    conn = self._open_dedicated_read_connection()
+                except BaseException:
+                    with self._read_pool_cond:
+                        self._read_pool_creating = max(0, self._read_pool_creating - 1)
+                        self._read_pool_cond.notify()
+                    raise
+                with self._read_pool_cond:
+                    self._read_pool_creating = max(0, self._read_pool_creating - 1)
+                    if self._closed:
+                        try:
+                            conn.close()
+                        except sqlite3.Error:
+                            pass
+                        self._read_pool_cond.notify_all()
+                        raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+                    self._read_pool_all.add(conn)
+                return conn
+
+    def _release_pooled_read_conn_sync(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        broken: bool = False,
+    ) -> None:
+        close_now = broken
+        with self._read_pool_cond:
+            if self._closed or broken:
+                self._read_pool_all.discard(conn)
+                close_now = True
+            else:
+                self._read_pool_idle.append(conn)
+            self._read_pool_cond.notify()
+        if close_now:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+    def _close_read_pool_sync(self) -> None:
+        with self._read_pool_cond:
+            to_close = list(self._read_pool_idle)
+            self._read_pool_idle.clear()
+            for conn in to_close:
+                self._read_pool_all.discard(conn)
+            self._read_pool_cond.notify_all()
+        for conn in to_close:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
     @contextmanager
     def _read_conn_sync(self):
-        """Yield a non-blocking dedicated read connection off ``self._lock``.
+        """Yield a non-blocking read-only connection from the persistent LIFO pool.
 
-        Falls back to ``self._conn`` under ``self._lock`` when opened with
-        ``read_only=True`` or when ``self._conn`` holds an uncommitted
-        transaction accessible without blocking on another writer's ``self._lock``.
-        Falls back to ``_timeline_read_connection`` when ``_read_lock`` is busy.
+        - Preserves read-your-own-writes when the calling thread has an open
+          uncommitted transaction on ``self._conn``.
+        - Uses ``_read_conn`` (slot #0) under ``_read_lock`` when immediately free,
+          keeping the hottest page cache warm under light load.
+        - On concurrent bursts (e.g. parallel dashboard GETs or multi-group hooks),
+          immediately checks out additional persistent ``mode=ro`` handles from
+          the hardware-scaled LIFO pool without queueing behind ``_read_lock``,
+          ``_timeline_read_lock``, ``_vector_read_lock``, or main ``self._lock``.
         """
         if self._read_only:
+            if self._closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+            if self._lock.acquire(blocking=False):
+                try:
+                    if self._closed:
+                        raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+                    yield self._conn
+                finally:
+                    self._lock.release()
+                return
+            if self.db_path.is_file():
+                conn = self._acquire_pooled_read_conn_sync()
+                broken = False
+                try:
+                    yield conn
+                except sqlite3.DatabaseError:
+                    broken = True
+                    raise
+                finally:
+                    self._release_pooled_read_conn_sync(conn, broken=broken)
+                return
             with self._lock:
                 if self._closed:
                     raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
@@ -927,11 +1092,15 @@ class MemoryStore(SummaryBatchStore):
             finally:
                 self._read_lock.release()
             return
-        tl_conn, tl_lock = self._timeline_read_connection()
-        with tl_lock:
-            if self._closed:
-                raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
-            yield tl_conn
+        conn = self._acquire_pooled_read_conn_sync()
+        broken = False
+        try:
+            yield conn
+        except sqlite3.DatabaseError:
+            broken = True
+            raise
+        finally:
+            self._release_pooled_read_conn_sync(conn, broken=broken)
 
     @staticmethod
     def _is_database_path_error(error: BaseException) -> bool:
@@ -1105,6 +1274,7 @@ class MemoryStore(SummaryBatchStore):
                 previous.close()
             except sqlite3.Error:
                 pass
+        self._close_read_pool_sync()
 
     def _run_with_database_recovery_sync(self, operation: Any, *args: Any, **kwargs: Any) -> Any:
         try:
@@ -2309,6 +2479,32 @@ class MemoryStore(SummaryBatchStore):
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_time_order_nullif "
                 f"ON memories({time_no_updated_sql})"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_list_order "
+                f"ON memories({time_no_updated_sql} DESC, created_at DESC, id DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_scope_list_order "
+                f"ON memories(scope, {time_no_updated_sql} DESC, created_at DESC, id DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_type_review_created "
+                "ON memories(memory_type, review_status, created_at DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_user_subject_active "
+                "ON memories(subject_id, owner_bot_id, durability, importance DESC, occurred_at DESC) "
+                "WHERE subject_kind='user' AND lifecycle!='archived'"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_knowledge_edges_updated "
+                "ON knowledge_edges(updated_at DESC, id DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_timeline_empty_content "
+                "ON timeline(id) "
+                "WHERE trim(COALESCE(content,''),char(9)||char(10)||char(13)||' ')=''"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_time_order_updated_nullif "
@@ -4760,9 +4956,12 @@ class MemoryStore(SummaryBatchStore):
         with self._operation_condition:
             tracked_ops = int(self._active_tracked_operations)
             owner_stack = self._operation_owner_stack
+        with self._read_pool_cond:
+            read_pool_open = len(self._read_pool_all)
         return {
             "main_conn_closed": bool(self._closed),
             "read_conn_closed": self._read_conn is None,
+            "read_pool_closed": read_pool_open == 0,
             "timeline_read_conn_closed": self._timeline_read_conn is None,
             "vector_read_conn_closed": self._vector_read_conn is None,
             "tracked_ops": tracked_ops,
@@ -4839,11 +5038,14 @@ class MemoryStore(SummaryBatchStore):
             self._vector_search_cache.clear()
             self._vector_corpus_cache.clear()
             self._vector_cache_sync_sig = None
+        with self._buckets_cache_lock:
+            self._buckets_cache.clear()
         light_lock = getattr(self, "_record_light_cache_lock", None)
         light_cache = self.__dict__.get("_record_light_cache")
         if light_lock is not None and light_cache is not None:
             with light_lock:
                 light_cache.clear()
+        self._close_read_pool_sync()
         with self._read_lock:
             if self._read_conn is not None:
                 try:
@@ -9238,6 +9440,64 @@ class MemoryStore(SummaryBatchStore):
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def _person_top_memories_batch_sync(
+        self,
+        conn: sqlite3.Connection,
+        user_ids: list[str],
+        bot_id: str,
+        limit: int = 3,
+    ) -> dict[str, list[dict[str, Any]]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        if not user_ids:
+            return grouped
+        safe_limit = max(1, int(limit))
+        for chunk in self._chunk_ids(user_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            where = (
+                f"subject_kind='user' AND subject_id IN ({placeholders}) "
+                "AND lifecycle!='archived' "
+                "AND COALESCE(validity_status, 'active') NOT IN "
+                "('archived', 'deleted', 'superseded', 'quarantined')"
+            )
+            params: list[Any] = list(chunk)
+            if bot_id:
+                where += (
+                    " AND (COALESCE(owner_bot_id, '')=? OR COALESCE(owner_bot_id, '')='')"
+                )
+                params.append(bot_id)
+            rows = conn.execute(
+                f"""
+                WITH ranked AS (
+                    SELECT subject_id, id, content, memory_type, importance, durability,
+                           metadata, tags, scope, occurred_at, created_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY subject_id
+                               ORDER BY CASE COALESCE(durability, 'normal')
+                                            WHEN 'pinned' THEN 3
+                                            WHEN 'durable' THEN 2
+                                            ELSE 1
+                                        END DESC,
+                                        importance DESC,
+                                        COALESCE(NULLIF(occurred_at, ''), created_at) DESC
+                           ) AS rn
+                    FROM memories
+                    WHERE {where}
+                )
+                SELECT subject_id, id, content, memory_type, importance, durability,
+                       metadata, tags, scope, occurred_at, created_at
+                FROM ranked
+                WHERE rn <= ?
+                ORDER BY subject_id, rn
+                """,
+                params + [safe_limit],
+            ).fetchall()
+            for row in rows:
+                item = dict(row)
+                uid = clean_text(item.pop("subject_id", ""), 120)
+                if uid:
+                    grouped.setdefault(uid, []).append(item)
+        return grouped
+
     def _list_person_cards_sync(
         self, bot_id: str, query: str, limit: int, offset: int, sort: str
     ) -> dict[str, Any]:
@@ -9263,131 +9523,196 @@ class MemoryStore(SummaryBatchStore):
                 params.append(bot_id)
             sql += " ORDER BY weight DESC, updated_at DESC LIMIT 4000"
             rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
-        if not rows:
-            return {"items": [], "total": 0, "bots": [], "state": "empty"}
-        user_ids = sorted(
-            {
-                clean_text(row.get("user_id"), 120)
-                for row in rows
-                if clean_text(row.get("user_id"), 120)
-            }
-        )
-        identities = self._person_identity_cards_sync(user_ids)
-        stats = self._person_memory_stats_sync(user_ids)
-        # 卡片是按人给的，所以「记得多少件事」也要按人合计：同一份记忆按
-        # (bot_id, platform) 各占一个桶，只取其中一个会少算，和卡片下面列出的
-        # 最近记忆对不上。按 bot 筛选时仍只看这个 bot 的桶，和筛选语义一致。
-        person_stats: dict[str, dict[str, Any]] = {}
-        if not bot_id:
-            for (_, stat_user), item in stats.items():
-                acc = person_stats.setdefault(
-                    stat_user,
-                    {"memory_count": 0, "imprint_count": 0, "last_at": ""},
-                )
-                acc["memory_count"] += int(item.get("memory_count") or 0)
-                acc["imprint_count"] += int(item.get("imprint_count") or 0)
-                stat_last = clean_text(item.get("last_at"), 40)
-                if stat_last > acc["last_at"]:
-                    acc["last_at"] = stat_last
-        groups: dict[str, list[dict[str, Any]]] = {}
-        for row in rows:
-            user_id = clean_text(row.get("user_id"), 120)
-            if not user_id:
-                continue
-            groups.setdefault(user_id, []).append(row)
-        bots: dict[str, int] = {}
-        cards: list[dict[str, Any]] = []
-        for user_id, group in groups.items():
-            # 同一个人可能因为 bot / 平台不同被记成多行（空 bot_id、QQ、飞书、导入来源），
-            # 面板按人只给一张卡：取分量最高的那行当主卡，其余只用来合并平台。
-            row = max(group, key=lambda item: clamp_weight(item.get("weight")))
-            row_bot = clean_text(row.get("bot_id"), 120)
-            platforms: list[str] = []
-            bot_ids: list[str] = []
-            group_bot_ids: list[str] = []
-            for item in group:
-                platform = clean_text(item.get("platform"), 40)
-                if platform and platform not in platforms:
-                    platforms.append(platform)
-                item_bot = clean_text(item.get("bot_id"), 120)
-                if item_bot not in group_bot_ids:
-                    group_bot_ids.append(item_bot)
-                if item_bot and item_bot not in bot_ids:
-                    bot_ids.append(item_bot)
-            for item_bot in group_bot_ids:
-                bots[item_bot] = bots.get(item_bot, 0) + 1
-            identity = identities.get(user_id, {})
-            profile = identity.get("profile")
-            if not isinstance(profile, dict):
-                profile = {}
-            stat = (
-                (stats.get((row_bot, user_id)) or stats.get(("", user_id)) or {})
-                if bot_id
-                else (person_stats.get(user_id) or {})
-            )
-            display_name = clean_text(identity.get("display_name"), 80)
-            address = clean_text(profile.get("relation_address"), 40)
-            relation = clean_text(profile.get("relation_label"), 40)
-            note = clean_text(profile.get("relation_note"), 80)
-            weight = clamp_weight(row.get("weight"))
-            band = clean_text(row.get("band"), 20) or band_of(weight)
-            aliases = identity.get("aliases") or []
-            haystack = " ".join(
-                value.casefold()
-                for value in (
-                    display_name,
-                    address,
-                    relation,
-                    note,
-                    user_id,
-                    " ".join(aliases),
-                )
-                if value
-            )
-            if needle and needle not in haystack:
-                continue
-            memory_count = int(stat.get("memory_count") or 0)
-            imprint_count = int(stat.get("imprint_count") or 0)
-            last_at = clean_text(stat.get("last_at"), 40)
-            days_since = self._days_since(last_at)
-            cards.append(
+            if not rows:
+                return {"items": [], "total": 0, "bots": [], "state": "empty"}
+            user_ids = sorted(
                 {
-                    "user_id": user_id,
-                    "platform": platforms[0] if platforms else "",
-                    "platforms": platforms,
-                    "bot_id": row_bot,
-                    "bot_ids": bot_ids,
-                    "display_name": display_name or address or user_id,
-                    "address": address,
-                    "relation_label": relation,
-                    "relation_note": note,
-                    "aliases": aliases,
-                    "weight": weight,
-                    "band": band,
-                    "band_label": BAND_LABELS.get(band, BAND_LABELS["stranger"]),
-                    "source": clean_text(row.get("source"), 20) or "auto",
-                    "correction": int(row.get("correction") or 0),
-                    "memory_count": memory_count,
-                    "imprint_count": imprint_count,
-                    "last_seen": last_at,
-                    "days_since_last": round(days_since, 1) if days_since is not None else None,
+                    clean_text(row.get("user_id"), 120)
+                    for row in rows
+                    if clean_text(row.get("user_id"), 120)
                 }
             )
-        if sort == "recent":
-            cards.sort(key=lambda card: card.get("last_seen") or "", reverse=True)
-        elif sort == "name":
-            cards.sort(key=lambda card: (card.get("display_name") or "").casefold())
-        elif sort == "memory":
-            cards.sort(key=lambda card: card.get("memory_count") or 0, reverse=True)
-        else:
-            cards.sort(key=lambda card: card.get("weight") or 0, reverse=True)
-        total = len(cards)
-        page_items = cards[max(0, offset) :][:limit]
+            identities: dict[str, dict[str, Any]] = {}
+            for chunk in self._chunk_ids(user_ids):
+                placeholders = ",".join("?" for _ in chunk)
+                for row in conn.execute(
+                    "SELECT entity_id, display_name, aliases, profile FROM identities "
+                    f"WHERE entity_kind='user' AND entity_id IN ({placeholders}) "
+                    "ORDER BY updated_at DESC",
+                    chunk,
+                ).fetchall():
+                    item = dict(row)
+                    user_id = clean_text(item.get("entity_id"), 120)
+                    if not user_id:
+                        continue
+                    name = clean_text(item.get("display_name"), 80)
+                    aliases = json_loads(item.get("aliases"), [])
+                    if not isinstance(aliases, list):
+                        aliases = []
+                    profile = json_loads(item.get("profile"), {})
+                    if not isinstance(profile, dict):
+                        profile = {}
+                    existing = identities.get(user_id)
+                    if existing is None or (name and not existing.get("display_name")):
+                        identities[user_id] = {
+                            "display_name": name,
+                            "aliases": [
+                                clean_text(alias, 40)
+                                for alias in aliases
+                                if clean_text(alias, 40)
+                            ],
+                            "profile": profile,
+                        }
+            stats: dict[tuple[str, str], dict[str, Any]] = {}
+            for chunk in self._chunk_ids(user_ids):
+                placeholders = ",".join("?" for _ in chunk)
+                for row in conn.execute(
+                    f"""
+                    SELECT subject_id AS user_id,
+                           COALESCE(owner_bot_id, '') AS bot_id,
+                           COUNT(*) AS memory_count,
+                           SUM(CASE WHEN COALESCE(durability, 'normal') = 'pinned'
+                                    THEN 1 ELSE 0 END) AS imprint_count,
+                           MAX(COALESCE(NULLIF(occurred_at, ''),
+                                        NULLIF(created_at, ''), updated_at)) AS last_at
+                    FROM memories
+                    WHERE subject_kind='user' AND lifecycle!='archived'
+                      AND COALESCE(validity_status, 'active') NOT IN
+                          ('archived', 'deleted', 'superseded', 'quarantined')
+                      AND subject_id IN ({placeholders})
+                    GROUP BY subject_id, COALESCE(owner_bot_id, '')
+                    """,
+                    chunk,
+                ).fetchall():
+                    item = dict(row)
+                    stats[
+                        (
+                            clean_text(item.get("bot_id"), 120),
+                            clean_text(item.get("user_id"), 120),
+                        )
+                    ] = item
+            # 卡片是按人给的，所以「记得多少件事」也要按人合计：同一份记忆按
+            # (bot_id, platform) 各占一个桶，只取其中一个会少算，和卡片下面列出的
+            # 最近记忆对不上。按 bot 筛选时仍只看这个 bot 的桶，和筛选语义一致。
+            person_stats: dict[str, dict[str, Any]] = {}
+            if not bot_id:
+                for (_, stat_user), item in stats.items():
+                    acc = person_stats.setdefault(
+                        stat_user,
+                        {"memory_count": 0, "imprint_count": 0, "last_at": ""},
+                    )
+                    acc["memory_count"] += int(item.get("memory_count") or 0)
+                    acc["imprint_count"] += int(item.get("imprint_count") or 0)
+                    stat_last = clean_text(item.get("last_at"), 40)
+                    if stat_last > acc["last_at"]:
+                        acc["last_at"] = stat_last
+            groups: dict[str, list[dict[str, Any]]] = {}
+            for row in rows:
+                user_id = clean_text(row.get("user_id"), 120)
+                if not user_id:
+                    continue
+                groups.setdefault(user_id, []).append(row)
+            bots: dict[str, int] = {}
+            cards: list[dict[str, Any]] = []
+            for user_id, group in groups.items():
+                # 同一个人可能因为 bot / 平台不同被记成多行（空 bot_id、QQ、飞书、导入来源），
+                # 面板按人只给一张卡：取分量最高的那行当主卡，其余只用来合并平台。
+                row = max(group, key=lambda item: clamp_weight(item.get("weight")))
+                row_bot = clean_text(row.get("bot_id"), 120)
+                platforms: list[str] = []
+                bot_ids: list[str] = []
+                group_bot_ids: list[str] = []
+                for item in group:
+                    platform = clean_text(item.get("platform"), 40)
+                    if platform and platform not in platforms:
+                        platforms.append(platform)
+                    item_bot = clean_text(item.get("bot_id"), 120)
+                    if item_bot not in group_bot_ids:
+                        group_bot_ids.append(item_bot)
+                    if item_bot and item_bot not in bot_ids:
+                        bot_ids.append(item_bot)
+                for item_bot in group_bot_ids:
+                    bots[item_bot] = bots.get(item_bot, 0) + 1
+                identity = identities.get(user_id, {})
+                profile = identity.get("profile")
+                if not isinstance(profile, dict):
+                    profile = {}
+                stat = (
+                    (stats.get((row_bot, user_id)) or stats.get(("", user_id)) or {})
+                    if bot_id
+                    else (person_stats.get(user_id) or {})
+                )
+                display_name = clean_text(identity.get("display_name"), 80)
+                address = clean_text(profile.get("relation_address"), 40)
+                relation = clean_text(profile.get("relation_label"), 40)
+                note = clean_text(profile.get("relation_note"), 80)
+                weight = clamp_weight(row.get("weight"))
+                band = clean_text(row.get("band"), 20) or band_of(weight)
+                aliases = identity.get("aliases") or []
+                haystack = " ".join(
+                    value.casefold()
+                    for value in (
+                        display_name,
+                        address,
+                        relation,
+                        note,
+                        user_id,
+                        " ".join(aliases),
+                    )
+                    if value
+                )
+                if needle and needle not in haystack:
+                    continue
+                memory_count = int(stat.get("memory_count") or 0)
+                imprint_count = int(stat.get("imprint_count") or 0)
+                last_at = clean_text(stat.get("last_at"), 40)
+                days_since = self._days_since(last_at)
+                cards.append(
+                    {
+                        "user_id": user_id,
+                        "platform": platforms[0] if platforms else "",
+                        "platforms": platforms,
+                        "bot_id": row_bot,
+                        "bot_ids": bot_ids,
+                        "display_name": display_name or address or user_id,
+                        "address": address,
+                        "relation_label": relation,
+                        "relation_note": note,
+                        "aliases": aliases,
+                        "weight": weight,
+                        "band": band,
+                        "band_label": BAND_LABELS.get(band, BAND_LABELS["stranger"]),
+                        "source": clean_text(row.get("source"), 20) or "auto",
+                        "correction": int(row.get("correction") or 0),
+                        "memory_count": memory_count,
+                        "imprint_count": imprint_count,
+                        "last_seen": last_at,
+                        "days_since_last": round(days_since, 1) if days_since is not None else None,
+                    }
+                )
+            if sort == "recent":
+                cards.sort(key=lambda card: card.get("last_seen") or "", reverse=True)
+            elif sort == "name":
+                cards.sort(key=lambda card: (card.get("display_name") or "").casefold())
+            elif sort == "memory":
+                cards.sort(key=lambda card: card.get("memory_count") or 0, reverse=True)
+            else:
+                cards.sort(key=lambda card: card.get("weight") or 0, reverse=True)
+            total = len(cards)
+            page_items = cards[max(0, offset) :][:limit]
+            # 批量一次拉取本页全部人物的 Top-3 记忆，彻底消除 24× N+1 查询往返。
+            top_by_bot: dict[str, list[str]] = {}
+            for card in page_items:
+                scope_bot = card["bot_id"] if bot_id else ""
+                top_by_bot.setdefault(scope_bot, []).append(card["user_id"])
+            top_map: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            for scope_bot, uids in top_by_bot.items():
+                batched = self._person_top_memories_batch_sync(conn, uids, scope_bot, 3)
+                for uid, items in batched.items():
+                    top_map[(scope_bot, uid)] = items
         for card in page_items:
-            # 没按 bot 筛选时卡片代表「这个人」，最近记忆也不该只翻主卡所在的 bot。
-            top_rows = self._person_top_memories_sync(
-                card["user_id"], card["bot_id"] if bot_id else "", 3
-            )
+            scope_bot = card["bot_id"] if bot_id else ""
+            top_rows = top_map.get((scope_bot, card["user_id"]), ())
             card["top"] = [
                 {
                     "id": clean_text(item.get("id"), 120),
@@ -9773,8 +10098,8 @@ class MemoryStore(SummaryBatchStore):
             where += " AND (s.label LIKE ? ESCAPE '\\' OR t.label LIKE ? ESCAPE '\\')"
             like = self._like_pattern(node)
             params.extend([like, like])
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_conn_sync() as conn:
+            rows = conn.execute(
                 f"""
                 SELECT
                     e.*,
@@ -10088,21 +10413,32 @@ class MemoryStore(SummaryBatchStore):
             if not matched_ids:
                 return labels[:limit]
             placeholders = ",".join("?" for _ in matched_ids)
+            edge_cap = max(8, int(limit) * 4)
             related = conn.execute(
                 f"""
-                SELECT DISTINCT n.label
-                FROM knowledge_edges e
-                JOIN knowledge_nodes n
-                  ON n.id = CASE
-                    WHEN e.source_node_id IN ({placeholders}) THEN e.target_node_id
-                    ELSE e.source_node_id
-                  END
-                WHERE e.source_node_id IN ({placeholders})
-                   OR e.target_node_id IN ({placeholders})
-                ORDER BY e.updated_at DESC
+                WITH neighbor_edges AS (
+                    SELECT target_node_id AS node_id, updated_at
+                    FROM knowledge_edges
+                    WHERE source_node_id IN ({placeholders})
+                    UNION ALL
+                    SELECT source_node_id AS node_id, updated_at
+                    FROM knowledge_edges
+                    WHERE target_node_id IN ({placeholders})
+                ),
+                top_neighbors AS (
+                    SELECT node_id, MAX(updated_at) AS latest_at
+                    FROM neighbor_edges
+                    GROUP BY node_id
+                    ORDER BY latest_at DESC
+                    LIMIT ?
+                )
+                SELECT n.label
+                FROM top_neighbors tn
+                JOIN knowledge_nodes n ON n.id = tn.node_id
+                ORDER BY tn.latest_at DESC
                 LIMIT ?
                 """,
-                matched_ids + matched_ids + matched_ids + [max(1, int(limit))],
+                matched_ids + matched_ids + [edge_cap, max(1, int(limit))],
             ).fetchall()
         for row in related:
             label = clean_text(row["label"], 80)
@@ -12440,9 +12776,9 @@ class MemoryStore(SummaryBatchStore):
         return await self._run_recoverable_database_operation(self._list_candidate_memories_sync, limit, include_pending)
 
     def _list_candidate_memories_sync(self, limit: int, include_pending: bool) -> list[MemoryRecord]:
-        with self._lock:
-            rows = self._materialized_candidate_rows(self._conn, limit, include_pending)
-        return [MemoryRecord.from_row(row) for row in rows]
+        with self._read_conn_sync() as conn:
+            rows = self._materialized_candidate_rows(conn, limit, include_pending)
+        return [self._cached_from_row_light(row) for row in rows]
 
     def _materialized_candidate_rows(
         self,
@@ -12504,8 +12840,7 @@ class MemoryStore(SummaryBatchStore):
 
     def _list_core_memories_sync(self, limit: int) -> list[MemoryRecord]:
         now = utc_now()
-        conn, lock = self._read_connection_for_bundle()
-        with lock:
+        with self._read_conn_sync() as conn:
             rows = conn.execute(
                 """
                 SELECT *
@@ -12796,12 +13131,12 @@ class MemoryStore(SummaryBatchStore):
         subject_person_id: str = "",
         identity_assurance: str = "",
     ) -> list[MemoryRecord]:
-        with self._lock:
+        with self._read_conn_sync() as conn:
             rows = self._current_window_candidate_rows(
-                self._conn, scope, session_id, user_id, group_id, limit, include_pending,
+                conn, scope, session_id, user_id, group_id, limit, include_pending,
                 subject_person_id, identity_assurance,
             )
-        return [MemoryRecord.from_row(row) for row in rows]
+        return [self._cached_from_row_light(row) for row in rows]
 
     def _current_window_candidate_rows(
         self,
@@ -13159,8 +13494,7 @@ class MemoryStore(SummaryBatchStore):
         include_pending: bool,
     ) -> dict[str, Any]:
         bundle_started = time.perf_counter()
-        conn, lock = self._read_connection_for_bundle()
-        with lock:
+        with self._read_conn_sync() as conn:
             lock_acquired_at = time.perf_counter()
             try:
                 rev_row = conn.execute(
@@ -13238,9 +13572,9 @@ class MemoryStore(SummaryBatchStore):
         limit: int,
         include_pending: bool,
     ) -> list[MemoryRecord]:
-        with self._lock:
-            rows = self._fts_candidate_rows(self._conn, terms, limit, include_pending)
-        return [MemoryRecord.from_row(row) for row in rows]
+        with self._read_conn_sync() as conn:
+            rows = self._fts_candidate_rows(conn, terms, limit, include_pending)
+        return [self._cached_from_row_light(row) for row in rows]
 
     def _fts_candidate_rows(
         self,
@@ -13332,9 +13666,9 @@ class MemoryStore(SummaryBatchStore):
         limit: int,
         include_pending: bool,
     ) -> list[MemoryRecord]:
-        with self._lock:
-            rows = self._keyword_candidate_rows(self._conn, terms, limit, include_pending)
-        return [MemoryRecord.from_row(row) for row in rows]
+        with self._read_conn_sync() as conn:
+            rows = self._keyword_candidate_rows(conn, terms, limit, include_pending)
+        return [self._cached_from_row_light(row) for row in rows]
 
     def _keyword_candidate_rows(
         self,
@@ -13414,8 +13748,8 @@ class MemoryStore(SummaryBatchStore):
         where = self._recallable_memory_sql()
         if not include_pending:
             where += " AND review_status != 'pending'"
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_conn_sync() as conn:
+            rows = conn.execute(
                 f"SELECT * FROM memories WHERE {where} ORDER BY created_at DESC LIMIT ?",
                 (max(1, int(limit)),),
             ).fetchall()
@@ -13552,16 +13886,10 @@ class MemoryStore(SummaryBatchStore):
             entity = clean_text(entity_id, 120)
             where += " AND (subject_id=? OR object_id=? OR group_id=? OR session_id LIKE ? ESCAPE '\\')"
             params.extend([entity, entity, entity, self._like_pattern(entity)])
-        # S1：这是列表/面板最热的纯读路径。走专用只读连接 + 自己的读锁，
-        # 不再和写事务抢同一把全局 RLock（WAL 下读写本来就可以并行）。
-        # 两种例外退回主连接，保证语义不变：
-        #   - read_only 库的主连接本身就是只读的；
-        #   - 主连接上有未提交事务时，只读连接看不到这些行，必须读主连接（读己之写）。
-        if self._read_only or self._conn.in_transaction:
-            conn, lock = self._conn, self._lock
-        else:
-            conn, lock = self._read_connection_for_bundle()
-        with lock:
+        # 列表/面板最热的纯读路径：走硬件自适应只读连接池，
+        # 既保持单请求复用 _read_conn 热缓存，又支持并发突发多路并行、零写锁阻塞，
+        # 同时在主连接存在未提交事务时自动回读主连接保证读己之写。
+        with self._read_conn_sync() as conn:
             rows = conn.execute(
                 f"""
                 SELECT * FROM memories
@@ -13882,6 +14210,46 @@ class MemoryStore(SummaryBatchStore):
                 return clean_text(row["session_id"], 200)
         return ""
 
+    @staticmethod
+    def _clone_bucket_items(items: list[dict[str, Any]], limit: int | None) -> list[dict[str, Any]]:
+        sliced = items[: max(1, int(limit))] if limit is not None else items
+        cloned: list[dict[str, Any]] = []
+        for bucket in sliced:
+            copy_bucket = dict(bucket)
+            contexts = bucket.get("sample_contexts")
+            if isinstance(contexts, list):
+                copy_bucket["sample_contexts"] = [dict(ctx) for ctx in contexts]
+            cloned.append(copy_bucket)
+        return cloned
+
+    @staticmethod
+    def _buckets_cache_watermark_sync(conn: sqlite3.Connection) -> str:
+        """Compute a lightweight ACID watermark covering memories + display-name tables."""
+        try:
+            rev_row = conn.execute(
+                "SELECT revision FROM retrieval_revision WHERE singleton=1"
+            ).fetchone()
+            mem_rev = str(int(rev_row[0] or 0)) if rev_row else ""
+        except sqlite3.OperationalError:
+            return ""
+        if not mem_rev:
+            return ""
+        id_wm = ""
+        rel_wm = ""
+        try:
+            r1 = conn.execute("SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM identities").fetchone()
+            if r1 is not None:
+                id_wm = f"{int(r1[0] or 0)}:{r1[1] or ''}"
+        except sqlite3.OperationalError:
+            pass
+        try:
+            r2 = conn.execute("SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM relationship_edges").fetchone()
+            if r2 is not None:
+                rel_wm = f"{int(r2[0] or 0)}:{r2[1] or ''}"
+        except sqlite3.OperationalError:
+            pass
+        return f"{mem_rev}|{id_wm}|{rel_wm}"
+
     def _list_memory_buckets_sync(
         self,
         limit: int | None,
@@ -13891,6 +14259,16 @@ class MemoryStore(SummaryBatchStore):
         source = "memories" if include_archive else self.RECALLABLE_MEMORY_VIEW
         sep = "\x1f"
         with self._read_conn_sync() as conn:
+            cache_key: tuple[str, bool, bool] | None = None
+            in_uncommitted = (not self._read_only) and conn is self._conn and self._conn.in_transaction
+            if not in_uncommitted:
+                watermark = self._buckets_cache_watermark_sync(conn)
+                if watermark:
+                    cache_key = (watermark, bool(include_raw_events), bool(include_archive))
+                    with self._buckets_cache_lock:
+                        cached_buckets = self._buckets_cache.get(cache_key)
+                    if cached_buckets is not None:
+                        return self._clone_bucket_items(cached_buckets, limit)
             rows = conn.execute(
                 f"""
                 WITH normalized AS (
@@ -13927,10 +14305,15 @@ class MemoryStore(SummaryBatchStore):
                         group_id AS sample_group_id,
                         CASE
                             WHEN owner_bot_id NOT IN ('', 'self') THEN owner_bot_id
-                            WHEN metadata LIKE '%"owner_bot_id"%'
-                                 AND json_valid(metadata)
-                                 AND COALESCE(CAST(json_extract(metadata, '$.owner_bot_id') AS TEXT), '') NOT IN ('', 'self')
-                            THEN CAST(json_extract(metadata, '$.owner_bot_id') AS TEXT)
+                            WHEN instr(metadata, '"owner_bot_id"') > 0 AND json_valid(metadata) THEN
+                                COALESCE(
+                                    NULLIF(NULLIF(CAST(json_extract(metadata, '$.owner_bot_id') AS TEXT), ''), 'self'),
+                                    CASE
+                                        WHEN subject_kind='bot' AND subject_id NOT IN ('', 'self') THEN subject_id
+                                        WHEN object_kind='bot' AND object_id NOT IN ('', 'self') THEN object_id
+                                        ELSE ''
+                                    END
+                                )
                             WHEN subject_kind='bot' AND subject_id NOT IN ('', 'self') THEN subject_id
                             WHEN object_kind='bot' AND object_id NOT IN ('', 'self') THEN object_id
                             ELSE ''
@@ -13946,7 +14329,7 @@ class MemoryStore(SummaryBatchStore):
                         occurred_at,
                         {_memory_time_sql()} AS sort_time
                     FROM {source}
-                    WHERE scope IN ('private', 'group')
+                    WHERE +scope IN ('private', 'group')
                       AND review_status!='pending'
                 )
                 SELECT
@@ -14132,8 +14515,6 @@ class MemoryStore(SummaryBatchStore):
                 ),
                 reverse=True,
             )
-            if limit is not None:
-                buckets = buckets[: max(1, int(limit))]
             resolved_names = self._resolve_bucket_target_names_batch_sync(conn, buckets)
             for bucket in buckets:
                 bucket.pop("active_latest_at", None)
@@ -14156,7 +14537,13 @@ class MemoryStore(SummaryBatchStore):
                     b_tid,
                     clean_text(bucket.get("sample_session_id"), 200),
                 )
-        return buckets
+            if cache_key is not None:
+                with self._buckets_cache_lock:
+                    if len(self._buckets_cache) >= 8:
+                        self._buckets_cache.clear()
+                    self._buckets_cache[cache_key] = buckets
+                return self._clone_bucket_items(buckets, limit)
+        return buckets[: max(1, int(limit))] if limit is not None else buckets
 
     def _resolve_bucket_target_names_batch_sync(
         self,
@@ -16525,8 +16912,8 @@ class MemoryStore(SummaryBatchStore):
         return await asyncio.to_thread(self._list_review_queue_sync, limit)
 
     def _list_review_queue_sync(self, limit: int) -> list[dict[str, Any]]:
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_conn_sync() as conn:
+            rows = conn.execute(
                 """
                 SELECT
                     rq.id,
@@ -17320,8 +17707,10 @@ class MemoryStore(SummaryBatchStore):
             archived_orphan_embeddings = int(
                 conn.execute(
                     """
-                    SELECT COUNT(*) FROM memory_embeddings
-                    WHERE memory_id NOT IN (SELECT id FROM memories WHERE lifecycle != 'archived')
+                    SELECT COUNT(*)
+                    FROM memory_embeddings e
+                    LEFT JOIN memories m ON m.id = e.memory_id
+                    WHERE m.id IS NULL OR m.lifecycle = 'archived'
                     """
                 ).fetchone()[0]
                 or 0

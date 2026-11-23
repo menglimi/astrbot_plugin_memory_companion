@@ -10912,6 +10912,20 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             wal = await self.store.wal_health(checkpoint=True)
         except Exception as exc:
             wal = {"checkpoint_attempted": False, "error": self._describe_exception(exc)}
+        # Bulk precision transcode / orphan cleanup updates thousands of rows and
+        # exceeds the incremental delta threshold; re-warm the vector corpus in
+        # background so the next live chat turn never stalls on a cold rebuild.
+        if (
+            isinstance(embedding_transcode, dict)
+            and (
+                int(embedding_transcode.get("transcoded", 0) or 0) > 0
+                or int(embedding_transcode.get("purged_orphans", 0) or 0) > 0
+            )
+        ):
+            try:
+                self.schedule_startup_vector_warmup(settle_seconds=1.0)
+            except Exception:
+                pass
         stats = await self.store.stats()
         state = {
             "ok": True,
@@ -11008,6 +11022,18 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             token_pruned = self._prune_token_usage_by_hour(self._token_usage)
             if token_pruned > 0:
                 self._save_token_usage(force=True)
+        primary_transcode = primary_result.get("transcode") if isinstance(primary_result, dict) else None
+        if (
+            isinstance(primary_transcode, dict)
+            and (
+                int(primary_transcode.get("transcoded", 0) or 0) > 0
+                or int(primary_transcode.get("purged_orphans", 0) or 0) > 0
+            )
+        ):
+            try:
+                self.schedule_startup_vector_warmup(settle_seconds=1.0)
+            except Exception:
+                pass
         health = await self.database_health_snapshot()
         notice = (
             f"本次仅按 {precision} 执行一次性转码；当前配置的向量存储精度仍为 {configured_precision}，"

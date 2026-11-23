@@ -512,28 +512,235 @@ class FtsMigrationIndexEqpAndLockFreeTests(unittest.IsolatedAsyncioTestCase):
             store.close()
 
     def test_memory_adaptive_pragmas_on_main_and_read_connections(self) -> None:
-        with patch.object(store_mod, "_detect_total_memory_mb", return_value=1024):
+        # Low tier (1-2 GiB VPS): lean 8 MiB cache, mmap=0, pool=2
+        with (
+            patch.object(store_mod, "_detect_total_memory_mb", return_value=1024),
+            patch.object(store_mod, "_detect_cpu_count", return_value=2),
+        ):
             low_store = MemoryStore(self.tmp_dir / "low_ram.db")
             low_store.initialize()
             try:
                 self.assertEqual(-8192, low_store._conn.execute("PRAGMA cache_size").fetchone()[0])
                 self.assertEqual(2, low_store._conn.execute("PRAGMA temp_store").fetchone()[0])
                 self.assertEqual(0, low_store._conn.execute("PRAGMA mmap_size").fetchone()[0])
+                self.assertEqual(2, low_store._read_pool_max)
                 rconn, _ = low_store._timeline_read_connection()
                 self.assertEqual(-8192, rconn.execute("PRAGMA cache_size").fetchone()[0])
                 self.assertEqual(0, rconn.execute("PRAGMA mmap_size").fetchone()[0])
             finally:
                 low_store.close()
 
-        with patch.object(store_mod, "_detect_total_memory_mb", return_value=16384):
+        # Mid tier (4-8 GiB host): 32 MiB cache, 256 MiB mmap, pool=4
+        with (
+            patch.object(store_mod, "_detect_total_memory_mb", return_value=8192),
+            patch.object(store_mod, "_detect_cpu_count", return_value=4),
+        ):
+            mid_store = MemoryStore(self.tmp_dir / "mid_ram.db")
+            mid_store.initialize()
+            try:
+                self.assertEqual(-32768, mid_store._conn.execute("PRAGMA cache_size").fetchone()[0])
+                self.assertEqual(2, mid_store._conn.execute("PRAGMA temp_store").fetchone()[0])
+                self.assertEqual(268435456, mid_store._conn.execute("PRAGMA mmap_size").fetchone()[0])
+                self.assertEqual(4, mid_store._read_pool_max)
+            finally:
+                mid_store.close()
+
+        # High tier (16 GiB / 8C): 64 MiB cache, 512 MiB mmap, pool=8
+        with (
+            patch.object(store_mod, "_detect_total_memory_mb", return_value=16384),
+            patch.object(store_mod, "_detect_cpu_count", return_value=8),
+        ):
             hi_store = MemoryStore(self.tmp_dir / "hi_ram.db")
             hi_store.initialize()
             try:
-                self.assertEqual(-16384, hi_store._conn.execute("PRAGMA cache_size").fetchone()[0])
+                self.assertEqual(-65536, hi_store._conn.execute("PRAGMA cache_size").fetchone()[0])
                 self.assertEqual(2, hi_store._conn.execute("PRAGMA temp_store").fetchone()[0])
-                self.assertEqual(67108864, hi_store._conn.execute("PRAGMA mmap_size").fetchone()[0])
+                self.assertEqual(536870912, hi_store._conn.execute("PRAGMA mmap_size").fetchone()[0])
+                self.assertEqual(8, hi_store._read_pool_max)
             finally:
                 hi_store.close()
+
+        # High tier (>= 20 GiB / 16C): 64 MiB cache, 1 GiB mmap, pool=12
+        with (
+            patch.object(store_mod, "_detect_total_memory_mb", return_value=32768),
+            patch.object(store_mod, "_detect_cpu_count", return_value=16),
+        ):
+            hi32_store = MemoryStore(self.tmp_dir / "hi32_ram.db")
+            hi32_store.initialize()
+            try:
+                self.assertEqual(-65536, hi32_store._conn.execute("PRAGMA cache_size").fetchone()[0])
+                self.assertEqual(1073741824, hi32_store._conn.execute("PRAGMA mmap_size").fetchone()[0])
+                self.assertEqual(12, hi32_store._read_pool_max)
+            finally:
+                hi32_store.close()
+
+    async def test_lifo_read_pool_parallel_burst_isolated_from_write_and_timeline_locks(self) -> None:
+        with (
+            patch.object(store_mod, "_detect_total_memory_mb", return_value=32768),
+            patch.object(store_mod, "_detect_cpu_count", return_value=16),
+        ):
+            store = MemoryStore(self.tmp_dir / "pool_burst.db")
+            store.initialize()
+            try:
+                for idx in range(6):
+                    await store.insert_memory(_make_record(f"pb-{idx}", content=f"并发池记忆 {idx}"))
+                # Hold BOTH main write lock AND primary _read_lock AND _timeline_read_lock!
+                locks_held = threading.Event()
+                release_locks = threading.Event()
+
+                def _hold_locks() -> None:
+                    with store._lock, store._read_lock, store._timeline_read_lock:
+                        locks_held.set()
+                        release_locks.wait(timeout=5.0)
+
+                holder = threading.Thread(target=_hold_locks, daemon=True)
+                holder.start()
+                self.assertTrue(locks_held.wait(timeout=2.0))
+                try:
+                    # 8 simultaneous read calls must execute in parallel via the LIFO overflow pool
+                    # without ever touching _lock, _read_lock, or _timeline_read_lock.
+                    results = await asyncio.wait_for(
+                        asyncio.gather(
+                            store.stats(),
+                            store.owner_bot_counts(),
+                            store.list_memories(limit=10),
+                            store.list_memory_buckets(limit=20),
+                            store.list_person_cards(limit=10),
+                            store.list_knowledge_edges(limit=10),
+                            store.summary_status_snapshot(max_events=20),
+                            store.database_health_snapshot(),
+                        ),
+                        timeout=3.0,
+                    )
+                    self.assertEqual(6, results[0]["total_memories"])
+                    self.assertEqual(6, len(results[2]))
+                    self.assertGreaterEqual(len(store._read_pool_all), 1)
+                finally:
+                    release_locks.set()
+                    holder.join(timeout=2.0)
+            finally:
+                store.close()
+                self.assertTrue(store.shutdown_state()["read_pool_closed"])
+
+    async def test_new_list_knowledge_and_timeline_indexes_buckets_cache_and_summary_fast_path(self) -> None:
+        store = MemoryStore(self.tmp_dir / "idx_cache.db")
+        store.initialize()
+        try:
+            for idx in range(10):
+                await store.insert_memory(
+                    _make_record(f"ic-{idx}", content=f"列表索引验证 {idx}", scope="group", group_id="g1")
+                )
+            n1 = await store.upsert_knowledge_node(node_type="topic", label="节点甲")
+            n2 = await store.upsert_knowledge_node(node_type="topic", label="节点乙")
+            await store.upsert_knowledge_edge(source_node_id=n1, target_node_id=n2, relation_type="related_to")
+
+            # Verify EXPLAIN QUERY PLAN uses new order-matching indexes without TEMP B-TREE
+            time_sql = store_mod._memory_time_sql()
+            plan_all = " | ".join(
+                str(r[3])
+                for r in store._conn.execute(
+                    f"EXPLAIN QUERY PLAN SELECT * FROM memories WHERE 1=1 ORDER BY {time_sql} DESC, created_at DESC, id DESC LIMIT 50"
+                ).fetchall()
+            )
+            self.assertIn("idx_memories_list_order", plan_all)
+            self.assertNotIn("TEMP B-TREE", plan_all.upper())
+
+            plan_scope = " | ".join(
+                str(r[3])
+                for r in store._conn.execute(
+                    f"EXPLAIN QUERY PLAN SELECT * FROM memories WHERE scope='group' ORDER BY {time_sql} DESC, created_at DESC, id DESC LIMIT 50"
+                ).fetchall()
+            )
+            self.assertIn("idx_memories_scope_list_order", plan_scope)
+            self.assertNotIn("TEMP B-TREE", plan_scope.upper())
+
+            plan_kg = " | ".join(
+                str(r[3])
+                for r in store._conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT * FROM knowledge_edges ORDER BY updated_at DESC LIMIT 50"
+                ).fetchall()
+            )
+            self.assertIn("idx_knowledge_edges_updated", plan_kg)
+            self.assertNotIn("TEMP B-TREE", plan_kg.upper())
+
+            plan_empty_tl = " | ".join(
+                str(r[3])
+                for r in store._conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM timeline "
+                    "WHERE trim(COALESCE(content,''),char(9)||char(10)||char(13)||' ')=''"
+                ).fetchall()
+            )
+            self.assertIn("idx_timeline_empty_content", plan_empty_tl)
+
+            # Verify buckets cache hit + ACID invalidation on memory insert and identity update
+            b1 = await store.list_memory_buckets(limit=20)
+            self.assertEqual(1, len(b1))
+            self.assertEqual(10, b1[0]["memory_count"])
+            self.assertEqual(1, len(store._buckets_cache))
+            # Mutating returned bucket must not pollute cache
+            b1[0]["memory_count"] = -999
+            b2 = await store.list_memory_buckets(limit=20)
+            self.assertEqual(10, b2[0]["memory_count"])
+            # New memory write invalidates watermark immediately
+            await store.insert_memory(_make_record("ic-10", content="新增记忆触发桶缓存刷新"))
+            b3 = await store.list_memory_buckets(limit=20)
+            self.assertEqual(11, b3[0]["memory_count"])
+
+            # Verify summary_status_snapshot fast path (0 empty rows) AND fallback path (>=1 empty row)
+            await store.add_timeline_event(
+                event_type="user_message",
+                session_id="qq:GroupMessage:g1",
+                scope="group",
+                subject_id="u1",
+                object_id="g1",
+                content="有内容的消息",
+                metadata={"owner_bot_id": "b1"},
+            )
+            snap_nonempty = await store.summary_status_snapshot(max_events=20)
+            self.assertEqual(1, snap_nonempty["raw_events"])
+
+            await store.add_timeline_event(
+                event_type="user_message",
+                session_id="qq:GroupMessage:g1",
+                scope="group",
+                subject_id="u1",
+                object_id="g1",
+                content="   \n\t  ",
+                metadata={"owner_bot_id": "b1"},
+            )
+            snap_with_empty = await store.summary_status_snapshot(max_events=20)
+            self.assertEqual(1, snap_with_empty["raw_events"])
+        finally:
+            store.close()
+
+    def test_fast_redaction_preserves_exact_credential_scrubbing_contract(self) -> None:
+        from astrbot_plugin_memory_companion.core.sensitive_data import (
+            REDACTED,
+            redact_sensitive_text,
+            redact_sensitive_value,
+        )
+
+        # Non-sensitive fast-path returns exact unchanged text
+        self.assertEqual("1032290619", redact_sensitive_text("1032290619"))
+        self.assertEqual("早安", redact_sensitive_text("早安"))
+        self.assertEqual("普通群聊记忆内容", redact_sensitive_text("普通群聊记忆内容"))
+
+        # All 6 credential patterns remain strictly redacted
+        self.assertIn(REDACTED, redact_sensitive_text("token sk-1234567890abcdef123456"))
+        self.assertIn(REDACTED, redact_sensitive_text("密码是12345678。"))
+        self.assertIn(REDACTED, redact_sensitive_text("Authorization: Bearer abcdefgh12345678"))
+        self.assertIn(REDACTED, redact_sensitive_text("https://alice:supersecret@example.com/path"))
+        self.assertIn(REDACTED, redact_sensitive_text("api_key=my_secret_value_123"))
+        self.assertIn(
+            REDACTED,
+            redact_sensitive_text("-----BEGIN RSA PRIVATE KEY-----\nABC\n-----END RSA PRIVATE KEY-----"),
+        )
+        scrubbed = redact_sensitive_value(
+            {"user_id": "12345", "api_key": "raw", "nested": [{"note": "密码:abcd1234"}]}
+        )
+        self.assertEqual("12345", scrubbed["user_id"])
+        self.assertEqual(REDACTED, scrubbed["api_key"])
+        self.assertIn(REDACTED, scrubbed["nested"][0]["note"])
 
     async def test_read_pool_endpoints_do_not_block_on_main_write_lock(self) -> None:
         store = MemoryStore(self.tmp_dir / "lockfree.db")

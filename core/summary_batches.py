@@ -29,8 +29,11 @@ class SummaryBatchStore:
             yield self._conn
 
     @staticmethod
-    def _summary_content_clause(*, unsummarized: bool = False) -> str:
+    def _summary_content_clause(*, unsummarized: bool = False, all_timeline_nonempty: bool = False) -> str:
         pending = "AND t.summarized_at=''" if unsummarized else ""
+        if all_timeline_nonempty:
+            return f"""EXISTS(SELECT 1 FROM summary_batch_events e JOIN timeline t ON t.id=e.event_id
+                WHERE e.batch_id=b.id {pending})"""
         return f"""EXISTS(SELECT 1 FROM summary_batch_events e JOIN timeline t ON t.id=e.event_id
             WHERE e.batch_id=b.id {pending}
               AND trim(COALESCE(t.content,''),char(9)||char(10)||char(13)||' ')<>'')"""
@@ -1100,7 +1103,21 @@ class SummaryBatchStore:
         def read():
             with self._summary_read_conn() as conn:
                 meaningful = "trim(COALESCE(t.content,''),char(9)||char(10)||char(13)||' ')<>''"
-                active = f"b.state IN ('pending','retry_pending') AND {self._summary_content_clause(unsummarized=True)}"
+                # 4 KiB partial index idx_timeline_empty_content covers empty rows;
+                # when zero empty rows exist (normal production state), raw_events and
+                # batch state counts skip reading 60 MiB of timeline.content pages.
+                empty_events = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM timeline "
+                        "WHERE trim(COALESCE(content,''),char(9)||char(10)||char(13)||' ')=''"
+                    ).fetchone()[0]
+                    or 0
+                )
+                all_nonempty = empty_events == 0
+                active = (
+                    "b.state IN ('pending','retry_pending') AND "
+                    f"{self._summary_content_clause(unsummarized=True, all_timeline_nonempty=all_nonempty)}"
+                )
                 batches = [dict(row) for row in conn.execute(f"""
                     SELECT b.*, {self._due_clause('b')} AS due
                     FROM summary_batches b WHERE {active} ORDER BY b.created_at,b.id
@@ -1125,10 +1142,11 @@ class SummaryBatchStore:
                     WHERE automatic=1 AND attempted_at>? GROUP BY session_id
                     """, (cutoff,)).fetchall()}
                 originals = {}
+                originals_content_clause = "" if all_nonempty else f"AND {meaningful}"
                 for row in conn.execute(f"""
                     SELECT t.id,t.event_type,t.session_id,t.scope,t.subject_id,t.object_id,
                            t.metadata,t.occurred_at,t.created_at
-                    FROM timeline t WHERE t.summarized_at='' AND {meaningful}
+                    FROM timeline t WHERE t.summarized_at='' {originals_content_clause}
                       AND NOT EXISTS(SELECT 1 FROM summary_batch_events e WHERE e.event_id=t.id)
                     ORDER BY COALESCE(julianday(NULLIF(t.occurred_at,'')),
                         julianday(NULLIF(t.created_at,'')),0),t.created_at,t.id
@@ -1140,13 +1158,14 @@ class SummaryBatchStore:
                         window['rows'].append(dict(row))
                 counts = dict(conn.execute(f"""
                     SELECT b.state,COUNT(*) FROM summary_batches b
-                    WHERE {self._summary_content_clause()} GROUP BY b.state
+                    WHERE {self._summary_content_clause(all_timeline_nonempty=all_nonempty)} GROUP BY b.state
                     """).fetchall())
                 memories = dict(conn.execute("""SELECT CASE WHEN review_status IN ('auto','manual')
                         THEN 'adopted' ELSE review_status END AS status,COUNT(*) FROM memories
                     WHERE memory_type='conversation_summary' AND lifecycle!='archived'
                     GROUP BY status""").fetchall())
-                raw_events = conn.execute(f"SELECT COUNT(*) FROM timeline t WHERE {meaningful}").fetchone()[0]
+                total_events = int(conn.execute("SELECT COUNT(*) FROM timeline").fetchone()[0] or 0)
+                raw_events = max(0, total_events - empty_events)
                 return {'batches': batches, 'sources': by_batch, 'budgets': budgets,
                         'originals': originals, 'counts': counts, 'memories': memories,
                         'raw_events': int(raw_events)}

@@ -16,6 +16,7 @@ Two invariants keep this module honest:
 from __future__ import annotations
 
 from collections import OrderedDict
+import copy
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -150,7 +151,7 @@ def _detect_blob_dtype(byte_length: int, dimension: int) -> str:
 
 def _slim_corpus_memory(memory: MemoryRecord) -> MemoryRecord:
     """Drop bulky content/evidence/metadata from cached corpus eligibility stubs."""
-    raw_meta = memory.metadata if isinstance(memory.metadata, dict) else {}
+    raw_meta = memory.metadata if type(memory.metadata) is dict else (memory.metadata if isinstance(memory.metadata, dict) else {})
     slim_meta = (
         {k: v for k, v in raw_meta.items() if k in _CORPUS_KEEP_METADATA_KEYS}
         if raw_meta
@@ -162,12 +163,15 @@ def _slim_corpus_memory(memory: MemoryRecord) -> MemoryRecord:
         or bool(slim_meta.get("profile_state"))
         or is_memory_placeholder(memory)
     )
-    return replace(
-        memory,
-        content=memory.content if keep_content else "",
-        evidence=[],
-        metadata=slim_meta,
-    )
+    clone_slim = getattr(memory, "clone_slim", None)
+    if callable(clone_slim):
+        return clone_slim(keep_content=keep_content, slim_meta=slim_meta)
+    slim = copy.copy(memory)
+    if not keep_content:
+        slim.content = ""
+    slim.evidence = []
+    slim.metadata = slim_meta
+    return slim
 
 
 def get_shared_query_embedding(
@@ -775,15 +779,23 @@ def _normalize_blob_batch(
     in_row_bytes = dimension * _dtype_itemsize(in_dtype)
     out_row_bytes = dimension * _dtype_itemsize(out_dtype)
 
-    raw_mat = np.empty((count, dimension), dtype=in_dtype)
-    raw_view = raw_mat.view(np.uint8).reshape(count, in_row_bytes)
-    for idx, blob in enumerate(blobs):
+    for blob in blobs:
         if len(blob) != in_row_bytes:
             return [None] * count, ["embedding_invalid"] * count
-        raw_view[idx] = np.frombuffer(blob, dtype=np.uint8)
 
-    # Normalize float16 inputs in float32 to prevent squaring overflow/underflow.
-    work_mat = raw_mat.astype(np.float32) if in_dtype == "<f2" else raw_mat
+    raw_mat = np.frombuffer(b"".join(blobs), dtype=in_dtype).reshape(count, dimension)
+
+    # Normalize float16 inputs in float32 to prevent squaring overflow/underflow;
+    # downcast normal finite float64 inputs to float32 before normalization to halve
+    # SIMD/memory bandwidth when targeting float32/float16 storage.
+    if in_dtype == "<f8" and out_dtype in ("<f4", "<f2"):
+        work_mat = raw_mat.astype(np.float32)
+        if not np.isfinite(work_mat).all():
+            work_mat = raw_mat.copy()
+    elif in_dtype == "<f2":
+        work_mat = raw_mat.astype(np.float32)
+    else:
+        work_mat = raw_mat.copy()
     finite_mask = np.isfinite(work_mat).all(axis=1)
     scales = np.max(np.abs(work_mat), axis=1)
     valid_mask = finite_mask & (scales > 0.0)
@@ -796,8 +808,8 @@ def _normalize_blob_batch(
         norm_valid = np.isfinite(norms) & (norms > 0.0)
         if norm_valid.all():
             work_mat /= norms[:, None]
-            out_mat = work_mat.astype(out_dtype, copy=False)
-            mv = memoryview(np.ascontiguousarray(out_mat).tobytes())
+            out_mat = np.ascontiguousarray(work_mat.astype(out_dtype, copy=False))
+            mv = memoryview(out_mat).cast("B")
             for idx in range(count):
                 start = idx * out_row_bytes
                 results[idx] = mv[start : start + out_row_bytes]
@@ -808,7 +820,8 @@ def _normalize_blob_batch(
             return results, errors
         kept_mat = work_mat[keep]
         kept_mat /= norms[keep, None]
-        mv = memoryview(np.ascontiguousarray(kept_mat.astype(out_dtype, copy=False)).tobytes())
+        out_mat = np.ascontiguousarray(kept_mat.astype(out_dtype, copy=False))
+        mv = memoryview(out_mat).cast("B")
         for out_idx, src_idx in enumerate(keep.tolist()):
             start = out_idx * out_row_bytes
             results[src_idx] = mv[start : start + out_row_bytes]
@@ -830,7 +843,8 @@ def _normalize_blob_batch(
         valid_mat = valid_mat[keep]
         norms = norms[keep]
     valid_mat /= norms[:, None]
-    mv = memoryview(np.ascontiguousarray(valid_mat.astype(out_dtype, copy=False)).tobytes())
+    out_mat = np.ascontiguousarray(valid_mat.astype(out_dtype, copy=False))
+    mv = memoryview(out_mat).cast("B")
     for out_idx, src_idx in enumerate(valid_indices.tolist()):
         start = out_idx * out_row_bytes
         results[src_idx] = mv[start : start + out_row_bytes]
@@ -935,7 +949,7 @@ def _memory_select_columns(conn: Any) -> str:
 
 
 def _row_batches(conn: Any, provider_id: str, where: str, batch_size: int,
-                 restrict_ids: tuple[str, ...] = ()) -> Any:
+                 restrict_ids: tuple[str, ...] = (), *, include_vector: bool = False) -> Any:
     """Yield row batches from the candidate join, optionally restricted to ids.
 
     The full scan is one cursor; the restricted re-read splits the id list into
@@ -943,9 +957,10 @@ def _row_batches(conn: Any, provider_id: str, where: str, batch_size: int,
     cap (the same limit the payload reads already honour).
     """
     m_cols = _memory_select_columns(conn)
+    vec_col = ", e.vector AS embedding_vector" if include_vector else ""
     columns = (f"SELECT {m_cols}, e.dimension AS embedding_dimension, "
-               "e.text_hash AS embedding_text_hash, "
-               "e.updated_at AS embedding_updated_at FROM memory_embeddings e "
+               f"e.text_hash AS embedding_text_hash, "
+               f"e.updated_at AS embedding_updated_at{vec_col} FROM memory_embeddings e "
                "JOIN memories m ON m.id=e.memory_id")
     if not restrict_ids:
         cursor = conn.execute(f"{columns} WHERE {where}", (provider_id,))
@@ -1078,6 +1093,7 @@ def _normalize_ref_payloads(
     counts: dict[str, int],
     *,
     target_dtype: str = "<f4",
+    inline_payloads: dict[str, Any] | None = None,
 ) -> tuple[list[VectorRef], list[bytes | memoryview]]:
     """Fetch uncached vector BLOBs in batches and return normalized row buffers."""
     reused_slices: list[bytes | memoryview | None] = []
@@ -1099,9 +1115,18 @@ def _normalize_ref_payloads(
         missing_refs = allowed
 
     payloads: dict[str, Any] = {}
-    for offset in range(0, len(missing_refs), 900):
+    if inline_payloads:
+        fetch_refs: list[VectorRef] = []
+        for ref in missing_refs:
+            if ref.memory_id in inline_payloads:
+                payloads[ref.memory_id] = inline_payloads[ref.memory_id]
+            else:
+                fetch_refs.append(ref)
+    else:
+        fetch_refs = missing_refs
+    for offset in range(0, len(fetch_refs), 900):
         check_cancelled()
-        part = missing_refs[offset : offset + 900]
+        part = fetch_refs[offset : offset + 900]
         placeholders = ",".join("?" for _ in part)
         payloads.update(
             dict(
@@ -1494,9 +1519,18 @@ def _populate_corpus_from_rows(
         "embedding_unauthorized_or_inactive": 0,
         "embedding_reused_rows": 0,
     }
-    for rows in _row_batches(conn, provider_id, where, fetch_batch, restrict_ids):
+    fetch_inline_vectors = not reusable_rows
+    for rows in _row_batches(
+        conn,
+        provider_id,
+        where,
+        fetch_batch,
+        restrict_ids,
+        include_vector=fetch_inline_vectors,
+    ):
         check_cancelled()
         to_normalize: list[VectorRef] = []
+        batch_inline_payloads: dict[str, Any] | None = {} if fetch_inline_vectors else None
         for row in rows:
             counts["embedding_scanned_rows"] += 1
             memory = parse_row(row, expected_revision)
@@ -1533,6 +1567,8 @@ def _populate_corpus_from_rows(
             if materialize_all or (eligible is not None and eligible(slim_memory)):
                 counts["embedding_candidates"] += 1
                 to_normalize.append(ref)
+                if batch_inline_payloads is not None:
+                    batch_inline_payloads[mid] = row["embedding_vector"]
             else:
                 counts["embedding_unauthorized_or_inactive"] += 1
         if to_normalize:
@@ -1547,6 +1583,7 @@ def _populate_corpus_from_rows(
                 check_cancelled,
                 norm_counts,
                 target_dtype=target_dtype,
+                inline_payloads=batch_inline_payloads,
             )
             counts["embedding_reused_rows"] += norm_counts["embedding_reused_rows"]
             counts["embedding_invalid"] += norm_counts["embedding_invalid"]

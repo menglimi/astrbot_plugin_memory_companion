@@ -121,7 +121,18 @@ class ScopedStore:
         conn.execute(f"PRAGMA synchronous={self._synchronous}")
         conn.execute("PRAGMA wal_autocheckpoint=500")
         conn.execute("PRAGMA secure_delete=ON")
-        for pragma in ("PRAGMA cache_size=-8192", "PRAGMA temp_store=MEMORY"):
+        try:
+            from .store import _sqlite_hardware_tier
+            tier = _sqlite_hardware_tier()
+        except Exception:
+            tier = "mid"
+        if tier == "low":
+            pragmas = ("PRAGMA cache_size=-4096", "PRAGMA temp_store=MEMORY", "PRAGMA mmap_size=0")
+        elif tier == "high":
+            pragmas = ("PRAGMA cache_size=-16384", "PRAGMA temp_store=MEMORY", "PRAGMA mmap_size=134217728")
+        else:
+            pragmas = ("PRAGMA cache_size=-8192", "PRAGMA temp_store=MEMORY", "PRAGMA mmap_size=33554432")
+        for pragma in pragmas:
             try:
                 conn.execute(pragma)
             except sqlite3.OperationalError:

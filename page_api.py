@@ -4572,8 +4572,19 @@ class PluginPageApi:
 
     def _load_config_schema(self) -> dict[str, Any]:
         path = Path(__file__).with_name("_conf_schema.json")
+        try:
+            stat = path.stat()
+            cache_key = (str(path), stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            cache_key = None
+        cached = getattr(self, "_config_schema_cache", None)
+        if cache_key is not None and isinstance(cached, tuple) and cached[0] == cache_key:
+            return cached[1]
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
+        result = data if isinstance(data, dict) else {}
+        if cache_key is not None:
+            self._config_schema_cache = (cache_key, result)
+        return result
 
     def _schema_config_values(self, schema: dict[str, Any]) -> dict[str, dict[str, Any]]:
         result: dict[str, dict[str, Any]] = {}
