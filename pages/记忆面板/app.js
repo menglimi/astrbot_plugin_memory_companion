@@ -4122,6 +4122,7 @@ const configSearchState = {
   hits: [],
   pendingTarget: null,
   hitTimer: 0,
+  closeTimer: 0,
   lastFocus: null,
   fetchPromise: null,
   initialized: false,
@@ -4618,14 +4619,31 @@ function renderConfigSearchResults() {
     .join("");
 }
 
+function prefersReducedMotion() {
+  try {
+    return Boolean(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  } catch (error) {
+    return false;
+  }
+}
+
 function openConfigSearch(initialQuery) {
   const modal = ensureConfigSearchModal();
+  window.clearTimeout(configSearchState.closeTimer);
+  configSearchState.closeTimer = 0;
   if (!configSearchState.open) {
     configSearchState.lastFocus = document.activeElement;
   }
   configSearchState.open = true;
   modal.hidden = false;
-  requestAnimationFrame(() => modal.classList.add("is-open"));
+  if (prefersReducedMotion()) {
+    modal.classList.add("is-open");
+  } else {
+    void modal.offsetWidth;
+    requestAnimationFrame(() => {
+      if (configSearchState.open) modal.classList.add("is-open");
+    });
+  }
   const input = $("#configSearchInput", modal);
   if (typeof initialQuery === "string") {
     configSearchState.query = initialQuery;
@@ -4648,8 +4666,17 @@ function closeConfigSearch(options) {
   const modal = $("#configSearchModal");
   if (!modal || !configSearchState.open) return;
   configSearchState.open = false;
+  window.clearTimeout(configSearchState.closeTimer);
+  configSearchState.closeTimer = 0;
   modal.classList.remove("is-open");
-  modal.hidden = true;
+  if (prefersReducedMotion() || (options && options.immediate)) {
+    modal.hidden = true;
+  } else {
+    configSearchState.closeTimer = window.setTimeout(() => {
+      configSearchState.closeTimer = 0;
+      if (!configSearchState.open) modal.hidden = true;
+    }, 180);
+  }
   if (!options || options.restoreFocus !== false) {
     const prev = configSearchState.lastFocus;
     configSearchState.lastFocus = null;

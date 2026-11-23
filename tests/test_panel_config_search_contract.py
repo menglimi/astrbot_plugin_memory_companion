@@ -181,6 +181,11 @@ class ModuleConfigAndGlobalSearchContractTests(unittest.TestCase):
         self.assertIn(".config-field:last-child.is-search-hit", self.app_css)
         self.assertIn("margin-bottom: -13px;", self.app_css)
 
+        # 隐藏 Chromium/WebKit 原生搜索取消按钮，避免与自定义清除键重叠
+        self.assertIn(".cfg-search-input::-webkit-search-cancel-button", self.app_css)
+        self.assertIn("-webkit-appearance: none;", self.app_css)
+        self.assertIn("pointer-events: none;", self.app_css)
+
         # 全局配置搜索弹窗桌面端舒展黄金尺寸，窄屏与矮屏优雅自适应
         dialog_rule = re.search(r"^\.cfg-search-dialog\s*\{([^}]*)\}", self.app_css, re.M)
         self.assertIsNotNone(dialog_rule)

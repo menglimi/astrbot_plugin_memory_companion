@@ -121,7 +121,7 @@ function loadAppConfigRuntime() {
 
   vm.runInNewContext(
     slice +
-      "\nthis.__exports = { MODULE_LABELS, moduleLabel, moduleSubtitle, CONFIG_COMMON_KEYS, CONFIG_OPTION_LABELS, CONFIG_CHOICE_CARDS, orderedCommonKeys, renderChoiceCards, buildConfigSearchCatalog, runConfigSearchQuery, applyPendingConfigFocus, configSearchState, activateConfigSearchHit };",
+      "\nthis.__exports = { MODULE_LABELS, moduleLabel, moduleSubtitle, CONFIG_COMMON_KEYS, CONFIG_OPTION_LABELS, CONFIG_CHOICE_CARDS, orderedCommonKeys, renderChoiceCards, buildConfigSearchCatalog, runConfigSearchQuery, applyPendingConfigFocus, configSearchState, activateConfigSearchHit, openConfigSearch, closeConfigSearch };",
     sandbox
   );
 
@@ -517,6 +517,113 @@ test("module config save: immediately syncs state.configSchema.values before mod
   await saveClickHandler();
   assert.equal(state.configSchema.values.retrieval_advanced.vector_precision, "float16", "保存后必须立即同步本地 configSchema 缓存值");
   assert.equal(goAwaited, true, "保存后必须 await go('config')");
+});
+
+test("config search modal: smooth open/close transition respects reduced motion and cancels stale close timer on reopen", () => {
+  const appSource = fs.readFileSync(APP_JS_PATH, "utf8");
+  const sIdx = appSource.indexOf("/* ============================================================\r\n   视图：模块配置");
+  const sAlt = appSource.indexOf("/* ============================================================\n   视图：模块配置");
+  const start = sIdx >= 0 ? sIdx : sAlt;
+  const eIdx = appSource.indexOf("/* ============================================================\r\n   视图：权限拓扑");
+  const eAlt = appSource.indexOf("/* ============================================================\n   视图：权限拓扑");
+  const end = eIdx >= 0 ? eIdx : eAlt;
+
+  let reducedMotion = false;
+  const timers = [];
+  const modalClasses = new Set();
+  const fakeModal = {
+    hidden: true,
+    offsetWidth: 840,
+    classList: {
+      add: (c) => modalClasses.add(c),
+      remove: (c) => modalClasses.delete(c),
+      contains: (c) => modalClasses.has(c),
+    },
+  };
+  const fakeInput = { value: "", focus: () => {}, select: () => {} };
+  const fakeBody = { innerHTML: "" };
+  const fakeCount = { textContent: "" };
+  const fakeClear = { hidden: true };
+
+  const sandbox = {
+    window: {
+      MemorySearchEngine: engine,
+      setTimeout: (fn, ms) => {
+        timers.push({ fn, ms, cleared: false });
+        return timers.length;
+      },
+      clearTimeout: (id) => {
+        if (id > 0 && timers[id - 1]) timers[id - 1].cleared = true;
+      },
+      matchMedia: () => ({ matches: reducedMotion }),
+    },
+    navigator: { platform: "Win32", userAgent: "Win64" },
+    document: { activeElement: null, contains: () => true, addEventListener: () => {}, body: { appendChild: () => {} } },
+    requestAnimationFrame: (fn) => fn(),
+    state: { view: "overview", group: "overview", theme: "light", mode: "standard", configSchema: { schema: realSchema, values: {} }, configModule: "appearance" },
+    NAV: [],
+    VIEWS: {},
+    defineView: () => {},
+    $: (sel) => {
+      if (sel === "#configSearchModal") return fakeModal;
+      if (sel === "#configSearchInput") return fakeInput;
+      if (sel === "#configSearchBody") return fakeBody;
+      if (sel === "#configSearchCount") return fakeCount;
+      if (sel === "#configSearchClear") return fakeClear;
+      return null;
+    },
+    $$: () => [],
+    esc: engine.escapeHtml,
+    compact: (v, f) => String(v ?? "").trim() || (f === undefined ? "" : f),
+    clip: (v) => String(v ?? ""),
+    fmtInt: (v) => String(v),
+    icon: () => "",
+    card: () => "",
+    emptyState: () => "",
+    apiGet: async () => ({}),
+    apiPost: async () => ({}),
+    withBusy: async (_t, fn) => fn(),
+    toast: () => {},
+    invalidatePool: () => {},
+    syncPalette: () => {},
+    go: async () => {},
+  };
+
+  vm.runInNewContext(
+    appSource.slice(start, end) + "\nthis.__api = { openConfigSearch, closeConfigSearch };",
+    sandbox
+  );
+
+  // 正常动效：打开即显示并加 is-open；关闭移除 is-open 并在 180ms 后隐藏
+  sandbox.__api.openConfigSearch();
+  assert.equal(fakeModal.hidden, false);
+  assert.equal(modalClasses.has("is-open"), true);
+
+  sandbox.__api.closeConfigSearch();
+  assert.equal(modalClasses.has("is-open"), false);
+  assert.equal(fakeModal.hidden, false, "退场动画期间暂不立即 hidden");
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 180);
+
+  // 关闭动画中途重新打开：必须取消旧定时器，保持可见
+  sandbox.__api.openConfigSearch();
+  assert.equal(timers[0].cleared, true);
+  assert.equal(fakeModal.hidden, false);
+  assert.equal(modalClasses.has("is-open"), true);
+
+  // 再次关闭并让定时器走完后隐藏
+  sandbox.__api.closeConfigSearch();
+  timers[1].fn();
+  assert.equal(fakeModal.hidden, true);
+
+  // 减少动效时关闭立即 hidden，不挂定时器
+  reducedMotion = true;
+  sandbox.__api.openConfigSearch();
+  assert.equal(modalClasses.has("is-open"), true);
+  const beforeTimers = timers.length;
+  sandbox.__api.closeConfigSearch();
+  assert.equal(fakeModal.hidden, true);
+  assert.equal(timers.length, beforeTimers);
 });
 
 test("legacy.html loads search-engine.js?v=2.6.8 before app.js?v=2.6.8", () => {
