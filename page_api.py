@@ -6,7 +6,6 @@ import copy
 import json
 import hashlib
 import inspect
-import logging
 import mimetypes
 import re
 import sqlite3
@@ -26,6 +25,7 @@ try:
 except Exception:  # pragma: no cover - optional in isolated page tests.
     astrbot_web_request = None
 
+from .core.astrbot_compat import logger
 from .core.bridge import serialize_memory
 from .core.capability_probe import CAPABILITY_SNAPSHOT_FIELDS
 from .core.coordination_status import build_coordination_status, project_p6_status
@@ -34,6 +34,7 @@ from .core.local_time import local_tz
 from .core.memory_atom import DURABILITY_LEVELS, SENSITIVITY_LEVELS, VALIDITY_STATUSES
 from .core.absorb import RELATION_SOURCE_USER, merge_relation_profile
 from .core.models import EntityRef, SessionContext, clean_text
+from .core.operations import persist_runtime_config
 from .core.person_weight import clamp_weight
 from .core.store import MemoryStoreUnavailableError
 from .companion_page_bridge import (
@@ -46,8 +47,6 @@ from .companion_page_bridge import (
 
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
 PAGE_API_PREFIXES = (f"/{PLUGIN_NAME}/page",)
-
-logger = logging.getLogger("MemoryCompanion.PageAPI")
 
 # Windows 绝对路径（盘符或 UNC）：非 Windows 平台上必须显式拒绝，
 # 否则 Path() 会把它当成普通相对路径拼到当前目录下。
@@ -2838,15 +2837,15 @@ class PluginPageApi:
             "embedding_backfill_enabled": bool(payload.get("embedding_backfill_enabled", True)),
             "embedding_backfill_batch_size": max(1, self._int(payload.get("embedding_backfill_batch_size"), 50)),
         }
-        raw.setdefault("retrieval", {})
-        if not isinstance(raw["retrieval"], dict):
-            raw["retrieval"] = {}
-        raw["retrieval"].update(core_values)
-        raw.setdefault("retrieval_advanced", {})
-        if not isinstance(raw["retrieval_advanced"], dict):
-            raw["retrieval_advanced"] = {}
-        raw["retrieval_advanced"].update(advanced_values)
-        self._write_plugin_config(raw)
+        retrieval = raw.get("retrieval")
+        retrieval_advanced = raw.get("retrieval_advanced")
+        self._write_plugin_config(
+            {
+                "retrieval": (retrieval if isinstance(retrieval, dict) else {}) | core_values,
+                "retrieval_advanced": (retrieval_advanced if isinstance(retrieval_advanced, dict) else {})
+                | advanced_values,
+            }
+        )
         return self._ok(
             {
                 "retrieval": {
@@ -2961,15 +2960,13 @@ class PluginPageApi:
                 403,
             )
 
-        target = raw.setdefault(module, {})
-        if not isinstance(target, dict):
-            target = {}
-            raw[module] = target
+        current = raw.get(module)
+        target = dict(current) if isinstance(current, dict) else {}
         for key, item_schema in items.items():
             if key not in values or not isinstance(item_schema, dict):
                 continue
             target[key] = self._coerce_config_value(values.get(key), item_schema)
-        self._write_plugin_config(raw)
+        self._write_plugin_config({module: target})
         return self._ok(
             {
                 "module": module,
@@ -4509,31 +4506,8 @@ class PluginPageApi:
             return "", f"{label}（{key}）最长 {limit} 个字符"
         return clean_text(text, limit), ""
 
-    def _write_plugin_config(self, raw: dict[str, Any]) -> None:
-        path = self._plugin_config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        import os
-        import tempfile
-        fd, tmp_path = tempfile.mkstemp(
-            suffix=".tmp",
-            prefix=path.stem,
-            dir=str(path.parent),
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(raw, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, str(path))
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-
-    def _plugin_config_path(self) -> Path:
-        data_dir = Path(getattr(self.plugin.service, "data_dir", ""))
-        root = data_dir.parent.parent if data_dir.parent.name == "plugin_data" else data_dir.parent
-        return root / "config" / f"{PLUGIN_NAME}_config.json"
+    def _write_plugin_config(self, updates: dict[str, Any]) -> None:
+        persist_runtime_config(self.plugin.service.config.raw, updates)
 
     def _load_config_schema(self) -> dict[str, Any]:
         path = Path(__file__).with_name("_conf_schema.json")

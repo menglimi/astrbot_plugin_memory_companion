@@ -1,0 +1,2 @@
+# Keep development tests out of installable source archives.
+/tests export-ignore

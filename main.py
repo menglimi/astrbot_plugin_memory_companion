@@ -27,7 +27,7 @@ from .core.query_session import bind_query_tool_schema, bind_query_tool_v3_schem
 from .core.service import MemoryCompanionService
 
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
-PLUGIN_VERSION = "2.6.8"
+PLUGIN_VERSION = "2.6.9"
 
 _ACTIVE_BRIDGE: MemoryCompanionBridge | None = None
 
@@ -90,7 +90,7 @@ class MemoryCompanionPlugin(Star):
         data_dir = _prepare_data_dir()
         self.service = MemoryCompanionService(
             context=context,
-            config=config or {},
+            config=config,
             plugin_root=Path(__file__).resolve().parent,
             data_dir=data_dir,
             defer_database_initialization=True,

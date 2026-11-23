@@ -206,23 +206,20 @@ def detect_preset(config: ConfigView) -> str:
     return "custom"
 
 
-def persist_runtime_config(raw: dict[str, Any], data_dir: Path) -> Path:
-    data_dir = Path(data_dir)
-    root = data_dir.parent.parent if data_dir.parent.name == "plugin_data" else data_dir.parent
-    path = root / "config" / "astrbot_plugin_memory_companion_config.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(suffix=".tmp", prefix=path.stem, dir=str(path.parent))
+def persist_runtime_config(raw: dict[str, Any], updates: dict[str, Any]) -> str:
+    save_config = getattr(raw, "save_config", None)
+    if not callable(save_config):
+        raise RuntimeError("AstrBot plugin configuration saving is unavailable")
+
+    previous = dict(raw)
+    raw.update(updates)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(raw, handle, ensure_ascii=False, indent=2)
-        os.replace(temp_name, path)
+        save_config()
     except Exception:
-        try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
+        raw.clear()
+        raw.update(previous)
         raise
-    return path
+    return str(getattr(raw, "config_path", ""))
 
 
 def scan_plugin_conflicts(plugin_root: Path) -> list[dict[str, Any]]:

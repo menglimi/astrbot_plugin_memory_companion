@@ -18,7 +18,6 @@ discarding any stale snapshot before it can touch disk.
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import tempfile
 import threading
@@ -26,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-logger = logging.getLogger("astrbot_plugin_memory_companion.json_persistence")
+from .astrbot_compat import logger
 
 JSON_SCALARS = (str, int, float, bool)
 

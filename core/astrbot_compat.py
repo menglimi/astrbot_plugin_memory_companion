@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import logging
 import re
 from html.parser import HTMLParser
 from typing import Any
 
-try:
-    from astrbot.api import logger  # type: ignore
-except Exception:  # pragma: no cover - useful for local syntax/unit checks
-    logger = logging.getLogger("MemoryCompanion")
+from astrbot.api import logger
 
 
 # TextPart 统一在这里解析，插件其它模块只从本模块取（A14）。

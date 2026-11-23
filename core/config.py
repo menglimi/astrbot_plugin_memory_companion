@@ -86,7 +86,7 @@ class ConfigView:
     }
 
     def __init__(self, raw: Any):
-        self.raw = raw or {}
+        self.raw = raw if isinstance(raw, dict) else raw or {}
 
     def get(self, dotted: str, default: Any = None) -> Any:
         marker = object()

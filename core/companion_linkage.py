@@ -17,11 +17,10 @@ private_companion 7.x（内部领域标识 ``private_companion.v2``）在宿主 
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections.abc import Mapping
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from .astrbot_compat import logger
 
 REGISTRY_ATTRIBUTE = "_private_companion_memory_providers"
 PROVIDER_API_VERSION = "companion.external-memory.v1"

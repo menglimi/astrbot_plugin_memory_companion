@@ -10579,8 +10579,9 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         raw = self.config.raw
         if not isinstance(raw, dict):
             raise RuntimeError("runtime config is not writable")
-        result = apply_preset(raw, name)
-        result["config_path"] = str(persist_runtime_config(raw, self.data_dir))
+        updated = deepcopy(dict(raw))
+        result = apply_preset(updated, name)
+        result["config_path"] = persist_runtime_config(raw, updated)
         self._retrieval_result_cache.clear()
         return result
 

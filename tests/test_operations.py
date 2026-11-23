@@ -5,6 +5,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from astrbot.api import AstrBotConfig
 
 
 try:
@@ -97,14 +100,24 @@ class OperationPresetTests(unittest.TestCase):
                     self.assertEqual(hi, items[key]["max"])
                     self.assertEqual({"min": lo, "max": hi, "step": step}, items[key]["slider"])
 
-    def test_persist_runtime_config_is_utf8_and_atomic_target(self) -> None:
+    def test_persist_runtime_config_uses_host_path_and_utf8(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            data_dir = Path(temp) / "plugin_data" / "astrbot_plugin_memory_companion"
-            data_dir.mkdir(parents=True)
-            path = persist_runtime_config({"备注": "中文配置"}, data_dir)
+            path = Path(temp) / "plugin-settings.json"
+            raw = AstrBotConfig(config_path=str(path), default_config={"备注": ""})
 
-            self.assertEqual("astrbot_plugin_memory_companion_config.json", path.name)
+            self.assertEqual(str(path), persist_runtime_config(raw, {"备注": "中文配置"}))
             self.assertIn("中文配置", path.read_text(encoding="utf-8"))
+
+    def test_persist_runtime_config_rolls_back_on_save_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "plugin-settings.json"
+            raw = AstrBotConfig(config_path=str(path), default_config={"retrieval": {"mode": "auto"}})
+
+            with patch.object(AstrBotConfig, "save_config", side_effect=OSError("disk full")):
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    persist_runtime_config(raw, {"retrieval": {"mode": "basic"}})
+
+            self.assertEqual({"retrieval": {"mode": "auto"}}, dict(raw))
 
 
 class PluginConflictTests(unittest.TestCase):

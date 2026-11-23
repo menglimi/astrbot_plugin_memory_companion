@@ -116,10 +116,12 @@ class SummaryBatchObservabilityTests(unittest.IsolatedAsyncioTestCase):
 
         api = PluginPageApi(SimpleNamespace(service=self.service))
         fake_request = SimpleNamespace(get_json=AsyncMock(return_value={'batch_id': batch_id, 'mode': 'retry'}))
+        test_logger = logging.getLogger('MemoryCompanion.SummaryBatchPageTest')
         with (
             patch.object(page_api_module, 'request', fake_request),
             patch.object(page_api_module, 'jsonify', side_effect=lambda body: body),
-            self.assertLogs(page_api_module.logger, level='INFO') as captured,
+            patch.object(page_api_module, 'logger', test_logger),
+            self.assertLogs(test_logger, level='INFO') as captured,
         ):
             response = await api.release_summary_batch()
 

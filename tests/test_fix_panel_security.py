@@ -179,7 +179,13 @@ class PanelConfigWriteGuardTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.api = make_api(self.temp_dir.name)
         self.written: list[dict] = []
-        patcher = patch.object(self.api, "_write_plugin_config", side_effect=self.written.append)
+        raw = self.api.plugin.service.config.raw
+
+        def write_config(updates):
+            self.written.append(updates)
+            raw.update(updates)
+
+        patcher = patch.object(self.api, "_write_plugin_config", side_effect=write_config)
         patcher.start()
         self.addCleanup(patcher.stop)
         schema_patcher = patch.object(self.api, "_schema_config_values", return_value={})

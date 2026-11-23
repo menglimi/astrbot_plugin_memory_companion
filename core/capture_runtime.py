@@ -4,13 +4,11 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import json
-import logging
 import secrets
 
+from .astrbot_compat import logger
 from .models import SessionContext, utc_now
 from .source_capture import SourceCapture, digest
-
-logger = logging.getLogger("astrbot_plugin_memory_companion.capture_runtime")
 
 
 async def _in_thread(function, *args, **kwargs):
