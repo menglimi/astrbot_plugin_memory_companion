@@ -49,16 +49,7 @@ def clean_text(value: Any, limit: int = 2000) -> str:
     text = value if type(value) is str else str(value)
     if not text:
         return ""
-    if (
-        len(text) <= limit
-        and text.isascii()
-        and " " not in text
-        and "\n" not in text
-        and "\t" not in text
-        and "\r" not in text
-        and "\x0b" not in text
-        and "\x0c" not in text
-    ):
+    if len(text) <= limit and text.isascii() and " " not in text and text.isprintable():
         return text
     text = " ".join(text.split())
     if len(text) > limit:

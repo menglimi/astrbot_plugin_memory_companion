@@ -786,11 +786,16 @@ def _normalize_blob_batch(
     raw_mat = np.frombuffer(b"".join(blobs), dtype=in_dtype).reshape(count, dimension)
 
     # Normalize float16 inputs in float32 to prevent squaring overflow/underflow;
-    # downcast normal finite float64 inputs to float32 before normalization to halve
-    # SIMD/memory bandwidth when targeting float32/float16 storage.
+    # downcast normal finite non-underflowing float64 inputs to float32 before
+    # normalization to halve SIMD/memory bandwidth when targeting float32/float16.
+    # Tiny non-zero float64 vectors (e.g. ~1e-50) that underflow to 0.0 in float32
+    # or overflow/non-finite inputs fall back to exact float64 scaling.
     if in_dtype == "<f8" and out_dtype in ("<f4", "<f2"):
         work_mat = raw_mat.astype(np.float32)
-        if not np.isfinite(work_mat).all():
+        if (
+            not np.isfinite(work_mat).all()
+            or not (np.max(np.abs(work_mat), axis=1) > 0.0).all()
+        ):
             work_mat = raw_mat.copy()
     elif in_dtype == "<f2":
         work_mat = raw_mat.astype(np.float32)

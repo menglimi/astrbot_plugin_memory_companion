@@ -750,6 +750,8 @@ class MemoryStore(SummaryBatchStore):
         self._read_pool_max: int = _read_pool_capacity()
         self._read_pool_idle: list[sqlite3.Connection] = []
         self._read_pool_all: set[sqlite3.Connection] = set()
+        self._read_pool_conn_gen: dict[sqlite3.Connection, int] = {}
+        self._read_pool_generation: int = 0
         self._read_pool_creating: int = 0
         self._read_pool_cond = threading.Condition()
         self._buckets_cache_lock = threading.Lock()
@@ -970,17 +972,31 @@ class MemoryStore(SummaryBatchStore):
         extra_cap = max(1, int(getattr(self, "_read_pool_max", 2) or 2) - 1)
         while True:
             should_open = False
+            open_gen = 0
+            stale_conn: sqlite3.Connection | None = None
             with self._read_pool_cond:
                 if self._closed:
                     raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
                 if self._read_pool_idle:
-                    return self._read_pool_idle.pop()
-                if len(self._read_pool_all) + self._read_pool_creating < extra_cap:
+                    candidate = self._read_pool_idle.pop()
+                    if self._read_pool_conn_gen.get(candidate) == self._read_pool_generation:
+                        return candidate
+                    self._read_pool_all.discard(candidate)
+                    self._read_pool_conn_gen.pop(candidate, None)
+                    stale_conn = candidate
+                elif len(self._read_pool_all) + self._read_pool_creating < extra_cap:
+                    open_gen = self._read_pool_generation
                     self._read_pool_creating += 1
                     should_open = True
                 else:
                     self._read_pool_cond.wait(timeout=0.05)
                     continue
+            if stale_conn is not None:
+                try:
+                    stale_conn.close()
+                except sqlite3.Error:
+                    pass
+                continue
             if should_open:
                 try:
                     conn = self._open_dedicated_read_connection()
@@ -989,17 +1005,28 @@ class MemoryStore(SummaryBatchStore):
                         self._read_pool_creating = max(0, self._read_pool_creating - 1)
                         self._read_pool_cond.notify()
                     raise
+                discard_stale = False
                 with self._read_pool_cond:
                     self._read_pool_creating = max(0, self._read_pool_creating - 1)
                     if self._closed:
+                        self._read_pool_cond.notify_all()
                         try:
                             conn.close()
                         except sqlite3.Error:
                             pass
-                        self._read_pool_cond.notify_all()
                         raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
-                    self._read_pool_all.add(conn)
-                return conn
+                    if open_gen != self._read_pool_generation:
+                        discard_stale = True
+                        self._read_pool_cond.notify()
+                    else:
+                        self._read_pool_all.add(conn)
+                        self._read_pool_conn_gen[conn] = open_gen
+                        return conn
+                if discard_stale:
+                    try:
+                        conn.close()
+                    except sqlite3.Error:
+                        pass
 
     def _release_pooled_read_conn_sync(
         self,
@@ -1009,8 +1036,10 @@ class MemoryStore(SummaryBatchStore):
     ) -> None:
         close_now = broken
         with self._read_pool_cond:
-            if self._closed or broken:
+            conn_gen = self._read_pool_conn_gen.get(conn)
+            if self._closed or broken or conn_gen != self._read_pool_generation:
                 self._read_pool_all.discard(conn)
+                self._read_pool_conn_gen.pop(conn, None)
                 close_now = True
             else:
                 self._read_pool_idle.append(conn)
@@ -1023,10 +1052,12 @@ class MemoryStore(SummaryBatchStore):
 
     def _close_read_pool_sync(self) -> None:
         with self._read_pool_cond:
+            self._read_pool_generation += 1
             to_close = list(self._read_pool_idle)
             self._read_pool_idle.clear()
             for conn in to_close:
                 self._read_pool_all.discard(conn)
+                self._read_pool_conn_gen.pop(conn, None)
             self._read_pool_cond.notify_all()
         for conn in to_close:
             try:
@@ -1274,6 +1305,8 @@ class MemoryStore(SummaryBatchStore):
                 previous.close()
             except sqlite3.Error:
                 pass
+        with self._buckets_cache_lock:
+            self._buckets_cache.clear()
         self._close_read_pool_sync()
 
     def _run_with_database_recovery_sync(self, operation: Any, *args: Any, **kwargs: Any) -> Any:
@@ -3219,6 +3252,44 @@ class MemoryStore(SummaryBatchStore):
             AFTER DELETE ON knowledge_edges
             BEGIN
                 UPDATE knowledge_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            CREATE TABLE IF NOT EXISTS buckets_meta_revision (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                revision INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT OR IGNORE INTO buckets_meta_revision(singleton, revision) VALUES(1, 0);
+
+            CREATE TRIGGER IF NOT EXISTS trg_identities_buckets_meta_revision_insert
+            AFTER INSERT ON identities
+            BEGIN
+                UPDATE buckets_meta_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_identities_buckets_meta_revision_update
+            AFTER UPDATE ON identities
+            BEGIN
+                UPDATE buckets_meta_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_identities_buckets_meta_revision_delete
+            AFTER DELETE ON identities
+            BEGIN
+                UPDATE buckets_meta_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_relationship_edges_buckets_meta_revision_insert
+            AFTER INSERT ON relationship_edges
+            BEGIN
+                UPDATE buckets_meta_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_relationship_edges_buckets_meta_revision_update
+            AFTER UPDATE ON relationship_edges
+            BEGIN
+                UPDATE buckets_meta_revision SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_relationship_edges_buckets_meta_revision_delete
+            AFTER DELETE ON relationship_edges
+            BEGIN
+                UPDATE buckets_meta_revision SET revision = revision + 1 WHERE singleton = 1;
             END;
             """
         )
@@ -14224,31 +14295,19 @@ class MemoryStore(SummaryBatchStore):
 
     @staticmethod
     def _buckets_cache_watermark_sync(conn: sqlite3.Connection) -> str:
-        """Compute a lightweight ACID watermark covering memories + display-name tables."""
+        """Read trigger-backed monotonic revisions covering memories and bucket names."""
         try:
             rev_row = conn.execute(
                 "SELECT revision FROM retrieval_revision WHERE singleton=1"
             ).fetchone()
-            mem_rev = str(int(rev_row[0] or 0)) if rev_row else ""
+            meta_row = conn.execute(
+                "SELECT revision FROM buckets_meta_revision WHERE singleton=1"
+            ).fetchone()
         except sqlite3.OperationalError:
             return ""
-        if not mem_rev:
+        if rev_row is None or meta_row is None:
             return ""
-        id_wm = ""
-        rel_wm = ""
-        try:
-            r1 = conn.execute("SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM identities").fetchone()
-            if r1 is not None:
-                id_wm = f"{int(r1[0] or 0)}:{r1[1] or ''}"
-        except sqlite3.OperationalError:
-            pass
-        try:
-            r2 = conn.execute("SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM relationship_edges").fetchone()
-            if r2 is not None:
-                rel_wm = f"{int(r2[0] or 0)}:{r2[1] or ''}"
-        except sqlite3.OperationalError:
-            pass
-        return f"{mem_rev}|{id_wm}|{rel_wm}"
+        return f"{int(rev_row[0] or 0)}:{int(meta_row[0] or 0)}"
 
     def _list_memory_buckets_sync(
         self,
@@ -14261,289 +14320,300 @@ class MemoryStore(SummaryBatchStore):
         with self._read_conn_sync() as conn:
             cache_key: tuple[str, bool, bool] | None = None
             in_uncommitted = (not self._read_only) and conn is self._conn and self._conn.in_transaction
-            if not in_uncommitted:
-                watermark = self._buckets_cache_watermark_sync(conn)
-                if watermark:
-                    cache_key = (watermark, bool(include_raw_events), bool(include_archive))
-                    with self._buckets_cache_lock:
-                        cached_buckets = self._buckets_cache.get(cache_key)
-                    if cached_buckets is not None:
-                        return self._clone_bucket_items(cached_buckets, limit)
-            rows = conn.execute(
-                f"""
-                WITH normalized AS (
-                    SELECT
-                        scope,
-                        CASE
-                            WHEN scope='group' THEN
-                                CASE
-                                    WHEN group_id!='' THEN group_id
-                                    WHEN object_kind='group' AND object_id!='' THEN object_id
-                                    ELSE session_id
-                                END
-                            ELSE
-                                CASE
-                                    WHEN subject_kind='user' AND subject_id!='' AND subject_id!='self' THEN subject_id
-                                    WHEN object_kind='user' AND object_id!='' AND object_id!='self' THEN object_id
-                                    ELSE session_id
-                                END
-                        END AS target_id,
-                        CASE
-                            WHEN scope='group' THEN
-                                CASE
-                                    WHEN object_kind='group' AND object_name!='' THEN object_name
-                                    ELSE ''
-                                END
-                            ELSE
-                                CASE
-                                    WHEN subject_kind='user' AND subject_id!='' AND subject_id!='self' THEN subject_name
-                                    WHEN object_kind='user' AND object_id!='' AND object_id!='self' THEN object_name
-                                    ELSE ''
-                                END
-                        END AS target_name,
-                        session_id AS sample_session_id,
-                        group_id AS sample_group_id,
-                        CASE
-                            WHEN owner_bot_id NOT IN ('', 'self') THEN owner_bot_id
-                            WHEN instr(metadata, '"owner_bot_id"') > 0 AND json_valid(metadata) THEN
-                                COALESCE(
-                                    NULLIF(NULLIF(CAST(json_extract(metadata, '$.owner_bot_id') AS TEXT), ''), 'self'),
+            started_snapshot = False
+            if not in_uncommitted and not conn.in_transaction:
+                conn.execute("BEGIN")
+                started_snapshot = True
+            try:
+                if started_snapshot:
+                    watermark = self._buckets_cache_watermark_sync(conn)
+                    if watermark:
+                        cache_key = (watermark, bool(include_raw_events), bool(include_archive))
+                        with self._buckets_cache_lock:
+                            cached_buckets = self._buckets_cache.get(cache_key)
+                        if cached_buckets is not None:
+                            return self._clone_bucket_items(cached_buckets, limit)
+                rows = conn.execute(
+                    f"""
+                    WITH normalized AS (
+                        SELECT
+                            scope,
+                            CASE
+                                WHEN scope='group' THEN
                                     CASE
-                                        WHEN subject_kind='bot' AND subject_id NOT IN ('', 'self') THEN subject_id
-                                        WHEN object_kind='bot' AND object_id NOT IN ('', 'self') THEN object_id
+                                        WHEN group_id!='' THEN group_id
+                                        WHEN object_kind='group' AND object_id!='' THEN object_id
+                                        ELSE session_id
+                                    END
+                                ELSE
+                                    CASE
+                                        WHEN subject_kind='user' AND subject_id!='' AND subject_id!='self' THEN subject_id
+                                        WHEN object_kind='user' AND object_id!='' AND object_id!='self' THEN object_id
+                                        ELSE session_id
+                                    END
+                            END AS target_id,
+                            CASE
+                                WHEN scope='group' THEN
+                                    CASE
+                                        WHEN object_kind='group' AND object_name!='' THEN object_name
                                         ELSE ''
                                     END
-                                )
-                            WHEN subject_kind='bot' AND subject_id NOT IN ('', 'self') THEN subject_id
-                            WHEN object_kind='bot' AND object_id NOT IN ('', 'self') THEN object_id
-                            ELSE ''
-                        END AS sample_bot_id,
-                        lifecycle,
-                        CASE
-                            WHEN lifecycle!='archived'
-                                 AND visibility!='internal'
-                                 AND (?=1 OR lifecycle!='raw_event')
-                            THEN 1
-                            ELSE 0
-                        END AS is_searchable,
-                        occurred_at,
-                        {_memory_time_sql()} AS sort_time
-                    FROM {source}
-                    WHERE +scope IN ('private', 'group')
-                      AND review_status!='pending'
-                )
-                SELECT
-                    scope,
-                    target_id,
-                    sample_bot_id,
-                    COUNT(*) AS memory_count,
-                    SUM(CASE WHEN lifecycle='archived' THEN 1 ELSE 0 END) AS archived_count,
-                    SUM(is_searchable) AS searchable_count,
-                    MAX(CASE WHEN is_searchable=1 THEN sort_time ELSE 0 END) AS active_latest_sort,
-                    MAX(sort_time) AS latest_sort,
-                    MAX(
-                        printf('%d' || char(31) || '%020.6f' || char(31) || '%s' || char(31) || '%s' || char(31) || '%s',
-                               is_searchable, sort_time, sample_session_id, sample_group_id, occurred_at)
-                    ) AS sample_pack,
-                    MAX(
-                        CASE WHEN target_name!='' THEN
-                            printf('%020.6f' || char(31) || '%s' || char(31) || '%s' || char(31) || '%s',
-                                   sort_time, sample_session_id, occurred_at, target_name)
-                        ELSE '' END
-                    ) AS name_pack,
-                    MAX(
-                        printf('%020.6f' || char(31) || '%s' || char(31) || '%s',
-                               sort_time, sample_session_id, occurred_at)
-                    ) AS latest_pack
-                FROM normalized
-                WHERE target_id!=''
-                GROUP BY scope, target_id, sample_bot_id
-                ORDER BY
-                    scope ASC,
-                    CASE WHEN MAX(is_searchable)>0 THEN 0 ELSE 1 END ASC,
-                    MAX(CASE WHEN is_searchable=1 THEN sort_time ELSE 0 END) DESC,
-                    MAX(sort_time) DESC
-                """,
-                (1 if include_raw_events else 0,),
-            ).fetchall()
-            merged: dict[tuple[str, str], dict[str, Any]] = {}
-            for raw in rows:
-                bucket = dict(raw)
-                sample_pack = str(bucket.pop("sample_pack", "") or "")
-                s_parts = sample_pack.split(sep, 4) if sample_pack else []
-                s_searchable = s_parts[0] == "1" if len(s_parts) >= 1 else False
-                bucket["sample_session_id"] = s_parts[2] if len(s_parts) >= 3 else ""
-                bucket["sample_group_id"] = s_parts[3] if len(s_parts) >= 4 else ""
-                bucket["active_latest_at"] = (s_parts[4] if len(s_parts) >= 5 else "") if s_searchable else ""
-
-                name_pack = str(bucket.pop("name_pack", "") or "")
-                if name_pack:
-                    n_parts = name_pack.split(sep, 3)
-                    try:
-                        bucket["name_latest_sort"] = float(n_parts[0])
-                    except (TypeError, ValueError):
-                        bucket["name_latest_sort"] = 0.0
-                    bucket["name_latest_at"] = n_parts[2] if len(n_parts) >= 3 else ""
-                    bucket["target_name"] = n_parts[3] if len(n_parts) >= 4 else ""
-                else:
-                    bucket["name_latest_sort"] = 0.0
-                    bucket["name_latest_at"] = ""
-                    bucket["target_name"] = ""
-
-                latest_pack = str(bucket.pop("latest_pack", "") or "")
-                l_parts = latest_pack.split(sep, 2) if latest_pack else []
-                bucket["latest_at"] = l_parts[2] if len(l_parts) >= 3 else ""
-
-                scope = clean_text(bucket.get("scope"), 40)
-                target_id = clean_text(bucket.get("target_id"), 200)
-                parsed_scope, parsed_target = parse_scope_from_session(target_id)
-                if parsed_scope == scope and clean_text(parsed_target, 120):
-                    target_id = clean_text(parsed_target, 120)
-                key = (scope, target_id)
-                sample_context = {
-                    "bot_id": clean_text(bucket.get("sample_bot_id"), 120),
-                    "session_id": clean_text(bucket.get("sample_session_id"), 200),
-                    "group_id": clean_text(bucket.get("sample_group_id"), 120),
-                    "memory_count": int(bucket.get("memory_count") or 0),
-                    "archived_count": int(bucket.get("archived_count") or 0),
-                    "searchable_count": int(bucket.get("searchable_count") or 0),
-                    "active_latest_at": clean_text(bucket.get("active_latest_at"), 80),
-                    "latest_at": clean_text(bucket.get("latest_at"), 80),
-                    "active_latest_sort": float(bucket.get("active_latest_sort") or 0),
-                    "latest_sort": float(bucket.get("latest_sort") or 0),
-                }
-                candidate_priority = (
-                    bool(sample_context["active_latest_at"]),
-                    sample_context["active_latest_sort"] or sample_context["latest_sort"],
-                )
-                current = merged.get(key)
-                if current is None:
-                    bucket["target_id"] = target_id
-                    bucket["sample_contexts"] = [sample_context]
-                    bucket["_sample_has_active"] = candidate_priority[0]
-                    bucket["_sample_latest_sort"] = candidate_priority[1]
-                    bucket["_name_latest_at"] = clean_text(bucket.get("name_latest_at"), 80)
-                    bucket["_name_latest_sort"] = float(bucket.get("name_latest_sort") or 0)
-                    merged[key] = bucket
-                    continue
-                current["memory_count"] = int(current.get("memory_count") or 0) + int(bucket.get("memory_count") or 0)
-                current["archived_count"] = int(current.get("archived_count") or 0) + int(bucket.get("archived_count") or 0)
-                current["searchable_count"] = int(current.get("searchable_count") or 0) + int(bucket.get("searchable_count") or 0)
-                if sample_context["active_latest_sort"] > float(current.get("active_latest_sort") or 0):
-                    current["active_latest_at"] = sample_context["active_latest_at"]
-                    current["active_latest_sort"] = sample_context["active_latest_sort"]
-                if sample_context["latest_sort"] > float(current.get("latest_sort") or 0):
-                    current["latest_at"] = sample_context["latest_at"]
-                    current["latest_sort"] = sample_context["latest_sort"]
-                current_priority = (
-                    bool(current.get("_sample_has_active")),
-                    float(current.get("_sample_latest_sort") or 0),
-                )
-                if candidate_priority > current_priority:
-                    current["sample_session_id"] = bucket.get("sample_session_id")
-                    current["sample_group_id"] = bucket.get("sample_group_id")
-                    current["sample_bot_id"] = bucket.get("sample_bot_id")
-                    current["_sample_has_active"] = candidate_priority[0]
-                    current["_sample_latest_sort"] = candidate_priority[1]
-                contexts = current.setdefault("sample_contexts", [])
-                existing_context = next(
-                    (
-                        item
-                        for item in contexts
-                        if clean_text(item.get("bot_id"), 120) == sample_context["bot_id"]
-                    ),
-                    None,
-                )
-                if existing_context is None:
-                    contexts.append(sample_context)
-                else:
-                    existing_priority = (
-                        bool(clean_text(existing_context.get("active_latest_at"), 80)),
-                        float(existing_context.get("active_latest_sort") or 0)
-                        or float(existing_context.get("latest_sort") or 0),
+                                ELSE
+                                    CASE
+                                        WHEN subject_kind='user' AND subject_id!='' AND subject_id!='self' THEN subject_name
+                                        WHEN object_kind='user' AND object_id!='' AND object_id!='self' THEN object_name
+                                        ELSE ''
+                                    END
+                            END AS target_name,
+                            session_id AS sample_session_id,
+                            group_id AS sample_group_id,
+                            CASE
+                                WHEN owner_bot_id NOT IN ('', 'self') THEN owner_bot_id
+                                WHEN instr(metadata, '"owner_bot_id"') > 0 AND json_valid(metadata) THEN
+                                    COALESCE(
+                                        NULLIF(NULLIF(CAST(json_extract(metadata, '$.owner_bot_id') AS TEXT), ''), 'self'),
+                                        CASE
+                                            WHEN subject_kind='bot' AND subject_id NOT IN ('', 'self') THEN subject_id
+                                            WHEN object_kind='bot' AND object_id NOT IN ('', 'self') THEN object_id
+                                            ELSE ''
+                                        END
+                                    )
+                                WHEN subject_kind='bot' AND subject_id NOT IN ('', 'self') THEN subject_id
+                                WHEN object_kind='bot' AND object_id NOT IN ('', 'self') THEN object_id
+                                ELSE ''
+                            END AS sample_bot_id,
+                            lifecycle,
+                            CASE
+                                WHEN lifecycle!='archived'
+                                     AND visibility!='internal'
+                                     AND (?=1 OR lifecycle!='raw_event')
+                                THEN 1
+                                ELSE 0
+                            END AS is_searchable,
+                            occurred_at,
+                            {_memory_time_sql()} AS sort_time
+                        FROM {source}
+                        WHERE +scope IN ('private', 'group')
+                          AND review_status!='pending'
                     )
-                    existing_context["memory_count"] = int(existing_context.get("memory_count") or 0) + sample_context["memory_count"]
-                    existing_context["archived_count"] = int(existing_context.get("archived_count") or 0) + sample_context["archived_count"]
-                    existing_context["searchable_count"] = int(existing_context.get("searchable_count") or 0) + sample_context["searchable_count"]
-                    if sample_context["active_latest_sort"] > float(existing_context.get("active_latest_sort") or 0):
-                        existing_context["active_latest_at"] = sample_context["active_latest_at"]
-                        existing_context["active_latest_sort"] = sample_context["active_latest_sort"]
-                    if sample_context["latest_sort"] > float(existing_context.get("latest_sort") or 0):
-                        existing_context["latest_at"] = sample_context["latest_at"]
-                        existing_context["latest_sort"] = sample_context["latest_sort"]
-                    if candidate_priority > existing_priority:
-                        existing_context["session_id"] = sample_context["session_id"]
-                        existing_context["group_id"] = sample_context["group_id"]
-                candidate_name = clean_text(bucket.get("target_name"), 120)
-                candidate_name_at = clean_text(bucket.get("name_latest_at"), 80)
-                candidate_name_sort = float(bucket.get("name_latest_sort") or 0)
-                current_name = clean_text(current.get("target_name"), 120)
-                current_name_at = clean_text(current.get("_name_latest_at"), 80)
-                current_name_sort = float(current.get("_name_latest_sort") or 0)
-                if (
-                    candidate_name
-                    and candidate_name not in {target_id, clean_text(bucket.get("sample_session_id"), 200)}
-                    and (not current_name or candidate_name_sort > current_name_sort)
-                ):
-                    current["target_name"] = candidate_name
-                    current["_name_latest_at"] = candidate_name_at
-                    current["_name_latest_sort"] = candidate_name_sort
-            buckets = list(merged.values())
-            for bucket in buckets:
-                contexts = bucket.get("sample_contexts") or []
-                contexts.sort(
+                    SELECT
+                        scope,
+                        target_id,
+                        sample_bot_id,
+                        COUNT(*) AS memory_count,
+                        SUM(CASE WHEN lifecycle='archived' THEN 1 ELSE 0 END) AS archived_count,
+                        SUM(is_searchable) AS searchable_count,
+                        MAX(CASE WHEN is_searchable=1 THEN sort_time ELSE 0 END) AS active_latest_sort,
+                        MAX(sort_time) AS latest_sort,
+                        MAX(
+                            printf('%d' || char(31) || '%020.6f' || char(31) || '%s' || char(31) || '%s' || char(31) || '%s',
+                                   is_searchable, sort_time, sample_session_id, sample_group_id, occurred_at)
+                        ) AS sample_pack,
+                        MAX(
+                            CASE WHEN target_name!='' THEN
+                                printf('%020.6f' || char(31) || '%s' || char(31) || '%s' || char(31) || '%s',
+                                       sort_time, sample_session_id, occurred_at, target_name)
+                            ELSE '' END
+                        ) AS name_pack,
+                        MAX(
+                            printf('%020.6f' || char(31) || '%s' || char(31) || '%s',
+                                   sort_time, sample_session_id, occurred_at)
+                        ) AS latest_pack
+                    FROM normalized
+                    WHERE target_id!=''
+                    GROUP BY scope, target_id, sample_bot_id
+                    ORDER BY
+                        scope ASC,
+                        CASE WHEN MAX(is_searchable)>0 THEN 0 ELSE 1 END ASC,
+                        MAX(CASE WHEN is_searchable=1 THEN sort_time ELSE 0 END) DESC,
+                        MAX(sort_time) DESC
+                    """,
+                    (1 if include_raw_events else 0,),
+                ).fetchall()
+                merged: dict[tuple[str, str], dict[str, Any]] = {}
+                for raw in rows:
+                    bucket = dict(raw)
+                    sample_pack = str(bucket.pop("sample_pack", "") or "")
+                    s_parts = sample_pack.split(sep, 4) if sample_pack else []
+                    s_searchable = s_parts[0] == "1" if len(s_parts) >= 1 else False
+                    bucket["sample_session_id"] = s_parts[2] if len(s_parts) >= 3 else ""
+                    bucket["sample_group_id"] = s_parts[3] if len(s_parts) >= 4 else ""
+                    bucket["active_latest_at"] = (s_parts[4] if len(s_parts) >= 5 else "") if s_searchable else ""
+
+                    name_pack = str(bucket.pop("name_pack", "") or "")
+                    if name_pack:
+                        n_parts = name_pack.split(sep, 3)
+                        try:
+                            bucket["name_latest_sort"] = float(n_parts[0])
+                        except (TypeError, ValueError):
+                            bucket["name_latest_sort"] = 0.0
+                        bucket["name_latest_at"] = n_parts[2] if len(n_parts) >= 3 else ""
+                        bucket["target_name"] = n_parts[3] if len(n_parts) >= 4 else ""
+                    else:
+                        bucket["name_latest_sort"] = 0.0
+                        bucket["name_latest_at"] = ""
+                        bucket["target_name"] = ""
+
+                    latest_pack = str(bucket.pop("latest_pack", "") or "")
+                    l_parts = latest_pack.split(sep, 2) if latest_pack else []
+                    bucket["latest_at"] = l_parts[2] if len(l_parts) >= 3 else ""
+
+                    scope = clean_text(bucket.get("scope"), 40)
+                    target_id = clean_text(bucket.get("target_id"), 200)
+                    parsed_scope, parsed_target = parse_scope_from_session(target_id)
+                    if parsed_scope == scope and clean_text(parsed_target, 120):
+                        target_id = clean_text(parsed_target, 120)
+                    key = (scope, target_id)
+                    sample_context = {
+                        "bot_id": clean_text(bucket.get("sample_bot_id"), 120),
+                        "session_id": clean_text(bucket.get("sample_session_id"), 200),
+                        "group_id": clean_text(bucket.get("sample_group_id"), 120),
+                        "memory_count": int(bucket.get("memory_count") or 0),
+                        "archived_count": int(bucket.get("archived_count") or 0),
+                        "searchable_count": int(bucket.get("searchable_count") or 0),
+                        "active_latest_at": clean_text(bucket.get("active_latest_at"), 80),
+                        "latest_at": clean_text(bucket.get("latest_at"), 80),
+                        "active_latest_sort": float(bucket.get("active_latest_sort") or 0),
+                        "latest_sort": float(bucket.get("latest_sort") or 0),
+                    }
+                    candidate_priority = (
+                        bool(sample_context["active_latest_at"]),
+                        sample_context["active_latest_sort"] or sample_context["latest_sort"],
+                    )
+                    current = merged.get(key)
+                    if current is None:
+                        bucket["target_id"] = target_id
+                        bucket["sample_contexts"] = [sample_context]
+                        bucket["_sample_has_active"] = candidate_priority[0]
+                        bucket["_sample_latest_sort"] = candidate_priority[1]
+                        bucket["_name_latest_at"] = clean_text(bucket.get("name_latest_at"), 80)
+                        bucket["_name_latest_sort"] = float(bucket.get("name_latest_sort") or 0)
+                        merged[key] = bucket
+                        continue
+                    current["memory_count"] = int(current.get("memory_count") or 0) + int(bucket.get("memory_count") or 0)
+                    current["archived_count"] = int(current.get("archived_count") or 0) + int(bucket.get("archived_count") or 0)
+                    current["searchable_count"] = int(current.get("searchable_count") or 0) + int(bucket.get("searchable_count") or 0)
+                    if sample_context["active_latest_sort"] > float(current.get("active_latest_sort") or 0):
+                        current["active_latest_at"] = sample_context["active_latest_at"]
+                        current["active_latest_sort"] = sample_context["active_latest_sort"]
+                    if sample_context["latest_sort"] > float(current.get("latest_sort") or 0):
+                        current["latest_at"] = sample_context["latest_at"]
+                        current["latest_sort"] = sample_context["latest_sort"]
+                    current_priority = (
+                        bool(current.get("_sample_has_active")),
+                        float(current.get("_sample_latest_sort") or 0),
+                    )
+                    if candidate_priority > current_priority:
+                        current["sample_session_id"] = bucket.get("sample_session_id")
+                        current["sample_group_id"] = bucket.get("sample_group_id")
+                        current["sample_bot_id"] = bucket.get("sample_bot_id")
+                        current["_sample_has_active"] = candidate_priority[0]
+                        current["_sample_latest_sort"] = candidate_priority[1]
+                    contexts = current.setdefault("sample_contexts", [])
+                    existing_context = next(
+                        (
+                            item
+                            for item in contexts
+                            if clean_text(item.get("bot_id"), 120) == sample_context["bot_id"]
+                        ),
+                        None,
+                    )
+                    if existing_context is None:
+                        contexts.append(sample_context)
+                    else:
+                        existing_priority = (
+                            bool(clean_text(existing_context.get("active_latest_at"), 80)),
+                            float(existing_context.get("active_latest_sort") or 0)
+                            or float(existing_context.get("latest_sort") or 0),
+                        )
+                        existing_context["memory_count"] = int(existing_context.get("memory_count") or 0) + sample_context["memory_count"]
+                        existing_context["archived_count"] = int(existing_context.get("archived_count") or 0) + sample_context["archived_count"]
+                        existing_context["searchable_count"] = int(existing_context.get("searchable_count") or 0) + sample_context["searchable_count"]
+                        if sample_context["active_latest_sort"] > float(existing_context.get("active_latest_sort") or 0):
+                            existing_context["active_latest_at"] = sample_context["active_latest_at"]
+                            existing_context["active_latest_sort"] = sample_context["active_latest_sort"]
+                        if sample_context["latest_sort"] > float(existing_context.get("latest_sort") or 0):
+                            existing_context["latest_at"] = sample_context["latest_at"]
+                            existing_context["latest_sort"] = sample_context["latest_sort"]
+                        if candidate_priority > existing_priority:
+                            existing_context["session_id"] = sample_context["session_id"]
+                            existing_context["group_id"] = sample_context["group_id"]
+                    candidate_name = clean_text(bucket.get("target_name"), 120)
+                    candidate_name_at = clean_text(bucket.get("name_latest_at"), 80)
+                    candidate_name_sort = float(bucket.get("name_latest_sort") or 0)
+                    current_name = clean_text(current.get("target_name"), 120)
+                    current_name_at = clean_text(current.get("_name_latest_at"), 80)
+                    current_name_sort = float(current.get("_name_latest_sort") or 0)
+                    if (
+                        candidate_name
+                        and candidate_name not in {target_id, clean_text(bucket.get("sample_session_id"), 200)}
+                        and (not current_name or candidate_name_sort > current_name_sort)
+                    ):
+                        current["target_name"] = candidate_name
+                        current["_name_latest_at"] = candidate_name_at
+                        current["_name_latest_sort"] = candidate_name_sort
+                buckets = list(merged.values())
+                for bucket in buckets:
+                    contexts = bucket.get("sample_contexts") or []
+                    contexts.sort(
+                        key=lambda item: (
+                            bool(clean_text(item.get("active_latest_at"), 80)),
+                            float(item.get("active_latest_sort") or 0)
+                            or float(item.get("latest_sort") or 0),
+                        ),
+                        reverse=True,
+                    )
+                    bucket.pop("_sample_has_active", None)
+                    bucket.pop("_sample_latest_sort", None)
+                    bucket.pop("_name_latest_at", None)
+                    bucket.pop("_name_latest_sort", None)
+                    bucket.pop("name_latest_at", None)
+                    bucket.pop("name_latest_sort", None)
+                buckets.sort(
                     key=lambda item: (
-                        bool(clean_text(item.get("active_latest_at"), 80)),
+                        bool(int(item.get("searchable_count") or 0)),
                         float(item.get("active_latest_sort") or 0)
                         or float(item.get("latest_sort") or 0),
+                        clean_text(item.get("scope"), 40),
+                        clean_text(item.get("target_id"), 160),
                     ),
                     reverse=True,
                 )
-                bucket.pop("_sample_has_active", None)
-                bucket.pop("_sample_latest_sort", None)
-                bucket.pop("_name_latest_at", None)
-                bucket.pop("_name_latest_sort", None)
-                bucket.pop("name_latest_at", None)
-                bucket.pop("name_latest_sort", None)
-            buckets.sort(
-                key=lambda item: (
-                    bool(int(item.get("searchable_count") or 0)),
-                    float(item.get("active_latest_sort") or 0)
-                    or float(item.get("latest_sort") or 0),
-                    clean_text(item.get("scope"), 40),
-                    clean_text(item.get("target_id"), 160),
-                ),
-                reverse=True,
-            )
-            resolved_names = self._resolve_bucket_target_names_batch_sync(conn, buckets)
-            for bucket in buckets:
-                bucket.pop("active_latest_at", None)
-                bucket.pop("active_latest_sort", None)
-                bucket.pop("latest_sort", None)
-                for context in bucket.get("sample_contexts") or []:
-                    context.pop("active_latest_at", None)
-                    context.pop("active_latest_sort", None)
-                    context.pop("latest_sort", None)
-                b_scope = clean_text(bucket.get("scope"), 40)
-                b_tid = clean_text(bucket.get("target_id"), 160)
-                b_fb = self._clean_window_display_name(bucket.get("target_name"))
-                bucket["target_name"] = (
-                    b_fb
-                    if (b_fb and b_fb != b_tid)
-                    else resolved_names.get((b_scope, b_tid), b_fb)
-                )
-                bucket["target_kind"] = self._bucket_target_kind(
-                    b_scope,
-                    b_tid,
-                    clean_text(bucket.get("sample_session_id"), 200),
-                )
-            if cache_key is not None:
-                with self._buckets_cache_lock:
-                    if len(self._buckets_cache) >= 8:
-                        self._buckets_cache.clear()
-                    self._buckets_cache[cache_key] = buckets
-                return self._clone_bucket_items(buckets, limit)
-        return buckets[: max(1, int(limit))] if limit is not None else buckets
+                resolved_names = self._resolve_bucket_target_names_batch_sync(conn, buckets)
+                for bucket in buckets:
+                    bucket.pop("active_latest_at", None)
+                    bucket.pop("active_latest_sort", None)
+                    bucket.pop("latest_sort", None)
+                    for context in bucket.get("sample_contexts") or []:
+                        context.pop("active_latest_at", None)
+                        context.pop("active_latest_sort", None)
+                        context.pop("latest_sort", None)
+                    b_scope = clean_text(bucket.get("scope"), 40)
+                    b_tid = clean_text(bucket.get("target_id"), 160)
+                    b_fb = self._clean_window_display_name(bucket.get("target_name"))
+                    bucket["target_name"] = (
+                        b_fb
+                        if (b_fb and b_fb != b_tid)
+                        else resolved_names.get((b_scope, b_tid), b_fb)
+                    )
+                    bucket["target_kind"] = self._bucket_target_kind(
+                        b_scope,
+                        b_tid,
+                        clean_text(bucket.get("sample_session_id"), 200),
+                    )
+                if cache_key is not None:
+                    with self._buckets_cache_lock:
+                        if len(self._buckets_cache) >= 8:
+                            self._buckets_cache.clear()
+                        self._buckets_cache[cache_key] = buckets
+                    return self._clone_bucket_items(buckets, limit)
+                return buckets[: max(1, int(limit))] if limit is not None else buckets
+            finally:
+                if started_snapshot:
+                    try:
+                        conn.rollback()
+                    except sqlite3.Error:
+                        pass
 
     def _resolve_bucket_target_names_batch_sync(
         self,

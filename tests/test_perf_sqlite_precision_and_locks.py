@@ -742,6 +742,134 @@ class FtsMigrationIndexEqpAndLockFreeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(REDACTED, scrubbed["api_key"])
         self.assertIn(REDACTED, scrubbed["nested"][0]["note"])
 
+    async def test_buckets_cache_invalidates_on_same_second_identity_and_relationship_updates(self) -> None:
+        store = MemoryStore(self.tmp_dir / "buckets_same_sec.db")
+        store.initialize()
+        try:
+            # Private memory with empty subject_name so display name resolves from identities/relationship_edges.
+            rec = MemoryRecord(
+                id="bs-1",
+                memory_type="fact",
+                scope="private",
+                platform="qq",
+                session_id="qq:FriendMessage:u_rename",
+                subject=EntityRef(kind="user", id="u_rename", name=""),
+                object=EntityRef(kind="bot", id="b1", name="Bot"),
+                content="同秒改名缓存失效测试",
+                visibility="private_pair",
+                importance=0.8,
+                confidence=0.9,
+                metadata={"owner_bot_id": "b1"},
+            ).ensure_defaults()
+            await store.insert_memory(rec)
+            same_ts = "2026-11-23T09:00:00+00:00"
+            with store._lock, store._conn:
+                store._conn.execute(
+                    "INSERT INTO identities(platform, entity_kind, entity_id, display_name, aliases, profile, updated_at) "
+                    "VALUES('qq', 'user', 'u_rename', '旧昵称', '[]', '{}', ?)",
+                    (same_ts,),
+                )
+            b1 = await store.list_memory_buckets(limit=20)
+            self.assertEqual("旧昵称", b1[0]["target_name"])
+
+            # In-place update keeping the EXACT same updated_at timestamp and row COUNT(*).
+            with store._lock, store._conn:
+                store._conn.execute(
+                    "UPDATE identities SET display_name='新昵称', updated_at=? WHERE entity_id='u_rename'",
+                    (same_ts,),
+                )
+            b2 = await store.list_memory_buckets(limit=20)
+            self.assertEqual("新昵称", b2[0]["target_name"])
+
+            # Clearing identity display_name + updating relationship_edges with identical timestamp must also invalidate.
+            with store._lock, store._conn:
+                store._conn.execute(
+                    "UPDATE identities SET display_name='', updated_at=? WHERE entity_id='u_rename'",
+                    (same_ts,),
+                )
+                store._conn.execute(
+                    "INSERT INTO relationship_edges("
+                    "id, subject_kind, subject_id, subject_name, object_kind, object_id, object_name, "
+                    "relation_type, scope, session_id, group_id, confidence, created_at, updated_at"
+                    ") VALUES('re-1', 'user', 'u_rename', '关系旧名', 'bot', 'b1', 'Bot', 'friend', 'private', 'qq:FriendMessage:u_rename', '', 0.9, ?, ?)",
+                    (same_ts, same_ts),
+                )
+            b3 = await store.list_memory_buckets(limit=20)
+            self.assertEqual("关系旧名", b3[0]["target_name"])
+            with store._lock, store._conn:
+                store._conn.execute(
+                    "UPDATE relationship_edges SET subject_name='关系新名', updated_at=? WHERE id='re-1'",
+                    (same_ts,),
+                )
+            b4 = await store.list_memory_buckets(limit=20)
+            self.assertEqual("关系新名", b4[0]["target_name"])
+        finally:
+            store.close()
+
+    def test_lifo_read_pool_generation_discards_stale_checked_out_connections(self) -> None:
+        with (
+            patch.object(store_mod, "_detect_total_memory_mb", return_value=32768),
+            patch.object(store_mod, "_detect_cpu_count", return_value=16),
+        ):
+            store = MemoryStore(self.tmp_dir / "pool_gen.db")
+            store.initialize()
+            try:
+                conn = store._acquire_pooled_read_conn_sync()
+                self.assertIn(conn, store._read_pool_all)
+                gen_before = store._read_pool_generation
+
+                # Simulate recovery closing/rotating the pool while `conn` is checked out.
+                store._close_read_pool_sync()
+                self.assertEqual(gen_before + 1, store._read_pool_generation)
+
+                # Returning the stale handle must close & discard it rather than re-queuing into idle.
+                store._release_pooled_read_conn_sync(conn)
+                self.assertNotIn(conn, store._read_pool_idle)
+                self.assertNotIn(conn, store._read_pool_all)
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    conn.execute("SELECT 1")
+
+                # Subsequent checkout opens a fresh handle tagged with the new generation.
+                fresh = store._acquire_pooled_read_conn_sync()
+                try:
+                    self.assertEqual(store._read_pool_generation, store._read_pool_conn_gen.get(fresh))
+                    self.assertEqual(1, fresh.execute("SELECT 1").fetchone()[0])
+                finally:
+                    store._release_pooled_read_conn_sync(fresh)
+                self.assertIn(fresh, store._read_pool_idle)
+            finally:
+                store.close()
+
+    def test_normalize_blob_batch_preserves_tiny_nonzero_float64_vectors_without_underflow(self) -> None:
+        np = vector_search._numpy()
+        if np is None:
+            self.skipTest("numpy unavailable")
+        tiny_blob = struct.pack("<4d", 1e-50, 0.0, 0.0, 0.0)
+        normal_blob = struct.pack("<4d", 3.0, 4.0, 0.0, 0.0)
+        for target_dtype, tol in (("<f4", 1e-6), ("<f2", 2e-3)):
+            slices, errors = vector_search._normalize_blob_batch(
+                [tiny_blob, normal_blob],
+                4,
+                np,
+                input_dtype="<f8",
+                target_dtype=target_dtype,
+            )
+            self.assertEqual(["", ""], errors)
+            self.assertIsNotNone(slices[0])
+            self.assertIsNotNone(slices[1])
+            vec0 = np.frombuffer(slices[0], dtype=target_dtype).astype(np.float64)
+            vec1 = np.frombuffer(slices[1], dtype=target_dtype).astype(np.float64)
+            self.assertAlmostEqual(1.0, float(vec0[0]), delta=tol)
+            self.assertAlmostEqual(0.6, float(vec1[0]), delta=tol)
+            self.assertAlmostEqual(0.8, float(vec1[1]), delta=tol)
+
+    def test_clean_text_normalizes_ascii_control_whitespace_separators(self) -> None:
+        from astrbot_plugin_memory_companion.core.models import clean_text
+
+        self.assertEqual("a b", clean_text("a\x1fb"))
+        self.assertEqual("a b c d", clean_text("a\x1cb\x1dc\x1ed"))
+        self.assertEqual("plain_token-123", clean_text("plain_token-123"))
+
     async def test_read_pool_endpoints_do_not_block_on_main_write_lock(self) -> None:
         store = MemoryStore(self.tmp_dir / "lockfree.db")
         store.initialize()
