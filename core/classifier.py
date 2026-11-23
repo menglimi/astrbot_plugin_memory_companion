@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .forward_extractor import strip_forward_digest_segments
 from .identity import entity_for_current_target, entity_for_user, looks_like_command
 from .models import EntityRef, MemoryRecord, SessionContext, clean_text
 from .profile_quality import (
@@ -17,7 +18,7 @@ class MemoryClassifier:
         self.capture_min_chars = max(1, int(capture_min_chars or 1))
 
     def from_user_message(self, ctx: SessionContext) -> MemoryRecord | None:
-        text = clean_text(ctx.message_text, 1800)
+        text = clean_text(strip_forward_digest_segments(ctx.message_text), 1800)
         if len(text) < self.capture_min_chars or looks_like_command(text):
             return None
 
@@ -81,7 +82,8 @@ class MemoryClassifier:
         )
 
     def derived_user_memories(self, ctx: SessionContext, source_memory_id: str = "") -> list[MemoryRecord]:
-        text = clean_text(ctx.message_text, 1800)
+        own_raw = strip_forward_digest_segments(ctx.message_text)
+        text = clean_text(own_raw, 1800)
         if len(text) < self.capture_min_chars or looks_like_command(text):
             return []
 
@@ -101,7 +103,7 @@ class MemoryClassifier:
             "source_plugin": "memory_companion",
         }
 
-        profile_facts = self._extract_profile_facts(ctx, ctx.message_text)
+        profile_facts = self._extract_profile_facts(ctx, own_raw)
         facts = profile_facts or [self._extract_non_profile_memory(ctx, text)]
         for fact in (item for item in facts if item):
             metadata = {

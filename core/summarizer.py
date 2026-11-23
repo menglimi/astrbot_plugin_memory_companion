@@ -9,6 +9,7 @@ from difflib import SequenceMatcher
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from .forward_extractor import timeline_row_has_forward
 from .local_time import local_tz, timezone_name
 from .models import clean_text, json_dumps, json_loads
 from .assertions import (
@@ -329,7 +330,23 @@ class MemorySummarizer:
                 "content": content,
                 "content_is_untrusted_chat_data": True,
             }
-            if event_type != "bot_response" and self._looks_like_user_correction_text(content):
+            has_forward = event_type != "bot_response" and timeline_row_has_forward(row, metadata)
+            forward_only = bool(
+                has_forward
+                and (
+                    metadata.get("forward_only")
+                    or original_content.lstrip().startswith("[合并转发聊天记录")
+                )
+            )
+            if has_forward:
+                item["has_forward"] = True
+            if forward_only:
+                item["turn_hint"] = "forwarded_chat_log"
+                item["summary_hint"] = (
+                    "本条是用户转发/分享的外部合并转发聊天记录，不代表当前用户本人说过的话。"
+                    "请记录为用户分享给角色的外部记录或话题背景，严禁把转发记录中第三方人物的话语、偏好或身份属性归属给当前用户本人。"
+                )
+            elif event_type != "bot_response" and self._looks_like_user_correction_text(content):
                 item["turn_hint"] = "user_correction"
                 item["summary_hint"] = "这是一条用户纠正，只能用于修正同一话题的前文；不要扩散到无关记忆。"
             elif routine_marker:
@@ -339,6 +356,16 @@ class MemorySummarizer:
             elif routine_check_window > 0 and self._has_routine_check_detail_value(content):
                 item["turn_hint"] = "routine_check_detail"
                 item["summary_hint"] = "这是例行检查后的具体内容；需要保留检查对象、检查结果、异常、已处理事项或待办。"
+            elif has_forward:
+                item["turn_hint"] = "forwarded_chat_log"
+                item["summary_hint"] = (
+                    "本条附带用户转发/分享的外部合并转发聊天记录。"
+                    "请区分用户本人的附言与转发记录中的第三方内容，严禁把第三方言行或属性归属给当前用户本人。"
+                )
+            if has_forward and not forward_only and item.get("turn_hint") != "forwarded_chat_log":
+                item["forward_note"] = (
+                    "本条附带用户转发的外部聊天记录，其中第三方人物的言行与属性不得归属给当前用户本人。"
+                )
             if injection_flag:
                 # P2：内容本身已降级为不可执行引用，risk_hint 与处理结果保持一致。
                 item["risk_hint"] = "possible_prompt_injection_or_role_override"
@@ -410,6 +437,7 @@ class MemorySummarizer:
             "11. 不要把用户纠正句复制到多个无关主题里；纠正后的事实只保留一处，并且必须写清被纠正对象。\n"
             "12. turn_hint=routine_check_marker 只说明用户有例行检查/查岗习惯；不要只写“用户每晚会例行检查”。真正要保留的是随后 turn_hint=routine_check_detail 的检查内容。\n"
             "13. 对例行检查后的内容，必须优先提炼“检查了什么、结果如何、有什么异常、是否已处理、还欠什么后续”；这些应进入 key_facts 或 routine_check_notes，方便之后问起时能想起具体检查项。\n"
+            "13b. turn_hint=forwarded_chat_log 或带 has_forward=true 的消息包含用户转发/分享的外部聊天记录，必须记录为用户分享/转发给角色的外部背景或谈资，严禁把转发记录中第三方人物说的话、偏好或身份属性当作当前用户本人说过的话或个人画像。\n"
             "14. 没有依据的内容不要编造；无法确认时就不要写成事实。\n"
             "14b. 转述时必须保留原文的肯定与否定表述：原文说“不喜欢/不去/没有”就不能写成“喜欢/去/有”，"
             "原文说“喜欢/去/有”也不能反向改写。改写句式可以，改写语义不行。\n"

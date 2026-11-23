@@ -411,6 +411,7 @@ class SourceCapture:
         generation: str,
         authorize=lambda: True,
         expires=None,
+        media=None,
     ):
         """Prepare, stage, and commit an incoming source in one SQLite transaction."""
         prepared = self.prepare(
@@ -418,6 +419,7 @@ class SourceCapture:
             body=body,
             source_message_at=source_message_at,
             observed_at=observed_at,
+            media=media,
         )
         operation, key, ph = (prepared[k] for k in ('operation', 'source_key', 'payload_digest'))
         payload = prepared['payload']
