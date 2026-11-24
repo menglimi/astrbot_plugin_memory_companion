@@ -5011,6 +5011,10 @@ html[data-ui-mode="cinema"] .cfg-search-tag.is-fuzzy {
   }
 }
 
+.content > .is-inplace-refresh {
+  animation: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .cfg-search-overlay,
   .cfg-search-dialog,

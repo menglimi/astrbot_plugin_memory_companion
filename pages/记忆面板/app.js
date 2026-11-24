@@ -908,6 +908,18 @@ async function go(viewId, options) {
   const view = VIEWS[viewId];
   if (!view || view.hidden) return;
   const opts = options || {};
+  const host = $("#content");
+  const isSameView = state.view === viewId;
+  const hasMountedChild = Boolean(host && (host.firstElementChild || (host.children && host.children.length > 0)));
+  const canInPlace = Boolean(opts.inPlace) && isSameView && hasMountedChild;
+  const prevScrollTop = canInPlace ? (host.scrollTop || 0) : 0;
+  const prevWinScrollY = canInPlace && typeof window !== "undefined" ? (window.scrollY || 0) : 0;
+  const activeEl = canInPlace && typeof document !== "undefined" ? document.activeElement : null;
+  const prevActiveId =
+    activeEl && activeEl.id && host && typeof host.contains === "function" && host.contains(activeEl)
+      ? activeEl.id
+      : "";
+
   state.view = viewId;
   state.group = findGroupOf(viewId);
   try {
@@ -925,19 +937,39 @@ async function go(viewId, options) {
 
   const token = renderToken + 1;
   renderToken = token;
-  const host = $("#content");
-  host.innerHTML = '<div class="skeleton" style="height:220px;border-radius:13px"></div>';
+  if (!canInPlace) {
+    host.innerHTML = '<div class="skeleton" style="height:220px;border-radius:13px"></div>';
+  }
 
   try {
     const payload = await view.load(opts);
     if (token !== renderToken) return;
     host.innerHTML = "";
     const node = document.createElement("div");
+    if (canInPlace && node.classList && typeof node.classList.add === "function") {
+      node.classList.add("is-inplace-refresh");
+    }
     node.innerHTML = view.render(payload, opts);
     host.appendChild(node);
     if (typeof view.mount === "function") view.mount(node, payload, opts);
+    if (canInPlace) {
+      host.scrollTop = prevScrollTop;
+      if (prevWinScrollY && typeof window !== "undefined" && typeof window.scrollTo === "function") {
+        window.scrollTo(0, prevWinScrollY);
+      }
+      if (prevActiveId) {
+        const nextActive = $("#" + prevActiveId.replace(/[^a-zA-Z0-9_-]/g, "\\$&"), node);
+        if (nextActive && !nextActive.disabled && typeof nextActive.focus === "function") {
+          try { nextActive.focus({ preventScroll: true }); } catch (err) { nextActive.focus(); }
+        }
+      }
+    }
   } catch (error) {
     if (token !== renderToken) return;
+    if (canInPlace) {
+      toast("刷新视图失败：" + (error.message || "未知错误"), "error");
+      return;
+    }
     host.innerHTML =
       '<div class="empty"><b>这个视图没能加载出来</b><span>' + esc(error.message || "未知错误") + "</span></div>";
   }
@@ -3611,6 +3643,18 @@ function renderDbHealthCard(dbHealthRes, shrinkReport) {
   );
 }
 
+function fetchDbHealthSnapshot() {
+  return apiGet("/maintenance/db_health")
+    .then((res) => ({ ok: true, health: (res && res.health) || res || null }))
+    .catch((err) => ({ ok: false, error: (err && err.message) || "数据库体检读取失败" }));
+}
+
+function renderMigrateOutputContent(output) {
+  return output
+    ? '<pre style="margin:0;font-size:11.5px;line-height:1.6;color:var(--text-2);white-space:pre-wrap;word-break:break-all">' + esc(jsonPreview(output)) + "</pre>"
+    : emptyState("还没有输出", "执行任一操作后，结果会显示在这里。");
+}
+
 defineView("migrate", {
   title: "维护与迁移",
   navLabel: "维护与迁移",
@@ -3619,9 +3663,7 @@ defineView("migrate", {
   async load() {
     const [preset, dbHealth] = await Promise.all([
       apiTry(() => apiGet("/operations/preset"), { preset: {} }),
-      apiGet("/maintenance/db_health")
-        .then((res) => ({ ok: true, health: (res && res.health) || res || null }))
-        .catch((err) => ({ ok: false, error: (err && err.message) || "数据库体检读取失败" })),
+      fetchDbHealthSnapshot(),
     ]);
     return {
       preset: preset.preset || {},
@@ -3737,41 +3779,24 @@ defineView("migrate", {
       .join("");
 
     return (
-      dbHealthCard +
+      '<div id="dbHealthSlot">' + dbHealthCard + "</div>" +
       '<div class="grid split-2">' +
       card("维护工具", "按顺序执行更稳妥", presets + tools) +
       card(
         "输出",
         "最近一次操作结果",
-        data.output
-          ? '<pre style="margin:0;font-size:11.5px;line-height:1.6;color:var(--text-2);white-space:pre-wrap;word-break:break-all">' + esc(jsonPreview(data.output)) + "</pre>"
-          : emptyState("还没有输出", "执行任一操作后，结果会显示在这里。")
+        '<div id="migrateOutputSlot">' + renderMigrateOutputContent(data.output) + "</div>"
       ) +
       "</div>"
     );
   },
   mount(node) {
-    const run = async (label, fn) => {
-      await withBusy(label + "…", async () => {
-        try {
-          migrateOutput = await fn();
-          toast(label + "完成", "ok");
-        } catch (error) {
-          migrateOutput = { error: error.message };
-          toast(label + "失败：" + error.message, "error");
-        }
-        go("migrate");
-      });
+    let dbHealthRefreshBusy = false;
+    const syncMigrateOutputSlot = () => {
+      const outputSlot = $("#migrateOutputSlot", node);
+      if (outputSlot) outputSlot.innerHTML = renderMigrateOutputContent(migrateOutput);
     };
 
-    const refreshHealthBtn = $("#dbHealthRefreshBtn", node);
-    if (refreshHealthBtn) {
-      refreshHealthBtn.addEventListener("click", () => go("migrate"));
-    }
-    const goPerfBtn = $("#dbGoPerfBtn", node);
-    if (goPerfBtn) {
-      goPerfBtn.addEventListener("click", () => go("performance"));
-    }
     const runDbShrink = async (fullVacuum) => {
       if (fullVacuum) {
         const confirmed = await showInlineConfirmation(
@@ -3794,13 +3819,102 @@ defineView("migrate", {
           migrateOutput = { error: error.message };
           toast(label + "失败：" + error.message, "error");
         }
-        await go("migrate");
+        syncMigrateOutputSlot();
+        await refreshDbHealthInPlace({ showToast: false });
       });
     };
-    const shrinkRegularBtn = $("#dbShrinkRegularBtn", node);
-    if (shrinkRegularBtn) shrinkRegularBtn.addEventListener("click", () => runDbShrink(false));
-    const shrinkFullBtn = $("#dbShrinkFullBtn", node);
-    if (shrinkFullBtn) shrinkFullBtn.addEventListener("click", () => runDbShrink(true));
+
+    const bindDbHealthControls = () => {
+      const slot = $("#dbHealthSlot", node) || node;
+      const refreshHealthBtn = $("#dbHealthRefreshBtn", slot);
+      if (refreshHealthBtn) {
+        refreshHealthBtn.addEventListener("click", () => refreshDbHealthInPlace({ showToast: true }));
+      }
+      const goPerfBtn = $("#dbGoPerfBtn", slot);
+      if (goPerfBtn) {
+        goPerfBtn.addEventListener("click", () => go("performance"));
+      }
+      const shrinkRegularBtn = $("#dbShrinkRegularBtn", slot);
+      if (shrinkRegularBtn) shrinkRegularBtn.addEventListener("click", () => runDbShrink(false));
+      const shrinkFullBtn = $("#dbShrinkFullBtn", slot);
+      if (shrinkFullBtn) shrinkFullBtn.addEventListener("click", () => runDbShrink(true));
+    };
+
+    const refreshDbHealthInPlace = async (opts) => {
+      if (dbHealthRefreshBusy) return;
+      dbHealthRefreshBusy = true;
+      const slot = $("#dbHealthSlot", node);
+      const refreshBtn = $("#dbHealthRefreshBtn", slot || node);
+      const prevBtnText = refreshBtn ? refreshBtn.textContent : "";
+      const activeEl = typeof document !== "undefined" ? document.activeElement : null;
+      const focusedId =
+        activeEl && activeEl.id && slot && typeof slot.contains === "function" && slot.contains(activeEl)
+          ? activeEl.id
+          : "";
+      if (refreshBtn) {
+        refreshBtn.disabled = true;
+        refreshBtn.textContent = "体检刷新中…";
+      }
+      try {
+        const nextHealth = await fetchDbHealthSnapshot();
+        if (node.isConnected === false || state.view !== "migrate") return;
+        if (slot) {
+          slot.innerHTML = renderDbHealthCard(nextHealth, migrateDbShrinkReport);
+          bindDbHealthControls();
+          if (focusedId) {
+            const nextFocused = $("#" + focusedId.replace(/[^a-zA-Z0-9_-]/g, "\\$&"), slot);
+            if (nextFocused && !nextFocused.disabled && typeof nextFocused.focus === "function") {
+              try { nextFocused.focus({ preventScroll: true }); } catch (err) { nextFocused.focus(); }
+            }
+          }
+        }
+        if (opts && opts.showToast) {
+          toast(
+            nextHealth.ok ? "数据库体检已刷新" : ("体检刷新失败：" + (nextHealth.error || "未知错误")),
+            nextHealth.ok ? "ok" : "error"
+          );
+        }
+      } finally {
+        dbHealthRefreshBusy = false;
+        const currentBtn = $("#dbHealthRefreshBtn", slot || node);
+        if (currentBtn && currentBtn === refreshBtn) {
+          currentBtn.disabled = false;
+          currentBtn.textContent = prevBtnText || "刷新体检";
+        }
+      }
+    };
+
+    const run = async (label, fn, runOpts) => {
+      await withBusy(label + "…", async () => {
+        try {
+          migrateOutput = await fn();
+          toast(label + "完成", "ok");
+        } catch (error) {
+          migrateOutput = { error: error.message };
+          toast(label + "失败：" + error.message, "error");
+        }
+        syncMigrateOutputSlot();
+        if (runOpts && runOpts.refreshPreset) {
+          const presetRes = await apiTry(() => apiGet("/operations/preset"), null);
+          const activePreset = compact(
+            (presetRes && presetRes.preset && (presetRes.preset.preset || presetRes.preset.current)) ||
+            (migrateOutput && !migrateOutput.error && runOpts.refreshPreset)
+          );
+          if (activePreset) {
+            $$("[data-preset]", node).forEach((btn) => {
+              btn.classList.toggle("is-primary", btn.dataset.preset === activePreset);
+            });
+            const badge = $(".tool-block .badge", node);
+            if (badge) badge.textContent = "当前：" + (PRESET_LABELS[activePreset] || activePreset);
+          }
+        }
+        if (/导入|迁移|修复|维护|清空/.test(label)) {
+          await refreshDbHealthInPlace({ showToast: false });
+        }
+      });
+    };
+
+    bindDbHealthControls();
 
     if (state.pendingViewFocus && state.pendingViewFocus.viewId === "migrate") {
       const targetId = state.pendingViewFocus.target;
@@ -3816,7 +3930,7 @@ defineView("migrate", {
     }
 
     $$("[data-preset]", node).forEach((button) => {
-      button.addEventListener("click", () => run("应用预设", () => apiPost("/operations/preset", { preset: button.dataset.preset })));
+      button.addEventListener("click", () => run("应用预设", () => apiPost("/operations/preset", { preset: button.dataset.preset }), { refreshPreset: button.dataset.preset }));
     });
 
     const bind = (id, fn, label) => {
@@ -6463,7 +6577,7 @@ defineView("performance", {
           } else {
             toast(resetAll ? "已恢复所选档位全部默认参数" : "性能调优已保存并热生效", "ok");
           }
-          await go("performance");
+          await go("performance", { inPlace: true });
         } catch (error) {
           toast("性能调优保存失败：" + error.message, "error");
         }

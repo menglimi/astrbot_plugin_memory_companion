@@ -1103,4 +1103,361 @@ test("performance view and migrate DB health card: render semantic markup and ze
   assert.ok(sec8Css.includes(".db-action-btns .btn") && sec8Css.includes("min-height: 38px"), "移动端长文案瘦身按钮应允许换行且触控高 >=38px");
   assert.ok(sec8Css.includes(".perf-param-ctrl select") && sec8Css.includes("min-height: 36px"), "移动端参数下拉与输入框应满宽且触控高 >=36px");
   assert.ok(sec8Css.includes(".db-health-card .card-head-actions"), "移动端数据库体检卡片按钮组应允许折行");
+  assert.ok(sec8Css.includes(".content > .is-inplace-refresh") && sec8Css.includes("animation: none"), "原地局部刷新容器应禁用 viewIn 滑入动画重播");
+});
+
+test("go(viewId, { inPlace: true }) skips skeleton flash, suppresses viewIn animation, and preserves scroll & focus", async () => {
+  const appSource = fs.readFileSync(APP_JS_PATH, "utf8");
+  const routeStart = appSource.indexOf("/* ------------------------------------------------------------\r\n   路由");
+  const routeAlt = appSource.indexOf("/* ------------------------------------------------------------\n   路由");
+  const rStart = routeStart >= 0 ? routeStart : routeAlt;
+  const compStart = appSource.indexOf("/* ------------------------------------------------------------\r\n   组件片段");
+  const compAlt = appSource.indexOf("/* ------------------------------------------------------------\n   组件片段");
+  const rEnd = compStart >= 0 ? compStart : compAlt;
+  assert.ok(rStart > 0 && rEnd > rStart, "应在 app.js 中找到 路由 区块");
+
+  const skeletonWrites = [];
+  let innerHtmlHistory = [];
+  let mountedNode = null;
+  let focusCalls = [];
+  const makeFakeEl = (id) => {
+    const classes = new Set();
+    return {
+      id: id || "",
+      disabled: false,
+      _html: "",
+      children: [],
+      get firstElementChild() { return this.children[0] || null; },
+      get innerHTML() { return this._html; },
+      set innerHTML(v) {
+        this._html = String(v);
+        if (this.id === "content") {
+          innerHtmlHistory.push(this._html);
+          if (this._html.includes("skeleton")) skeletonWrites.push(this._html);
+        }
+        if (this._html === "") this.children = [];
+      },
+      appendChild(child) { this.children.push(child); mountedNode = child; return child; },
+      classList: {
+        add(c) { classes.add(c); },
+        contains(c) { return classes.has(c); },
+      },
+      contains(target) { return Boolean(target && target.__insideHost); },
+      scrollTop: 0,
+      focus(opts) { focusCalls.push({ id: this.id, opts }); },
+    };
+  };
+
+  const host = makeFakeEl("content");
+  const saveBtn = makeFakeEl("perfSaveBtn");
+  saveBtn.__insideHost = true;
+  const toasts = [];
+  let loadCount = 0;
+  let failNext = false;
+  let scrollToCalls = [];
+
+  const sandbox = {
+    NAV_KEY: "mc_nav",
+    VIEWS: {
+      performance: {
+        title: "性能调优",
+        eyebrow: "Settings · Performance",
+        hint: "hint",
+        async load() {
+          loadCount += 1;
+          if (failNext) throw new Error("network down");
+          return { rev: loadCount };
+        },
+        render(payload) { return `<div data-rev="${payload.rev}">rev ${payload.rev}</div>`; },
+        mount() {},
+      },
+    },
+    state: { view: "", group: "", mode: "standard" },
+    findGroupOf: () => "settings",
+    renderRail: () => {},
+    esc: engine.escapeHtml,
+    toast: (msg, tone) => toasts.push({ msg, tone }),
+    $: (sel, root) => {
+      if (sel === "#content") return host;
+      if (sel === "#perfSaveBtn" && root) return saveBtn;
+      if (sel === "#viewEyebrow" || sel === "#viewTitle" || sel === "#viewHint") return { textContent: "" };
+      return null;
+    },
+    document: {
+      title: "",
+      activeElement: null,
+      createElement: () => makeFakeEl(""),
+    },
+    window: {
+      localStorage: { setItem() {} },
+      scrollY: 0,
+      scrollTo(x, y) { scrollToCalls.push([x, y]); },
+    },
+  };
+  vm.runInNewContext(appSource.slice(rStart, rEnd) + "\nthis.__go = go;", sandbox);
+
+  // 1) Initial navigation shows skeleton and does NOT tag is-inplace-refresh
+  await sandbox.__go("performance");
+  assert.equal(skeletonWrites.length, 1);
+  assert.equal(mountedNode.classList.contains("is-inplace-refresh"), false);
+
+  // 2) In-place refresh on the same view: zero skeleton write, tagged is-inplace-refresh, restores scroll & focus
+  host.scrollTop = 345;
+  sandbox.window.scrollY = 180;
+  sandbox.document.activeElement = saveBtn;
+  await sandbox.__go("performance", { inPlace: true });
+  assert.equal(skeletonWrites.length, 1, "inPlace 刷新不得写入 220px skeleton 骨架屏");
+  assert.equal(mountedNode.classList.contains("is-inplace-refresh"), true, "inPlace 刷新容器必须带 is-inplace-refresh");
+  assert.equal(host.scrollTop, 345, "inPlace 刷新必须保留 #content scrollTop");
+  assert.deepEqual(scrollToCalls[scrollToCalls.length - 1], [0, 180], "inPlace 刷新在移动端应保留 window.scrollY");
+  assert.equal(focusCalls.length, 1);
+  assert.equal(focusCalls[0].id, "perfSaveBtn");
+
+  // 3) Reload failure during inPlace preserves existing DOM and emits an error toast
+  const prevChild = host.firstElementChild;
+  failNext = true;
+  await sandbox.__go("performance", { inPlace: true });
+  assert.equal(host.firstElementChild, prevChild, "inPlace 刷新失败时不得销毁当前页面");
+  assert.ok(toasts.some((t) => t.tone === "error" && t.msg.includes("network down")));
+});
+
+test("performance save triggers inPlace refresh; migrate DB health & shrink update in place without clearing form inputs", async () => {
+  const appSource = fs.readFileSync(APP_JS_PATH, "utf8");
+
+  // --- Part 1: performance view applyTuning calls go('performance', { inPlace: true }) ---
+  const perfStart = appSource.indexOf("/* ============================================================\r\n   视图：性能调优");
+  const perfAlt = appSource.indexOf("/* ============================================================\n   视图：性能调优");
+  const pStart = perfStart >= 0 ? perfStart : perfAlt;
+  const bootStart = appSource.indexOf("/* ============================================================\r\n   启动");
+  const bootAlt = appSource.indexOf("/* ============================================================\n   启动");
+  const pEnd = bootStart >= 0 ? bootStart : bootAlt;
+
+  const perfGoCalls = [];
+  const perfListeners = {};
+  const makeBtn = (id) => ({
+    id,
+    disabled: false,
+    textContent: "",
+    addEventListener(type, fn) { perfListeners[`${id}:${type}`] = fn; },
+  });
+  const perfViews = {};
+  vm.runInNewContext(appSource.slice(pStart, pEnd), {
+    window: { setTimeout: () => 1, clearTimeout: () => {} },
+    state: { view: "performance", pendingViewFocus: null, configSchema: {} },
+    defineView: (id, cfg) => { perfViews[id] = cfg; },
+    $: (sel) => {
+      if (sel === "#perfSaveBtn") return makeBtn("perfSaveBtn");
+      if (sel === "#perfResetAllBtn") return makeBtn("perfResetAllBtn");
+      return null;
+    },
+    $$: () => [],
+    esc: engine.escapeHtml,
+    compact: (v, f) => String(v ?? "").trim() || (f === undefined ? "" : f),
+    num: (v) => String(v),
+    int: (v) => Math.round(Number(v) || 0),
+    fmtInt: (v) => String(Math.round(Number(v) || 0)),
+    fmtBytes: (b) => `${b} B`,
+    icon: () => "",
+    card: (_t, _s, b) => b,
+    apiGet: async () => ({}),
+    apiPost: async () => ({ tuning: { hot_reload: { read_pool_generation: 2 }, clamped_fields: [] } }),
+    withBusy: async (_t, fn) => fn(),
+    toast: () => {},
+    invalidatePool: () => {},
+    bindSmoothDetails: () => {},
+    prefersReducedMotion: () => false,
+    requestAnimationFrame: (fn) => fn(),
+    go: async (viewId, opts) => { perfGoCalls.push({ viewId, opts }); },
+  });
+  perfViews.performance.mount({}, { profile: "balanced", override_count: 0, overrides: {}, params: [] });
+  await perfListeners["perfSaveBtn:click"]();
+  await perfListeners["perfResetAllBtn:click"]();
+  assert.equal(perfGoCalls.length, 2);
+  assert.equal(perfGoCalls[0].viewId, "performance");
+  assert.equal(Boolean(perfGoCalls[0].opts && perfGoCalls[0].opts.inPlace), true, "性能调优保存必须使用 inPlace 刷新");
+  assert.equal(Boolean(perfGoCalls[1].opts && perfGoCalls[1].opts.inPlace), true, "恢复档位默认必须使用 inPlace 刷新");
+
+  // --- Part 2: migrate view DB health refresh / shrink / preview preserve #portablePath, #lmPath, #releaseBatchId ---
+  const migStart = appSource.indexOf("/* ============================================================\r\n   视图：维护与迁移");
+  const migAlt = appSource.indexOf("/* ============================================================\n   视图：维护与迁移");
+  const mStart = migStart >= 0 ? migStart : migAlt;
+  const qStart = appSource.indexOf("/* ============================================================\r\n   视图：待修复批次");
+  const qAlt = appSource.indexOf("/* ============================================================\n   视图：待修复批次");
+  const mEnd = qStart >= 0 ? qStart : qAlt;
+
+  const migViews = {};
+  const migGoCalls = [];
+  const migToasts = [];
+  let healthFetchCount = 0;
+  let optimizePayloads = [];
+
+  const makeSlotEl = (id) => ({
+    id,
+    innerHTML: "",
+    contains: () => false,
+  });
+  const dbHealthSlot = makeSlotEl("dbHealthSlot");
+  const migrateOutputSlot = makeSlotEl("migrateOutputSlot");
+  const portablePathInput = { id: "portablePath", value: "/data/my_export.jsonl" };
+  const lmPathInput = { id: "lmPath", value: "/data/livingmemory.db" };
+  const releaseBatchInput = { id: "releaseBatchId", value: "sb_keep_me_99" };
+
+  let slotButtons = {};
+  const makeSlotButton = (id) => {
+    const btn = {
+      id,
+      disabled: false,
+      textContent: id === "dbHealthRefreshBtn" ? "刷新体检" : id,
+      handlers: {},
+      addEventListener(type, fn) { this.handlers[type] = fn; },
+    };
+    slotButtons[id] = btn;
+    return btn;
+  };
+  let staticButtons = {};
+  const makeStaticButton = (id) => {
+    if (!staticButtons[id]) {
+      staticButtons[id] = {
+        id,
+        handlers: {},
+        addEventListener(type, fn) { this.handlers[type] = fn; },
+      };
+    }
+    return staticButtons[id];
+  };
+  const resetSlotButtons = () => {
+    slotButtons = {};
+    makeSlotButton("dbHealthRefreshBtn");
+    makeSlotButton("dbGoPerfBtn");
+    makeSlotButton("dbShrinkRegularBtn");
+    makeSlotButton("dbShrinkFullBtn");
+  };
+  resetSlotButtons();
+  const origSlotDesc = { value: "" };
+  Object.defineProperty(dbHealthSlot, "innerHTML", {
+    get() { return origSlotDesc.value; },
+    set(v) {
+      origSlotDesc.value = String(v);
+      resetSlotButtons();
+    },
+  });
+
+  vm.runInNewContext(appSource.slice(mStart, mEnd), {
+    window: { setTimeout: () => 1, clearTimeout: () => {} },
+    document: { activeElement: portablePathInput },
+    state: { view: "migrate", pendingViewFocus: null },
+    defineView: (id, cfg) => { migViews[id] = cfg; },
+    $: (sel, root) => {
+      if (sel === "#dbHealthSlot") return dbHealthSlot;
+      if (sel === "#migrateOutputSlot") return migrateOutputSlot;
+      if (sel === "#portablePath") return portablePathInput;
+      if (sel === "#lmPath") return lmPathInput;
+      if (sel === "#releaseBatchId") return releaseBatchInput;
+      if (sel === "#dbHealthRefreshBtn") return slotButtons.dbHealthRefreshBtn;
+      if (sel === "#dbGoPerfBtn") return slotButtons.dbGoPerfBtn;
+      if (sel === "#dbShrinkRegularBtn") return slotButtons.dbShrinkRegularBtn;
+      if (sel === "#dbShrinkFullBtn") return slotButtons.dbShrinkFullBtn;
+      if (sel.startsWith("#")) return makeStaticButton(sel.slice(1));
+      return null;
+    },
+    $$: () => [],
+    esc: engine.escapeHtml,
+    compact: (v, f) => String(v ?? "").trim() || (f === undefined ? "" : f),
+    int: (v) => Math.round(Number(v) || 0),
+    fmtInt: (v) => String(Math.round(Number(v) || 0)),
+    fmtBytes: (b) => `${Math.round(Number(b) / 1048576)} MB`,
+    jsonPreview: (o) => JSON.stringify(o),
+    card: (t, s, b, a, ex) => `<section class="card ${ex || ""}"><h3>${t}</h3><p>${s}</p>${b}${a || ""}</section>`,
+    emptyState: (t, s) => `<div>${t}:${s}</div>`,
+    apiTry: async (fn, fb) => fb,
+    apiGet: async (url) => {
+      if (url === "/maintenance/db_health") {
+        healthFetchCount += 1;
+        return {
+          health: {
+            configured_vector_precision: "float16",
+            primary: {
+              total_bytes: (100 - healthFetchCount * 10) * 1048576,
+              files: { db_bytes: 80 * 1048576, wal_bytes: 2 * 1048576 },
+              freelist_bytes: 0,
+              freelist_count: 0,
+              auto_vacuum: 2,
+              vector_precision: "float16",
+              embeddings: { total_rows: 10, float64_rows: 0, float32_rows: 0, float16_rows: 10, json_rows: 0, archived_orphan_rows: 0, vector_bytes: 1024, estimated_transcode_savings_bytes: 0 },
+              recommendations: [],
+            },
+            scoped: { total_bytes: 0 },
+          },
+        };
+      }
+      if (url.startsWith("/data/import/preview")) {
+        return { preview: true, count: 7 };
+      }
+      return {};
+    },
+    apiPost: async (url, body) => {
+      if (url === "/maintenance/db_optimize") {
+        optimizePayloads.push(body);
+        return {
+          ok: true,
+          primary: {
+            before_bytes: 90 * 1048576,
+            after_bytes: 60 * 1048576,
+            bytes_reclaimed: 30 * 1048576,
+            vacuum_mode: body.run_full_vacuum ? "full_vacuum_incremental_enabled" : "incremental_vacuum",
+            transcode: { transcoded: 12, purged_orphans: 2 },
+          },
+        };
+      }
+      return { ok: true };
+    },
+    withBusy: async (_t, fn) => fn(),
+    showInlineConfirmation: async () => true,
+    toast: (msg, tone) => migToasts.push({ msg, tone }),
+    invalidatePool: () => {},
+    prefersReducedMotion: () => false,
+    requestAnimationFrame: (fn) => fn(),
+    go: async (viewId, opts) => { migGoCalls.push({ viewId, opts }); },
+  });
+
+  const rootNode = { isConnected: true };
+  migViews.migrate.mount(rootNode);
+
+  // 1) Click 刷新体检 -> partial update of #dbHealthSlot only, zero go() call, form values untouched
+  await slotButtons.dbHealthRefreshBtn.handlers.click();
+  assert.equal(migGoCalls.length, 0, "点击刷新体检不得触发整页 go('migrate')");
+  assert.equal(healthFetchCount, 1);
+  assert.ok(dbHealthSlot.innerHTML.includes("90 MB"), "体检卡应原地刷新为最新体积");
+  assert.equal(portablePathInput.value, "/data/my_export.jsonl");
+  assert.equal(lmPathInput.value, "/data/livingmemory.db");
+  assert.equal(releaseBatchInput.value, "sb_keep_me_99");
+
+  // 2) Click 一键常规无损瘦身 (on the rebound button!) -> partial update of output & health slot, zero go()
+  await slotButtons.dbShrinkRegularBtn.handlers.click();
+  assert.equal(migGoCalls.length, 0, "常规瘦身不得触发整页 go('migrate')");
+  assert.equal(optimizePayloads.length, 1);
+  assert.equal(optimizePayloads[0].run_full_vacuum, false);
+  assert.ok(dbHealthSlot.innerHTML.includes("最近一次瘦身结果"), "瘦身后体检卡应原地展示瘦身报告");
+  assert.ok(migrateOutputSlot.innerHTML.includes("incremental_vacuum"), "输出区应原地更新瘦身 JSON");
+  assert.equal(portablePathInput.value, "/data/my_export.jsonl");
+  assert.equal(lmPathInput.value, "/data/livingmemory.db");
+  assert.equal(releaseBatchInput.value, "sb_keep_me_99");
+
+  // 3) Click 深度整理压缩 -> partial update, zero go(), form values still intact
+  await slotButtons.dbShrinkFullBtn.handlers.click();
+  assert.equal(migGoCalls.length, 0, "深度压缩不得触发整页 go('migrate')");
+  assert.equal(optimizePayloads.length, 2);
+  assert.equal(optimizePayloads[1].run_full_vacuum, true);
+  assert.ok(migrateOutputSlot.innerHTML.includes("full_vacuum_incremental_enabled"));
+  assert.equal(portablePathInput.value, "/data/my_export.jsonl");
+  assert.equal(lmPathInput.value, "/data/livingmemory.db");
+  assert.equal(releaseBatchInput.value, "sb_keep_me_99");
+
+  // 4) Click 预览导入 -> output updates in place without wiping #portablePath / #lmPath / #releaseBatchId
+  await staticButtons.portablePreviewBtn.handlers.click();
+  assert.equal(migGoCalls.length, 0, "预览导入不得触发整页 go('migrate')");
+  assert.ok(migrateOutputSlot.innerHTML.includes("&quot;count&quot;:7"));
+  assert.equal(portablePathInput.value, "/data/my_export.jsonl");
+  assert.equal(lmPathInput.value, "/data/livingmemory.db");
+  assert.equal(releaseBatchInput.value, "sb_keep_me_99");
 });
