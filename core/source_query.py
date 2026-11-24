@@ -18,10 +18,44 @@ from .query_session import query_context
 
 
 PROFILE = "memory.local-source-query.v1"
+_EMPTY_SEARCH_HINT = "未命中，可换2-4字短词/同义词，或改用 range/range_batch 按时间段重试。"
+_EMPTY_RANGE_HINT = "该时间段无消息，可扩大起止时间或换关键词 search 重试。"
+_LEGACY_TOGETHER_SESSION_PREFIX = "together_companion:"
+_LEGACY_TOGETHER_SHARED_EVENTS = frozenset({"shared_call", "shared_watch", "shared_activity"})
 
 
 class SourceQueryError(ValueError):
     pass
+
+
+def default_range_end_at() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def normalize_source_query_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+    """Normalize ergonomic range defaults before strict request validation."""
+    if not isinstance(parameters, dict):
+        return parameters
+    cursor = parameters.get("cursor")
+    if isinstance(cursor, str) and cursor.strip():
+        return parameters
+    action = parameters.get("action")
+    if action not in {"range", "range_batch"}:
+        return parameters
+    normalized = dict(parameters)
+    start_at = normalized.get("start_at")
+    end_at = normalized.get("end_at")
+    if (
+        isinstance(start_at, str)
+        and start_at.strip()
+        and (end_at is None or (isinstance(end_at, str) and not end_at.strip()))
+    ):
+        normalized["end_at"] = default_range_end_at()
+    if action == "range_batch" and "limit" in normalized:
+        raw_limit = normalized["limit"]
+        if type(raw_limit) is int and raw_limit > 0:
+            normalized["limit"] = 0
+    return normalized
 
 
 def _text(value: Any, limit: int) -> str:
@@ -68,7 +102,12 @@ class SourceQuery:
         terms = tuple(dict.fromkeys(_text(term, 80) for term in terms))
         if any(not term for term in terms):
             raise SourceQueryError("empty_term")
-        start, end = _instant(value.get("start_at", "")), _instant(value.get("end_at", ""))
+        raw_end = value.get("end_at", "")
+        if action == "range" and raw_end is None:
+            raw_end = ""
+        start, end = _instant(value.get("start_at", "")), _instant(raw_end)
+        if action == "range" and start and not end:
+            end = default_range_end_at()
         if start and end and datetime.fromisoformat(start) >= datetime.fromisoformat(end):
             raise SourceQueryError("time_range_reversed_or_empty")
         source_ref = _text(value.get("source_ref", ""), 180)
@@ -129,6 +168,90 @@ def _authorized_group_read_policy(
     return allow_all, effective_allowed, denied
 
 
+def _legacy_together_session_id(ctx: Any) -> str:
+    """Return the exact legacy together_companion:<user_id> read alias for private chats."""
+    if getattr(ctx, "scope", "") != "private" or getattr(ctx, "strict_session_only", False):
+        return ""
+    user_id = clean_text(getattr(ctx, "user_id", ""), 120)
+    bot_id = clean_text(getattr(ctx, "bot_id", ""), 120)
+    if not user_id or not bot_id or bot_id == "self":
+        return ""
+    return f"{_LEGACY_TOGETHER_SESSION_PREFIX}{user_id}"
+
+
+def _legacy_together_source_visible(
+    ctx: Any,
+    row: dict[str, Any],
+    metadata: dict[str, Any],
+) -> bool:
+    """Strictly verify a legacy together_companion:<user_id> private timeline row."""
+    alias_session = _legacy_together_session_id(ctx)
+    if not alias_session:
+        return False
+    if row.get("scope") != "private" or row.get("session_id") != alias_session:
+        return False
+    raw_meta = row.get("metadata")
+    if isinstance(raw_meta, str) and raw_meta.strip():
+        try:
+            if not isinstance(json.loads(raw_meta), dict):
+                return False
+        except ValueError:
+            return False
+    event_type = clean_text(row.get("event_type"), 40)
+    if event_type not in {"user_message", "bot_response", *_LEGACY_TOGETHER_SHARED_EVENTS}:
+        return False
+    user_id = clean_text(ctx.user_id, 120)
+    bot_id = clean_text(ctx.bot_id, 120)
+    if row.get("object_id") != user_id:
+        return False
+    if clean_text(metadata.get("participant_user_id"), 120) not in {"", user_id}:
+        return False
+    owner = clean_text(metadata.get("owner_bot_id"), 120)
+    meta_bot = clean_text(metadata.get("bot_id"), 120)
+    if owner == "self" or (owner and owner != bot_id):
+        return False
+    if meta_bot not in {"", bot_id}:
+        return False
+    platform = clean_text(metadata.get("platform"), 80)
+    if platform not in {"", "together_companion", clean_text(ctx.platform, 80)}:
+        return False
+    persona_id = clean_text(metadata.get("persona_id"), 96)
+    if persona_id not in {"", "legacy", clean_text(ctx.persona_id, 96)}:
+        return False
+    if event_type == "user_message":
+        return bool(owner == bot_id and row.get("subject_id") == user_id)
+    return row.get("subject_id") == bot_id
+
+
+def _legacy_together_source_sql(ctx: Any, field: Any) -> tuple[str, list[str]] | None:
+    """SQL equivalent of _legacy_together_source_visible."""
+    alias_session = _legacy_together_session_id(ctx)
+    if not alias_session:
+        return None
+    user_id = clean_text(ctx.user_id, 120)
+    bot_id = clean_text(ctx.bot_id, 120)
+    platform = clean_text(ctx.platform, 80)
+    persona_id = clean_text(ctx.persona_id, 96)
+    clause = (
+        "(t.scope='private' AND t.session_id=? AND t.object_id=? "
+        "AND (t.metadata IS NULL OR t.metadata='' OR json_valid(t.metadata)) "
+        f"AND {field('participant_user_id')} IN ('',?) "
+        f"AND {field('owner_bot_id')} IN ('',?) "
+        f"AND {field('bot_id')} IN ('',?) "
+        f"AND {field('platform')} IN ('','together_companion',?) "
+        f"AND {field('persona_id')} IN ('','legacy',?) "
+        "AND ("
+        f"(t.event_type='user_message' AND t.subject_id=? AND {field('owner_bot_id')}=?) "
+        "OR (t.event_type IN ('bot_response','shared_call','shared_watch','shared_activity') AND t.subject_id=?)"
+        "))"
+    )
+    params = [
+        alias_session, user_id, user_id, bot_id, bot_id, platform, persona_id,
+        user_id, bot_id, bot_id,
+    ]
+    return clause, params
+
+
 def source_visible(
     ctx: Any,
     row: dict[str, Any],
@@ -137,8 +260,11 @@ def source_visible(
     group_policy: dict[str, Any] | None = None,
 ) -> bool:
     """Never derive raw-source authority from a parent summary or supplied ID."""
-    if (ctx.scope not in {"private", "group"} or not ctx.session_id
-            or row.get("event_type") not in {"user_message", "bot_response"}):
+    if ctx.scope not in {"private", "group"} or not ctx.session_id:
+        return False
+    if _legacy_together_source_visible(ctx, row, metadata):
+        return True
+    if row.get("event_type") not in {"user_message", "bot_response"}:
         return False
     owner = clean_text(metadata.get("owner_bot_id"), 120)
     if not owner or owner == "self" or owner != clean_text(ctx.bot_id, 120):
@@ -200,6 +326,7 @@ def source_partition(
     def field(name: str) -> str:
         return f"COALESCE(json_extract({meta}, '$.{name}'), '')"
     policy = _authorized_group_read_policy(ctx, group_policy)
+    legacy_together = _legacy_together_source_sql(ctx, field)
     if policy is None:
         clauses = [
             "t.scope=?", "t.session_id=?", "t.object_id=?",
@@ -214,7 +341,11 @@ def source_partition(
         if ctx.scope == "private":
             clauses.extend(["(t.event_type!='user_message' OR t.subject_id=?)", f"{field('participant_user_id')} IN ('',?)"])
             params.extend([ctx.user_id, ctx.user_id])
-        return " AND ".join(clauses), params
+        standard = " AND ".join(clauses)
+        if legacy_together is not None:
+            legacy_clause, legacy_params = legacy_together
+            return f"(({standard}) OR {legacy_clause})", [*params, *legacy_params]
+        return standard, params
     allow_all, allowed_groups, denied_groups = policy
     common_clauses = [
         f"{field('owner_bot_id')}=?",
@@ -251,7 +382,11 @@ def source_partition(
         group_conditions.append(f"t.object_id IN ({marks})")
         params.extend(ordered_allowed)
     group_branch = "(" + " AND ".join(group_conditions) + ")"
-    return " AND ".join([*common_clauses, f"({private_branch} OR {group_branch})"]), params
+    standard = " AND ".join([*common_clauses, f"({private_branch} OR {group_branch})"])
+    if legacy_together is not None:
+        legacy_clause, legacy_params = legacy_together
+        return f"(({standard}) OR {legacy_clause})", [*params, *legacy_params]
+    return standard, params
 
 
 async def query_sources(service: Any, event: Any, *, cursor: str = "", limit: int = 0, **parameters: Any) -> dict[str, Any]:
@@ -353,9 +488,20 @@ async def query_sources(service: Any, event: Any, *, cursor: str = "", limit: in
                 raise SourceQueryError("cursor_invalid")
             record_source_read(state, sources, source_revision=page["revision"], policy_revision=policy,
                                expires_at=expires_at, coverage=coverage, event=event, ctx=ctx)
-        return {**empty, "ok": True, "error": "", "status": "page" if sources else "empty",
-                "sources": sources, "coverage": coverage, "usage": usage,
-                "query": query.as_dict(), "next_cursor": cursors.get("next"),
-                "context_cursors": {key: value for key, value in cursors.items() if key != "next"}}
+        result = {
+            **empty,
+            "ok": True,
+            "error": "",
+            "status": "page" if sources else "empty",
+            "sources": sources,
+            "coverage": coverage,
+            "usage": usage,
+            "query": query.as_dict(),
+            "next_cursor": cursors.get("next"),
+            "context_cursors": {key: value for key, value in cursors.items() if key != "next"},
+        }
+        if not sources and budget["remaining_steps"] > 0:
+            result["hint"] = _EMPTY_SEARCH_HINT if query.action == "search" else _EMPTY_RANGE_HINT
+        return result
     except SourceQueryError as exc:
         return {**empty, "error": str(exc)}

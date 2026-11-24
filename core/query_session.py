@@ -363,6 +363,9 @@ async def execute(service: Any, event: Any, operation: str = "status", parameter
         note_ids, params = params.get("note_ids"), {}
     if _notes and query_note is not None and operation != "sources":
         return {**result, "error": "query_note_requires_sources"}
+    if operation == "sources" and isinstance(params, dict):
+        from .source_query import normalize_source_query_parameters
+        params = normalize_source_query_parameters(params)
     payload = {"operation": operation, "parameters": params}
     if not request_validator().is_valid(payload):
         return {**result, "error": "invalid_query_arguments"}
@@ -454,6 +457,9 @@ async def execute_v3(service: Any, event: Any, operation: str = "status", parame
         note_ids, params = params.get("note_ids"), {}
     if _notes and query_note is not None and normalized_operation != "sources":
         return {**result, "error": "query_note_requires_sources"}
+    if normalized_operation == "sources" and isinstance(params, dict):
+        from .source_query import normalize_source_query_parameters
+        params = normalize_source_query_parameters(params)
     payload = {"operation": operation, "parameters": params}
     if not request_validator_v3().is_valid(payload):
         return {**result, "error": "invalid_query_arguments"}

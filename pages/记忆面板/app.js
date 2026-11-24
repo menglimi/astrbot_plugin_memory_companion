@@ -3445,17 +3445,66 @@ defineView("chatimport", {
 const PRESET_LABELS = { light: "轻量", standard: "标准", companion: "陪伴" };
 let migrateOutput = null;
 
+async function copyTextValue(text) {
+  const value = String(text || "").trim();
+  if (!value) return false;
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch (_) {
+      // Fallback to execCommand below for insecure contexts / embedded WebViews.
+    }
+  }
+  try {
+    const area = document.createElement("textarea");
+    area.value = value;
+    area.setAttribute("readonly", "readonly");
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    const ok = document.execCommand && document.execCommand("copy");
+    document.body.removeChild(area);
+    return !!ok;
+  } catch (_) {
+    return false;
+  }
+}
+
+function renderAllowedPathHint(label, dirPath) {
+  const cleanPath = compact(dirPath);
+  if (!cleanPath) return "";
+  return (
+    '<div class="allowed-path-hint">' +
+    '<span class="allowed-path-hint-text">' +
+    esc(label) +
+    '：<code class="allowed-path-hint-code">' +
+    esc(cleanPath) +
+    "</code></span>" +
+    '<button class="btn is-sm allowed-path-hint-btn" type="button" data-copy-path="' +
+    esc(cleanPath) +
+    '">复制路径</button>' +
+    "</div>"
+  );
+}
+
 defineView("migrate", {
   title: "维护与迁移",
   navLabel: "维护与迁移",
   eyebrow: "Import · Maintenance",
   hint: "运行预设、运维诊断、可移植数据、LivingMemory 迁移与可回滚审计",
   async load() {
-    const preset = await apiTry(() => apiGet("/operations/preset"), { preset: {} });
-    return { preset: preset.preset || {}, output: migrateOutput };
+    const preset = await apiTry(() => apiGet("/operations/preset"), { preset: {}, allowed_import_roots: {} });
+    return {
+      preset: preset.preset || {},
+      allowedRoots: preset.allowed_import_roots || {},
+      output: migrateOutput,
+    };
   },
   render(data) {
     const preset = data.preset || {};
+    const allowedRoots = data.allowedRoots || {};
     const current = compact(preset.preset) || compact(preset.current) || "-";
 
     const presets =
@@ -3478,8 +3527,12 @@ defineView("migrate", {
       {
         title: "3. 可移植数据",
         desc: "仅用于本插件导出的 UTF-8 JSONL，包含记忆、身份、关系、时间线与 ACL。",
+        pathHint: renderAllowedPathHint(
+          "当前允许存放目录",
+          allowedRoots.portable_export_dir || allowedRoots.memory_data_dir
+        ),
         input: "portablePath",
-        placeholder: "导入时填写 JSONL 路径；导出无需填写",
+        placeholder: "导入时填写允许目录内的 JSONL 路径；导出无需填写",
         actions: [
           ["portableExportBtn", "导出"],
           ["portablePreviewBtn", "预览"],
@@ -3488,9 +3541,13 @@ defineView("migrate", {
       },
       {
         title: "4. LivingMemory 导入",
-        desc: "先预览可导入数量和跳过原因，再执行导入。当前策略只导入完整摘要。",
+        desc: "先预览可导入数量和跳过原因，再执行导入。支持填 .db 文件或所在目录路径，留空自动扫描。",
+        pathHint: renderAllowedPathHint(
+          "当前允许存放目录（plugin_data）",
+          allowedRoots.plugin_data_dir || allowedRoots.memory_data_dir
+        ),
         input: "lmPath",
-        placeholder: "LivingMemory 数据库路径，可留空自动扫描",
+        placeholder: "LivingMemory 数据库文件或目录路径，可留空自动扫描",
         actions: [
           ["lmPreviewBtn", "预览导入"],
           ["lmRunBtn", "执行导入"],
@@ -3500,7 +3557,7 @@ defineView("migrate", {
         title: "5. 内容修复",
         desc: "修复早期导入后只剩旧库编号的记忆。",
         input: "lmRepairPath",
-        placeholder: "LivingMemory 数据库路径，可留空自动扫描",
+        placeholder: "LivingMemory 数据库文件或目录路径，可留空自动扫描",
         actions: [["lmRepairBtn", "修复内容"]],
       },
       {
@@ -3548,7 +3605,7 @@ defineView("migrate", {
           : "";
         return (
           '<div class="tool-block"><b>' + esc(tool.title) + "</b><p>" + esc(tool.desc) + "</p>" +
-          input + audits +
+          (tool.pathHint || "") + input + audits +
           '<div class="tool-actions">' +
           (tool.actions || [])
             .map((row) => '<button class="btn is-sm' + (tool.danger ? " is-danger" : "") + '" type="button" id="' + row[0] + '">' + esc(row[1]) + "</button>")
@@ -3587,6 +3644,13 @@ defineView("migrate", {
 
     $$("[data-preset]", node).forEach((button) => {
       button.addEventListener("click", () => run("应用预设", () => apiPost("/operations/preset", { preset: button.dataset.preset })));
+    });
+
+    $$("[data-copy-path]", node).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const copied = await copyTextValue(button.dataset.copyPath || "");
+        toast(copied ? "已复制允许目录路径" : "复制失败，请手动选中路径复制", copied ? "ok" : "error");
+      });
     });
 
     const bind = (id, fn, label) => {

@@ -301,6 +301,7 @@ class InjectionComposer:
         core_memory_max_chars: int = DEFAULT_CORE_MEMORY_CHARS,
         max_item_chars: int = DEFAULT_MAX_ITEM_CHARS,
         snapshot_options: dict[str, Any] | None = None,
+        recall_tools_available: bool = False,
     ) -> str:
         included_memory_ids = included_memory_ids if included_memory_ids is not None else []
         self.humanize_pending = []
@@ -368,9 +369,9 @@ class InjectionComposer:
             lines.append("这是辅助记忆，不是用户新发言或新任务。先回应 current_user_message，旧记忆只在自然相关时融入。")
         if self._humanize_enabled():
             lines.append(
-                "你像人一样记忆：越久没提起的事细节越淡。标注了印象模糊或只剩轮廓的条目，"
-                "坦然用‘我记得…不过细节想不起来了’的口吻承认模糊，这不丢分也不算错误；"
-                "真正想不起时直接说想不起，不要用编造的细节填空。"
+                "你像人一样记忆：越久没提起的事细节越淡。日常提到印象模糊或只剩轮廓的条目时，"
+                "可以坦然用‘我记得…不过细节想不起来了’的口吻承认模糊，不要编造细节填空；"
+                "若对方明确追问具体日期、原话或次数且本轮可用记忆检索工具，先调工具核查原文后再判断，确认查不到再自然说明。"
             )
         lines.extend(
             [
@@ -479,7 +480,8 @@ class InjectionComposer:
                 # 只是噪音，还会让模型开口就交代「我查了记忆库」。默认不写。
                 # 拟人模式下改成「真想不起来」的坦然提示——那是人话，不是检索回执。
                 if (
-                    not self.humanize_pending
+                    not recall_tools_available
+                    and not self.humanize_pending
                     and self._humanize_enabled()
                     and bool(self._humanize_config_value("no_recall_hint_enabled", True))
                 ):

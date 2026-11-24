@@ -18,15 +18,18 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+import time
 from typing import Any
 
 from .astrbot_compat import logger
+from .models import SessionContext
 
 REGISTRY_ATTRIBUTE = "_private_companion_memory_providers"
 PROVIDER_API_VERSION = "companion.external-memory.v1"
 PROVIDER_ID = "memory_companion"
 DISPLAY_NAME = "我会牢牢记住你"
 SUMMARY_CATEGORIES = ("profile", "preference", "relationship", "private_conversation", "other")
+_QUERY_SEARCH_TIMEOUT_SECONDS = 3.0
 
 
 def _clean(value: Any, limit: int = 200) -> str:
@@ -204,8 +207,7 @@ class CompanionMemoryLinkage:
 
     # -- provider 回调 ------------------------------------------------------
 
-    async def _authorized_records(self, request, *, limit):
-        """Resolve opaque host authority; never trust member IDs supplied in JSON."""
+    def _authorize_scope(self, request: Any) -> tuple[Any, Any, dict[str, Any]]:
         if not isinstance(request, Mapping):
             raise ValueError("memory_read_authorization_required")
         registry = self._registry
@@ -218,27 +220,191 @@ class CompanionMemoryLinkage:
         config = getattr(self._service, "config", None)
         if config is None or not config.bool("private_companion_bridge.enabled", True):
             raise ValueError("bridge_disabled")
-        reader = getattr(getattr(self._service, "store", None), "read_authorized_linked_memories", None)
+        return authorize, config, scope
+
+    async def _search_authorized_candidate_ids(
+        self,
+        scope: Mapping[str, Any],
+        query: str,
+        *,
+        limit: int,
+    ) -> list[str]:
+        """Run bounded semantic/keyword slot search per authorized private member."""
+        search = getattr(self._service, "search_context_slots", None)
+        if not callable(search):
+            return []
+        members = scope.get("members") if isinstance(scope, Mapping) else None
+        persona_id = _clean(scope.get("persona_id") if isinstance(scope, Mapping) else "", 96)
+        if not isinstance(members, (list, tuple)) or not persona_id:
+            return []
+        deadline = time.monotonic() + _QUERY_SEARCH_TIMEOUT_SECONDS
+        scored: dict[str, float] = {}
+        seen_sessions: set[str] = set()
+        per_member_top_k = max(limit, 8)
+        for member in members[:8]:
+            if not isinstance(member, Mapping):
+                continue
+            session_id = _clean(member.get("session_id"), 200)
+            user_id = _clean(member.get("native_account_id"), 120)
+            platform = _clean(member.get("platform"), 80)
+            identity = member.get("memory_identity") if isinstance(member.get("memory_identity"), Mapping) else {}
+            owner_bot_id = _clean(identity.get("owner_bot_id") or member.get("account_id") or member.get("bot_id"), 120)
+            if not session_id or session_id in seen_sessions or not user_id or not owner_bot_id or owner_bot_id == "self":
+                continue
+            seen_sessions.add(session_id)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.08:
+                break
+            member_ctx = SessionContext(
+                session_id=session_id,
+                scope="private",
+                platform=platform,
+                user_id=user_id,
+                bot_id=owner_bot_id,
+                persona_id=persona_id,
+                message_text=query,
+                strict_session_only=True,
+            )
+            try:
+                results, _blocked, _slot_map = await asyncio.wait_for(
+                    search(query, member_ctx, per_member_top_k),
+                    timeout=remaining,
+                )
+            except asyncio.CancelledError:
+                raise
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.debug("[MemoryCompanion] scoped query search skipped: %s", type(exc).__name__)
+                continue
+            for item in results or ():
+                memory = getattr(item, "memory", None)
+                memory_id = _clean(getattr(memory, "id", ""), 120)
+                if not memory_id:
+                    continue
+                try:
+                    score = float(getattr(item, "score", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    score = 0.0
+                if memory_id not in scored or score > scored[memory_id]:
+                    scored[memory_id] = score
+        ranked = sorted(scored.items(), key=lambda pair: (-pair[1], pair[0]))
+        return [memory_id for memory_id, _score in ranked[: min(32, max(limit * 2, 12))]]
+
+    @staticmethod
+    def _compose_query_records(
+        *,
+        core_records: list[Any],
+        matched_records: list[Any],
+        recent_records: list[Any],
+        limit: int,
+    ) -> list[Any]:
+        """Balance core memories, query-relevant recalls, and recent private continuity."""
+        if limit <= 0:
+            return []
+        selected: list[Any] = []
+        seen: set[str] = set()
+
+        def append_item(record: Any) -> bool:
+            record_id = _clean(getattr(record, "id", ""), 120)
+            if not record_id or record_id in seen or len(selected) >= limit:
+                return False
+            seen.add(record_id)
+            selected.append(record)
+            return True
+
+        core_quota = min(2, max(1, limit // 4)) if limit >= 2 else 0
+        for record in core_records[:core_quota]:
+            append_item(record)
+
+        matched_ids = {_clean(getattr(record, "id", ""), 120) for record in matched_records}
+        recent_only = [
+            record for record in recent_records
+            if _clean(getattr(record, "id", ""), 120) not in seen
+            and _clean(getattr(record, "id", ""), 120) not in matched_ids
+        ]
+        continuity_reserve = 0
+        if recent_only:
+            if limit >= 4:
+                continuity_reserve = min(2, len(recent_only))
+            elif limit >= 3:
+                continuity_reserve = 1
+
+        topic_cap = max(len(selected), limit - continuity_reserve)
+        deferred_matched: list[Any] = []
+        for record in matched_records:
+            if len(selected) < topic_cap:
+                append_item(record)
+            else:
+                deferred_matched.append(record)
+
+        for record in recent_records:
+            if len(selected) >= limit:
+                break
+            append_item(record)
+
+        for record in deferred_matched:
+            if len(selected) >= limit:
+                break
+            append_item(record)
+
+        return selected
+
+    async def _authorized_records(self, request, *, limit, query: str = ""):
+        """Resolve opaque host authority; never trust member IDs supplied in JSON."""
+        authorize, config, scope = self._authorize_scope(request)
+        store = getattr(self._service, "store", None)
+        reader = getattr(store, "read_authorized_linked_memories", None)
         if not callable(reader):
             raise ValueError("scoped_memory_reader_unavailable")
+        clean_query = _clean(query, 1000)
+        matched_raw: dict[str, Any] | None = None
+        if clean_query and limit > 0:
+            by_ids_reader = getattr(store, "read_authorized_linked_memories_by_ids", None)
+            if callable(by_ids_reader):
+                candidate_ids = await self._search_authorized_candidate_ids(scope, clean_query, limit=limit)
+                core_quota = min(2, max(1, limit // 4)) if limit >= 2 else 0
+                if candidate_ids or core_quota > 0:
+                    matched_raw = await by_ids_reader(
+                        scope,
+                        candidate_ids,
+                        include_core_limit=core_quota,
+                    )
         raw = await reader(scope, limit=limit)
-        revision = await self._service.store.memory_revision()
-        source_revision = await self._service.store.source_revision()
+        revision = await store.memory_revision()
+        source_revision = await store.source_revision()
         if (str(raw.get("memory_revision")) != revision
                 or raw.get("source_revision") != source_revision):
+            raise ValueError("memory_read_snapshot_changed")
+        if matched_raw is not None and (
+            str(matched_raw.get("memory_revision")) != revision
+            or matched_raw.get("source_revision") != source_revision
+        ):
             raise ValueError("memory_read_snapshot_changed")
         if not config.bool("private_companion_bridge.enabled", True):
             raise ValueError("bridge_disabled")
         if authorize(request) != scope:
             raise ValueError("memory_read_authorization_changed")
-        return raw
+        if matched_raw is None:
+            return raw
+        composed = self._compose_query_records(
+            core_records=list(matched_raw.get("core_records") or ()),
+            matched_records=list(matched_raw.get("records") or ()),
+            recent_records=list(raw.get("records") or ()),
+            limit=limit,
+        )
+        provenance = {**(raw.get("provenance") or {}), **(matched_raw.get("provenance") or {})}
+        return {
+            **raw,
+            "records": composed,
+            "provenance": provenance,
+        }
 
     async def _read(self, request: Any) -> dict[str, Any]:
         payload = request if isinstance(request, Mapping) else {}
         limit = _int(payload.get("limit"), 8, 1, 20)
         max_chars = _int(payload.get("max_chars"), 2400, 0, 20000)
+        query = _clean(payload.get("query"), 1000)
         try:
-            raw = await self._authorized_records(request, limit=limit)
+            raw = await self._authorized_records(request, limit=limit, query=query)
         except Exception as exc:
             logger.debug("[MemoryCompanion] scoped recall unavailable: %s", type(exc).__name__)
             return {"items": [], "reason": "memory_read_authorization_unavailable"}

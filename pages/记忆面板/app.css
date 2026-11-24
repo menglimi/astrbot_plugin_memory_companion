@@ -1446,6 +1446,33 @@ html[data-ui-mode="cinema"] .terminal-stage + .recovery-card { margin-top: 16px;
 .tool-block b { font-size: 12.5px; font-weight: 600; }
 .tool-block p { font-size: 11.5px; color: var(--text-3); line-height: 1.6; }
 .tool-block .tool-actions { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 2px; }
+.allowed-path-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 4px 0 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+.allowed-path-hint-text {
+  flex: 1 1 min(180px, 100%);
+  min-width: min(180px, 100%);
+  word-break: break-all;
+}
+.allowed-path-hint-code {
+  color: var(--text);
+  font-family: var(--font-mono);
+}
+@media (max-width: 640px) {
+  .allowed-path-hint-btn {
+    min-height: 34px;
+  }
+}
 
 /* ============================================================
    授权矩阵（权限拓扑）

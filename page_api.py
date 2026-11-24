@@ -1652,7 +1652,10 @@ class PluginPageApi:
 
     async def operations_preset(self):
         if request.method == "GET":
-            return self._ok({"preset": self.plugin.service.operation_preset_status()})
+            return self._ok({
+                "preset": self.plugin.service.operation_preset_status(),
+                "allowed_import_roots": self._allowed_import_roots_payload(),
+            })
         payload = await self._json()
         try:
             result = self.plugin.service.apply_operation_preset(clean_text(payload.get("preset"), 40))
@@ -1669,9 +1672,9 @@ class PluginPageApi:
             return self._err(f"导出失败: {exc}", 500)
 
     async def data_import_preview(self):
-        path = clean_text(request.args.get("path", ""), 2000)
+        path = self._strip_path_input(request.args.get("path", ""))
         if not path:
-            return self._err("path is required", 400)
+            return self._err("请填写可移植档案路径（path is required）", 400)
         try:
             return self._ok({"data": self.plugin.service.preview_portable_data(path)})
         except (OSError, ValueError) as exc:
@@ -1679,9 +1682,9 @@ class PluginPageApi:
 
     async def data_import_run(self):
         payload = await self._json()
-        path = clean_text(payload.get("path"), 2000)
+        path = self._strip_path_input(payload.get("path"))
         if not path:
-            return self._err("path is required", 400)
+            return self._err("请填写可移植档案路径（path is required）", 400)
         try:
             return self._ok({"data": await self.plugin.service.import_portable_data(path)})
         except (OSError, ValueError) as exc:
@@ -4436,26 +4439,72 @@ class PluginPageApi:
         roots.append(Path(__file__).resolve().parent)
         return tuple(roots)
 
+    @staticmethod
+    def _strip_path_input(raw: Any) -> str:
+        text = clean_text(raw, 1000)
+        while len(text) >= 2 and (
+            (text[0] == text[-1] and text[0] in {'"', "'"})
+            or (text[0] == "“" and text[-1] == "”")
+            or (text[0] == "‘" and text[-1] == "’")
+        ):
+            text = text[1:-1].strip()
+        if text.lower().startswith("file:///"):
+            rest = text[8:]
+            text = rest if _WINDOWS_ABSOLUTE_PATH.match(rest) else ("/" + rest.lstrip("/"))
+        elif text.lower().startswith("file://"):
+            text = text[7:]
+        return text.strip()
+
+    def _allowed_root_display_paths(self) -> list[str]:
+        display: list[str] = []
+        for root in self._page_allowed_roots():
+            try:
+                label = str(root.expanduser().resolve(strict=False))
+            except OSError:
+                continue
+            if label not in display:
+                display.append(label)
+        return display
+
+    def _allowed_import_roots_payload(self) -> dict[str, Any]:
+        data_dir = self._page_data_dir()
+        resolved_data: Path | None = None
+        if data_dir is not None:
+            try:
+                resolved_data = data_dir.expanduser().resolve(strict=False)
+            except OSError:
+                resolved_data = data_dir
+        return {
+            "memory_data_dir": str(resolved_data) if resolved_data is not None else "",
+            "portable_export_dir": str(resolved_data / "exports") if resolved_data is not None else "",
+            "plugin_data_dir": str(resolved_data.parent) if resolved_data is not None else "",
+            "roots": self._allowed_root_display_paths(),
+        }
+
     def _resolve_page_path(self, raw: Any) -> tuple[Path | None, str]:
         """把调用方给的路径解析成允许根内的绝对路径。
 
         返回 (路径, 错误说明)：空输入返回 (None, "")，表示"用插件自己的默认配置"，
-        其余任何越界、含 ".."、解析失败的情况都返回错误说明。
+        其余任何越界、含 ".."、解析失败的情况都返回包含允许目录指引的错误说明。
         """
-        text = clean_text(raw, 1000)
+        text = self._strip_path_input(raw)
         if not text:
             return None, ""
+        allowed_hint = "；".join(self._allowed_root_display_paths()[:2]) or "插件数据目录"
         if sys.platform != "win32" and _WINDOWS_ABSOLUTE_PATH.match(text):
             # 非 Windows 平台上 Path("C:\\...") 会被当成相对路径拼到当前目录，
             # 绕过允许根检查；Windows 绝对路径一律按"逃逸出数据目录"拒绝。
-            return None, "path is outside the plugin data directory"
+            return (
+                None,
+                f"路径（path）为 Windows 本地路径，超出当前服务器允许的插件数据目录范围；请先将文件上传到以下目录后重试：{allowed_hint}",
+            )
         normalized = text.replace(chr(92), "/")
         if ".." in Path(normalized).parts:
-            return None, "path must not contain .."
+            return None, "路径（path）不能包含上级目录跳转（..），请填写允许目录内的完整路径"
         try:
             resolved = Path(text).expanduser().resolve(strict=False)
         except OSError as exc:
-            return None, f"path cannot be resolved: {clean_text(exc, 120)}"
+            return None, f"路径（path）无法解析：{clean_text(exc, 120)}"
         for root in self._page_allowed_roots():
             try:
                 base = root.expanduser().resolve(strict=False)
@@ -4463,7 +4512,10 @@ class PluginPageApi:
                 continue
             if resolved == base or base in resolved.parents:
                 return resolved, ""
-        return None, "path is outside the plugin data directory"
+        return (
+            None,
+            f"路径（path）超出允许的插件数据目录范围，请将文件放到以下目录后再填写路径：{allowed_hint}",
+        )
 
     async def import_preview(self):
         resolved, error = self._resolve_page_path(request.args.get("path", ""))
