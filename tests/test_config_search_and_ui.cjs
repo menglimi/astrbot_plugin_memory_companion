@@ -852,10 +852,11 @@ test("drawer and confirmation dialog: blur/inert on drawer close and restore foc
   assert.equal(confirmTriggerFocused, true, "关闭确认弹窗后应归还触发元素焦点");
 });
 
-test("legacy.html loads search-engine.js?v=2.6.8 before app.js?v=2.6.8", () => {
+test("legacy.html loads the versioned search engine before the panel app", () => {
   const html = fs.readFileSync(LEGACY_HTML_PATH, "utf8");
-  const seIdx = html.indexOf('./search-engine.js?v=2.6.8');
-  const appIdx = html.indexOf('./app.js?v=2.6.8');
-  assert.ok(seIdx > 0, "legacy.html 必须引入 ./search-engine.js?v=2.6.8");
-  assert.ok(appIdx > seIdx, "search-engine.js 必须在 app.js 之前加载");
+  const search = /src="\.\/search-engine\.js\?v=([^"]+)"/.exec(html);
+  const app = /src="\.\/app\.js\?v=([^"]+)"/.exec(html);
+  assert.ok(search && app, "搜索脚本和面板脚本都必须带缓存版本");
+  assert.equal(search[1], app[1], "搜索脚本和面板脚本的缓存版本必须一致");
+  assert.ok(search.index < app.index, "search-engine.js 必须在 app.js 之前加载");
 });
