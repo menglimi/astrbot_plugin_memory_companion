@@ -1110,13 +1110,16 @@ class PluginPageApi:
         else:
             ui_style = "people"
         theme_name = str(config.get("appearance.theme", DEFAULT_THEME_NAME))
-        dark_mode = self._read_ui_preferences().get("dark_mode", True)
+        saved = self._read_ui_preferences()
+        dark_mode_saved = isinstance(saved.get("dark_mode"), bool)
+        dark_mode = saved["dark_mode"] if dark_mode_saved else True
         return self._ok(
             {
                 "ui_style": ui_style,
                 "palette": self._theme_key(theme_name),
                 "theme": theme_name,
                 "dark_mode": bool(dark_mode),
+                "dark_mode_saved": dark_mode_saved,
                 "available_palettes": list(THEME_NAME_TO_KEY.keys()),
             }
         )

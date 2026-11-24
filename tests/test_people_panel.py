@@ -6,6 +6,8 @@ import ast
 import importlib
 import json
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import types
@@ -242,6 +244,34 @@ class PeoplePageApiTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(page_api_module, "jsonify", side_effect=_fake_jsonify):
                 response = await api.ui_preferences()
             self.assertEqual(expected, response.payload["ui_style"], value)
+
+    async def test_ui_preferences_reports_whether_dark_mode_was_explicitly_saved(self) -> None:
+        plugin = SimpleNamespace(
+            service=SimpleNamespace(
+                config=ConfigView({"appearance": {"ui_style": "人物"}}),
+                data_dir=self.temp.name,
+            )
+        )
+        api = PluginPageApi(plugin)
+        with patch.object(page_api_module, "jsonify", side_effect=_fake_jsonify):
+            initial = (await api.ui_preferences()).payload
+        self.assertTrue(initial["dark_mode"])
+        self.assertFalse(initial["dark_mode_saved"])
+
+        api._json = AsyncMock(return_value={"dark_mode": False})
+        with patch.object(page_api_module, "jsonify", side_effect=_fake_jsonify):
+            saved = (await api.ui_preferences_save()).payload
+            after_light = (await api.ui_preferences()).payload
+        self.assertTrue(saved["success"])
+        self.assertFalse(after_light["dark_mode"])
+        self.assertTrue(after_light["dark_mode_saved"])
+
+        api._json = AsyncMock(return_value={"dark_mode": True})
+        with patch.object(page_api_module, "jsonify", side_effect=_fake_jsonify):
+            await api.ui_preferences_save()
+            after_dark = (await api.ui_preferences()).payload
+        self.assertTrue(after_dark["dark_mode"])
+        self.assertTrue(after_dark["dark_mode_saved"])
 
 
 def _extract_css_rules(css_text: str) -> list[tuple[str, str]]:
@@ -500,6 +530,390 @@ class PeoplePanelAssetsTests(unittest.TestCase):
         self.assertEqual("人物", style["default"])
         self.assertEqual(["人物", "控制台", "三维终端"], style["options"])
         self.assertTrue(schema["memory_humanization"]["items"]["enabled"]["default"])
+
+    def test_people_css_is_tokenized_for_light_theme_palettes_and_danger_zone(self) -> None:
+        css = (PAGES / "people.css").read_text(encoding="utf-8")
+        rules = _extract_css_rules(css)
+
+        # 1) 必须声明完整的浅色主题变量，并与完整控制台浅色质感对齐。
+        light_bodies = [body for selector, body in rules if selector == ':root[data-theme="light"]']
+        self.assertTrue(light_bodies, "people.css 缺少 :root[data-theme=\"light\"] 浅色色阶")
+        light_block = "\n".join(light_bodies)
+        for expected_token in (
+            "color-scheme: light",
+            "--bg: #f6f7fa",
+            "--card: #ffffff",
+            "--text: #1b2430",
+            "--danger: #dc2626",
+        ):
+            self.assertIn(expected_token, light_block)
+
+        # 2) 非令牌组件规则里不允许残留硬编码十六进制/rgba 颜色（var() 语义兜底除外）。
+        hardcoded: list[str] = []
+        for selector, body in rules:
+            if ":root" in selector or "[data-palette=" in selector or "[data-theme=" in selector:
+                continue
+            without_var_fallbacks = re.sub(r"var\([^)]*\)", "", body)
+            if re.search(r"#[0-9a-fA-F]{3,8}\b|rgba?\(", without_var_fallbacks):
+                hardcoded.append(selector)
+        self.assertEqual([], hardcoded, f"people.css 组件规则仍含硬编码颜色：{hardcoded}")
+
+        # 3) 14 套传统色在深/浅两态均已定义，且浅色块完整覆盖深色块全部变量避免泄漏。
+        palettes = list(page_api_module.THEME_NAME_TO_KEY.values())
+        self.assertEqual(14, len(palettes))
+        dark_props: dict[str, set[str]] = {}
+        light_props: dict[str, set[str]] = {}
+        for selector, body in rules:
+            props = set(re.findall(r"(--[a-z0-9-]+)\s*:", body))
+            m_light = re.fullmatch(r':root\[data-palette="([a-z]+)"\]\[data-theme="light"\]', selector)
+            m_dark = re.fullmatch(r':root\[data-palette="([a-z]+)"\]', selector)
+            if m_light:
+                light_props[m_light.group(1)] = props
+            elif m_dark:
+                dark_props[m_dark.group(1)] = props
+        people_js = (PAGES / "people.js").read_text(encoding="utf-8")
+        for key in palettes:
+            self.assertIn(key, dark_props, f"people.css 缺少深色色板 {key}")
+            self.assertIn(key, light_props, f"people.css 缺少浅色色板 {key}")
+            leaked = dark_props[key] - light_props[key]
+            self.assertEqual(set(), leaked, f"people.css 色板 {key} 浅色块漏覆盖变量：{leaked}")
+            self.assertRegex(people_js, rf'"{key}"', f"people.js 的色板白名单缺少 {key}")
+
+        # 4) 补齐危险区（.block.danger / button.danger）与主题切换按钮样式。
+        selectors = {selector for selector, _body in rules}
+        self.assertIn(".block.danger", selectors)
+        self.assertTrue(any("button.danger" in selector for selector in selectors))
+        self.assertIn(".theme-btn", selectors)
+
+    def test_people_panel_does_not_rely_on_sandbox_blocked_web_storage(self) -> None:
+        html = (PAGES / "people.html").read_text(encoding="utf-8")
+        script = (PAGES / "people.js").read_text(encoding="utf-8")
+        for label, source in (("people.html", html), ("people.js", script)):
+            self.assertNotIn("localStorage", source, f"{label} 不应依赖沙箱禁用的 localStorage")
+            self.assertNotIn("sessionStorage", source, f"{label} 不应依赖沙箱禁用的 sessionStorage")
+
+    def test_people_html_first_frame_theme_script_and_toggle_controls(self) -> None:
+        html = (PAGES / "people.html").read_text(encoding="utf-8")
+        self.assertIn('id="themeToggle"', html)
+        self.assertIn('id="themeToggleLabel"', html)
+        self.assertIn('data-console-link href="./legacy.html"', html)
+        self.assertLess(
+            html.index('URLSearchParams(location.search).get("theme")'),
+            html.index('rel="stylesheet"'),
+            "防闪烁主题初始化脚本必须位于样式表之前",
+        )
+
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is needed only for the first-frame theme script check")
+        code = r"""
+const fs = require("node:fs");
+const vm = require("node:vm");
+const html = fs.readFileSync(process.argv[1], "utf8");
+const m = html.match(/<head>[\s\S]*?<script>([\s\S]*?)<\/script>[\s\S]*?<\/head>/i);
+if (!m) throw new Error("missing inline head script");
+const script = m[1];
+function run({ search = "", preset = "", preferLight = false }) {
+  const root = { dataset: preset ? { theme: preset } : {} };
+  let metaContent = "#0f1218";
+  const ctx = vm.createContext({
+    location: { search },
+    URLSearchParams,
+    document: {
+      documentElement: root,
+      querySelector(sel) {
+        if (sel === 'meta[name="theme-color"]') {
+          return { setAttribute(name, val) { if (name === "content") metaContent = val; } };
+        }
+        return null;
+      },
+    },
+    window: {
+      matchMedia: (q) => ({ matches: preferLight && String(q).includes("light") }),
+      get localStorage() { throw new Error("SecurityError"); },
+      get sessionStorage() { throw new Error("SecurityError"); },
+    },
+  });
+  vm.runInContext(script, ctx);
+  return { theme: root.dataset.theme, metaContent };
+}
+process.stdout.write(JSON.stringify({
+  queryLight: run({ search: "?theme=light&asset_token=tok", preferLight: false }),
+  queryDark: run({ search: "?theme=dark&asset_token=tok", preferLight: true }),
+  preferLight: run({ search: "?asset_token=tok", preferLight: true }),
+  fallbackDark: run({ search: "", preferLight: false }),
+  presetLight: run({ search: "", preset: "light", preferLight: false }),
+}));
+"""
+        raw = subprocess.run(
+            [node, "-e", code, str(PAGES / "people.html")],
+            capture_output=True, text=True, encoding="utf-8", check=True,
+        ).stdout
+        out = json.loads(raw)
+        self.assertEqual({"theme": "light", "metaContent": "#f6f7fa"}, out["queryLight"])
+        self.assertEqual({"theme": "dark", "metaContent": "#0f1218"}, out["queryDark"])
+        self.assertEqual({"theme": "light", "metaContent": "#f6f7fa"}, out["preferLight"])
+        self.assertEqual({"theme": "dark", "metaContent": "#0f1218"}, out["fallbackDark"])
+        self.assertEqual({"theme": "light", "metaContent": "#f6f7fa"}, out["presetLight"])
+
+    def test_people_js_preferences_bridge_sync_and_search_passthrough(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is needed only for the people.js behavior check")
+        code = r"""
+const fs = require("node:fs");
+const vm = require("node:vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+
+async function runScenario({ search, prefs, initialHostIsDark }) {
+  const nodes = {};
+  const makeNode = (id) => {
+    const attrs = {};
+    const listeners = {};
+    return {
+      id,
+      hidden: false,
+      innerHTML: "",
+      textContent: "",
+      value: "",
+      attrs,
+      addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
+      dispatch(type, evt) { (listeners[type] || []).forEach((fn) => fn(evt || {})); },
+      setAttribute(k, v) { attrs[k] = String(v); },
+      getAttribute(k) { return attrs[k]; },
+      querySelectorAll() { return []; },
+      focus() {},
+    };
+  };
+  const topLink = makeNode("consoleLink");
+  topLink.setAttribute("href", "./legacy.html");
+  const emptyLink = makeNode("emptyConsoleLink");
+  emptyLink.setAttribute("href", "./legacy.html");
+  nodes.consoleLink = topLink;
+
+  const root = { dataset: {} };
+  let metaColor = "#0f1218";
+  const posts = [];
+  let contextCb = null;
+  const bridge = {
+    onContext(fn) {
+      contextCb = fn;
+      if (typeof initialHostIsDark === "boolean") {
+        root.dataset.theme = initialHostIsDark ? "dark" : "light";
+        fn({ isDark: initialHostIsDark });
+      }
+      return () => {};
+    },
+    apiGet(endpoint) {
+      if (endpoint === "page/ui-preferences") return Promise.resolve({ success: true, data: prefs });
+      if (endpoint === "page/ui/csrf") return Promise.resolve({ success: true, data: { token: "csrf-1", expires_in: 900 } });
+      if (endpoint === "page/people") return Promise.resolve({ success: true, data: { items: [], bots: [], total: 0 } });
+      if (endpoint === "page/maintenance/summary_status") return Promise.resolve({ success: true, data: { status: null } });
+      return Promise.resolve({ success: true, data: {} });
+    },
+    apiPost(endpoint, body) {
+      posts.push({ endpoint, body });
+      return Promise.resolve({ success: true, data: { dark_mode: body.dark_mode } });
+    },
+  };
+
+  const ctx = vm.createContext({
+    location: { search, origin: "null" },
+    URLSearchParams,
+    setTimeout,
+    clearTimeout,
+    document: {
+      documentElement: root,
+      getElementById(id) { return nodes[id] || (nodes[id] = makeNode(id)); },
+      querySelector(sel) {
+        if (sel === 'meta[name="theme-color"]') {
+          return { setAttribute(k, v) { if (k === "content") metaColor = v; } };
+        }
+        return null;
+      },
+      querySelectorAll(sel) {
+        if (sel.includes("data-console-link")) return [topLink, emptyLink];
+        return [];
+      },
+      addEventListener() {},
+    },
+    window: {
+      AstrBotPluginPage: bridge,
+      addEventListener() {},
+      confirm: () => false,
+      get localStorage() { throw new Error("SecurityError"); },
+      get sessionStorage() { throw new Error("SecurityError"); },
+    },
+  });
+  vm.runInContext(source, ctx);
+  await new Promise((r) => setTimeout(r, 30));
+
+  const afterBoot = {
+    theme: root.dataset.theme,
+    palette: root.dataset.palette || "",
+    metaColor,
+    toggleLabel: nodes.themeToggleLabel.textContent,
+    topHref: topLink.attrs.href,
+    emptyHref: emptyLink.attrs.href,
+    emptyHtml: nodes.empty.innerHTML,
+    postCount: posts.length,
+  };
+
+  // 宿主实时切换深浅模式
+  if (contextCb) {
+    const nextDark = !(typeof initialHostIsDark === "boolean" ? initialHostIsDark : false);
+    root.dataset.theme = nextDark ? "dark" : "light";
+    contextCb({ isDark: nextDark });
+  }
+  const afterHostToggle = {
+    theme: root.dataset.theme,
+    toggleLabel: nodes.themeToggleLabel.textContent,
+    topHref: topLink.attrs.href,
+    postCount: posts.length,
+  };
+
+  // 手动点击人物页顶部主题切换按钮 -> 调用 POST /ui-preferences/save
+  nodes.themeToggle.dispatch("click");
+  await new Promise((r) => setTimeout(r, 30));
+  const afterManualToggle = {
+    theme: root.dataset.theme,
+    toggleLabel: nodes.themeToggleLabel.textContent,
+    topHref: topLink.attrs.href,
+    posts,
+  };
+
+  return { afterBoot, afterHostToggle, afterManualToggle };
+}
+
+(async () => {
+  const hostLightUnsaved = await runScenario({
+    search: "?theme=light&asset_token=tok999",
+    prefs: { palette: "yuebai", dark_mode: true, dark_mode_saved: false },
+    initialHostIsDark: false,
+  });
+  const explicitLightSaved = await runScenario({
+    search: "?theme=dark&asset_token=tok888",
+    prefs: { palette: "tianpiao", dark_mode: false, dark_mode_saved: true },
+    initialHostIsDark: true,
+  });
+  process.stdout.write(JSON.stringify({ hostLightUnsaved, explicitLightSaved }));
+})();
+"""
+        raw = subprocess.run(
+            [node, "-e", code, str(PAGES / "people.js")],
+            capture_output=True, text=True, encoding="utf-8", check=True,
+        ).stdout
+        out = json.loads(raw)
+
+        # 场景 1：宿主浅色 + 后端尚未显式保存偏好 -> 保持浅色并同步色板，透传参数。
+        s1 = out["hostLightUnsaved"]
+        self.assertEqual("light", s1["afterBoot"]["theme"])
+        self.assertEqual("yuebai", s1["afterBoot"]["palette"])
+        self.assertEqual("#f6f7fa", s1["afterBoot"]["metaColor"])
+        self.assertEqual("浅色", s1["afterBoot"]["toggleLabel"])
+        self.assertEqual("./legacy.html?theme=light&asset_token=tok999", s1["afterBoot"]["topHref"])
+        self.assertEqual("./legacy.html?theme=light&asset_token=tok999", s1["afterBoot"]["emptyHref"])
+        self.assertIn('href="./legacy.html?theme=light&amp;asset_token=tok999"', s1["afterBoot"]["emptyHtml"])
+        self.assertEqual(0, s1["afterBoot"]["postCount"])
+
+        # 宿主实时切换 -> 立即切到深色，不发无谓写请求。
+        self.assertEqual("dark", s1["afterHostToggle"]["theme"])
+        self.assertEqual("深色", s1["afterHostToggle"]["toggleLabel"])
+        self.assertEqual("./legacy.html?theme=dark&asset_token=tok999", s1["afterHostToggle"]["topHref"])
+        self.assertEqual(0, s1["afterHostToggle"]["postCount"])
+
+        # 手动点击按钮 -> 切回浅色并持久化到 /ui-preferences/save。
+        self.assertEqual("light", s1["afterManualToggle"]["theme"])
+        self.assertEqual("浅色", s1["afterManualToggle"]["toggleLabel"])
+        self.assertEqual("./legacy.html?theme=light&asset_token=tok999", s1["afterManualToggle"]["topHref"])
+        self.assertEqual(1, len(s1["afterManualToggle"]["posts"]))
+        self.assertEqual("page/ui-preferences/save", s1["afterManualToggle"]["posts"][0]["endpoint"])
+        self.assertIs(False, s1["afterManualToggle"]["posts"][0]["body"]["dark_mode"])
+        self.assertEqual("csrf-1", s1["afterManualToggle"]["posts"][0]["body"]["csrf_token"])
+
+        # 场景 2：用户在控制台显式保存了浅色偏好 -> 即使宿主初始暗色，人物页也同步恢复浅色与色板。
+        s2 = out["explicitLightSaved"]
+        self.assertEqual("light", s2["afterBoot"]["theme"])
+        self.assertEqual("tianpiao", s2["afterBoot"]["palette"])
+        self.assertEqual("./legacy.html?theme=light&asset_token=tok888", s2["afterBoot"]["topHref"])
+
+    def test_legacy_console_provides_people_entries_and_preserves_search_params(self) -> None:
+        legacy_html = (PAGES / "legacy.html").read_text(encoding="utf-8")
+        app_js = (PAGES / "app.js").read_text(encoding="utf-8")
+
+        # 1) 完整控制台静态外壳在左侧 .rail-nav 与顶部 .topbar-tools 均有返回「她记得的人」入口。
+        self.assertIn('id="railPeopleLink" data-people-link href="./people.html"', legacy_html)
+        self.assertIn('id="topbarPeopleLink" data-people-link href="./people.html"', legacy_html)
+        self.assertIn('URLSearchParams(location.search).get("theme")', legacy_html)
+
+        # 2) 运行 app.js 验证侧栏渲染、总览「六个常用工作区」6 张卡片与 location.search 全链路透传。
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is needed only for the app.js console nav check")
+        code = r"""
+const fs = require("node:fs");
+const vm = require("node:vm");
+const railHost = { innerHTML: "" };
+const topbarLink = { attrs: { href: "./people.html" }, setAttribute(k, v) { this.attrs[k] = String(v); } };
+const root = { dataset: { theme: "light" } };
+const ctx = vm.createContext({
+  location: { search: "?theme=light&asset_token=tok777" },
+  URLSearchParams,
+  CustomEvent: function CustomEvent(type, init) { this.type = type; this.detail = init && init.detail; },
+  document: {
+    documentElement: root,
+    readyState: "loading",
+    addEventListener() {},
+    querySelector(sel) {
+      if (sel === "#railNav") return railHost;
+      if (sel === "#themeToggleLabel") return { textContent: "" };
+      return null;
+    },
+    querySelectorAll(sel) {
+      if (sel.includes("data-people-link")) return [topbarLink];
+      return [];
+    },
+  },
+  window: { addEventListener() {}, dispatchEvent() {} },
+});
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), ctx);
+const inner = vm.runInContext(`(() => {
+  renderRail();
+  const overviewHtml = VIEWS.overview.render({ stats: {}, buckets: [], core: [], caps: {}, personal: {}, coord: {}, memories: [], injectionLogs: [], bots: [] });
+  const lightHref = peopleHref();
+  applyTheme("dark", { persist: false });
+  const darkHref = peopleHref();
+  return { overviewHtml, lightHref, darkHref };
+})()`, ctx);
+process.stdout.write(JSON.stringify({
+  railHtml: railHost.innerHTML,
+  overviewHtml: inner.overviewHtml,
+  lightHref: inner.lightHref,
+  darkHref: inner.darkHref,
+  syncedTopbarHref: topbarLink.attrs.href,
+}));
+"""
+        raw = subprocess.run(
+            [node, "-e", code, str(PAGES / "app.js")],
+            capture_output=True, text=True, encoding="utf-8", check=True,
+        ).stdout
+        data = json.loads(raw)
+        self.assertIn("她记得的人", data["railHtml"])
+        self.assertIn('href="./people.html?theme=light&amp;asset_token=tok777"', data["railHtml"])
+        self.assertEqual("./people.html?theme=light&asset_token=tok777", data["lightHref"])
+        self.assertEqual("./people.html?theme=dark&asset_token=tok777", data["darkHref"])
+        self.assertEqual("./people.html?theme=dark&asset_token=tok777", data["syncedTopbarHref"])
+
+        # 核对总览「功能入口」副标题「六个常用工作区」与实际渲染卡片数量严格一致（6 张卡）。
+        overview = data["overviewHtml"]
+        self.assertIn("六个常用工作区", overview)
+        m = re.search(r'<h3>功能入口</h3><div class="card-sub">六个常用工作区</div></div></div><div class="row-list">(.*?)</div></section>', overview)
+        self.assertIsNotNone(m, "找不到总览「功能入口」卡片")
+        entry_rows = re.findall(r'<(?:a|button)\s+class="row"', m.group(1))
+        self.assertEqual(6, len(entry_rows), f"「六个常用工作区」应渲染 6 个入口，实际 {len(entry_rows)}")
+        self.assertIn('href="./people.html?theme=light&amp;asset_token=tok777"', m.group(1))
+        self.assertIn("她记得的人", m.group(1))
+        self.assertIn("peopleHref", app_js)
 
 
 if __name__ == "__main__":

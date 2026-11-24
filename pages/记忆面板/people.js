@@ -5,8 +5,60 @@
    动作复用 /memory/update 与 /memory/delete。 */
 const API = "/api/plug/astrbot_plugin_memory_companion/page";
 const PAGE_ENDPOINT_PREFIX = "page";
+const PALETTE_KEYS = new Set([
+  "huangbaiyou", "tianpiao", "haitianxia", "yingying", "oubi", "qingming",
+  "zipu", "shanlan", "qielan", "tuihong", "congqing", "yuebai", "mocan", "gupiao",
+]);
+const THEME_META_COLORS = { dark: "#0f1218", light: "#f6f7fa" };
 
-const state = { items: [], bots: [], total: 0, query: "", sort: "weight", botId: "", selected: null, selectedScope: { platform: "", bot_id: "" }, loading: false };
+function currentSearch() {
+  return typeof location !== "undefined" && location && typeof location.search === "string"
+    ? location.search
+    : "";
+}
+
+function readUrlTheme() {
+  try {
+    const searchText = currentSearch();
+    if (!searchText || typeof URLSearchParams !== "function") return "";
+    const value = new URLSearchParams(searchText).get("theme");
+    return value === "light" || value === "dark" ? value : "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function resolveInitialTheme() {
+  const fromUrl = readUrlTheme();
+  if (fromUrl) return fromUrl;
+  const root = typeof document !== "undefined" && document ? document.documentElement : null;
+  const preset = root && root.dataset ? root.dataset.theme : "";
+  if (preset === "light" || preset === "dark") return preset;
+  try {
+    if (typeof window !== "undefined" && window && typeof window.matchMedia === "function") {
+      if (window.matchMedia("(prefers-color-scheme: light)").matches) return "light";
+    }
+  } catch (_) {}
+  return "dark";
+}
+
+const state = {
+  items: [],
+  bots: [],
+  total: 0,
+  query: "",
+  sort: "weight",
+  botId: "",
+  selected: null,
+  selectedScope: { platform: "", bot_id: "" },
+  loading: false,
+  theme: resolveInitialTheme(),
+  palette: "",
+  hasHostTheme: Boolean(readUrlTheme()),
+  lastHostIsDark: null,
+  explicitTheme: "",
+  manualThemeToggled: false,
+};
 
 const el = (id) => document.getElementById(id);
 const grid = el("grid");
@@ -20,6 +72,148 @@ const botFilter = el("botFilter");
 const drawer = el("drawer");
 const drawerBody = el("drawerBody");
 const scrim = el("scrim");
+const themeToggle = el("themeToggle");
+const themeToggleLabel = el("themeToggleLabel");
+
+function pageHref(targetPath) {
+  const searchText = currentSearch();
+  if (!searchText) return targetPath;
+  const hashIndex = targetPath.indexOf("#");
+  const base = hashIndex >= 0 ? targetPath.slice(0, hashIndex) : targetPath;
+  const hash = hashIndex >= 0 ? targetPath.slice(hashIndex) : "";
+  if (base.includes("?")) return targetPath;
+  try {
+    if (typeof URLSearchParams === "function") {
+      const params = new URLSearchParams(searchText);
+      if (params.has("theme") && (state.theme === "light" || state.theme === "dark")) {
+        params.set("theme", state.theme);
+        const serialized = params.toString();
+        return `${base}${serialized ? `?${serialized}` : ""}${hash}`;
+      }
+    }
+  } catch (_) {}
+  return `${base}${searchText}${hash}`;
+}
+
+function syncConsoleLinks() {
+  if (typeof document === "undefined" || !document || typeof document.querySelectorAll !== "function") return;
+  const href = pageHref("./legacy.html");
+  document.querySelectorAll('a[data-console-link], a[href^="./legacy.html"]').forEach((link) => {
+    if (link && typeof link.setAttribute === "function") link.setAttribute("href", href);
+  });
+}
+
+function resolveThemeMetaColor(theme) {
+  const fallback = theme === "light" ? THEME_META_COLORS.light : THEME_META_COLORS.dark;
+  const root = typeof document !== "undefined" && document ? document.documentElement : null;
+  if (root && typeof window !== "undefined" && window && typeof window.getComputedStyle === "function") {
+    try {
+      const bg = String(window.getComputedStyle(root).getPropertyValue("--bg") || "").trim();
+      if (/^#[0-9a-f]{3,8}$/i.test(bg)) return bg;
+    } catch (_) {}
+  }
+  return fallback;
+}
+
+function syncThemeChrome(theme) {
+  const isLight = theme === "light";
+  const meta =
+    typeof document !== "undefined" && document && typeof document.querySelector === "function"
+      ? document.querySelector('meta[name="theme-color"]')
+      : null;
+  if (meta && typeof meta.setAttribute === "function") {
+    meta.setAttribute("content", resolveThemeMetaColor(theme));
+  }
+  if (themeToggle && typeof themeToggle.setAttribute === "function") {
+    themeToggle.setAttribute("aria-pressed", isLight ? "false" : "true");
+    themeToggle.setAttribute("title", isLight ? "当前浅色，点击切换为深色主题" : "当前深色，点击切换为浅色主题");
+  }
+  if (themeToggleLabel) {
+    themeToggleLabel.textContent = isLight ? "浅色" : "深色";
+  }
+  syncConsoleLinks();
+}
+
+function applyPalette(key) {
+  const value = String(key || "").trim().toLowerCase();
+  const root = typeof document !== "undefined" && document ? document.documentElement : null;
+  if (PALETTE_KEYS.has(value)) {
+    state.palette = value;
+    if (root && root.dataset) root.dataset.palette = value;
+    else if (root && typeof root.setAttribute === "function") root.setAttribute("data-palette", value);
+    syncThemeChrome(state.theme);
+    return value;
+  }
+  state.palette = "";
+  if (root && root.dataset) delete root.dataset.palette;
+  else if (root && typeof root.removeAttribute === "function") root.removeAttribute("data-palette");
+  syncThemeChrome(state.theme);
+  return "";
+}
+
+function applyTheme(theme, options) {
+  const opts = options && typeof options === "object" ? options : {};
+  const next = theme === "light" ? "light" : "dark";
+  state.theme = next;
+  const root = typeof document !== "undefined" && document ? document.documentElement : null;
+  if (root && root.dataset) root.dataset.theme = next;
+  else if (root && typeof root.setAttribute === "function") root.setAttribute("data-theme", next);
+  syncThemeChrome(next);
+  if (opts.persist === true) {
+    state.manualThemeToggled = true;
+    state.explicitTheme = next;
+    request("POST", "ui-preferences/save", null, { dark_mode: next === "dark" }).catch(() => {});
+  }
+}
+
+function handleBridgeContext(ctx) {
+  if (!ctx || typeof ctx !== "object" || typeof ctx.isDark !== "boolean") return;
+  const hostTheme = ctx.isDark ? "dark" : "light";
+  const prevHostIsDark = state.lastHostIsDark;
+  state.lastHostIsDark = ctx.isDark;
+  state.hasHostTheme = true;
+
+  // 宿主实时切换主题：立即跟随宿主当前深浅模式。
+  if (prevHostIsDark !== null && prevHostIsDark !== ctx.isDark) {
+    state.explicitTheme = "";
+    applyTheme(hostTheme, { persist: false });
+    return;
+  }
+
+  // 首次收到宿主上下文：若用户已手动切换或后端已有显式偏好，恢复该偏好。
+  if (state.manualThemeToggled || state.explicitTheme) {
+    applyTheme(state.explicitTheme || state.theme, { persist: false });
+    return;
+  }
+  applyTheme(hostTheme, { persist: false });
+}
+
+async function bindBridgeContext() {
+  const bridge = getBridge() || (await waitForBridge());
+  if (!bridge) return;
+  if (typeof bridge.onContext === "function") {
+    bridge.onContext(handleBridgeContext);
+  } else if (typeof bridge.getContext === "function") {
+    handleBridgeContext(bridge.getContext());
+  }
+}
+
+async function loadPreferences() {
+  try {
+    const prefs = await request("GET", "ui-preferences");
+    if (!prefs || typeof prefs !== "object") return;
+    if (typeof prefs.palette === "string") {
+      applyPalette(prefs.palette);
+    }
+    if (typeof prefs.dark_mode === "boolean" && prefs.dark_mode_saved !== false) {
+      const want = prefs.dark_mode ? "dark" : "light";
+      state.explicitTheme = want;
+      if (!state.manualThemeToggled) {
+        applyTheme(want, { persist: false });
+      }
+    }
+  } catch (_) {}
+}
 
 function esc(value) {
   return String(value == null ? "" : value).replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[ch]);
@@ -249,14 +443,13 @@ function renderRecoveryStatus(status) {
     .filter((key) => safeInt(waitsMap[key]) > 0)
     .map((key) => `${esc(labels[key])} ${safeInt(waitsMap[key])} 批`)
     .join(" · ");
-  const searchSuffix = typeof location !== "undefined" && location && location.search ? location.search : "";
   node.hidden = false;
   node.innerHTML = `<summary>记忆整理：待处理 <b>${safeInt(status.pending_batches)}</b> 批</summary>
     <p>全局状态，包含所有机器人。最老等待 ${formatWaitDuration(status.oldest_wait_seconds)}。
     ${waits || "没有有效待处理批次"}。</p>
     <p>未分批原文 ${safeInt(originals.events)} 条，下一轮达到条件且身份有效 ${safeInt(originals.eligible_events)} 条。
     正式会话记忆 ${safeInt(progress.adopted_memories)} 条，待审候选 ${safeInt(progress.review_candidates)} 条，隔离批次 ${safeInt(progress.quarantined_batches)} 批。</p>
-    <p>查看状态不会调用模型或通过候选。<a href="./legacy.html${esc(searchSuffix)}">在完整控制台查看详细等待原因</a></p>`;
+    <p>查看状态不会调用模型或通过候选。<a data-console-link href="${esc(pageHref("./legacy.html"))}">在完整控制台查看详细等待原因</a></p>`;
 }
 
 function renderSummary() {
@@ -285,7 +478,7 @@ function renderGrid() {
     empty.hidden = false;
     empty.innerHTML = hasQuery
       ? "<h2>这个人她还没记住</h2><p>换个名字试试，或者清掉筛选。她只会记住真的聊过的人。</p>"
-      : `<h2>她还没记住谁</h2><p>等有人跟她多聊几次，人就会自己长出来。这里不用配置，她本来就在记。</p><p class="dim">想看她把每句话记成了什么？去 <a href="./legacy.html">完整控制台</a> 翻记忆库。</p>`;
+      : `<h2>她还没记住谁</h2><p>等有人跟她多聊几次，人就会自己长出来。这里不用配置，她本来就在记。</p><p class="dim">想看她把每句话记成了什么？去 <a data-console-link href="${esc(pageHref("./legacy.html"))}">完整控制台</a> 翻记忆库。</p>`;
     return;
   }
   empty.hidden = true;
@@ -529,9 +722,25 @@ el("refresh").addEventListener("click", () => {
   load();
   loadRecoveryStatus();
 });
+if (themeToggle && typeof themeToggle.addEventListener === "function") {
+  themeToggle.addEventListener("click", () => {
+    applyTheme(state.theme === "dark" ? "light" : "dark", { persist: true });
+  });
+}
+document.addEventListener("click", (event) => {
+  const target = event && event.target && typeof event.target.closest === "function"
+    ? event.target.closest('a[data-console-link], a[href^="./legacy.html"]')
+    : null;
+  if (target && typeof target.setAttribute === "function") {
+    target.setAttribute("href", pageHref("./legacy.html"));
+  }
+});
 el("close").addEventListener("click", closeDrawer);
 scrim.addEventListener("click", closeDrawer);
 document.addEventListener("keydown", (event) => { if (event.key === "Escape") closeDrawer(); });
 
+applyTheme(state.theme, { persist: false });
+bindBridgeContext();
+loadPreferences();
 load();
 loadRecoveryStatus();

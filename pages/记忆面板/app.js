@@ -484,6 +484,9 @@ const state = {
   companion: null,
   acl: null,
   assemblyViewer: null,
+  lastHostIsDark: null,
+  explicitTheme: "",
+  manualThemeToggled: false,
 };
 
 /* ------------------------------------------------------------
@@ -604,11 +607,50 @@ async function syncPalette() {
   } catch (error) { /* 忽略存储禁用 */ }
 }
 
+function currentPageSearch() {
+  if (typeof location !== "undefined" && location && typeof location.search === "string") {
+    return location.search;
+  }
+  if (typeof window !== "undefined" && window && window.location && typeof window.location.search === "string") {
+    return window.location.search;
+  }
+  return "";
+}
+
+function peopleHref() {
+  const search = currentPageSearch();
+  if (!search) return "./people.html";
+  try {
+    if (typeof URLSearchParams === "function") {
+      const params = new URLSearchParams(search);
+      if (params.has("theme") && (state.theme === "light" || state.theme === "dark")) {
+        params.set("theme", state.theme);
+        const serialized = params.toString();
+        return "./people.html" + (serialized ? "?" + serialized : "");
+      }
+    }
+  } catch (error) { /* 忽略非法查询串 */ }
+  return "./people.html" + search;
+}
+
+function syncPeopleLinks() {
+  if (typeof document === "undefined" || !document || typeof document.querySelectorAll !== "function") return;
+  const href = peopleHref();
+  $$('a[data-people-link], a[href^="./people.html"]').forEach((link) => {
+    if (link && typeof link.setAttribute === "function") link.setAttribute("href", href);
+  });
+}
+
 function applyTheme(theme, options = {}) {
   state.theme = theme === "light" ? "light" : "dark";
   document.documentElement.dataset.theme = state.theme;
   const label = $("#themeToggleLabel");
   if (label) label.textContent = state.theme === "dark" ? "深色" : "浅色";
+  const meta = typeof document.querySelector === "function" ? $('meta[name="theme-color"]') : null;
+  if (meta && typeof meta.setAttribute === "function") {
+    meta.setAttribute("content", state.theme === "light" ? "#f6f7fa" : "#0b0d12");
+  }
+  syncPeopleLinks();
   try {
     window.localStorage.setItem(THEME_KEY, state.theme);
   } catch (error) {
@@ -617,7 +659,38 @@ function applyTheme(theme, options = {}) {
   window.dispatchEvent(new CustomEvent("mc:theme", { detail: state.theme }));
   // 2.6.6：localStorage 在部分 WebView 里会被清掉，主题再落一份到插件数据目录
   if (options.persist !== false) {
+    state.manualThemeToggled = true;
+    state.explicitTheme = state.theme;
     apiPost("/ui-preferences/save", { dark_mode: state.theme === "dark" }).catch(() => {});
+  }
+}
+
+function handleBridgeContext(ctx) {
+  if (!ctx || typeof ctx !== "object" || typeof ctx.isDark !== "boolean") return;
+  const hostTheme = ctx.isDark ? "dark" : "light";
+  const prevHostIsDark = state.lastHostIsDark;
+  state.lastHostIsDark = ctx.isDark;
+  if (prevHostIsDark !== null && prevHostIsDark !== ctx.isDark) {
+    state.explicitTheme = "";
+    applyTheme(hostTheme, { persist: false });
+    return;
+  }
+  if (state.manualThemeToggled || state.explicitTheme) {
+    applyTheme(state.explicitTheme || state.theme, { persist: false });
+    return;
+  }
+  if (hostTheme !== state.theme) {
+    applyTheme(hostTheme, { persist: false });
+  }
+}
+
+async function bindBridgeContext() {
+  const bridge = getBridge() || (await waitForBridge());
+  if (!bridge) return;
+  if (typeof bridge.onContext === "function") {
+    bridge.onContext(handleBridgeContext);
+  } else if (typeof bridge.getContext === "function") {
+    handleBridgeContext(bridge.getContext());
   }
 }
 
@@ -676,7 +749,15 @@ function findGroupOf(viewId) {
    ------------------------------------------------------------ */
 function renderRail() {
   const host = $("#railNav");
-  host.innerHTML = NAV.map((group) => {
+  if (!host) return;
+  const peopleEntry =
+    '<div class="nav-people-wrap">' +
+    '<a class="nav-item nav-people" id="railPeopleLink" data-people-link href="' + esc(peopleHref()) + '" title="返回「她记得的人」人物面板">' +
+    icon("heart") +
+    '<span class="nav-label">她记得的人</span>' +
+    '<span class="nav-ext" aria-hidden="true">↗</span>' +
+    "</a></div>";
+  host.innerHTML = peopleEntry + NAV.map((group) => {
     const isOpen = group.id === state.group;
     const groupIcon = icon(group.icon);
     const subs = group.views
@@ -1381,7 +1462,14 @@ defineView("overview", {
       kpi("已处理，无新增记忆", recoveryProgress ? fmtInt(recoveryProgress.no_memory_batches) : "—", "原文保留，不重复总结", "private", "processed", "box"),
     ].join("");
 
-    const entries = [
+    const peopleEntry =
+      '<a class="row" data-people-link href="' + esc(peopleHref()) + '">' +
+      icon("heart", "scope-icon") +
+      '<div class="row-main"><div class="row-title">她记得的人</div>' +
+      '<div class="row-sub">按人查看分量、称呼与她记得的事</div></div>' +
+      '<div class="row-meta"><span class="badge">前往 ↗</span></div></a>';
+
+    const entries = peopleEntry + [
       ["navigate", "记忆导航", "按私聊 / 群聊 / 个人等范围进入", "scope"],
       ["inspect", "记忆检视", "逐条查看并修正记忆参数", "db"],
       ["microscope", "记忆显微镜", "模拟一次真实召回", "scope"],
@@ -4439,6 +4527,14 @@ function bindShell() {
   });
 
   document.addEventListener("click", (event) => {
+    const peopleLink =
+      event && event.target && typeof event.target.closest === "function"
+        ? event.target.closest('a[data-people-link], a[href^="./people.html"]')
+        : null;
+    if (peopleLink && typeof peopleLink.setAttribute === "function") {
+      peopleLink.setAttribute("href", peopleHref());
+      return;
+    }
     const target = event.target.closest("[data-goto]");
     if (!target) return;
     const view = target.dataset.goto;
@@ -4523,19 +4619,28 @@ async function boot() {
   applyTheme(state.theme, { persist: false });
   applyMode(state.mode);
   renderRail();
+  bindBridgeContext();
   setRailStatus("loading", "正在连接…");
 
   const initial = document.documentElement.dataset.initialNav;
   const target = state.mode === "cinema" ? "overview" : (initial && VIEWS[initial] ? initial : "overview");
 
+  let prefsLoaded = false;
   try {
     await apiGet("/stats");
     setRailStatus("ok", "已连接");
     // 2.6.6：浏览器存储被清过也能恢复上次的深色/浅色选择
     const prefs = await apiGet("/ui-preferences").catch(() => null);
-    if (prefs && typeof prefs.dark_mode === "boolean") {
-      const want = prefs.dark_mode ? "dark" : "light";
-      if (want !== state.theme) applyTheme(want, { persist: false });
+    if (prefs) {
+      prefsLoaded = true;
+      if (typeof prefs.palette === "string") applyPalette(prefs.palette);
+      if (typeof prefs.dark_mode === "boolean" && prefs.dark_mode_saved !== false) {
+        const want = prefs.dark_mode ? "dark" : "light";
+        state.explicitTheme = want;
+        if (!state.manualThemeToggled && want !== state.theme) {
+          applyTheme(want, { persist: false });
+        }
+      }
     }
   } catch (error) {
     setRailStatus("bad", "连接失败");
@@ -4544,7 +4649,7 @@ async function boot() {
   state.ready = true;
   await go(target);
   // 配色放最后：不阻塞首屏，失败也不影响面板可用
-  syncPalette();
+  if (!prefsLoaded) syncPalette();
 }
 
 if (document.readyState === "loading") {

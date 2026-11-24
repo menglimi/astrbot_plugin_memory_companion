@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0d12" />
   <title>记忆面板 · 我会牢牢记住你</title>
   <script>
     (() => {
@@ -10,12 +11,32 @@
       const navKey = "memory_companion_nav";
       const modeKey = "memory_companion_mode";
       const paletteKey = "memory_companion_palette";
-      let theme = "dark";
+      let theme = "";
       try {
-        const saved = window.localStorage.getItem(themeKey);
-        if (saved === "dark" || saved === "light") theme = saved;
+        const param = new URLSearchParams(location.search).get("theme");
+        if (param === "dark" || param === "light") theme = param;
       } catch (_) {}
+      if (!theme) {
+        try {
+          const saved = window.localStorage.getItem(themeKey);
+          if (saved === "dark" || saved === "light") theme = saved;
+        } catch (_) {}
+      }
+      if (!theme) {
+        const preset = document.documentElement.dataset.theme;
+        if (preset === "dark" || preset === "light") theme = preset;
+      }
+      if (!theme) {
+        try {
+          if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
+            theme = "light";
+          }
+        } catch (_) {}
+      }
+      if (theme !== "dark" && theme !== "light") theme = "dark";
       document.documentElement.dataset.theme = theme;
+      const meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) meta.setAttribute("content", theme === "light" ? "#f6f7fa" : "#0b0d12");
       try {
         const savedNav = window.localStorage.getItem(navKey);
         if (savedNav) document.documentElement.dataset.initialNav = savedNav;
@@ -68,11 +89,11 @@
   <div class="shell" id="shell">
     <aside class="rail" id="rail" aria-label="主导航">
       <div class="rail-brand"><span class="brand-mark" aria-hidden="true"></span><span class="brand-copy"><b>记忆面板</b><small>我会牢牢记住你</small></span></div>
-      <nav class="rail-nav" id="railNav" role="navigation"></nav>
+      <nav class="rail-nav" id="railNav" role="navigation"><div class="nav-people-wrap"><a class="nav-item nav-people" id="railPeopleLink" data-people-link href="./people.html" title="返回「她记得的人」人物面板"><span class="nav-icon" aria-hidden="true"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13.2S2.6 10 2.6 6.2A2.9 2.9 0 018 4.9a2.9 2.9 0 015.4 1.3c0 3.8-5.4 7-5.4 7z"/></svg></span><span class="nav-label">她记得的人</span><span class="nav-ext" aria-hidden="true">↗</span></a></div></nav>
       <div class="rail-foot"><button class="theme-toggle" id="themeToggle" type="button" aria-label="切换深浅主题"><span class="theme-toggle-track"><span class="theme-toggle-knob"></span></span><span class="theme-toggle-label" id="themeToggleLabel">深色</span></button><div class="rail-status" id="railStatus"><span class="status-dot" aria-hidden="true"></span><span id="railStatusText">正在连接…</span></div></div>
     </aside>
     <main class="main" id="main">
-      <header class="topbar"><div class="topbar-copy"><p class="eyebrow" id="viewEyebrow">Memory Companion</p><h1 id="viewTitle">总览</h1><p class="topbar-hint" id="viewHint">记忆库、范围与联动的整体状态</p></div><div class="topbar-tools"><div class="topbar-search"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4 14 14"/></svg><input id="globalSearch" type="search" placeholder="搜索记忆内容、证据或 ID" autocomplete="off" /></div><button class="tool-btn" id="refreshBtn" type="button" title="刷新当前视图"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.75"/><path d="M13.4 2.2v3.1h-3.1"/></svg><span>刷新</span></button><button class="tool-btn mode-toggle" id="modeToggle" type="button" aria-pressed="false" aria-label="切换标准界面与终端界面"><span id="modeToggleLabel">终端模式</span></button></div></header>
+      <header class="topbar"><div class="topbar-copy"><p class="eyebrow" id="viewEyebrow">Memory Companion</p><h1 id="viewTitle">总览</h1><p class="topbar-hint" id="viewHint">记忆库、范围与联动的整体状态</p></div><div class="topbar-tools"><div class="topbar-search"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4 14 14"/></svg><input id="globalSearch" type="search" placeholder="搜索记忆内容、证据或 ID" autocomplete="off" /></div><button class="tool-btn" id="refreshBtn" type="button" title="刷新当前视图"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.75"/><path d="M13.4 2.2v3.1h-3.1"/></svg><span>刷新</span></button><button class="tool-btn mode-toggle" id="modeToggle" type="button" aria-pressed="false" aria-label="切换标准界面与终端界面"><span id="modeToggleLabel">终端模式</span></button><a class="tool-btn people-link" id="topbarPeopleLink" data-people-link href="./people.html" title="返回「她记得的人」人物面板" aria-label="返回她记得的人"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 13.2S2.6 10 2.6 6.2A2.9 2.9 0 018 4.9a2.9 2.9 0 015.4 1.3c0 3.8-5.4 7-5.4 7z"/></svg><span>她记得的人</span></a></div></header>
       <div class="content" id="content" tabindex="-1"></div>
     </main>
   </div>

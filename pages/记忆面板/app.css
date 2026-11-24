@@ -216,6 +216,12 @@ input, select, textarea { font: inherit; color: inherit; }
 
 .nav-group { margin-bottom: 2px; }
 
+.nav-people-wrap {
+  padding-bottom: 8px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
 .nav-item {
   display: flex;
   align-items: center;
@@ -228,10 +234,20 @@ input, select, textarea { font: inherit; color: inherit; }
   color: var(--text-2);
   cursor: pointer;
   text-align: left;
+  text-decoration: none;
   transition: background 0.18s var(--ease), color 0.18s var(--ease);
   position: relative;
 }
 .nav-item:hover { background: var(--surface-2); color: var(--text); }
+.nav-item.nav-people .nav-icon { color: var(--accent-2); opacity: 0.9; }
+.nav-item.nav-people:hover .nav-icon { opacity: 1; }
+.nav-ext {
+  font-size: 11px;
+  color: var(--text-3);
+  line-height: 1;
+  transition: transform 0.18s var(--ease), color 0.18s var(--ease);
+}
+.nav-item.nav-people:hover .nav-ext { color: var(--text-2); transform: translate(1px, -1px); }
 .nav-item.is-active {
   background: var(--accent-soft);
   color: var(--text);
@@ -458,10 +474,12 @@ input, select, textarea { font: inherit; color: inherit; }
   background: var(--surface);
   color: var(--text-2);
   font-size: 12.5px;
+  text-decoration: none;
   cursor: pointer;
   transition: all 0.18s var(--ease);
 }
 .tool-btn:hover { background: var(--surface-2); color: var(--text); border-color: var(--border-strong); }
+.tool-btn.people-link:hover { border-color: var(--accent-line); }
 .tool-btn svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
 .tool-btn.is-busy { opacity: 0.6; pointer-events: none; }
 
@@ -691,6 +709,8 @@ button.kpi.is-link:hover { border-color: var(--border-strong); }
   border: 1px solid var(--border);
   border-radius: var(--r-sm);
   background: var(--surface);
+  color: inherit;
+  text-decoration: none;
   cursor: pointer;
   transition: all 0.18s var(--ease);
   text-align: left;
@@ -1629,6 +1649,8 @@ html[data-ui-mode="cinema"] .nav-item.is-active { background: rgba(167,180,154,.
 html[data-ui-mode="cinema"] .nav-item.is-active::before { width: 2px; border-radius: 0; background: #a7b49a; }
 html[data-ui-mode="cinema"] .nav-sub.is-active { background: rgba(167,180,154,.11); color: #f2f0e9; }
 html[data-ui-mode="cinema"] .nav-sub.is-active::before { border-radius: 0; background: #a7b49a; }
+html[data-ui-mode="cinema"] .nav-people-wrap { border-bottom-color: rgba(164,174,143,.18); }
+html[data-ui-mode="cinema"] .nav-item.nav-people .nav-icon { color: #a7b49a; }
 html[data-ui-mode="cinema"] .rail-foot { border-top-color: rgba(164,174,143,.18); }
 html[data-ui-mode="cinema"] .theme-toggle { border-radius: 0; background: rgba(167,180,154,.06); border-color: rgba(164,174,143,.18); }
 html[data-ui-mode="cinema"] .theme-toggle-track { border-radius: 0; background: rgba(167,180,154,.14); border-color: rgba(164,174,143,.26); }
@@ -1829,6 +1851,7 @@ html[data-ui-mode="cinema"] .tool-btn:not(.mode-toggle) { color: #59604b; border
   .rail-brand .brand-copy,
   .nav-label,
   .nav-chevron,
+  .nav-ext,
   .theme-toggle-label,
   .rail-status span:last-child { display: none; }
   .nav-item { justify-content: center; padding: 10px 0; }
@@ -2813,12 +2836,14 @@ html, body { transition: background-color 0.3s var(--ease), color 0.3s var(--eas
   .rail-brand { display: none; }
   .rail-nav { flex-direction: row; align-items: stretch; overflow-x: auto; overflow-y: hidden; padding: 0; gap: 2px; -webkit-overflow-scrolling: touch; }
   .nav-group { display: contents; }
+  .nav-people-wrap { display: contents; border: 0; margin: 0; padding: 0; }
   .nav-item {
     flex-direction: column; justify-content: center; gap: 2px;
     min-width: 60px; padding: 6px 6px 5px; font-size: 10px; border-radius: 10px;
   }
   .nav-item .nav-label { flex: none; display: block; font-size: 9.5px; line-height: 1.2; }
-  .nav-item .nav-chevron { display: none; }
+  .nav-item .nav-chevron,
+  .nav-item .nav-ext { display: none; }
   .nav-item.is-active::before { display: none; }
   .nav-icon { width: 18px; height: 18px; }
   .nav-subs {
