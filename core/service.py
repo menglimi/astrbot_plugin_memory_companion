@@ -4878,6 +4878,27 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             "non_conversation_budget": self.config.int(
                 "retrieval_advanced.non_conversation_budget", 2
             ),
+            # 下面六个 retrieval_advanced 旋钮直接改打分与候选筛选（引擎构造见
+            # _retrieval_engine）。默认值与那里逐字一致；漏在缓存 key 外会让面板改完
+            # 要等 TTL 过期才生效，看起来像「改了没反应」。
+            "relax_keyword_min_hits": self.config.bool(
+                "retrieval_advanced.relax_keyword_min_hits", False
+            ),
+            "proactive_message_score_penalty": self.config.float(
+                "retrieval_advanced.proactive_message_score_penalty", 1.0
+            ),
+            "dedupe_content_ratio": self.config.float(
+                "retrieval_advanced.dedupe_content_ratio", 0.0
+            ),
+            "anchor_floor_enabled": self.config.bool(
+                "retrieval_advanced.anchor_floor_enabled", False
+            ),
+            "scope_bonus_scale": self.config.float(
+                "retrieval_advanced.scope_bonus_scale", 0.2
+            ),
+            "mmr_redundancy_weight": self.config.float(
+                "retrieval_advanced.mmr_redundancy_weight", 0.35
+            ),
             "current_window_candidate_limit": self.config.int("retrieval.current_window_candidate_limit", 600),
             "keyword_fallback_min_fts_candidates": self.config.int(
                 "retrieval.keyword_fallback_min_fts_candidates", 80
