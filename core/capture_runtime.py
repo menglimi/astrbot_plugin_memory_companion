@@ -10,6 +10,16 @@ import time
 from .astrbot_compat import logger
 from .models import SessionContext, utc_now
 from .source_capture import SourceCapture, digest
+from .forward_extractor import (
+    DEFAULT_CARD_MAX_CHARS,
+    ParsedForwards,
+    build_forward_media_refs,
+    extract_forwards,
+    format_forward_capture_body,
+    format_single_card_text,
+    group_separate_card_entries,
+    split_distinct_card_entries,
+)
 
 
 async def _in_thread(function, *args, **kwargs):
@@ -86,9 +96,8 @@ class CaptureRuntime:
             return None
         ctx=ctx or s._normalized_session_context(await s.identity.resolve_event_context(event))
         obj=getattr(event,'message_obj',None)
-        raw_id=str(getattr(obj,'message_id','') or ctx.message_id or '')
-        if not raw_id:
-            raw_id='observed:'+secrets.token_hex(24)
+        explicit_id=str(getattr(obj,'message_id','') or ctx.message_id or '')
+        raw_id=explicit_id or ('observed:'+secrets.token_hex(24))
         identity=self.identity(ctx,direction='incoming',message=raw_id)
         if not self.allowed(identity):
             return None
@@ -96,13 +105,16 @@ class CaptureRuntime:
         # fallback with explicitly weaker observation completeness.
         parts=getattr(obj,'message',None)
         body=''.join(str(p.text) for p in parts if type(p).__name__=='Plain') if isinstance(parts,list) else str(getattr(event,'message_str','') or '')
-        if not body:
+        parsed_forwards=await extract_forwards(event)
+        if not body and parsed_forwards is None:
             return None
         stamp=getattr(obj,'timestamp',None)
         try:
             message_at=datetime.fromtimestamp(float(stamp),timezone.utc).isoformat() if stamp else ''
         except (TypeError,ValueError,OverflowError,OSError):
             message_at=''
+        if parsed_forwards is not None:
+            return await self._incoming_forwards(event,ctx,explicit_id,body,message_at,parsed_forwards)
         fast_commit=getattr(self.store,'stage_and_commit_incoming',None)
         if callable(fast_commit):
             return await self._incoming_single_hop(event,identity,body,message_at,fast_commit)
@@ -235,3 +247,126 @@ class CaptureRuntime:
         self.last_error=result['reason']
         self.wake.set()
         return result
+
+    async def _incoming_forwards(self,event,ctx,explicit_id,plain_body,message_at,parsed_forwards):
+        """Capture forward cards (single, mixed, or multi-card aggregated) with dedupe."""
+        has_own_text = bool(str(plain_body or "").strip())
+        separate_cards, attached_cards = split_distinct_card_entries(
+            parsed_forwards,
+            outer_message_id=explicit_id,
+            has_own_text=has_own_text,
+        )
+        units: list[tuple[dict, str, str, list[dict[str, str]]]] = []
+        seen_unit_ids: set[str] = set()
+
+        for group_id, group_cards in group_separate_card_entries(separate_cards):
+            if group_id in seen_unit_ids:
+                continue
+            seen_unit_ids.add(group_id)
+            if len(group_cards) == 1:
+                card = group_cards[0]
+                group_body = format_single_card_text(card, max_chars=DEFAULT_CARD_MAX_CHARS, single_line=False)
+                group_ts = card.timestamp or message_at
+            else:
+                group_parsed = ParsedForwards(
+                    version=parsed_forwards.version,
+                    source=parsed_forwards.source,
+                    cards=tuple(group_cards),
+                    total_nodes=sum(c.node_count for c in group_cards),
+                    truncated=any(c.truncated for c in group_cards),
+                )
+                group_body = format_forward_capture_body("", group_parsed)
+                group_ts = next((c.timestamp for c in group_cards if c.timestamp), "") or message_at
+            group_media = build_forward_media_refs(group_cards)
+            units.append((self.identity(ctx, direction='incoming', message=group_id), group_body, group_ts, group_media))
+
+        if attached_cards:
+            outer_id = explicit_id
+            if not outer_id:
+                fwd_ids = [card.forward_id for card in attached_cards if card.forward_id]
+                if len(fwd_ids) == 1:
+                    outer_id = f"forward:{fwd_ids[0]}"
+                elif fwd_ids:
+                    outer_id = f"forward:{digest(fwd_ids)[:24]}"
+                else:
+                    outer_id = 'observed:' + secrets.token_hex(24)
+            if outer_id not in seen_unit_ids:
+                seen_unit_ids.add(outer_id)
+                attached_parsed = ParsedForwards(
+                    version=parsed_forwards.version,
+                    source=parsed_forwards.source,
+                    cards=tuple(attached_cards),
+                    total_nodes=sum(card.node_count for card in attached_cards),
+                    truncated=any(card.truncated for card in attached_cards),
+                )
+                outer_body = format_forward_capture_body(plain_body, attached_parsed)
+                outer_media = build_forward_media_refs(attached_cards)
+                units.append((self.identity(ctx, direction='incoming', message=outer_id), outer_body, message_at, outer_media))
+        elif has_own_text:
+            outer_id = explicit_id or ('observed:' + secrets.token_hex(24))
+            if outer_id not in seen_unit_ids:
+                seen_unit_ids.add(outer_id)
+                units.append((self.identity(ctx, direction='incoming', message=outer_id), plain_body, message_at, []))
+
+        if not units:
+            return None
+
+        receipts: list[dict] = []
+        for unit_identity, unit_body, unit_ts, unit_media in units:
+            receipt = await self._commit_incoming_unit(unit_identity, unit_body, unit_ts, media=unit_media)
+            receipts.append(receipt)
+
+        primary = next(
+            (r for r in reversed(receipts) if isinstance(r, dict) and r.get('status') == 'committed'),
+            receipts[-1],
+        )
+        setattr(event, '_memory_capture_receipts', receipts)
+        setattr(event, '_memory_capture_receipt', primary)
+        if any(not isinstance(r, dict) or r.get('status') not in {'committed', 'excluded'} for r in receipts):
+            self.wake.set()
+        return primary
+
+    async def _commit_incoming_unit(self, identity, body, message_at, *, media=None):
+        """Commit one incoming unit via single-hop fast path or prepare/stage/commit."""
+        media_list = list(media or [])
+        fast_commit = getattr(self.store, 'stage_and_commit_incoming', None)
+
+        def run_sync():
+            store_dict = getattr(self.store, '__dict__', {})
+            use_staged = (not callable(fast_commit)) or any(
+                name in store_dict for name in ('prepare', 'stage', 'commit')
+            )
+            kwargs = {'media': media_list} if media_list else {}
+            if use_staged:
+                prepared = self.store.prepare(
+                    identity,
+                    body=body,
+                    source_message_at=message_at,
+                    observed_at=utc_now(),
+                    **kwargs,
+                )
+                authorize = lambda: self.allowed(identity)
+                result = self.store.stage(prepared, generation=self.generation, authorize=authorize)
+                if result['status'] in {'staged', 'uncertain', 'retry_due'}:
+                    result = self.store.commit(prepared['operation'], generation=self.generation, authorize=authorize)
+                return result
+            return fast_commit(
+                identity,
+                body=body,
+                source_message_at=message_at,
+                observed_at=utc_now(),
+                generation=self.generation,
+                authorize=lambda: self.allowed(identity),
+                **kwargs,
+            )
+
+        try:
+            return await asyncio.to_thread(run_sync)
+        except (ValueError, UnicodeError) as exc:
+            result = {'status': 'held', 'reason': str(exc), 'durably_staged': False}
+            self.last_error = result['reason']
+            return result
+        except Exception as exc:
+            result = {'status': 'uncertain', 'reason': type(exc).__name__}
+            self.last_error = result['reason']
+            return result

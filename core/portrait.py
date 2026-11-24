@@ -19,6 +19,7 @@ except ImportError:  # Existing standalone core.* test/import compatibility.
         validate_person_ref,
         validate_portrait_request,
     )
+from .forward_extractor import strip_forward_digest_segments
 from .models import clean_text
 from .profile_quality import RULE_EXTRACTOR, extract_profile_candidates
 
@@ -127,9 +128,12 @@ def cross_scene_whitelisted_fact(
 
 def extract_explicit_candidates(text: Any) -> list[dict[str, Any]]:
     """Extract only self-contained first-person statements without context text."""
+    own_text = strip_forward_digest_segments(text)
+    if not own_text:
+        return []
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for candidate in extract_profile_candidates(text):
+    for candidate in extract_profile_candidates(own_text):
         dimension = _text(candidate.get("profile_dimension"), 80)
         kind = _text(candidate.get("kind"), 40)
         value = _text(candidate.get("profile_value"), 80)

@@ -74,6 +74,16 @@ from .memory_revision import current_memory, memory_ref
 from .memory_lifecycle import is_open_loop_candidate, open_loop_expired
 from .emotion_event_contract import normalize_emotion_event
 from .emotion_targeting import memory_emotion_refs
+from .forward_extractor import (
+    ParsedForwards,
+    TIMELINE_FORWARD_MAX_CHARS,
+    extract_forwards,
+    format_forward_timeline_text,
+    format_single_card_text,
+    group_separate_card_entries,
+    split_distinct_card_entries,
+    strip_forward_digest_segments,
+)
 from .identity import IdentityResolver, canonical_user_id, looks_like_command, maybe_await, normalize_session_context_fields, session_target_id
 from .importance import ImportanceEvaluator
 from .injection import (
@@ -1455,9 +1465,22 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             source_receipt = await await_hook_stage(
                 capture_runtime.incoming(event, ctx), "capture_incoming"
             )
-            if source_receipt and source_receipt.get("status") == "committed" and source_receipt.get("source_state") == "current":
+            raw_receipts = getattr(event, "_memory_capture_receipts", None)
+            receipt_list = (
+                list(raw_receipts)
+                if isinstance(raw_receipts, list) and raw_receipts
+                else ([source_receipt] if source_receipt else [])
+            )
+            committed_receipts = [
+                item
+                for item in receipt_list
+                if isinstance(item, dict)
+                and item.get("status") == "committed"
+                and item.get("source_state") == "current"
+            ]
+            if committed_receipts:
                 from .source_evidence import remember_source_reads
-                remember_source_reads(event, ctx, [source_receipt])
+                remember_source_reads(event, ctx, committed_receipts)
             stage_timer.mark("capture_incoming")
         self._sanitize_session_context_message_text(ctx)
         self._apply_companion_relationship_projection(ctx, event=event, req=req)
@@ -1656,7 +1679,38 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             if not self.config.bool("memory_capture.capture_user_messages", True):
                 return
             record = self.classifier.from_user_message(ctx)
+            parsed_forwards = await self._extract_event_forwards(event)
+            raw_receipts = getattr(event, "_memory_capture_receipts", None)
+            capture_receipt = getattr(event, "_memory_capture_receipt", None)
             if not record:
+                if parsed_forwards is None:
+                    return
+                committed_ids = [
+                    str(item.get("source_ref") or "").removeprefix("timeline:")
+                    for item in (
+                        raw_receipts
+                        if isinstance(raw_receipts, list) and raw_receipts
+                        else ([capture_receipt] if isinstance(capture_receipt, dict) else [])
+                    )
+                    if isinstance(item, dict)
+                    and item.get("status") == "committed"
+                    and item.get("source_state") == "current"
+                    and str(item.get("source_ref") or "")
+                ]
+                if not committed_ids and capture_receipt is None:
+                    committed_ids = await self._write_forward_timeline_entries(
+                        ctx,
+                        event,
+                        parsed_forwards,
+                        reply_chain=reply_chain or [],
+                        own_text="",
+                        source="llm_request",
+                    )
+                for tl_id in committed_ids:
+                    if tl_id:
+                        self._schedule_source_semantic_maintenance(ctx, tl_id)
+                if committed_ids and not self.config.bool("memory_capture.capture_bot_responses", True):
+                    self._schedule_session_summary(ctx, reason="after_user_message")
                 return
             recent_timeline_rows: list[dict[str, Any]] | None = None
             if ctx.scope == "group":
@@ -1666,12 +1720,21 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                     session_id=ctx.session_id,
                     entity_id=ctx.current_target_id,
                 )
-            capture_receipt = getattr(event, "_memory_capture_receipt", None)
             if capture_receipt is not None and (capture_receipt.get("status") != "committed" or capture_receipt.get("source_state") != "current"):
                 return
             memory_id = (capture_receipt.get("source_ref", "").removeprefix("timeline:") if capture_receipt
                          else await self._existing_timeline_message_id(ctx, "user_message", recent_rows=recent_timeline_rows))
-            if not memory_id:
+            if not memory_id and parsed_forwards is not None:
+                written_ids = await self._write_forward_timeline_entries(
+                    ctx,
+                    event,
+                    parsed_forwards,
+                    reply_chain=reply_chain or [],
+                    own_text=clean_text(ctx.message_text, 2000),
+                    source="llm_request",
+                )
+                memory_id = written_ids[-1] if written_ids else ""
+            elif not memory_id:
                 event_metadata = {
                     "memory_id": memory_id,
                     "sender_name": ctx.user_name,
@@ -1700,6 +1763,16 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 )
             if not memory_id:
                 return  # The original source was suppressed; no derived capture.
+            if isinstance(raw_receipts, list) and len(raw_receipts) > 1:
+                for item in raw_receipts:
+                    if (
+                        isinstance(item, dict)
+                        and item.get("status") == "committed"
+                        and item.get("source_state") == "current"
+                    ):
+                        tl_id = str(item.get("source_ref") or "").removeprefix("timeline:")
+                        if tl_id and tl_id != memory_id:
+                            self._schedule_source_semantic_maintenance(ctx, tl_id)
             self._schedule_source_semantic_maintenance(ctx, memory_id)
             # 采集写链收集为批量操作，合并单事务一次 commit，减少独立事务/fsync 次数。
             write_ops: list[dict[str, Any]] = []
@@ -1883,12 +1956,19 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             return
         if not self._scope_feature_enabled(ctx, "capture"):
             return
-        if not clean_text(ctx.message_text, 2000) or looks_like_command(ctx.message_text):
+        parsed_forwards = await self._extract_event_forwards(event)
+        own_text = clean_text(ctx.message_text, 2000)
+        if own_text and looks_like_command(own_text):
+            return
+        if not own_text and parsed_forwards is None:
             return
         if ctx.bot_id and ctx.user_id and ctx.bot_id == ctx.user_id:
             return
         if not ctx.persona_id:
             ctx.persona_id = await self.identity.resolve_persona_id(event)
+        if parsed_forwards is not None:
+            await self._observe_forward_message(ctx, event, parsed_forwards, own_text=own_text)
+            return
         await self.note_identity(ctx)
         reply_chain = await self._reply_chain_for_event(event)
         record = self.classifier.from_user_message(ctx)
@@ -2800,6 +2880,215 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             ctx.session_id,
             drop,
         )
+
+    async def _extract_event_forwards(self, event: Any) -> ParsedForwards | None:
+        if event is None:
+            return None
+        try:
+            return await extract_forwards(event)
+        except Exception as exc:
+            logger.warning("[MemoryCompanion] 合并转发解析失败，已跳过: error=%s", exc)
+            return None
+
+    async def _write_forward_timeline_entries(
+        self,
+        ctx: SessionContext,
+        event: Any,
+        parsed_forwards: ParsedForwards,
+        *,
+        reply_chain: list[dict[str, Any]],
+        own_text: str,
+        source: str,
+    ) -> list[str]:
+        recent_rows = await self.store.recent_timeline(
+            limit=max(32, len(parsed_forwards.cards) * 2 + 16),
+            scope=ctx.scope,
+            session_id=ctx.session_id,
+            entity_id=ctx.current_target_id,
+        )
+        sender_id = clean_text(ctx.user_id, 120)
+        existing_msg_ids: set[str] = set()
+        recent_contents: list[tuple[str, datetime | None]] = []
+        for row in recent_rows:
+            if clean_text(row.get("event_type"), 80) != "user_message":
+                continue
+            if sender_id and clean_text(row.get("subject_id"), 120) != sender_id:
+                continue
+            meta = json_loads(row.get("metadata"), {})
+            mid = clean_text(row.get("message_id") or meta.get("message_id") or "", 120)
+            if mid:
+                existing_msg_ids.add(mid)
+            recent_contents.append(
+                (
+                    clean_text(row.get("content"), 1000),
+                    self._parse_utc_datetime(str(row.get("occurred_at") or row.get("created_at") or "")),
+                )
+            )
+
+        now_utc = datetime.now(timezone.utc)
+
+        def is_recent_duplicate_content(text: str) -> bool:
+            target = clean_text(text, 1000)
+            if not target:
+                return False
+            for old_content, old_dt in recent_contents:
+                if old_content == target and old_dt is not None:
+                    if abs((now_utc - old_dt).total_seconds()) <= 3.0:
+                        return True
+            return False
+
+        separate_cards, attached_cards = split_distinct_card_entries(
+            parsed_forwards,
+            outer_message_id=ctx.message_id,
+            has_own_text=bool(own_text),
+        )
+        written_ids: list[str] = []
+
+        async def write_entry(
+            *,
+            entry_msg_id: str,
+            content: str,
+            forward_meta: dict[str, Any],
+            occurred_at: str = "",
+            include_reply: bool = False,
+        ) -> None:
+            clean_msg_id = clean_text(entry_msg_id, 120)
+            if clean_msg_id and clean_msg_id in existing_msg_ids:
+                return
+            if not clean_msg_id and is_recent_duplicate_content(content):
+                return
+            if source == "group_conversation_observer" or ctx.scope == "group":
+                event_metadata = await self._conversation_memory_metadata(ctx, source=source)
+            else:
+                event_metadata = {"source": source, "conversation_memory": False}
+            event_metadata.update(
+                {
+                    "memory_id": "",
+                    "sender_name": ctx.user_name,
+                    "message_id": clean_msg_id,
+                }
+            )
+            event_metadata.update(self._cross_window_event_metadata(ctx))
+            if include_reply and reply_chain:
+                event_metadata.update(self._reply_chain_metadata(reply_chain))
+            event_metadata.update(forward_meta)
+            captured_id = await self.store.add_timeline_event(
+                event_type="user_message",
+                session_id=ctx.session_id,
+                scope=ctx.scope,
+                subject_id=ctx.user_id,
+                object_id=ctx.current_target_id,
+                content=content,
+                metadata=event_metadata,
+                occurred_at=occurred_at,
+            )
+            if captured_id:
+                if clean_msg_id:
+                    existing_msg_ids.add(clean_msg_id)
+                recent_contents.append((clean_text(content, 1000), now_utc))
+                self._schedule_source_semantic_maintenance(ctx, captured_id)
+                written_ids.append(captured_id)
+
+        for group_msg_id, group_cards in group_separate_card_entries(separate_cards):
+            if len(group_cards) == 1:
+                card = group_cards[0]
+                group_content = format_single_card_text(
+                    card,
+                    max_chars=TIMELINE_FORWARD_MAX_CHARS,
+                    single_line=True,
+                )
+                group_ts = card.timestamp
+            else:
+                group_parsed = ParsedForwards(
+                    version=parsed_forwards.version,
+                    source=parsed_forwards.source,
+                    cards=tuple(group_cards),
+                    total_nodes=sum(c.node_count for c in group_cards),
+                    truncated=any(c.truncated for c in group_cards),
+                )
+                group_content = format_forward_timeline_text(
+                    group_parsed,
+                    max_chars=TIMELINE_FORWARD_MAX_CHARS,
+                )
+                group_ts = next((c.timestamp for c in group_cards if c.timestamp), "")
+            await write_entry(
+                entry_msg_id=group_msg_id,
+                content=group_content,
+                forward_meta={
+                    "has_forward": True,
+                    "forward_count": len(group_cards),
+                    "forward_node_count": sum(c.node_count for c in group_cards),
+                    "forward_ids": [c.forward_id for c in group_cards if c.forward_id],
+                    "forward_only": True,
+                    "forward_truncated": any(c.truncated for c in group_cards),
+                },
+                occurred_at=group_ts,
+                include_reply=False,
+            )
+
+        if attached_cards:
+            attached_parsed = ParsedForwards(
+                version=parsed_forwards.version,
+                source=parsed_forwards.source,
+                cards=tuple(attached_cards),
+                total_nodes=sum(card.node_count for card in attached_cards),
+                truncated=any(card.truncated for card in attached_cards),
+            )
+            fwd_text = format_forward_timeline_text(attached_parsed, max_chars=TIMELINE_FORWARD_MAX_CHARS)
+            combined = f"{own_text}\n{fwd_text}" if own_text else fwd_text
+            final_content = self._timeline_content_with_reply_chain(combined, reply_chain)
+            outer_msg_id = ctx.message_id or (
+                f"forward:{attached_cards[0].forward_id}" if attached_cards[0].forward_id else ""
+            )
+            await write_entry(
+                entry_msg_id=outer_msg_id,
+                content=final_content,
+                forward_meta={
+                    "has_forward": True,
+                    "forward_count": len(attached_cards),
+                    "forward_node_count": attached_parsed.total_nodes,
+                    "forward_ids": [card.forward_id for card in attached_cards if card.forward_id],
+                    "forward_only": not bool(own_text),
+                    "forward_truncated": bool(attached_parsed.truncated),
+                },
+                include_reply=True,
+            )
+        elif own_text:
+            await write_entry(
+                entry_msg_id=ctx.message_id,
+                content=self._timeline_content_with_reply_chain(own_text, reply_chain),
+                forward_meta={},
+                include_reply=True,
+            )
+
+        return written_ids
+
+    async def _observe_forward_message(
+        self,
+        ctx: SessionContext,
+        event: Any,
+        parsed_forwards: ParsedForwards,
+        *,
+        own_text: str,
+    ) -> None:
+        await self.note_identity(ctx)
+        reply_chain = await self._reply_chain_for_event(event)
+        written_ids = await self._write_forward_timeline_entries(
+            ctx,
+            event,
+            parsed_forwards,
+            reply_chain=reply_chain,
+            own_text=own_text,
+            source="group_conversation_observer",
+        )
+        if not written_ids:
+            return
+        if self.config.bool("memory_capture.record_relationship_edges", True):
+            await self.note_relationships(ctx)
+        if own_text:
+            await self.portraits.capture_user_message(ctx, event=event)
+            self._ensure_portrait_daily_dispatcher()
+        self._schedule_session_summary(ctx, reason="group_conversation")
 
     @staticmethod
     def _apply_private_companion_preferred_address(
@@ -13880,7 +14169,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         # Low-information follow-ups like "还有的吧" should only inherit a memory
         # search scene while that scene is still live in the newest turns.
         for row in (rows or [])[:3]:
-            text = clean_text(row.get("content"), 600)
+            text = clean_text(strip_forward_digest_segments(row.get("content")), 600)
             if not text:
                 continue
             speaker_is_user = clean_text(row.get("event_type"), 40) != "bot_response" and clean_text(row.get("subject_id"), 80) != "self"
@@ -13908,13 +14197,17 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         for index, row in enumerate(rows or []):
             if relevant_indices and index not in relevant_indices:
                 continue
-            text = clean_text(row.get("content"), 900)
-            if not text:
+            raw_text = clean_text(row.get("content"), 900)
+            if not raw_text:
                 continue
             event_type = clean_text(row.get("event_type"), 40)
             speaker_is_user = event_type != "bot_response" and clean_text(row.get("subject_id"), 80) != "self"
-            correction = speaker_is_user and self._looks_like_user_correction_text(text)
-            memory_request = speaker_is_user and self._message_is_contextual_memory_request(text)
+            own_text = clean_text(strip_forward_digest_segments(row.get("content")), 900) if speaker_is_user else raw_text
+            text = own_text if speaker_is_user else raw_text
+            if not text:
+                continue
+            correction = speaker_is_user and self._looks_like_user_correction_text(own_text)
+            memory_request = speaker_is_user and self._message_is_contextual_memory_request(own_text)
             if correction or memory_request:
                 newest_support_index = min(newest_support_index, index)
             recency = 1.0 / (1.0 + index * 0.18)
@@ -13979,7 +14272,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
     def _contextual_anchor_row_indices(self, rows: list[dict[str, Any]]) -> set[int]:
         support: set[int] = set()
         for index, row in enumerate(rows or []):
-            text = clean_text(row.get("content"), 800)
+            text = clean_text(strip_forward_digest_segments(row.get("content")), 800)
             if not text:
                 continue
             speaker_is_user = clean_text(row.get("event_type"), 40) != "bot_response" and clean_text(row.get("subject_id"), 80) != "self"
@@ -14214,7 +14507,8 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
 
     @staticmethod
     def _looks_like_user_correction_text(text: str) -> bool:
-        compact = re.sub(r"\s+", "", clean_text(text, 500)).lower()
+        own = strip_forward_digest_segments(text)
+        compact = re.sub(r"\s+", "", clean_text(own, 500)).lower()
         if not compact:
             return False
         correction_markers = (
