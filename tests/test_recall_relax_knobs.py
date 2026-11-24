@@ -256,6 +256,12 @@ CACHE_KEY_SORTING_KNOBS: tuple[tuple[str, object, object], ...] = (
     ("retrieval_advanced.anchor_floor_enabled", False, True),
     ("retrieval_advanced.scope_bonus_scale", 0.2, 1.0),
     ("retrieval_advanced.mmr_redundancy_weight", 0.35, 0.8),
+    # 来源主次（task-19）：priority / weight / 显式权重表，以及参与「未声明来源恒 1.0」
+    # 判定的注册表——注册名集合变了，权重结果也会变，所以它同样必须在 key 里。
+    ("retrieval_advanced.source_surface_priority", "equal", "qq"),
+    ("retrieval_advanced.source_surface_weight", 1.0, 0.6),
+    ("retrieval_advanced.source_surface_weights", "", '{"minecraft": 0.4}'),
+    ("memory_capture.source_surfaces", "", '[{"name": "discord", "message_id_prefixes": ["dc-"]}]'),
 )
 
 

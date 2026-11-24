@@ -147,6 +147,7 @@ from .source_surface import (
     parse_surface_weights,
     source_surface_metadata,
     source_surface_rules,
+    surface_specs,
 )
 from .source_semantic import (
     acknowledge_dirty as acknowledge_semantic_dirty,
@@ -4904,6 +4905,16 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             "mmr_redundancy_weight": self.config.float(
                 "retrieval_advanced.mmr_redundancy_weight", 0.35
             ),
+            # 来源主次三项 + 注册表：注册名集合参与「未声明来源恒 1.0」的判定，
+            # 所以它同样影响结果，必须一起进 key。
+            "source_surface_priority": str(
+                self.config.get("retrieval_advanced.source_surface_priority", "equal")
+            ),
+            "source_surface_weight": self.config.float(
+                "retrieval_advanced.source_surface_weight", 1.0
+            ),
+            "source_surface_weights": self._source_surface_weights(),
+            "source_surface_registry": list(self._source_surface_names()),
             "current_window_candidate_limit": self.config.int("retrieval.current_window_candidate_limit", 600),
             "keyword_fallback_min_fts_candidates": self.config.int(
                 "retrieval.keyword_fallback_min_fts_candidates", 80
@@ -5296,6 +5307,16 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             mmr_redundancy_weight=self.config.float(
                 "retrieval_advanced.mmr_redundancy_weight", 0.35
             ),
+            # 来源主次：priority 只能是 equal 或已注册来源名（引擎里再校验一次，
+            # 非法值回落 equal），weights 是显式覆盖表，优先于 priority+weight。
+            source_surface_priority=str(
+                self.config.get("retrieval_advanced.source_surface_priority", "equal")
+            ),
+            source_surface_weight=self.config.float(
+                "retrieval_advanced.source_surface_weight", 1.0
+            ),
+            source_surface_weights=self._source_surface_weights(),
+            source_surface_names=self._source_surface_names(),
         )
 
     async def _resolve_rerank_provider(self, ctx: SessionContext, *, mode: str) -> tuple[Any, str]:
@@ -9211,6 +9232,21 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         rules = {"known_prefixes": prefixes, "known_platforms": platforms}
         self._source_surface_rules_cache = (raw, rules)
         return rules
+
+    def _source_surface_names(self) -> tuple[str, ...]:
+        """Registered surface names: built-ins plus configured entries.
+
+        Used for two things: validating ``source_surface_priority`` (it may only
+        name a registered surface) and deciding that an undeclared-but-valid
+        label stays neutral. Memoised on the raw config value, like the rules.
+        """
+        raw = self.config.get("memory_capture.source_surfaces", "")
+        cached = getattr(self, "_source_surface_names_cache", None)
+        if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == raw:
+            return cached[1]
+        names = tuple(spec.name for spec in surface_specs(raw))
+        self._source_surface_names_cache = (raw, names)
+        return names
 
     def _source_surface_weights(self) -> dict[str, float]:
         """Explicit per-surface multipliers from ``retrieval_advanced.source_surface_weights``.
