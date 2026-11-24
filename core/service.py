@@ -713,10 +713,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         self._performance_plan: MemoryPerformancePlan = resolve_performance_plan(self.config)
         self._background_grace_seconds = max(
             0,
-            self.config.int(
-                "startup.background_grace_seconds",
-                self._performance_plan.background_grace_seconds,
-            ),
+            int(self._performance_plan.background_grace_seconds),
         )
 
         self.store = MemoryStore(
@@ -4969,7 +4966,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             "rerank_timeout_ms": bounded_model_call_timeout_ms(
                 self.config.int("retrieval.rerank_timeout_ms", MAX_MODEL_CALL_TIMEOUT_MS)
             ),
-            "latency_budget_ms": self.config.int("retrieval_advanced.recall_latency_budget_ms", 1800),
+            "latency_budget_ms": self.performance_plan().recall_latency_budget_ms,
             "query_vector_cache_ttl_seconds": self.config.float(
                 "retrieval_advanced.query_vector_cache_ttl_seconds", 120.0
             ),
@@ -5304,11 +5301,11 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         mode = clean_text(self.config.get("retrieval.mode", "auto"), 40).lower()
         if mode not in {"auto", "basic", "rerank"}:
             mode = "auto"
-        # 向量快照的保留预算走既有的 retrieval_advanced 读取路径，每轮读一次，
-        # 面板改完下一轮就生效（与上面那些 config 读取完全同构）。
+        # retrieval_advanced.vector_snapshot_cache_mb 由 performance_plan 统一融合档位默认、
+        # 用户微调与 Anti-OOM 限幅，确保 schema 默认 512MB 或手填过大值在低内存机上严格受限。
         perf_plan = self.performance_plan()
         self.store.vector_snapshot_cache_bytes = bounded_cache_bytes(
-            self.config.int("retrieval_advanced.vector_snapshot_cache_mb", perf_plan.vector_snapshot_cache_mb)
+            perf_plan.vector_snapshot_cache_mb
         )
         self._sync_store_vector_precision()
         provider = None
@@ -5334,10 +5331,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 self.config.int("retrieval.rerank_timeout_ms", MAX_MODEL_CALL_TIMEOUT_MS)
             ),
             rerank_circuit_breaker=self._configured_rerank_circuit_breaker(),
-            latency_budget_ms=self.config.int(
-                "retrieval_advanced.recall_latency_budget_ms",
-                perf_plan.recall_latency_budget_ms,
-            ),
+            latency_budget_ms=perf_plan.recall_latency_budget_ms,
             query_vector_cache_ttl_seconds=self.config.float(
                 "retrieval_advanced.query_vector_cache_ttl_seconds", 120.0
             ),
@@ -6045,10 +6039,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         if not perf_plan.startup_vector_warmup_enabled:
             return False
         self.store.vector_snapshot_cache_bytes = bounded_cache_bytes(
-            self.config.int(
-                "retrieval_advanced.vector_snapshot_cache_mb",
-                perf_plan.vector_snapshot_cache_mb,
-            )
+            perf_plan.vector_snapshot_cache_mb
         )
         self._sync_store_vector_precision()
         if settle_seconds is None:

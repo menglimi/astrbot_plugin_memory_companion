@@ -1043,7 +1043,6 @@ class MemoryStore(SummaryBatchStore):
 
     def _acquire_pooled_read_conn_sync(self) -> sqlite3.Connection:
         """Check out a warm read-only connection from the bounded LIFO overflow pool."""
-        extra_cap = max(1, int(getattr(self, "_read_pool_max", 2) or 2) - 1)
         while True:
             should_open = False
             open_gen = 0
@@ -1051,6 +1050,7 @@ class MemoryStore(SummaryBatchStore):
             with self._read_pool_cond:
                 if self._closed:
                     raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+                extra_cap = max(1, int(getattr(self, "_read_pool_max", 2) or 2) - 1)
                 if self._read_pool_idle:
                     candidate = self._read_pool_idle.pop()
                     if self._read_pool_conn_gen.get(candidate) == self._read_pool_generation:

@@ -268,10 +268,22 @@ class MemoryCompanionPlugin(Star):
         """钩子熔断预算（秒）。
 
         配置项在 _conf_schema.json 的 memory_injection 段下；早期版本读的是顶层同名
-        键，嵌套配置下恒为 0、熔断永不生效。这里先读嵌套键，读不到再回退旧键；若
-        显式指定了非 auto 性能档位且未单独设置本键，则跟随性能档位的等待预算。
+        键，嵌套配置下恒为 0、熔断永不生效。当配置包含 performance 段时（例如宿主加载
+        schema 或启用性能调优后），统一以 resolve_performance_plan() 为单一事实来源，
+        保证运行时预算与「性能调优」面板展示完全一致；无 performance 段时保持嵌套键
+        优先、旧顶层键回退、空配置返回 0.0 的兼容契约。
         """
         config = self.service.config
+        raw_candidate = getattr(config, "raw", None)
+        raw = raw_candidate if isinstance(raw_candidate, dict) else {}
+        if isinstance(raw.get("performance"), dict):
+            nested = config.float("memory_injection.hook_request_budget_seconds", 0.0)
+            legacy = config.float("hook_request_budget_seconds", 0.0)
+            if nested <= 0 and legacy > 0:
+                return legacy
+            from .core.performance_tuning import resolve_performance_plan
+
+            return resolve_performance_plan(config).hook_request_budget_seconds
         for key in (
             "memory_injection.hook_request_budget_seconds",
             "hook_request_budget_seconds",
@@ -279,11 +291,6 @@ class MemoryCompanionPlugin(Star):
             budget = config.float(key, 0.0)
             if budget > 0:
                 return budget
-        profile = str(config.get("performance.profile", "") or "").strip().lower()
-        if profile in {"eco", "balanced", "turbo", "compat"}:
-            from .core.performance_tuning import resolve_performance_plan
-
-            return resolve_performance_plan(config).hook_request_budget_seconds
         return 0.0
 
     @filter.on_llm_request(priority=-20)

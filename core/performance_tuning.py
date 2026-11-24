@@ -375,7 +375,7 @@ PERFORMANCE_PARAMS: tuple[PerformanceParamSpec, ...] = (
         value_type="float",
         unit="秒",
         display_scale=1,
-        min_value=0.5,
+        min_value=0.1,
         max_value=8.0,
         step=0.1,
         options=(),
@@ -1071,6 +1071,12 @@ def resolve_performance_plan(
     tier_defaults = resolve_tier_defaults(effective_tier, hw)
 
     managed_by_profile = bool(perf_dict.get("managed_by_profile", False))
+    applied_tier = clean_text(perf_dict.get("applied_tier", ""), 32).lower()
+    applied_tier_defaults = (
+        resolve_tier_defaults(applied_tier, hw)
+        if managed_by_profile and applied_tier in CONCRETE_PERFORMANCE_TIERS and applied_tier != effective_tier
+        else None
+    )
     stored_overrides = perf_dict.get("overrides") if isinstance(perf_dict.get("overrides"), dict) else {}
 
     overrides: dict[str, Any] = {}
@@ -1095,7 +1101,9 @@ def resolve_performance_plan(
             # Cross-module parameter reconciliation:
             # 1) Explicit sparse override recorded by /performance/tuning (unless edited later in module config).
             # 2) Unmanaged / upgraded config: honor values customized away from _conf_schema default.
-            # 3) Managed config: honor values edited away from tier baseline in module config.
+            # 3) Managed config where profile was switched externally (e.g. AstrBot config file):
+            #    compare against the previous applied_tier baseline so old tier defaults switch cleanly.
+            # 4) Managed config on the same tier: honor values edited away from tier baseline in module config.
             if spec.key in stored_overrides:
                 source_val = raw_val if raw_present else stored_overrides[spec.key]
                 try:
@@ -1108,7 +1116,12 @@ def resolve_performance_plan(
             elif raw_present:
                 try:
                     coerced = _coerce_param_value(spec, raw_val)
-                    baseline_compare = tier_val if managed_by_profile else spec.schema_default
+                    if applied_tier_defaults is not None:
+                        baseline_compare = applied_tier_defaults[spec.key]
+                    elif managed_by_profile:
+                        baseline_compare = tier_val
+                    else:
+                        baseline_compare = spec.schema_default
                     if not _values_equal(spec, coerced, baseline_compare):
                         chosen = coerced
                         is_override = not _values_equal(spec, coerced, tier_val)
@@ -1208,6 +1221,7 @@ def build_performance_config_updates(
 
     perf_section["profile"] = norm_profile
     perf_section["managed_by_profile"] = True
+    perf_section["applied_tier"] = effective_tier
 
     clamped_list: list[dict[str, Any]] = []
     final_overrides: dict[str, Any] = {}

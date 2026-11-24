@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -24,7 +25,9 @@ from astrbot_plugin_memory_companion.core.latency import (
     MAX_MEMORY_HOOK_BUDGET_SECONDS,
     bounded_memory_hook_budget_seconds,
 )
+from astrbot_plugin_memory_companion.core.models import SessionContext
 from astrbot_plugin_memory_companion.core.operations import PRESETS, apply_preset
+from astrbot_plugin_memory_companion.core import performance_tuning as perf_mod
 from astrbot_plugin_memory_companion.core.performance_tuning import (
     PERFORMANCE_PARAMS,
     PERFORMANCE_TIER_SPECS,
@@ -311,6 +314,46 @@ class PerformanceTierAndHardwareTests(unittest.TestCase):
         shell_compat.service = SimpleNamespace(config=ConfigView({"performance": {"profile": "compat"}}))
         self.assertEqual(5.0, shell_compat._hook_request_budget_seconds())
 
+        # Schema-materialized default 1.0 alongside performance section must align with performance plan
+        hw_mid = detect_host_hardware(host_memory_mb=8192, cpu_count=4, is_32bit=False)
+        with patch.object(perf_mod, "detect_host_hardware", return_value=hw_mid):
+            for profile_name, expected_budget in (
+                ("auto", 3.0),
+                ("eco", 2.0),
+                ("balanced", 3.0),
+                ("compat", 5.0),
+            ):
+                shell = main_module.MemoryCompanionPlugin.__new__(main_module.MemoryCompanionPlugin)
+                shell.service = SimpleNamespace(
+                    config=ConfigView(
+                        {
+                            "performance": {"profile": profile_name},
+                            "memory_injection": {"hook_request_budget_seconds": 1.0},
+                        }
+                    )
+                )
+                self.assertEqual(expected_budget, shell._hook_request_budget_seconds(), profile_name)
+                self.assertEqual(
+                    resolve_performance_plan(shell.service.config, hardware=hw_mid).hook_request_budget_seconds,
+                    shell._hook_request_budget_seconds(),
+                )
+
+            # Explicit low budget 0.15s (>= MIN 0.1s) must NOT be silently lifted to 0.5s
+            shell_low = main_module.MemoryCompanionPlugin.__new__(main_module.MemoryCompanionPlugin)
+            shell_low.service = SimpleNamespace(
+                config=ConfigView(
+                    {
+                        "performance": {"profile": "auto"},
+                        "memory_injection": {"hook_request_budget_seconds": 0.15},
+                    }
+                )
+            )
+            self.assertEqual(0.15, shell_low._hook_request_budget_seconds())
+            self.assertEqual(
+                0.15,
+                resolve_performance_plan(shell_low.service.config, hardware=hw_mid).hook_request_budget_seconds,
+            )
+
 
 class StoreHotReloadDiskGuardAndApiTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
@@ -533,6 +576,150 @@ class StoreHotReloadDiskGuardAndApiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual("visible", by_path[path]["exposure"])
         finally:
             service.close()
+
+    async def test_runtime_retrieval_and_warmup_enforce_anti_oom_over_schema_defaults(self) -> None:
+        hw_1g = detect_host_hardware(host_memory_mb=1024, cpu_count=2, is_32bit=False)
+        ctx = SessionContext(
+            scope="private",
+            platform="qq",
+            user_id="u1",
+            bot_id="b1",
+            persona_id="p1",
+            session_id="qq:FriendMessage:u1",
+        )
+        # 1) Full schema defaults present in raw config on 1 GiB host -> auto->eco applies strictly
+        schema_like_cfg = _SaveableConfig(
+            {
+                "performance": {"profile": "auto"},
+                "retrieval": {"mode": "basic", "embedding_enabled": True},
+                "retrieval_advanced": {
+                    "vector_precision": "float32",
+                    "vector_snapshot_cache_mb": 512,
+                    "startup_vector_warmup_enabled": True,
+                    "recall_latency_budget_ms": 1800,
+                },
+                "startup": {"background_grace_seconds": 60},
+            }
+        )
+        with patch.object(perf_mod, "detect_host_hardware", return_value=hw_1g):
+            service = MemoryCompanionService(
+                context=SimpleNamespace(),
+                config=schema_like_cfg,
+                plugin_root=ROOT,
+                data_dir=self.tmp_dir / "anti_oom_schema",
+            )
+            try:
+                self.assertEqual(90, service._background_grace_seconds)
+                self.assertEqual("float16", service.store.vector_storage_precision)
+                self.assertEqual(64 * 1024 * 1024, service.store.vector_snapshot_cache_bytes)
+                self.assertFalse(service.schedule_startup_vector_warmup())
+
+                engine = await service._retrieval_engine(ctx)
+                self.assertEqual(64 * 1024 * 1024, service.store.vector_snapshot_cache_bytes)
+                self.assertEqual(1200, engine.latency_budget_ms)
+
+                # 2) User manually writes oversized 2048 MB -> Anti-OOM 30% cap (307 MB) holds on next turn
+                schema_like_cfg["retrieval_advanced"]["vector_snapshot_cache_mb"] = 2048
+                service.refresh_performance_tuning()
+                self.assertEqual(307 * 1024 * 1024, service.store.vector_snapshot_cache_bytes)
+                await service._retrieval_engine(ctx)
+                self.assertEqual(307 * 1024 * 1024, service.store.vector_snapshot_cache_bytes)
+            finally:
+                service.close()
+
+    async def test_config_module_update_performance_switch_syncs_cross_module_without_false_overrides(self) -> None:
+        hw_mid = detect_host_hardware(host_memory_mb=8192, cpu_count=4, is_32bit=False)
+        cfg = _SaveableConfig({"startup": {"background_grace_seconds": 0}}, config_path=str(self.tmp_dir / "mod.json"))
+        with patch.object(perf_mod, "detect_host_hardware", return_value=hw_mid):
+            service = MemoryCompanionService(
+                context=SimpleNamespace(),
+                config=cfg,
+                plugin_root=ROOT,
+                data_dir=self.tmp_dir / "mod_switch",
+            )
+            try:
+                plugin = SimpleNamespace(service=service, context=SimpleNamespace(), terminated=False)
+                api = PluginPageApi(plugin)
+
+                # Step 1: Save balanced via /performance/tuning (managed_by_profile=True, applied_tier="balanced")
+                await service.apply_performance_tuning(profile="balanced", reset_overrides=True)
+                self.assertEqual("balanced", cfg["performance"]["applied_tier"])
+                self.assertEqual("float32", cfg["retrieval_advanced"]["vector_precision"])
+                self.assertEqual(256, cfg["retrieval_advanced"]["vector_snapshot_cache_mb"])
+
+                # Step 2: Switch profile to eco via generic POST /config/module/update (module="performance")
+                payload = {"module": "performance", "values": {"profile": "eco"}}
+                payload["confirm"] = api._expected_confirmation("/config/module/update", payload)[0]
+                req = SimpleNamespace(args={}, method="POST", get_json=AsyncMock(return_value=payload))
+                wrapped_update = api._wrap_route("/config/module/update", api.config_module_update)
+                with patch.object(page_api_module, "request", req), patch.object(
+                    page_api_module, "jsonify", side_effect=_fake_jsonify
+                ):
+                    resp = await wrapped_update()
+                self.assertEqual(200, resp.status_code)
+
+                # All cross-module keys synced to eco with ZERO phantom overrides
+                snap = await service.get_performance_tuning_snapshot()
+                self.assertEqual("eco", snap["profile"])
+                self.assertEqual("eco", snap["effective_tier"])
+                self.assertEqual(0, snap["override_count"])
+                self.assertEqual("float16", cfg["retrieval_advanced"]["vector_precision"])
+                self.assertEqual(64, cfg["retrieval_advanced"]["vector_snapshot_cache_mb"])
+                self.assertEqual(2.0, cfg["memory_injection"]["hook_request_budget_seconds"])
+                self.assertEqual(1200, cfg["retrieval_advanced"]["recall_latency_budget_ms"])
+                self.assertEqual(-8192, service.store._conn.execute("PRAGMA cache_size").fetchone()[0])
+                self.assertEqual(0, service.store._conn.execute("PRAGMA mmap_size").fetchone()[0])
+
+                # Step 3: Even a direct external edit to profile (AstrBot native config) uses applied_tier cleanly
+                cfg["performance"]["profile"] = "compat"
+                plan_external = resolve_performance_plan(cfg, hardware=hw_mid)
+                self.assertEqual("compat", plan_external.effective_tier)
+                self.assertEqual({}, plan_external.overrides)
+                self.assertEqual(5.0, plan_external.hook_request_budget_seconds)
+                self.assertEqual("FULL", plan_external.sqlite_synchronous)
+            finally:
+                service.close()
+
+    def test_waiting_read_pool_thread_observes_hot_expanded_capacity(self) -> None:
+        hw = detect_host_hardware(host_memory_mb=16384, cpu_count=8, is_32bit=False)
+        plan_eco = resolve_performance_plan({"performance": {"profile": "eco"}}, hardware=hw)
+        plan_turbo = resolve_performance_plan({"performance": {"profile": "turbo"}}, hardware=hw)
+        store = MemoryStore(self.tmp_dir / "pool_wake.db", performance_plan=plan_eco)
+        store.initialize()
+        first_conn = None
+        second_conn: list = []
+        acquired = threading.Event()
+        errors: list[BaseException] = []
+        try:
+            # eco has _read_pool_max=2 -> extra_cap=1; hold the single overflow slot
+            first_conn = store._acquire_pooled_read_conn_sync()
+
+            def _waiter() -> None:
+                try:
+                    conn = store._acquire_pooled_read_conn_sync()
+                    second_conn.append(conn)
+                    acquired.set()
+                except BaseException as exc:  # pragma: no cover
+                    errors.append(exc)
+                    acquired.set()
+
+            thread = threading.Thread(target=_waiter, daemon=True)
+            thread.start()
+            # Give waiter time to enter _read_pool_cond.wait() under eco capacity
+            self.assertFalse(acquired.wait(timeout=0.08))
+
+            # Hot-expand pool capacity to turbo (8) while first_conn is STILL held
+            store.apply_performance_plan(plan_turbo)
+            self.assertTrue(acquired.wait(timeout=2.0), "等待线程应在热扩容后立刻感知新 extra_cap 并唤醒")
+            self.assertEqual([], errors)
+            self.assertEqual(1, len(second_conn))
+            self.assertEqual(1, second_conn[0].execute("SELECT 1").fetchone()[0])
+        finally:
+            if second_conn:
+                store._release_pooled_read_conn_sync(second_conn[0])
+            if first_conn is not None:
+                store._release_pooled_read_conn_sync(first_conn)
+            store.close()
 
 
 if __name__ == "__main__":

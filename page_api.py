@@ -3018,7 +3018,35 @@ class PluginPageApi:
             if key not in values or not isinstance(item_schema, dict):
                 continue
             target[key] = self._coerce_config_value(values.get(key), item_schema)
-        self._write_plugin_config({module: target})
+        if module == "performance":
+            from .core.performance_tuning import (
+                SQLITE_SENTINELS,
+                build_performance_config_updates,
+            )
+
+            next_profile = clean_text(target.get("profile"), 32).lower() or None
+            sqlite_overrides: dict[str, Any] = {}
+            for full_key in SQLITE_SENTINELS:
+                field_name = full_key.split(".", 1)[1]
+                if field_name in values:
+                    sqlite_overrides[full_key] = target.get(field_name)
+            try:
+                updated_full, _plan = build_performance_config_updates(
+                    raw,
+                    profile=next_profile,
+                    overrides=sqlite_overrides if sqlite_overrides else None,
+                    preserve_overrides=True,
+                )
+            except ValueError as exc:
+                return self._err(str(exc), 400)
+            changed_sections = {
+                sec: updated_full[sec]
+                for sec in ("performance", "retrieval_advanced", "memory_injection", "maintenance", "startup")
+                if sec in updated_full
+            }
+            self._write_plugin_config(changed_sections)
+        else:
+            self._write_plugin_config({module: target})
         if module in {"performance", "retrieval_advanced", "memory_injection", "maintenance", "startup"}:
             refresher = getattr(self.plugin.service, "refresh_performance_tuning", None)
             if callable(refresher):
