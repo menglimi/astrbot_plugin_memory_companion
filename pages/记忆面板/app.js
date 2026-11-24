@@ -127,6 +127,7 @@ const ICON_PATHS = {
   clock: '<circle cx="8" cy="8" r="5.6"/><path d="M8 4.8V8l2.4 1.5"/>',
   tag: '<path d="M8.6 2.6H13v4.4l-6 6-4.4-4.4z"/><circle cx="10.4" cy="5.2" r="0.9"/>',
   db: '<ellipse cx="8" cy="4.2" rx="5" ry="2"/><path d="M3 4.2v7.6c0 1.1 2.2 2 5 2s5-.9 5-2V4.2"/><path d="M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>',
+  search: '<circle cx="7.2" cy="7.2" r="4.5"/><path d="M10.6 10.6L14 14"/>',
 };
 
 function icon(name, cls) {
@@ -493,7 +494,17 @@ const state = {
    提示 / 忙碌 / 抽屉
    ------------------------------------------------------------ */
 let toastTimer = 0;
+let scrimTimer = 0;
+let drawerLastFocus = null;
 let assemblyViewerTicket = 0;
+
+function prefersReducedMotion() {
+  try {
+    return Boolean(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  } catch (error) {
+    return false;
+  }
+}
 
 function toast(message, tone) {
   const node = $("#toast");
@@ -533,22 +544,69 @@ function setBusyText(text) {
 }
 
 function openDrawer(title, eyebrow, html) {
+  const drawer = $("#drawer");
+  const scrim = $("#scrim");
+  if (drawer && !drawer.classList.contains("is-open")) {
+    drawerLastFocus = document.activeElement;
+  }
   $("#drawerEyebrow").textContent = eyebrow || "记忆";
   $("#drawerTitle").textContent = title || "未选择";
   $("#drawerBody").innerHTML = html;
-  $("#drawer").classList.add("is-open");
-  $("#drawer").setAttribute("aria-hidden", "false");
-  $("#scrim").hidden = false;
+  window.clearTimeout(scrimTimer);
+  scrimTimer = 0;
+  if (scrim) {
+    scrim.hidden = false;
+    if (prefersReducedMotion()) {
+      scrim.classList.add("is-open");
+    } else {
+      void scrim.offsetWidth;
+      requestAnimationFrame(() => {
+        if (drawer && drawer.classList.contains("is-open")) scrim.classList.add("is-open");
+      });
+    }
+  }
+  if (drawer) {
+    drawer.inert = false;
+    drawer.classList.add("is-open");
+    drawer.setAttribute("aria-hidden", "false");
+  }
 }
 
 function closeDrawer() {
-  $("#drawer").classList.remove("is-open");
-  $("#drawer").setAttribute("aria-hidden", "true");
-  $("#scrim").hidden = true;
+  const drawer = $("#drawer");
+  const scrim = $("#scrim");
+  if (drawer) {
+    const active = document.activeElement;
+    if (active && typeof drawer.contains === "function" && drawer.contains(active) && typeof active.blur === "function") {
+      active.blur();
+    }
+    drawer.classList.remove("is-open");
+    drawer.setAttribute("aria-hidden", "true");
+    drawer.inert = true;
+  }
+  if (scrim) {
+    window.clearTimeout(scrimTimer);
+    scrimTimer = 0;
+    scrim.classList.remove("is-open");
+    if (prefersReducedMotion()) {
+      scrim.hidden = true;
+    } else {
+      scrimTimer = window.setTimeout(() => {
+        scrimTimer = 0;
+        if (!drawer || !drawer.classList.contains("is-open")) scrim.hidden = true;
+      }, 240);
+    }
+  }
+  const prev = drawerLastFocus;
+  drawerLastFocus = null;
+  if (prev && typeof prev.focus === "function" && document.contains(prev)) {
+    try { prev.focus({ preventScroll: true }); } catch (error) { /* 忽略 */ }
+  }
 }
 
 function showInlineConfirmation(title, message, confirmLabel) {
   return new Promise((resolve) => {
+    const prevFocus = document.activeElement;
     const overlay = document.createElement("div");
     overlay.className = "inline-confirm-overlay";
     overlay.innerHTML =
@@ -557,15 +615,42 @@ function showInlineConfirmation(title, message, confirmLabel) {
       '<p>' + esc(message || "确认继续此操作？") + "</p>" +
       '<div class="inline-confirm-actions"><button type="button" data-confirm-cancel>取消</button><button type="button" class="is-danger" data-confirm-ok>' +
       esc(confirmLabel || "继续") + "</button></div></section>";
+    let settled = false;
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        finish(false);
+      }
+    };
     const finish = (value) => {
-      overlay.remove();
+      if (settled) return;
+      settled = true;
+      document.removeEventListener("keydown", onKeyDown);
+      overlay.classList.remove("is-open");
+      if (prefersReducedMotion()) {
+        overlay.remove();
+      } else {
+        window.setTimeout(() => overlay.remove(), 180);
+      }
+      if (prevFocus && typeof prevFocus.focus === "function" && document.contains(prevFocus)) {
+        try { prevFocus.focus({ preventScroll: true }); } catch (error) { /* 忽略 */ }
+      }
       resolve(value);
     };
     overlay.addEventListener("click", (event) => {
       if (event.target === overlay || event.target.closest("[data-confirm-cancel]")) finish(false);
       if (event.target.closest("[data-confirm-ok]")) finish(true);
     });
+    document.addEventListener("keydown", onKeyDown);
     document.body.appendChild(overlay);
+    if (prefersReducedMotion()) {
+      overlay.classList.add("is-open");
+    } else {
+      void overlay.offsetWidth;
+      requestAnimationFrame(() => {
+        if (!settled) overlay.classList.add("is-open");
+      });
+    }
     const ok = $("[data-confirm-ok]", overlay);
     if (ok) ok.focus();
   });
@@ -2481,12 +2566,31 @@ async function hydratePersonalAlbumImages(root) {
   }));
 }
 
+function closeLightbox(box) {
+  if (!box || box.dataset.closing === "1") return;
+  box.dataset.closing = "1";
+  box.classList.remove("is-open");
+  if (prefersReducedMotion()) {
+    box.remove();
+  } else {
+    window.setTimeout(() => box.remove(), 180);
+  }
+}
+
 function openLightbox(src, caption) {
   const box = document.createElement("div");
   box.className = "lightbox";
   box.innerHTML = '<img src="' + esc(src) + '" alt="" /><div class="lightbox-cap">' + esc(caption || "") + "</div>";
-  box.addEventListener("click", () => box.remove());
+  box.addEventListener("click", () => closeLightbox(box));
   document.body.appendChild(box);
+  if (prefersReducedMotion()) {
+    box.classList.add("is-open");
+  } else {
+    void box.offsetWidth;
+    requestAnimationFrame(() => {
+      if (box.dataset.closing !== "1") box.classList.add("is-open");
+    });
+  }
 }
 
 /* ============================================================
@@ -3755,29 +3859,46 @@ const MODULE_LABELS = {
   memory_capture: "记忆捕获",
   scope_control: "范围控制",
   portrait: "统一画像",
+  memory_assertions: "记忆断言",
   memory_summary: "记忆摘要",
   historical_chat_import: "历史聊天导入",
   retrieval: "检索",
   retrieval_advanced: "检索进阶",
+  source_semantic: "原文语义",
   memory_injection: "记忆注入",
+  memory_humanization: "拟人化记忆",
   conversation_memory: "对话记忆",
   conversation_memory_advanced: "对话记忆进阶",
   core_memory: "核心记忆",
   context_orchestration: "上下文编排",
   context_orchestration_advanced: "上下文编排进阶",
+  persona_memory: "记得这个人",
   private_companion_bridge: "陪伴桥接",
   visibility: "可见性",
   memory_tools: "记忆工具",
   memory_reconstruction: "记忆重建",
   knowledge_graph: "知识图谱",
-  livingmemory_migration: "LivingMemory 迁移",
+  livingmemory_migration: "旧版记忆迁移",
   maintenance: "维护",
   maintenance_audit: "记忆审计",
   maintenance_decay: "记忆衰减",
-  memory_assertions: "记忆断言",
-  source_semantic: "原文语义",
   startup: "启动",
+  identity: "跨平台身份",
 };
+
+function moduleLabel(id, moduleSchema) {
+  if (MODULE_LABELS[id]) return MODULE_LABELS[id];
+  const desc = compact(moduleSchema && moduleSchema.description);
+  return desc || compact(id);
+}
+
+function moduleSubtitle(id, moduleSchema) {
+  const title = moduleLabel(id, moduleSchema);
+  const hint = compact(moduleSchema && moduleSchema.hint);
+  if (hint) return hint;
+  const desc = compact(moduleSchema && moduleSchema.description);
+  return desc && desc !== title ? desc : "";
+}
 
 // 2.6.2：面板里只把每个模块最常用的几项摆在明面上，其余收进「高级项」折叠，
 // 免得一个模块几十个输入框糊一屏、找不到该改哪一项。完整配置仍在 AstrBot 配置页。
@@ -3805,7 +3926,14 @@ const CONFIG_COMMON_KEYS = {
   ],
   historical_chat_import: ["qq_max_range_days", "qq_max_messages", "max_retries"],
   retrieval: ["embedding_enabled", "embedding_provider_id", "mode", "rerank_provider_id"],
-  retrieval_advanced: ["embedding_top_k", "embedding_weight", "embedding_score_threshold", "mmr_redundancy_weight"],
+  retrieval_advanced: [
+    "vector_precision",
+    "vector_storage_precision",
+    "embedding_top_k",
+    "embedding_weight",
+    "embedding_score_threshold",
+    "mmr_redundancy_weight",
+  ],
   source_semantic: ["enabled", "provider_id"],
   memory_injection: ["enabled", "top_k", "max_chars", "enable_injection_logs"],
   memory_humanization: ["enabled", "vivid_full_days", "no_recall_hint_enabled"],
@@ -3813,6 +3941,7 @@ const CONFIG_COMMON_KEYS = {
   conversation_memory_advanced: [
     "cross_window_group_to_private_enabled",
     "cross_window_private_to_group_enabled",
+    "cross_window_group_to_group_enabled",
     "recent_fact_guard_enabled",
     "topic_shift_guard_enabled",
   ],
@@ -3830,7 +3959,95 @@ const CONFIG_COMMON_KEYS = {
   maintenance_audit: ["enabled", "max_candidates"],
   maintenance_decay: ["memory_decay_after_days", "memory_decay_idle_days", "memory_decay_gradual_enabled"],
   startup: ["background_grace_seconds"],
+  identity: ["merge_platform_accounts"],
 };
+
+const CONFIG_OPTION_LABELS = {
+  "retrieval.mode": {
+    auto: "自动（有重排模型时自动启用）",
+    basic: "基础检索（语义 + 关键词）",
+    rerank: "强制重排",
+  },
+  "memory_capture.proposal_mode": {
+    hybrid: "混合模式（推荐）",
+    summary_first: "阶段总结优先",
+    explicit_only: "仅显式记住",
+  },
+  "context_orchestration.query_mode": {
+    current_message: "按当前消息检索",
+    guarded_companion: "带保护的陪伴协同",
+    companion_augmented: "陪伴上下文增强",
+  },
+  "livingmemory_migration.default_review_status": {
+    auto: "直接生效（auto）",
+    pending: "进入待复核（pending）",
+  },
+  "retrieval_advanced.vector_precision": {
+    float32: "标准精度（float32 · 推荐）",
+    float16: "半精度省流（float16 · 空间直降 75%）",
+  },
+  "retrieval_advanced.vector_storage_precision": {
+    float32: "标准精度（float32 · 推荐）",
+    float16: "半精度省流（float16 · 空间直降 75%）",
+  },
+};
+
+const VECTOR_PRECISION_CHOICES = {
+  float32: {
+    title: "标准精度",
+    tag: "推荐",
+    code: "float32",
+    desc: "精度无损，空间减半 · 日常首选",
+  },
+  float16: {
+    title: "半精度省流",
+    tag: "省 75% 空间",
+    code: "float16",
+    desc: "空间直降 75%，召回几乎无感 · 低配云服推荐",
+  },
+};
+
+const CONFIG_CHOICE_CARDS = {
+  "retrieval_advanced.vector_precision": VECTOR_PRECISION_CHOICES,
+  "retrieval_advanced.vector_storage_precision": VECTOR_PRECISION_CHOICES,
+};
+
+function fieldOptions(item) {
+  if (item && Array.isArray(item.options) && item.options.length) return item.options;
+  if (item && Array.isArray(item.enum) && item.enum.length) return item.enum;
+  return null;
+}
+
+function renderChoiceCards(key, options, value, choiceMap, locked) {
+  const current = String(value === undefined || value === null || value === "" ? options[0] : value);
+  const cards = options
+    .map((opt) => {
+      const optStr = String(opt);
+      const info = choiceMap[optStr] || { title: optStr, tag: "", code: optStr, desc: "" };
+      const active = current === optStr;
+      return (
+        '<button type="button" class="cfg-choice-card' + (active ? " is-active" : "") + '"' +
+        ' role="radio" aria-checked="' + (active ? "true" : "false") + '"' +
+        ' data-choice-key="' + esc(key) + '" data-choice-val="' + esc(optStr) + '"' +
+        (locked ? " disabled" : "") + ">" +
+        '<span class="cfg-choice-head">' +
+          '<span class="cfg-choice-dot" aria-hidden="true"></span>' +
+          '<strong class="cfg-choice-title">' + esc(info.title) + "</strong>" +
+          (info.tag ? '<span class="cfg-choice-tag">' + esc(info.tag) + "</span>" : "") +
+          (info.code ? '<code class="cfg-choice-code">' + esc(info.code) + "</code>" : "") +
+        "</span>" +
+        (info.desc ? '<span class="cfg-choice-desc">' + esc(info.desc) + "</span>" : "") +
+        "</button>"
+      );
+    })
+    .join("");
+  return (
+    '<div class="cfg-choice-group" role="radiogroup" data-choice-group="' + esc(key) + '">' +
+    '<input type="hidden" id="cfg_' + esc(key) + '" value="' + esc(current) + '"' + (locked ? " disabled" : "") + " />" +
+    cards +
+    "</div>"
+  );
+}
 
 // P8：后端下发的受保护键（可见性 / 桥接闸门 / 凭据类）在面板里只读，
 // 保存时也不提交——面板不能成为修改安全键的通道。
@@ -3844,12 +4061,29 @@ function isProtectedConfigKey(guard, moduleId, key) {
   return guard.modules.has(moduleId) || guard.keys.has(moduleId + "." + key);
 }
 
+function orderedCommonKeys(moduleId, items) {
+  const preferred = CONFIG_COMMON_KEYS[moduleId] || [];
+  const out = [];
+  const seen = new Set();
+  for (let i = 0; i < preferred.length; i += 1) {
+    const key = preferred[i];
+    if (Object.prototype.hasOwnProperty.call(items, key) && !seen.has(key)) {
+      seen.add(key);
+      out.push(key);
+    }
+  }
+  return out;
+}
+
 defineView("config", {
   title: "模块配置",
   navLabel: "模块配置",
   eyebrow: "Settings · Config",
   hint: "按模块调整检索、注入、编排与维护策略，保存后立即写入插件配置",
-  async load() {
+  async load(opts) {
+    if (opts && opts.useCachedSchema && state.configSchema && state.configSchema.schema) {
+      return state.configSchema;
+    }
     const result = await apiGet("/config/schema");
     state.configSchema = result;
     return result;
@@ -3864,74 +4098,107 @@ defineView("config", {
     const moduleValues = values[moduleId] || {};
     const items = moduleSchema.items || {};
     const guard = protectedConfigSets(data);
+    const totalFields = modules.reduce((sum, key) => sum + Object.keys((schema[key] || {}).items || {}).length, 0);
 
-    const nav = modules
-      .map(
-        (key) =>
-          '<button type="button" class="' + (key === moduleId ? "is-active" : "") + '" data-module="' + esc(key) + '">' +
-          "<span>" + esc(MODULE_LABELS[key] || key) + "</span>" +
-          "<em>" + Object.keys((schema[key] || {}).items || {}).length + "</em></button>"
-      )
-      .join("");
+    const navSearch =
+      '<button type="button" class="config-nav-search" data-open-config-search aria-label="全局搜索所有配置项">' +
+      icon("search", "config-nav-search-icon") +
+      "<span>搜索全部 " + fmtInt(totalFields) + " 项…</span>" +
+      '<kbd class="cfg-kbd">' + esc(shortcutBadgeText()) + "</kbd>" +
+      "</button>";
 
-    const commonKeySet = new Set(CONFIG_COMMON_KEYS[moduleId] || []);
-    const commonKeys = Object.keys(items).filter((key) => commonKeySet.has(key));
+    const nav =
+      navSearch +
+      modules
+        .map((key) => {
+          const active = key === moduleId;
+          return (
+            '<button type="button" class="' + (active ? "is-active" : "") + '"' +
+            (active ? ' aria-current="page"' : "") +
+            ' data-module="' + esc(key) + '">' +
+            "<span>" + esc(moduleLabel(key, schema[key])) + "</span>" +
+            "<em>" + Object.keys((schema[key] || {}).items || {}).length + "</em></button>"
+          );
+        })
+        .join("");
+
+    const commonKeys = orderedCommonKeys(moduleId, items);
+    const commonKeySet = new Set(commonKeys);
     const advancedKeys = Object.keys(items).filter((key) => !commonKeySet.has(key));
     const renderFields = (keys) =>
       keys
         .map((key) => {
-        const item = items[key] || {};
-        const value = moduleValues[key] === undefined ? item.default : moduleValues[key];
-        const desc = compact(item.description) || key;
-        const hint = compact(item.hint);
-        const locked = isProtectedConfigKey(guard, moduleId, key);
-        let input;
-        if (Array.isArray(item.options) && item.options.length) {
-          input =
-            '<select id="cfg_' + esc(key) + '">' +
-            item.options
-              .map((opt) => '<option value="' + esc(opt) + '"' + (String(value) === String(opt) ? " selected" : "") + ">" + esc(opt) + "</option>")
-              .join("") +
-            "</select>";
-        } else if (item.type === "bool" || item.type === "boolean") {
-          input =
-            '<label class="switch"><input type="checkbox" id="cfg_' + esc(key) + '"' + (value ? " checked" : "") + ' /><span class="switch-track"></span><span>' + (value ? "已启用" : "已关闭") + "</span></label>";
-        } else if (item.type === "int" || item.type === "float" || item.type === "number") {
-          input = '<input type="number" id="cfg_' + esc(key) + '" value="' + esc(value === undefined || value === null ? "" : value) + '" step="' + (item.type === "float" ? "0.01" : "1") + '" />';
-        } else if (item.type === "list" || Array.isArray(value)) {
-          input = '<input type="text" id="cfg_' + esc(key) + '" value="' + esc(Array.isArray(value) ? value.join(",") : compact(value)) + '" />';
-        } else {
-          input = '<input type="text" id="cfg_' + esc(key) + '" value="' + esc(value === undefined || value === null ? "" : value) + '" />';
-        }
-        if (locked) input = input.replace(/<(input|select)/, "<$1 disabled");
-        return (
-          '<div class="config-field"><div><div class="cf-label">' + esc(desc) +
-          (locked ? ' <span class="cf-desc">（安全键 · 只读）</span>' : "") + "</div>" +
-          (hint ? '<div class="cf-desc">' + esc(hint) + "</div>" : "") +
-          '<div class="cf-desc mono" style="opacity:.7;margin-top:4px">' + esc(key) + "</div></div>" +
-          '<div class="cf-input">' + input + "</div></div>"
-        );
-      })
-      .join("");
+          const item = items[key] || {};
+          const value = moduleValues[key] === undefined ? item.default : moduleValues[key];
+          const desc = compact(item.description) || key;
+          const hint = compact(item.hint);
+          const locked = isProtectedConfigKey(guard, moduleId, key);
+          const choiceMap = CONFIG_CHOICE_CARDS[moduleId + "." + key] || null;
+          const optionList = fieldOptions(item);
+          const optionLabelMap = CONFIG_OPTION_LABELS[moduleId + "." + key] || null;
+          const isChoiceField = Boolean(choiceMap && optionList && optionList.length);
+          let input;
+          if (isChoiceField) {
+            input = renderChoiceCards(key, optionList, value, choiceMap, locked);
+          } else if (Array.isArray(item.options) && item.options.length) {
+            input =
+              '<select id="cfg_' + esc(key) + '">' +
+              item.options
+                .map((opt) => {
+                  const text = (optionLabelMap && optionLabelMap[String(opt)]) || String(opt);
+                  return '<option value="' + esc(opt) + '"' + (String(value) === String(opt) ? " selected" : "") + ">" + esc(text) + "</option>";
+                })
+                .join("") +
+              "</select>";
+          } else if (Array.isArray(item.enum) && item.enum.length) {
+            input =
+              '<select id="cfg_' + esc(key) + '">' +
+              item.enum
+                .map((opt) => {
+                  const text = (optionLabelMap && optionLabelMap[String(opt)]) || String(opt);
+                  return '<option value="' + esc(opt) + '"' + (String(value) === String(opt) ? " selected" : "") + ">" + esc(text) + "</option>";
+                })
+                .join("") +
+              "</select>";
+          } else if (item.type === "bool" || item.type === "boolean") {
+            input =
+              '<label class="switch"><input type="checkbox" id="cfg_' + esc(key) + '"' + (value ? " checked" : "") + ' /><span class="switch-track"></span><span>' + (value ? "已启用" : "已关闭") + "</span></label>";
+          } else if (item.type === "int" || item.type === "float" || item.type === "number") {
+            input = '<input type="number" id="cfg_' + esc(key) + '" value="' + esc(value === undefined || value === null ? "" : value) + '" step="' + (item.type === "float" ? "0.01" : "1") + '" />';
+          } else if (item.type === "list" || Array.isArray(value)) {
+            input = '<input type="text" id="cfg_' + esc(key) + '" value="' + esc(Array.isArray(value) ? value.join(",") : compact(value)) + '" />';
+          } else {
+            input = '<input type="text" id="cfg_' + esc(key) + '" value="' + esc(value === undefined || value === null ? "" : value) + '" />';
+          }
+          if (locked && !isChoiceField) input = input.replace(/<(input|select)/, "<$1 disabled");
+          return (
+            '<div class="config-field' + (isChoiceField ? " is-choice-field" : "") + '" data-config-field="' + esc(key) + '"><div><div class="cf-label">' + esc(desc) +
+            (locked ? ' <span class="cf-desc">（安全键 · 只读）</span>' : "") + "</div>" +
+            (hint ? '<div class="cf-desc">' + esc(hint) + "</div>" : "") +
+            '<div class="cf-desc mono" style="opacity:.66;margin-top:4px">' + esc(key) + "</div></div>" +
+            '<div class="cf-input">' + input + "</div></div>"
+          );
+        })
+        .join("");
     const fields = renderFields(commonKeys);
     const advancedFields = renderFields(advancedKeys);
 
     return (
       '<div class="config-layout">' +
-      '<nav class="config-nav">' + nav + "</nav>" +
-      '<div style="display:grid;gap:14px">' +
+      '<nav class="config-nav" aria-label="配置模块">' + nav + "</nav>" +
+      '<div class="config-main">' +
         card(
-          MODULE_LABELS[moduleId] || moduleId,
-          compact(moduleSchema.description) || moduleId,
+          moduleLabel(moduleId, moduleSchema),
+          moduleSubtitle(moduleId, moduleSchema),
           '<form id="configForm" class="config-form">' +
   (fields || (advancedFields ? "" : emptyState("该模块没有可配置项", ""))) +
   (advancedFields
-    ? '<details class="config-advanced"><summary>高级项（' + advancedKeys.length + " 个）· 一般不用改</summary>" + advancedFields + "</details>"
+    ? '<details class="config-advanced"><summary>高级项（' + advancedKeys.length + ' 个）· 一般不用改</summary><div class="config-advanced-body"><div class="config-advanced-inner">' + advancedFields + "</div></div></details>"
     : "") +
   "</form>",
-          '<button class="btn is-primary is-sm" type="button" id="configSaveBtn">保存本模块</button>'
+          '<button class="btn is-primary is-sm" type="button" id="configSaveBtn">保存本模块</button>',
+          "config-card"
         ) +
-        (moduleSchema.hint ? '<p class="section-note">' + esc(moduleSchema.hint) + "</p>" : "") +
       "</div>" +
       "</div>"
     );
@@ -3941,7 +4208,40 @@ defineView("config", {
     $$("[data-module]", node).forEach((button) => {
       button.addEventListener("click", () => {
         state.configModule = button.dataset.module;
-        go("config");
+        go("config", { useCachedSchema: true });
+      });
+    });
+
+    $$("[data-open-config-search]", node).forEach((button) => {
+      button.addEventListener("click", () => openConfigSearch());
+    });
+
+    $$(".cfg-choice-group", node).forEach((group) => {
+      const key = group.dataset.choiceGroup;
+      const hiddenInput = $("#cfg_" + key, group);
+      const cards = $$(".cfg-choice-card", group);
+      const pick = (cardEl, shouldFocus) => {
+        if (!cardEl || cardEl.disabled) return;
+        const val = cardEl.dataset.choiceVal;
+        if (hiddenInput) hiddenInput.value = val;
+        cards.forEach((btn) => {
+          const isSel = btn === cardEl;
+          btn.classList.toggle("is-active", isSel);
+          btn.setAttribute("aria-checked", isSel ? "true" : "false");
+        });
+        if (shouldFocus && typeof cardEl.focus === "function") cardEl.focus();
+      };
+      cards.forEach((btn, idx) => {
+        btn.addEventListener("click", () => pick(btn, false));
+        btn.addEventListener("keydown", (event) => {
+          if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+            event.preventDefault();
+            pick(cards[(idx + 1) % cards.length], true);
+          } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+            event.preventDefault();
+            pick(cards[(idx - 1 + cards.length) % cards.length], true);
+          }
+        });
       });
     });
 
@@ -3959,18 +4259,24 @@ defineView("config", {
           if (!el) return;
           if (el.type === "checkbox") values[key] = el.checked;
           else if (el.type === "number") values[key] = el.value === "" ? null : Number(el.value);
-          else if (Array.isArray(item.options)) values[key] = el.value;
+          else if (Array.isArray(item.options) || Array.isArray(item.enum)) values[key] = el.value;
           else if (item.type === "list" || Array.isArray(items[key].default)) {
             values[key] = el.value.trim() === "" ? [] : el.value.split(",").map((v) => v.trim());
           } else values[key] = el.value;
         });
         await withBusy("正在保存…", async () => {
-          await apiPost("/config/module/update", { module: moduleId, values });
-          toast("已保存 " + (MODULE_LABELS[moduleId] || moduleId), "ok");
+          const saved = await apiPost("/config/module/update", { module: moduleId, values });
+          if (state.configSchema && state.configSchema.values) {
+            state.configSchema.values[moduleId] =
+              saved && saved.values && typeof saved.values === "object"
+                ? saved.values
+                : Object.assign({}, state.configSchema.values[moduleId] || {}, values);
+          }
+          toast("已保存 " + moduleLabel(moduleId, schema[moduleId]), "ok");
           invalidatePool();
           // 配色改完当场生效，不用刷新页面——不然用户会以为这项又没生效
           if (moduleId === "appearance") syncPalette();
-          go("config");
+          await go("config");
         });
       });
     }
@@ -3981,8 +4287,801 @@ defineView("config", {
         if (label) label.textContent = input.checked ? "已启用" : "已关闭";
       });
     });
+
+    bindSmoothDetails(node);
+
+    const activeNav = $(".config-nav button.is-active", node);
+    if (activeNav && typeof activeNav.scrollIntoView === "function") {
+      try { activeNav.scrollIntoView({ block: "nearest" }); } catch (error) { /* 忽略 */ }
+    }
+    applyPendingConfigFocus(node);
   },
 });
+
+function bindSmoothDetails(rootNode) {
+  $$("details.config-advanced", rootNode).forEach((details) => {
+    const summary = details.querySelector(":scope > summary") || details.querySelector("summary");
+    const body = details.querySelector(":scope > .config-advanced-body") || details.querySelector(".config-advanced-body");
+    if (!summary || !body) return;
+    let animTimer = 0;
+    let animToken = 0;
+
+    const clearInline = () => {
+      body.style.height = "";
+      body.style.opacity = "";
+      body.style.overflow = "";
+      body.style.transition = "";
+      details.classList.remove("is-animating", "is-closing");
+    };
+
+    details.__cancelSmoothAnim = () => {
+      animToken += 1;
+      window.clearTimeout(animTimer);
+      animTimer = 0;
+      clearInline();
+    };
+
+    const renderedHeight = () => {
+      const rect = typeof body.getBoundingClientRect === "function" ? body.getBoundingClientRect() : null;
+      const h = rect && Number.isFinite(rect.height) ? rect.height : Number(body.offsetHeight);
+      return Number.isFinite(h) && h > 0 ? h : 0;
+    };
+
+    summary.addEventListener("click", (event) => {
+      if (prefersReducedMotion()) return;
+      event.preventDefault();
+      animToken += 1;
+      const token = animToken;
+      window.clearTimeout(animTimer);
+      animTimer = 0;
+
+      const shouldOpen = !details.open || details.classList.contains("is-closing");
+      if (shouldOpen) {
+        const wasOpen = Boolean(details.open);
+        const startHeight = wasOpen ? renderedHeight() : 0;
+        details.open = true;
+        details.classList.remove("is-closing");
+        details.classList.add("is-animating");
+        body.style.transition = "none";
+        body.style.overflow = "hidden";
+        body.style.height = startHeight + "px";
+        if (!wasOpen) body.style.opacity = "0";
+        void body.offsetHeight;
+        const targetHeight = body.scrollHeight;
+        body.style.transition = "height 0.24s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.2s cubic-bezier(0.22, 1, 0.36, 1)";
+        body.style.height = targetHeight + "px";
+        body.style.opacity = "1";
+        animTimer = window.setTimeout(() => {
+          if (token !== animToken) return;
+          animTimer = 0;
+          clearInline();
+        }, 260);
+      } else {
+        const startHeight = renderedHeight() || body.scrollHeight;
+        details.classList.add("is-animating", "is-closing");
+        body.style.transition = "none";
+        body.style.overflow = "hidden";
+        body.style.height = startHeight + "px";
+        body.style.opacity = "1";
+        void body.offsetHeight;
+        body.style.transition = "height 0.18s cubic-bezier(0.4, 0, 1, 1), opacity 0.15s cubic-bezier(0.4, 0, 1, 1)";
+        body.style.height = "0px";
+        body.style.opacity = "0";
+        animTimer = window.setTimeout(() => {
+          if (token !== animToken) return;
+          animTimer = 0;
+          details.open = false;
+          clearInline();
+        }, 190);
+      }
+    });
+  });
+}
+
+/* ============================================================
+   全局配置搜索（Ctrl+K / Cmd+K / / 快捷键 + 侧栏入口）
+   ============================================================ */
+const configSearchState = {
+  open: false,
+  query: "",
+  selectedIndex: 0,
+  loading: false,
+  error: "",
+  schemaRef: null,
+  moduleCount: 0,
+  fieldCount: 0,
+  catalog: [],
+  index: null,
+  hits: [],
+  pendingTarget: null,
+  hitTimer: 0,
+  closeTimer: 0,
+  lastFocus: null,
+  fetchPromise: null,
+  initialized: false,
+};
+
+const CONFIG_SEARCH_QUICK_CHIPS = [
+  "向量存储精度",
+  "跨群衔接",
+  "拟人化记忆",
+  "记得这个人",
+  "配色主题",
+  "总结模型",
+  "待复核",
+  "旧版记忆迁移",
+];
+
+function isMacPlatform() {
+  try {
+    const p = (navigator && (navigator.platform || navigator.userAgent)) || "";
+    return /mac|iphone|ipad|ipod/i.test(p);
+  } catch (error) {
+    return false;
+  }
+}
+
+function shortcutBadgeText() {
+  return isMacPlatform() ? "⌘ K" : "Ctrl K";
+}
+
+function isEditableElement(target) {
+  if (!target || typeof target !== "object") return false;
+  const tag = String(target.tagName || "").toUpperCase();
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+  if (target.isContentEditable) return true;
+  return false;
+}
+
+function buildConfigSearchCatalog(data) {
+  const schema = (data && data.schema) || {};
+  const guard = protectedConfigSets(data);
+  const catalog = [];
+  const moduleIds = Object.keys(schema);
+  let fieldCount = 0;
+
+  for (let m = 0; m < moduleIds.length; m += 1) {
+    const moduleId = moduleIds[m];
+    const modSchema = schema[moduleId] || {};
+    const modLabel = moduleLabel(moduleId, modSchema);
+    const modSub = moduleSubtitle(moduleId, modSchema);
+    const items = modSchema.items || {};
+    const fieldKeys = Object.keys(items);
+    const commonSet = new Set(orderedCommonKeys(moduleId, items));
+
+    const modAliases = [moduleId];
+    if (compact(modSchema.description) && compact(modSchema.description) !== modLabel) {
+      modAliases.push(compact(modSchema.description));
+    }
+
+    catalog.push({
+      kind: "module",
+      moduleId,
+      moduleLabel: modLabel,
+      fieldKey: "",
+      title: modLabel,
+      group: "模块配置",
+      desc: modSub || ("包含 " + fieldKeys.length + " 个配置项"),
+      key: moduleId,
+      aliases: modAliases,
+      fieldCount: fieldKeys.length,
+      isAdvanced: false,
+      locked: false,
+      priority: 22,
+    });
+
+    for (let f = 0; f < fieldKeys.length; f += 1) {
+      const fieldKey = fieldKeys[f];
+      const item = items[fieldKey] || {};
+      fieldCount += 1;
+      const title = compact(item.description) || fieldKey;
+      const hint = compact(item.hint);
+      const isAdvanced = !commonSet.has(fieldKey);
+      const locked = isProtectedConfigKey(guard, moduleId, fieldKey);
+      const opts = fieldOptions(item) || [];
+      const optLabelMap = CONFIG_OPTION_LABELS[moduleId + "." + fieldKey] || null;
+      const choiceMap = CONFIG_CHOICE_CARDS[moduleId + "." + fieldKey] || null;
+      const aliases = [moduleId, fieldKey, moduleId + "." + fieldKey];
+      for (let o = 0; o < opts.length; o += 1) {
+        const optStr = String(opts[o]);
+        aliases.push(optStr);
+        if (optLabelMap && optLabelMap[optStr]) aliases.push(optLabelMap[optStr]);
+        if (choiceMap && choiceMap[optStr]) {
+          if (choiceMap[optStr].title) aliases.push(choiceMap[optStr].title);
+          if (choiceMap[optStr].tag) aliases.push(choiceMap[optStr].tag);
+          if (choiceMap[optStr].desc) aliases.push(choiceMap[optStr].desc);
+        }
+      }
+
+      catalog.push({
+        kind: "field",
+        moduleId,
+        moduleLabel: modLabel,
+        fieldKey,
+        title,
+        group: modLabel,
+        desc: hint,
+        key: moduleId + "." + fieldKey,
+        aliases,
+        isAdvanced,
+        locked,
+        priority: isAdvanced ? 0 : 12,
+      });
+    }
+  }
+
+  // 附带控制台功能视图入口，便于一键切换页面
+  for (let g = 0; g < NAV.length; g += 1) {
+    const group = NAV[g];
+    for (let v = 0; v < group.views.length; v += 1) {
+      const viewId = group.views[v];
+      const view = VIEWS[viewId];
+      if (!view || view.hidden || viewId === "config") continue;
+      catalog.push({
+        kind: "view",
+        viewId,
+        moduleId: "",
+        moduleLabel: group.label,
+        fieldKey: "",
+        title: view.title || view.navLabel || viewId,
+        group: "面板视图 · " + group.label,
+        desc: compact(view.hint),
+        key: viewId,
+        aliases: [group.label, view.navLabel || "", view.eyebrow || ""].filter(Boolean),
+        isAdvanced: false,
+        locked: false,
+        priority: -4,
+      });
+    }
+  }
+
+  return { catalog, moduleCount: moduleIds.length, fieldCount };
+}
+
+function ensureConfigSearchIndex() {
+  const data = state.configSchema;
+  if (!data || !data.schema) return null;
+  if (configSearchState.schemaRef === data && configSearchState.index) {
+    return configSearchState.index;
+  }
+  const built = buildConfigSearchCatalog(data);
+  configSearchState.schemaRef = data;
+  configSearchState.catalog = built.catalog;
+  configSearchState.moduleCount = built.moduleCount;
+  configSearchState.fieldCount = built.fieldCount;
+  const engine = window.MemorySearchEngine;
+  if (engine && typeof engine.prepare === "function") {
+    configSearchState.index = engine.prepare(built.catalog, {
+      getTitle: (it) => it.title,
+      getDesc: (it) => it.desc,
+      getKey: (it) => it.key,
+      getGroup: (it) => it.group,
+      getAliases: (it) => it.aliases,
+      getPriority: (it) => it.priority,
+    });
+  } else {
+    configSearchState.index = { fallback: true, items: built.catalog };
+  }
+  return configSearchState.index;
+}
+
+function runConfigSearchQuery(rawQuery) {
+  const query = compact(rawQuery);
+  const index = ensureConfigSearchIndex();
+  if (!query || !index) return [];
+  const engine = window.MemorySearchEngine;
+  if (engine && typeof engine.search === "function" && !index.fallback) {
+    return engine.search(index, query, { limit: 36 });
+  }
+  const lower = query.toLowerCase();
+  return (index.items || [])
+    .filter((it) => {
+      const hay = [it.group, it.title, it.key, it.desc].concat(it.aliases || []).join(" ").toLowerCase();
+      return hay.includes(lower);
+    })
+    .slice(0, 36)
+    .map((item) => ({ item, score: 100, matchKind: "exact", reason: "", matchedAlias: "", matchedTerms: [query] }));
+}
+
+function highlightConfigText(text, matchedTerms) {
+  const engine = window.MemorySearchEngine;
+  if (engine && typeof engine.highlight === "function") {
+    return engine.highlight(text, matchedTerms, { markClass: "cfg-search-mark" });
+  }
+  return esc(text);
+}
+
+async function ensureConfigSchemaLoaded() {
+  if (state.configSchema && state.configSchema.schema) return state.configSchema;
+  if (!configSearchState.fetchPromise) {
+    configSearchState.loading = true;
+    configSearchState.error = "";
+    renderConfigSearchResults();
+    configSearchState.fetchPromise = apiGet("/config/schema")
+      .then((result) => {
+        state.configSchema = result;
+        configSearchState.error = "";
+        return result;
+      })
+      .catch((error) => {
+        configSearchState.error = (error && error.message) || "配置索引加载失败";
+        return null;
+      })
+      .finally(() => {
+        configSearchState.loading = false;
+        configSearchState.fetchPromise = null;
+        if (configSearchState.open) renderConfigSearchResults();
+      });
+  }
+  return configSearchState.fetchPromise;
+}
+
+function ensureConfigSearchModal() {
+  let modal = $("#configSearchModal");
+  if (modal) return modal;
+  modal = document.createElement("div");
+  modal.id = "configSearchModal";
+  modal.className = "cfg-search-overlay";
+  modal.hidden = true;
+  modal.innerHTML =
+    '<div class="cfg-search-dialog" role="dialog" aria-modal="true" aria-labelledby="cfgSearchTitle">' +
+      '<div class="cfg-search-head">' +
+        '<span class="cfg-search-icon" aria-hidden="true">' +
+          '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">' +
+            '<circle cx="7.2" cy="7.2" r="4.5"/><path d="M10.6 10.6L14 14"/>' +
+          "</svg>" +
+        "</span>" +
+        '<input id="configSearchInput" class="cfg-search-input" type="search" placeholder="搜索全部配置项：中文、简称、拼音、英文键或别名（如 向量精度 / xljd / float16 / 跨群）" autocomplete="off" spellcheck="false" aria-label="全局配置搜索" />' +
+        '<button type="button" class="cfg-search-clear" id="configSearchClear" aria-label="清空搜索" hidden>×</button>' +
+        '<span class="cfg-search-count" id="configSearchCount"></span>' +
+        '<button type="button" class="cfg-search-esc" id="configSearchClose" aria-label="关闭配置搜索">Esc</button>' +
+      "</div>" +
+      '<span id="cfgSearchTitle" class="sr-only">全局配置搜索</span>' +
+      '<div class="cfg-search-body" id="configSearchBody" role="listbox" aria-label="配置搜索结果"></div>' +
+      '<div class="cfg-search-foot">' +
+        '<span><kbd>↑</kbd><kbd>↓</kbd> 选择</span>' +
+        '<span><kbd>Enter</kbd> 直达并定位</span>' +
+        '<span><kbd>Esc</kbd> 关闭</span>' +
+        '<span class="cfg-search-foot-right">支持同义词 · 拼音首字母 · 错字容错</span>' +
+      "</div>" +
+    "</div>";
+
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal) {
+      closeConfigSearch();
+      return;
+    }
+    const chip = event.target.closest("[data-search-chip]");
+    if (chip) {
+      const input = $("#configSearchInput", modal);
+      if (input) {
+        input.value = chip.dataset.searchChip || "";
+        configSearchState.query = input.value;
+        configSearchState.selectedIndex = 0;
+        renderConfigSearchResults();
+        input.focus();
+      }
+      return;
+    }
+    const retry = event.target.closest("[data-search-retry]");
+    if (retry) {
+      ensureConfigSchemaLoaded();
+      return;
+    }
+    const row = event.target.closest("[data-search-hit]");
+    if (row) {
+      const idx = Number(row.dataset.searchHit);
+      if (Number.isFinite(idx) && configSearchState.hits[idx]) {
+        activateConfigSearchHit(configSearchState.hits[idx]);
+      }
+      return;
+    }
+    const modBtn = event.target.closest("[data-search-module]");
+    if (modBtn) {
+      activateConfigSearchHit({ item: { kind: "module", moduleId: modBtn.dataset.searchModule } });
+    }
+  });
+
+  modal.addEventListener("mousemove", (event) => {
+    const row = event.target.closest("[data-search-hit]");
+    if (!row) return;
+    const idx = Number(row.dataset.searchHit);
+    if (Number.isFinite(idx) && idx !== configSearchState.selectedIndex) {
+      configSearchState.selectedIndex = idx;
+      syncConfigSearchSelection(modal, false);
+    }
+  });
+
+  const input = $("#configSearchInput", modal);
+  const clearBtn = $("#configSearchClear", modal);
+  const closeBtn = $("#configSearchClose", modal);
+
+  input.addEventListener("input", () => {
+    configSearchState.query = input.value;
+    configSearchState.selectedIndex = 0;
+    renderConfigSearchResults();
+  });
+
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown") {
+      if (!configSearchState.hits.length) return;
+      event.preventDefault();
+      configSearchState.selectedIndex = (configSearchState.selectedIndex + 1) % configSearchState.hits.length;
+      syncConfigSearchSelection(modal, true);
+    } else if (event.key === "ArrowUp") {
+      if (!configSearchState.hits.length) return;
+      event.preventDefault();
+      configSearchState.selectedIndex =
+        (configSearchState.selectedIndex - 1 + configSearchState.hits.length) % configSearchState.hits.length;
+      syncConfigSearchSelection(modal, true);
+    } else if (event.key === "Home" && configSearchState.hits.length) {
+      event.preventDefault();
+      configSearchState.selectedIndex = 0;
+      syncConfigSearchSelection(modal, true);
+    } else if (event.key === "End" && configSearchState.hits.length) {
+      event.preventDefault();
+      configSearchState.selectedIndex = configSearchState.hits.length - 1;
+      syncConfigSearchSelection(modal, true);
+    } else if (event.key === "Enter") {
+      const hit = configSearchState.hits[configSearchState.selectedIndex];
+      if (hit) {
+        event.preventDefault();
+        activateConfigSearchHit(hit);
+      }
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeConfigSearch();
+    }
+  });
+
+  clearBtn.addEventListener("click", () => {
+    input.value = "";
+    configSearchState.query = "";
+    configSearchState.selectedIndex = 0;
+    renderConfigSearchResults();
+    input.focus();
+  });
+
+  closeBtn.addEventListener("click", () => closeConfigSearch());
+
+  document.body.appendChild(modal);
+  return modal;
+}
+
+function syncConfigSearchSelection(modal, shouldScroll) {
+  const rows = $$("[data-search-hit]", modal);
+  rows.forEach((row, idx) => {
+    const active = idx === configSearchState.selectedIndex;
+    row.classList.toggle("is-selected", active);
+    row.setAttribute("aria-selected", active ? "true" : "false");
+    if (active && shouldScroll && typeof row.scrollIntoView === "function") {
+      try { row.scrollIntoView({ block: "nearest" }); } catch (error) { /* 忽略 */ }
+    }
+  });
+}
+
+function renderConfigSearchResults() {
+  const modal = $("#configSearchModal");
+  if (!modal) return;
+  const body = $("#configSearchBody", modal);
+  const countEl = $("#configSearchCount", modal);
+  const clearBtn = $("#configSearchClear", modal);
+  const query = compact(configSearchState.query);
+  if (clearBtn) clearBtn.hidden = !configSearchState.query;
+
+  if (configSearchState.loading && !state.configSchema) {
+    configSearchState.hits = [];
+    if (countEl) countEl.textContent = "索引中…";
+    body.innerHTML = '<div class="cfg-search-empty"><b>正在载入全部配置项索引…</b><span>涵盖全部模块与折叠高级项</span></div>';
+    return;
+  }
+
+  if (configSearchState.error && !state.configSchema) {
+    configSearchState.hits = [];
+    if (countEl) countEl.textContent = "加载失败";
+    body.innerHTML =
+      '<div class="cfg-search-empty"><b>配置索引未能加载</b><span>' + esc(configSearchState.error) + "</span>" +
+      '<button type="button" class="btn is-sm" data-search-retry style="margin-top:10px">重试加载</button></div>';
+    return;
+  }
+
+  ensureConfigSearchIndex();
+
+  if (!query) {
+    configSearchState.hits = [];
+    if (countEl) {
+      countEl.textContent = configSearchState.moduleCount + " 模块 · " + configSearchState.fieldCount + " 项";
+    }
+    const chipsHtml = CONFIG_SEARCH_QUICK_CHIPS
+      .map((label) => '<button type="button" class="cfg-search-chip" data-search-chip="' + esc(label) + '">' + esc(label) + "</button>")
+      .join("");
+    const schema = (state.configSchema && state.configSchema.schema) || {};
+    const featuredIds = [
+      "retrieval_advanced",
+      "conversation_memory_advanced",
+      "memory_humanization",
+      "persona_memory",
+      "appearance",
+      "memory_summary",
+      "identity",
+      "livingmemory_migration",
+    ].filter((id) => Object.prototype.hasOwnProperty.call(schema, id));
+    const modGrid = featuredIds
+      .map((id) => {
+        const mod = schema[id] || {};
+        const count = Object.keys(mod.items || {}).length;
+        return (
+          '<button type="button" class="cfg-search-modcard" data-search-module="' + esc(id) + '">' +
+          '<b>' + esc(moduleLabel(id, mod)) + "</b>" +
+          '<em>' + count + " 项</em>" +
+          '<span>' + esc(clip(moduleSubtitle(id, mod) || "点击进入该模块配置", 36)) + "</span>" +
+          "</button>"
+        );
+      })
+      .join("");
+    body.innerHTML =
+      '<div class="cfg-search-welcome">' +
+        '<div class="cfg-search-sec-label">快捷直达</div>' +
+        '<div class="cfg-search-chips">' + chipsHtml + "</div>" +
+        (modGrid ? '<div class="cfg-search-sec-label" style="margin-top:14px">常用配置模块</div><div class="cfg-search-modgrid">' + modGrid + "</div>" : "") +
+      "</div>";
+    return;
+  }
+
+  const hits = runConfigSearchQuery(query);
+  configSearchState.hits = hits;
+  if (configSearchState.selectedIndex >= hits.length) configSearchState.selectedIndex = 0;
+  if (countEl) countEl.textContent = "命中 " + hits.length + " 项";
+
+  if (!hits.length) {
+    const chipsHtml = CONFIG_SEARCH_QUICK_CHIPS.slice(0, 5)
+      .map((label) => '<button type="button" class="cfg-search-chip" data-search-chip="' + esc(label) + '">' + esc(label) + "</button>")
+      .join("");
+    body.innerHTML =
+      '<div class="cfg-search-empty">' +
+        '<b>未找到与「' + esc(query) + '」匹配的配置</b>' +
+        "<span>可以尝试简称、同义词（如 省内存 / 小黑屋 / 跨群）、拼音首字母（如 xljd / nrh）或英文键名</span>" +
+        '<div class="cfg-search-chips" style="justify-content:center;margin-top:12px">' + chipsHtml + "</div>" +
+      "</div>";
+    return;
+  }
+
+  body.innerHTML = hits
+    .map((hit, idx) => {
+      const it = hit.item;
+      const selected = idx === configSearchState.selectedIndex;
+      const tags = [];
+      if (hit.matchKind === "alias" && hit.reason) {
+        tags.push('<span class="cfg-search-tag is-alias">' + esc(hit.reason) + "</span>");
+      } else if (hit.matchKind === "pinyin") {
+        tags.push('<span class="cfg-search-tag is-pinyin">拼音</span>');
+      } else if (hit.matchKind === "fuzzy") {
+        tags.push('<span class="cfg-search-tag is-fuzzy">容错</span>');
+      }
+      if (it.kind === "module") {
+        tags.push('<span class="cfg-search-tag is-mod">模块 · ' + esc(it.fieldCount) + " 项</span>");
+      } else if (it.kind === "view") {
+        tags.push('<span class="cfg-search-tag is-mod">视图</span>');
+      } else {
+        if (it.isAdvanced) tags.push('<span class="cfg-search-tag is-adv">高级项</span>');
+        if (it.locked) tags.push('<span class="cfg-search-tag is-lock">只读</span>');
+      }
+
+      const crumb =
+        it.kind === "field"
+          ? '<span class="cfg-search-mod">' + highlightConfigText(it.moduleLabel, hit.matchedTerms) + "</span>" +
+            '<span class="cfg-search-sep" aria-hidden="true">›</span>' +
+            '<strong class="cfg-search-title">' + highlightConfigText(it.title, hit.matchedTerms) + "</strong>"
+          : '<span class="cfg-search-mod">' + esc(it.group) + "</span>" +
+            '<span class="cfg-search-sep" aria-hidden="true">›</span>' +
+            '<strong class="cfg-search-title">' + highlightConfigText(it.title, hit.matchedTerms) + "</strong>";
+
+      return (
+        '<button type="button" class="cfg-search-item' + (selected ? " is-selected" : "") + '"' +
+        ' role="option" aria-selected="' + (selected ? "true" : "false") + '"' +
+        ' data-search-hit="' + idx + '">' +
+        '<div class="cfg-search-row-top">' +
+          '<div class="cfg-search-crumb">' + crumb + "</div>" +
+          (tags.length ? '<div class="cfg-search-tags">' + tags.join("") + "</div>" : "") +
+        "</div>" +
+        (it.desc ? '<div class="cfg-search-desc">' + highlightConfigText(it.desc, hit.matchedTerms) + "</div>" : "") +
+        '<div class="cfg-search-key mono">' + highlightConfigText(it.key, hit.matchedTerms) + "</div>" +
+        "</button>"
+      );
+    })
+    .join("");
+}
+
+function openConfigSearch(initialQuery) {
+  const modal = ensureConfigSearchModal();
+  window.clearTimeout(configSearchState.closeTimer);
+  configSearchState.closeTimer = 0;
+  if (!configSearchState.open) {
+    configSearchState.lastFocus = document.activeElement;
+  }
+  configSearchState.open = true;
+  modal.hidden = false;
+  if (prefersReducedMotion()) {
+    modal.classList.add("is-open");
+  } else {
+    void modal.offsetWidth;
+    requestAnimationFrame(() => {
+      if (configSearchState.open) modal.classList.add("is-open");
+    });
+  }
+  const input = $("#configSearchInput", modal);
+  if (typeof initialQuery === "string") {
+    configSearchState.query = initialQuery;
+    if (input) input.value = initialQuery;
+  } else if (input) {
+    input.value = configSearchState.query;
+  }
+  configSearchState.selectedIndex = 0;
+  renderConfigSearchResults();
+  if (!state.configSchema || !state.configSchema.schema) {
+    ensureConfigSchemaLoaded();
+  }
+  if (input) {
+    input.focus();
+    if (input.value) input.select();
+  }
+}
+
+function closeConfigSearch(options) {
+  const modal = $("#configSearchModal");
+  if (!modal || !configSearchState.open) return;
+  configSearchState.open = false;
+  window.clearTimeout(configSearchState.closeTimer);
+  configSearchState.closeTimer = 0;
+  modal.classList.remove("is-open");
+  if (prefersReducedMotion() || (options && options.immediate)) {
+    modal.hidden = true;
+  } else {
+    configSearchState.closeTimer = window.setTimeout(() => {
+      configSearchState.closeTimer = 0;
+      if (!configSearchState.open) modal.hidden = true;
+    }, 180);
+  }
+  if (!options || options.restoreFocus !== false) {
+    const prev = configSearchState.lastFocus;
+    configSearchState.lastFocus = null;
+    if (prev && typeof prev.focus === "function" && document.contains(prev)) {
+      try { prev.focus({ preventScroll: true }); } catch (error) { /* 忽略 */ }
+    }
+  } else {
+    configSearchState.lastFocus = null;
+  }
+}
+
+async function activateConfigSearchHit(hit) {
+  const item = hit && hit.item;
+  if (!item) return;
+  closeConfigSearch({ restoreFocus: false });
+  if (item.kind === "view" && item.viewId) {
+    await go(item.viewId);
+    return;
+  }
+  if (item.moduleId) {
+    state.configModule = item.moduleId;
+    if (item.kind === "field" && item.fieldKey) {
+      configSearchState.pendingTarget = {
+        moduleId: item.moduleId,
+        fieldKey: item.fieldKey,
+        isAdvanced: Boolean(item.isAdvanced),
+      };
+    } else {
+      configSearchState.pendingTarget = null;
+    }
+    await go("config", { useCachedSchema: Boolean(state.configSchema && state.configSchema.schema) });
+  }
+}
+
+function applyPendingConfigFocus(rootNode) {
+  const target = configSearchState.pendingTarget;
+  if (!target || target.moduleId !== state.configModule) return;
+  configSearchState.pendingTarget = null;
+
+  const scope = rootNode || $("#content");
+  if (!scope) return;
+  const safeKey = String(target.fieldKey || "").replace(/["\\]/g, "\\$&");
+  const fieldEl = scope.querySelector('[data-config-field="' + safeKey + '"]');
+  if (!fieldEl) return;
+
+  const details = fieldEl.closest("details.config-advanced");
+  if (details) {
+    if (typeof details.__cancelSmoothAnim === "function") details.__cancelSmoothAnim();
+    if (!details.open) details.open = true;
+  }
+
+  let reducedMotion = false;
+  try {
+    reducedMotion = Boolean(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  } catch (error) { /* 忽略 */ }
+
+  requestAnimationFrame(() => {
+    if (typeof fieldEl.scrollIntoView === "function") {
+      try {
+        fieldEl.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "center" });
+      } catch (error) {
+        fieldEl.scrollIntoView();
+      }
+    }
+    $$(".config-field.is-search-hit", scope).forEach((el) => el.classList.remove("is-search-hit"));
+    void fieldEl.offsetWidth;
+    fieldEl.classList.add("is-search-hit");
+    window.clearTimeout(configSearchState.hitTimer);
+    configSearchState.hitTimer = window.setTimeout(() => {
+      fieldEl.classList.remove("is-search-hit");
+    }, 2200);
+
+    const focusable =
+      fieldEl.querySelector('.cfg-choice-card.is-active:not([disabled])') ||
+      fieldEl.querySelector('input:not([type="hidden"]):not([disabled]), select:not([disabled]), button:not([disabled])');
+    if (focusable && typeof focusable.focus === "function") {
+      try { focusable.focus({ preventScroll: true }); } catch (error) { /* 忽略 */ }
+    }
+  });
+}
+
+function mountConfigSearchTrigger() {
+  if ($("#configSearchBtn")) return;
+  const foot = $(".rail-foot");
+  if (!foot) return;
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.id = "configSearchBtn";
+  btn.className = "rail-search-btn";
+  btn.title = "搜索全部配置项 (" + shortcutBadgeText() + ")";
+  btn.setAttribute("aria-label", "搜索配置");
+  btn.innerHTML =
+    icon("search", "rail-search-icon") +
+    '<span class="rail-search-label">搜索配置</span>' +
+    '<kbd class="rail-search-kbd">' + esc(shortcutBadgeText()) + "</kbd>";
+  btn.addEventListener("click", () => openConfigSearch());
+  foot.insertBefore(btn, foot.firstChild);
+}
+
+function initConfigSearch() {
+  if (configSearchState.initialized) return;
+  configSearchState.initialized = true;
+  mountConfigSearchTrigger();
+
+  document.addEventListener("keydown", (event) => {
+    const key = String(event.key || "");
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && key.toLowerCase() === "k") {
+      event.preventDefault();
+      if (configSearchState.open) {
+        const input = $("#configSearchInput");
+        if (input) {
+          input.focus();
+          input.select();
+        }
+      } else {
+        openConfigSearch();
+      }
+      return;
+    }
+
+    if (key === "Escape" && configSearchState.open) {
+      event.preventDefault();
+      closeConfigSearch();
+      return;
+    }
+
+    if (
+      key === "/" &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      !configSearchState.open &&
+      !isEditableElement(event.target) &&
+      !(state.mode === "cinema" && state.view === "overview")
+    ) {
+      event.preventDefault();
+      openConfigSearch();
+    }
+  });
+}
 
 /* ============================================================
    视图：权限拓扑
@@ -4486,6 +5585,8 @@ function bindShell() {
     applyTheme(state.theme === "dark" ? "light" : "dark");
   });
 
+  const drawerNode = $("#drawer");
+  if (drawerNode && !drawerNode.classList.contains("is-open")) drawerNode.inert = true;
   $("#drawerClose").addEventListener("click", closeDrawer);
   $("#scrim").addEventListener("click", closeDrawer);
   $("#assemblyViewerClose")?.addEventListener("click", closeAssemblyViewer);
@@ -4501,6 +5602,8 @@ function bindShell() {
     invalidatePool();
     refresh();
   });
+
+  initConfigSearch();
 
   const modeToggle = $("#modeToggle");
   if (modeToggle) {
@@ -4609,7 +5712,7 @@ function bindShell() {
     if (event.key === "Escape") {
       closeDrawer();
       const box = $(".lightbox");
-      if (box) box.remove();
+      if (box) closeLightbox(box);
     }
   });
 }
