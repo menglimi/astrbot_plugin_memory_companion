@@ -9220,6 +9220,16 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
     async def list_core_memory_blocks(self) -> list[MemoryRecord]:
         return await self.store.list_core_memories(limit=1000)
 
+    def _config_text(self, key: str, default: str = "") -> Any:
+        """Read a dotted string config value, tolerating partial doubles.
+
+        Production configs expose ``get``; a few tests build a stand-in that
+        only implements the typed accessors (``bool``/``int``/``float``). In
+        that case fall back to the default instead of raising.
+        """
+        getter = getattr(self.config, "get", None)
+        return getter(key, default) if callable(getter) else default
+
     def _source_surface_rules(self) -> dict[str, dict[str, str]]:
         """Registry from ``memory_capture.source_surfaces`` as helper kwargs.
 
@@ -9228,7 +9238,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         existed. The parsed maps are memoised on the raw value: re-parsing the
         same JSON for every captured message would be pure waste.
         """
-        raw = self.config.get("memory_capture.source_surfaces", "")
+        raw = self._config_text("memory_capture.source_surfaces", "")
         cached = getattr(self, "_source_surface_rules_cache", None)
         if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == raw:
             return cached[1]
@@ -9244,7 +9254,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         name a registered surface) and deciding that an undeclared-but-valid
         label stays neutral. Memoised on the raw config value, like the rules.
         """
-        raw = self.config.get("memory_capture.source_surfaces", "")
+        raw = self._config_text("memory_capture.source_surfaces", "")
         cached = getattr(self, "_source_surface_names_cache", None)
         if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == raw:
             return cached[1]
@@ -9259,7 +9269,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         "no explicit weights", which is the default and never discounts a row.
         """
         return parse_surface_weights(
-            self.config.get("retrieval_advanced.source_surface_weights", "")
+            self._config_text("retrieval_advanced.source_surface_weights", "")
         )
 
     async def _core_source_surface_metadata(self, refs: Any) -> dict[str, Any]:
