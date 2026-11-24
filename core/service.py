@@ -4881,6 +4881,10 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             "embedding_top_k": self.config.int("retrieval.embedding_top_k", 32),
             "embedding_score_threshold": self.config.float("retrieval.embedding_score_threshold", 0.34),
             "embedding_weight": self.config.float("retrieval.embedding_weight", 0.55),
+            # 这两个同样改「送进 embedding 的文本长度 / 调用期限」→ 改向量召回结果；
+            # 默认值与引擎构造处（_embedding_timeout_ms() / 1200）逐字同口径。
+            "embedding_timeout_ms": self._embedding_timeout_ms(),
+            "embedding_max_text_chars": self.config.int("retrieval.embedding_max_text_chars", 1200),
             "non_conversation_budget": self.config.int(
                 "retrieval_advanced.non_conversation_budget", 2
             ),

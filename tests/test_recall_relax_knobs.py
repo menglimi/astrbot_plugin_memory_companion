@@ -262,6 +262,9 @@ CACHE_KEY_SORTING_KNOBS: tuple[tuple[str, object, object], ...] = (
     ("retrieval_advanced.source_surface_weight", 1.0, 0.6),
     ("retrieval_advanced.source_surface_weights", "", '{"minecraft": 0.4}'),
     ("memory_capture.source_surfaces", "", '[{"name": "discord", "message_id_prefixes": ["dc-"]}]'),
+    # 这两个改「送进 embedding 的文本长度 / 调用期限」，超时与截断都会改向量召回结果。
+    ("retrieval.embedding_max_text_chars", 1200, 600),
+    ("retrieval.embedding_timeout_ms", 2000, 500),
 )
 
 
