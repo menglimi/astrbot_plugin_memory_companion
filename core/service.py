@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 import math
 import threading
 import time
-import threading
 from collections import Counter, OrderedDict, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field, is_dataclass, replace
@@ -126,7 +126,7 @@ from .latency import (
     detach_memory_hook_budget,
 )
 from .retrieval import RerankCircuitBreaker, RetrievalEngine
-from .store import MemoryStore
+from .store import DEFAULT_VECTOR_PRECISION, MemoryStore, normalize_vector_precision
 from .vector_search import bounded_cache_bytes
 from .source_query import query_sources, source_visible
 from .source_discovery import discover_sources as run_source_discovery
@@ -484,16 +484,84 @@ class _HookStageTimer:
         return int(round((time.perf_counter_ns() - self._started) / 1_000_000))
 
 
+_TURN_TIMELINE_CACHE: ContextVar[
+    dict[tuple[str, str, str, str], tuple[int, list[dict[str, Any]]]] | None
+] = ContextVar("_mc_turn_timeline_cache", default=None)
+
+
 class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
     _SCOPE_CONTROL_FEATURES = frozenset({"capture", "recall", "topology"})
     # Token statistics are rewritten at most this often; the document grows to
     # several megabytes, so an unbounded write per provider call would dominate
     # the hook budget. Shutdown paths flush dirty state via _close_json_writers.
     _TOKEN_USAGE_SAVE_INTERVAL_SECONDS = 30.0
+    _TOKEN_USAGE_MAX_HOUR_BUCKETS = 336
     # How often the worker thread compares the stored revision and rebuilds the
     # in-process ACL projection.  The hot read never touches the database, so a
     # missed write-path update self-heals within one interval.
     _ACL_RECONCILE_INTERVAL_SECONDS = 60.0
+
+    def _configured_vector_precision(self) -> str:
+        return normalize_vector_precision(
+            self.config.get("retrieval_advanced.vector_precision", DEFAULT_VECTOR_PRECISION)
+        )
+
+    def _sync_store_vector_precision(self) -> str:
+        precision = self._configured_vector_precision()
+        self.store.vector_storage_precision = precision
+        return precision
+
+    async def _recent_timeline_cached(
+        self,
+        *,
+        limit: int,
+        scope: str = "",
+        session_id: str = "",
+        entity_id: str = "",
+        bot_id: str = "",
+    ) -> list[dict[str, Any]]:
+        """Share recent_timeline reads within a single LLM turn without cross-turn staleness."""
+        need = max(1, int(limit or 1))
+        cache = _TURN_TIMELINE_CACHE.get()
+        if cache is None:
+            return await self.store.recent_timeline(
+                limit=need,
+                scope=scope,
+                session_id=session_id,
+                entity_id=entity_id,
+                bot_id=bot_id,
+            )
+        norm_scope = clean_text(scope, 40)
+        norm_session = clean_text(session_id, 160)
+        norm_entity = clean_text(entity_id, 120)
+        norm_bot = clean_text(bot_id, 120)
+        key = (norm_scope, norm_session, norm_entity, norm_bot)
+        cached = cache.get(key)
+        if cached is not None and cached[0] >= need:
+            return list(cached[1][:need])
+        if norm_bot:
+            unfiltered = cache.get((norm_scope, norm_session, norm_entity, ""))
+            if unfiltered is not None and unfiltered[0] >= need:
+                unfiltered_limit, unfiltered_rows = unfiltered
+                filtered = [
+                    row
+                    for row in unfiltered_rows
+                    if clean_text(row.get("bot_id"), 120) in {"", norm_bot}
+                ]
+                if len(filtered) >= need or len(unfiltered_rows) < unfiltered_limit:
+                    cache[key] = (max(need, len(filtered)), filtered)
+                    return list(filtered[:need])
+        fetch_limit = max(need, 24)
+        rows = await self.store.recent_timeline(
+            limit=fetch_limit,
+            scope=scope,
+            session_id=session_id,
+            entity_id=entity_id,
+            bot_id=bot_id,
+        )
+        rows_list = list(rows)
+        cache[key] = (fetch_limit, rows_list)
+        return list(rows_list[:need])
 
     def _host_timezone_name(self) -> str:
         """Read AstrBot's global ``timezone`` for the plugin's wall clock.
@@ -545,6 +613,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         )
 
         self.store = MemoryStore(self.data_dir / "memory_companion.db")
+        self._sync_store_vector_precision()
         self.scoped_store = ScopedStore(
             self.data_dir / "req041_scoped.db",
             initialize=False,
@@ -552,6 +621,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         self._database_init_lock = threading.Lock()
         self._database_initialized = False
         self._database_init_task: asyncio.Task[bool] | None = None
+        self._capture_init_task: asyncio.Task[Any] | None = None
         if not defer_database_initialization:
             try:
                 self._initialize_database_sync()
@@ -1438,30 +1508,34 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         )
         stage_timer.mark("reply_chain")
 
-        if capture_enabled:
-            await await_hook_stage(
-                self._apply_user_reaction_feedback(ctx), "feedback"
-            )
-            self._update_address_evolution(ctx, ctx.message_text or "")
-        stage_timer.mark("feedback")
-
-        self._hook_stage_timer = stage_timer
+        turn_cache_token = _TURN_TIMELINE_CACHE.set({})
         try:
-            await await_hook_stage(
-                self.inject_memories(ctx, req, event=event), "memory_injection"
-            )
-        except Exception as exc:
-            logger.warning(
-                "[MemoryCompanion] 记忆注入失败，已放行本轮 LLM 请求: session=%s error=%s",
-                ctx.session_id,
-                exc,
-                exc_info=True,
-            )
-        finally:
-            self._hook_stage_timer = None
-        stage_timer.mark("inject")
+            if capture_enabled:
+                await await_hook_stage(
+                    self._apply_user_reaction_feedback(ctx), "feedback"
+                )
+                self._update_address_evolution(ctx, ctx.message_text or "")
+            stage_timer.mark("feedback")
 
-        self._apply_reconstruction_turn_hint(req, ctx, event=event)
+            self._hook_stage_timer = stage_timer
+            try:
+                await await_hook_stage(
+                    self.inject_memories(ctx, req, event=event), "memory_injection"
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[MemoryCompanion] 记忆注入失败，已放行本轮 LLM 请求: session=%s error=%s",
+                    ctx.session_id,
+                    exc,
+                    exc_info=True,
+                )
+            finally:
+                self._hook_stage_timer = None
+            stage_timer.mark("inject")
+
+            self._apply_reconstruction_turn_hint(req, ctx, event=event)
+        finally:
+            _TURN_TIMELINE_CACHE.reset(turn_cache_token)
 
         if capture_enabled:
             # 关于本轮回复的采集写入（写时间线、写关系、抽取事实、调度向量化等）
@@ -1820,7 +1894,15 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         record = self.classifier.from_user_message(ctx)
         if not record:
             return
-        existing_id = await self._existing_timeline_message_id(ctx, "user_message")
+        recent_timeline_rows = await self.store.recent_timeline(
+            limit=20,
+            scope=ctx.scope,
+            session_id=ctx.session_id,
+            entity_id=ctx.current_target_id,
+        )
+        existing_id = await self._existing_timeline_message_id(
+            ctx, "user_message", recent_rows=recent_timeline_rows
+        )
         if existing_id:
             await self.store.backfill_timeline_display_metadata(
                 existing_id,
@@ -1831,7 +1913,11 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 },
             )
             return
-        event_metadata = await self._conversation_memory_metadata(ctx, source="group_conversation_observer")
+        event_metadata = await self._conversation_memory_metadata(
+            ctx,
+            source="group_conversation_observer",
+            recent_rows=recent_timeline_rows,
+        )
         event_metadata.update(
             {
                 "memory_id": "",
@@ -2321,7 +2407,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
     async def _lifecycle_maintenance_dispatch_loop(self) -> None:
         startup_delay = max(
             5,
-            self.config.int("maintenance.auto_startup_delay_seconds", 120),
+            self.config.int("maintenance.auto_startup_delay_seconds", 300),
         )
         interval_hours = max(
             1,
@@ -2555,9 +2641,21 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             self._schedule_session_summary(ctx, reason="after_bot_response")
 
     async def _timeline_already_has_message(
-        self, ctx: SessionContext, event_type: str, *, content: str = ""
+        self,
+        ctx: SessionContext,
+        event_type: str,
+        *,
+        content: str = "",
+        recent_rows: list[dict[str, Any]] | None = None,
     ) -> bool:
-        return bool(await self._existing_timeline_message_id(ctx, event_type, content=content))
+        return bool(
+            await self._existing_timeline_message_id(
+                ctx,
+                event_type,
+                content=content,
+                recent_rows=recent_rows,
+            )
+        )
 
     async def _existing_timeline_message_id(
         self,
@@ -4441,6 +4539,17 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             revision = ""
         if not revision:
             return ""
+        knowledge_graph_enabled = self.config.bool(
+            "knowledge_graph.retrieval_expansion_enabled", True
+        )
+        knowledge_revision = ""
+        if knowledge_graph_enabled:
+            kg_rev_fn = getattr(self.store, "knowledge_revision", None)
+            if callable(kg_rev_fn):
+                try:
+                    knowledge_revision = await kg_rev_fn()
+                except Exception:
+                    knowledge_revision = ""
         time_payload = {}
         if time_intent is not None:
             time_payload = {
@@ -4459,10 +4568,11 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             "rerank_timeout_ms": bounded_model_call_timeout_ms(
                 self.config.int("retrieval.rerank_timeout_ms", MAX_MODEL_CALL_TIMEOUT_MS)
             ),
-            "latency_budget_ms": self.config.int("retrieval_advanced.recall_latency_budget_ms", 0),
+            "latency_budget_ms": self.config.int("retrieval_advanced.recall_latency_budget_ms", 1800),
             "query_vector_cache_ttl_seconds": self.config.float(
-                "retrieval_advanced.query_vector_cache_ttl_seconds", 0.0
+                "retrieval_advanced.query_vector_cache_ttl_seconds", 120.0
             ),
+            "vector_precision": self._configured_vector_precision(),
             "embedding_enabled": self.config.bool("retrieval.embedding_enabled", False),
             "embedding_provider_id": clean_text(self.config.get("retrieval.embedding_provider_id", ""), 160),
             "embedding_candidate_limit": self.config.int("retrieval.embedding_candidate_limit", 1200),
@@ -4476,7 +4586,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             "keyword_fallback_min_fts_candidates": self.config.int(
                 "retrieval.keyword_fallback_min_fts_candidates", 80
             ),
-            "knowledge_graph_enabled": self.config.bool("knowledge_graph.retrieval_expansion_enabled", True),
+            "knowledge_graph_enabled": knowledge_graph_enabled,
             "knowledge_graph_expansion_limit": self.config.int("knowledge_graph.expansion_limit", 12),
             "context_orchestration_enabled": self.config.bool("context_orchestration.enabled", True),
             "allow_self_timeline_everywhere": self.config.bool(
@@ -4512,6 +4622,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             "capped_slots": sorted(clean_text(slot, 60) for slot in (capped_slots or set()) if clean_text(slot, 60)),
             "config": config_payload,
             "revision": revision,
+            "knowledge_revision": knowledge_revision,
         }
         raw = json_dumps(payload)
         return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
@@ -4797,6 +4908,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         self.store.vector_snapshot_cache_bytes = bounded_cache_bytes(
             self.config.int("retrieval_advanced.vector_snapshot_cache_mb", 512)
         )
+        self._sync_store_vector_precision()
         provider = None
         provider_id = ""
         if mode != "basic":
@@ -4820,9 +4932,9 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 self.config.int("retrieval.rerank_timeout_ms", MAX_MODEL_CALL_TIMEOUT_MS)
             ),
             rerank_circuit_breaker=self._configured_rerank_circuit_breaker(),
-            latency_budget_ms=self.config.int("retrieval_advanced.recall_latency_budget_ms", 0),
+            latency_budget_ms=self.config.int("retrieval_advanced.recall_latency_budget_ms", 1800),
             query_vector_cache_ttl_seconds=self.config.float(
-                "retrieval_advanced.query_vector_cache_ttl_seconds", 0.0
+                "retrieval_advanced.query_vector_cache_ttl_seconds", 120.0
             ),
             query_vector_cache=self._query_vector_cache,
             embedding_provider=embedding_provider,
@@ -5054,7 +5166,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             writer = BackgroundJsonWriter(
                 path=lambda: self.token_usage_path,
                 snapshot=self._token_usage_snapshot,
-                serialise=lambda document: json.dumps(document, ensure_ascii=False, indent=2),
+                serialise=lambda document: json.dumps(document, ensure_ascii=False, separators=(",", ":")),
                 spawn=lambda coro: self._spawn_persistence_task(coro, label="token-usage-save"),
                 label="Token 统计",
             )
@@ -5109,6 +5221,22 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         return max(1, int(ascii_chars / 4.0 + non_ascii_chars / 1.6))
 
     @classmethod
+    def _prune_token_usage_by_hour(cls, payload: dict[str, Any]) -> int:
+        by_hour = payload.get("by_hour")
+        if not isinstance(by_hour, dict):
+            return 0
+        excess = len(by_hour) - cls._TOKEN_USAGE_MAX_HOUR_BUCKETS
+        if excess <= 0:
+            return 0
+        keep_keys = set(sorted(str(k) for k in by_hour.keys())[-cls._TOKEN_USAGE_MAX_HOUR_BUCKETS :])
+        removed = 0
+        for key in list(by_hour.keys()):
+            if str(key) not in keep_keys:
+                by_hour.pop(key, None)
+                removed += 1
+        return removed
+
+    @classmethod
     def _normalize_token_usage(cls, payload: Any) -> dict[str, Any]:
         """Add separated reported/estimated counters to legacy statistics."""
         if not isinstance(payload, dict):
@@ -5135,6 +5263,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 visit(child)
 
         visit(payload)
+        cls._prune_token_usage_by_hour(payload)
         payload.setdefault("token_usage_schema_version", 2)
         return payload
 
@@ -5339,6 +5468,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             }
         )
         del recent[:-240]
+        self._prune_token_usage_by_hour(store)
         store["updated_at"] = now_dt.strftime("%Y-%m-%d %H:%M:%S")
         self._save_token_usage()
 
@@ -5500,7 +5630,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             breaker.configure(failure_threshold=threshold, cooldown_seconds=cooldown)
         return breaker
 
-    def schedule_startup_vector_warmup(self, *, settle_seconds: float = 0.5) -> bool:
+    def schedule_startup_vector_warmup(self, *, settle_seconds: float | None = None) -> bool:
         """Schedule background vector corpus warmup right after initialization without API calls."""
         if getattr(self, "_closing", False) or getattr(self, "_closed", False):
             return False
@@ -5511,6 +5641,17 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         self.store.vector_snapshot_cache_bytes = bounded_cache_bytes(
             self.config.int("retrieval_advanced.vector_snapshot_cache_mb", 512)
         )
+        self._sync_store_vector_precision()
+        if settle_seconds is None:
+            grace = max(0, int(getattr(self, "_background_grace_seconds", 0) or 0))
+            if grace > 0:
+                created_at = float(getattr(self, "_service_created_at", 0.0) or 0.0)
+                elapsed = max(0.0, time.monotonic() - created_at) if created_at > 0 else 0.0
+                resolved_settle = max(0.5, grace - elapsed)
+            else:
+                resolved_settle = 0.5
+        else:
+            resolved_settle = max(0.0, float(settle_seconds))
         provider_id = clean_text(self.config.get("retrieval.embedding_provider_id", ""), 160)
         include_pending = not self.config.bool("visibility.hide_pending_review", True)
         max_text_chars = max(200, int(self.config.int("retrieval.embedding_max_text_chars", 1200) or 1200))
@@ -5524,7 +5665,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 include_pending=include_pending,
                 batch_size=batch_size,
                 max_text_chars=max_text_chars,
-                settle_seconds=settle_seconds,
+                settle_seconds=resolved_settle,
             )
         )
 
@@ -6278,6 +6419,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
 
     async def _background_backfill_embeddings(self, provider: Any, provider_id: str) -> None:
         provider_id = clean_text(provider_id, 160)
+        self._sync_store_vector_precision()
         indexed = 0
         try:
             batch_size = max(
@@ -6308,6 +6450,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             self._embedding_backfill_inflight.discard(provider_id)
 
     async def _embed_memory_record(self, provider: Any, provider_id: str, record: MemoryRecord) -> bool:
+        self._sync_store_vector_precision()
         if record.lifecycle == "archived":
             return False
         if record.review_status == "pending" and not self.config.bool("retrieval.embedding_index_pending", False):
@@ -10872,6 +11015,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         self._reconstruction_states.clear()
 
     async def sleep_maintenance(self, *, reason: str = "manual") -> dict[str, Any]:
+        self._sync_store_vector_precision()
         backup = ""
         if self.config.bool("maintenance.sleep_backup_enabled", False):
             backup = str(await self.store.backup_async(".before_sleep_maintenance"))
@@ -10890,9 +11034,57 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         knowledge_graph = await self._backfill_knowledge_graph()
         decay = await self._run_memory_decay()
         try:
+            embedding_transcode = await self.store.transcode_memory_embeddings(
+                target_precision=self._configured_vector_precision(),
+                max_rows=5000,
+            )
+        except Exception as exc:
+            embedding_transcode = {"error": self._describe_exception(exc)}
+        try:
+            scoped_pruned = await asyncio.to_thread(
+                self.scoped_store.prune_expired_operations,
+                older_than_seconds=14 * 86400.0,
+                limit=5000,
+            )
+        except Exception as exc:
+            scoped_pruned = {"error": self._describe_exception(exc)}
+        capture_pruned: dict[str, Any] = {"skipped": True}
+        if getattr(self, "capture", None) is not None:
+            try:
+                removed_capture_ops = await asyncio.to_thread(
+                    self.capture.store.prune_completed_operations,
+                    older_than_seconds=7 * 86400.0,
+                    limit=5000,
+                )
+                capture_pruned = {"deleted": int(removed_capture_ops or 0)}
+            except Exception as exc:
+                capture_pruned = {"error": self._describe_exception(exc)}
+        try:
+            db_optimize = await self.store.optimize_and_shrink(
+                target_precision=self._configured_vector_precision(),
+                transcode_limit=0,
+                run_full_vacuum=False,
+            )
+        except Exception as exc:
+            db_optimize = {"error": self._describe_exception(exc)}
+        try:
             wal = await self.store.wal_health(checkpoint=True)
         except Exception as exc:
             wal = {"checkpoint_attempted": False, "error": self._describe_exception(exc)}
+        # Bulk precision transcode / orphan cleanup updates thousands of rows and
+        # exceeds the incremental delta threshold; re-warm the vector corpus in
+        # background so the next live chat turn never stalls on a cold rebuild.
+        if (
+            isinstance(embedding_transcode, dict)
+            and (
+                int(embedding_transcode.get("transcoded", 0) or 0) > 0
+                or int(embedding_transcode.get("purged_orphans", 0) or 0) > 0
+            )
+        ):
+            try:
+                self.schedule_startup_vector_warmup(settle_seconds=1.0)
+            except Exception:
+                pass
         stats = await self.store.stats()
         state = {
             "ok": True,
@@ -10903,6 +11095,10 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             "raw_retention": raw_retention,
             "knowledge_graph": knowledge_graph,
             "decay": decay,
+            "embedding_transcode": embedding_transcode,
+            "scoped_pruned": scoped_pruned,
+            "capture_pruned": capture_pruned,
+            "db_optimize": db_optimize,
             "wal": wal,
             "stats": {
                 "total_memories": stats.get("total_memories", 0),
@@ -10915,6 +11111,107 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         }
         self.sleep_state_path.write_text(json_dumps(state), encoding="utf-8")
         return state
+
+    async def database_health_snapshot(self) -> dict[str, Any]:
+        """Read-only database storage, vector precision, FTS, and sidecar health overview."""
+        precision = self._sync_store_vector_precision()
+        primary = await self.store.database_health_snapshot()
+        try:
+            scoped = await asyncio.to_thread(self.scoped_store.health_snapshot)
+        except Exception as exc:
+            scoped = {"error": self._describe_exception(exc)}
+        token_usage = self._token_usage if isinstance(self._token_usage, dict) else {}
+        by_hour = token_usage.get("by_hour") if isinstance(token_usage.get("by_hour"), dict) else {}
+        token_file_bytes = 0
+        try:
+            if self.token_usage_path.exists():
+                token_file_bytes = int(self.token_usage_path.stat().st_size)
+        except OSError:
+            token_file_bytes = 0
+        return {
+            "ok": True,
+            "configured_vector_precision": precision,
+            "primary": primary,
+            "scoped": scoped,
+            "token_usage": {
+                "by_hour_buckets": len(by_hour),
+                "by_hour_cap": self._TOKEN_USAGE_MAX_HOUR_BUCKETS,
+                "file_bytes": token_file_bytes,
+            },
+        }
+
+    async def optimize_and_shrink_database(
+        self,
+        *,
+        target_precision: str = "",
+        transcode_limit: int = 20000,
+        run_full_vacuum: bool = False,
+    ) -> dict[str, Any]:
+        """One-click database slimming: precision transcode, orphan cleanup, vacuum, PRAGMA optimize."""
+        configured_precision = self._sync_store_vector_precision()
+        precision = normalize_vector_precision(target_precision or configured_precision)
+        override_temporary = precision != configured_precision
+        primary_result = await self.store.optimize_and_shrink(
+            target_precision=precision,
+            transcode_limit=max(0, int(transcode_limit)),
+            run_full_vacuum=bool(run_full_vacuum),
+        )
+        try:
+            scoped_prune = await asyncio.to_thread(
+                self.scoped_store.prune_expired_operations,
+                older_than_seconds=14 * 86400.0,
+                limit=20000,
+                run_full_vacuum=bool(run_full_vacuum),
+            )
+        except Exception as exc:
+            scoped_prune = {"error": self._describe_exception(exc)}
+        capture_prune: dict[str, Any] = {"skipped": True}
+        if getattr(self, "capture", None) is not None:
+            try:
+                removed_capture_ops = await asyncio.to_thread(
+                    self.capture.store.prune_completed_operations,
+                    older_than_seconds=7 * 86400.0,
+                    limit=10000,
+                )
+                capture_prune = {"deleted": int(removed_capture_ops or 0)}
+            except Exception as exc:
+                capture_prune = {"error": self._describe_exception(exc)}
+        token_pruned = 0
+        if isinstance(self._token_usage, dict):
+            token_pruned = self._prune_token_usage_by_hour(self._token_usage)
+            if token_pruned > 0:
+                self._save_token_usage(force=True)
+        primary_transcode = primary_result.get("transcode") if isinstance(primary_result, dict) else None
+        if (
+            isinstance(primary_transcode, dict)
+            and (
+                int(primary_transcode.get("transcoded", 0) or 0) > 0
+                or int(primary_transcode.get("purged_orphans", 0) or 0) > 0
+            )
+        ):
+            try:
+                self.schedule_startup_vector_warmup(settle_seconds=1.0)
+            except Exception:
+                pass
+        health = await self.database_health_snapshot()
+        notice = (
+            f"本次仅按 {precision} 执行一次性转码；当前配置的向量存储精度仍为 {configured_precision}，"
+            f"如需长期保持 {precision}，请在「检索进阶 → 向量存储精度」保存配置。"
+            if override_temporary
+            else ""
+        )
+        return {
+            "ok": True,
+            "target_precision": precision,
+            "configured_vector_precision": configured_precision,
+            "precision_override_temporary": override_temporary,
+            "notice": notice,
+            "primary": primary_result,
+            "scoped_prune": scoped_prune,
+            "capture_prune": capture_prune,
+            "token_usage_hours_pruned": token_pruned,
+            "health": health,
+        }
 
     async def _backfill_knowledge_graph(self) -> dict[str, Any]:
         if not self.config.bool("knowledge_graph.enabled", True):
@@ -11230,14 +11527,31 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             if len(subjects) >= 200:
                 break
         factors: dict[tuple[str, str, str], float] = {}
+        grouped: dict[tuple[str, str], list[str]] = defaultdict(list)
         for bot_id, platform, user_id in subjects:
+            grouped[(bot_id, platform)].append(user_id)
+        for (bot_id, platform), user_ids in grouped.items():
+            cached_weights: dict[str, float] = {}
             try:
-                info = await self.store.person_weight(
-                    user_id=user_id, platform=platform, bot_id=bot_id
+                cached_weights = await self.store.person_weight_map(
+                    user_ids=user_ids, platform=platform, bot_id=bot_id
                 )
             except Exception:
-                continue
-            factors[(bot_id, platform, user_id)] = decay_factor(info.get("weight"))
+                cached_weights = {}
+            missing_users: list[str] = []
+            for user_id in user_ids:
+                if user_id in cached_weights:
+                    factors[(bot_id, platform, user_id)] = decay_factor(cached_weights[user_id])
+                else:
+                    missing_users.append(user_id)
+            for user_id in missing_users:
+                try:
+                    info = await self.store.person_weight(
+                        user_id=user_id, platform=platform, bot_id=bot_id
+                    )
+                except Exception:
+                    continue
+                factors[(bot_id, platform, user_id)] = decay_factor(info.get("weight"))
         return factors
 
     def _decay_candidate(
@@ -12149,6 +12463,15 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         return injection
 
     async def inject_memories(self, ctx: SessionContext, req: Any, *, event: Any = None) -> None:
+        if _TURN_TIMELINE_CACHE.get() is None:
+            turn_cache_token = _TURN_TIMELINE_CACHE.set({})
+            try:
+                return await self._inject_memories_impl(ctx, req, event=event)
+            finally:
+                _TURN_TIMELINE_CACHE.reset(turn_cache_token)
+        return await self._inject_memories_impl(ctx, req, event=event)
+
+    async def _inject_memories_impl(self, ctx: SessionContext, req: Any, *, event: Any = None) -> None:
         stage_timer = getattr(self, "_hook_stage_timer", None)
         self._mark_memory_companion_injection_state(event, req, injected=False, conversation_memory=False, slot_map={})
         removed = remove_temp_text(req, MEMORY_COMPANION_INJECTION_HEADER, MEMORY_COMPANION_INJECTION_FOOTER)
@@ -12200,6 +12523,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             and turn_signal.kind == "affection"
             and self._context_bool(ctx, "suppress_memory_on_low_information", True)
         )
+        static_core_revision = ""
         if skip_long_memory:
             # Low-information turns discard old memory below, so avoid loading
             # large windows that cannot affect this reply.
@@ -12211,6 +12535,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 stage_timer.mark("recent_fact")
                 stage_timer.mark("cross_window")
         else:
+            static_core_revision = await self.store.memory_revision()
             (
                 core_memories,
                 recent_fact_context,
@@ -12231,7 +12556,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 if not isolate_low_information and gap_limit > 0:
                     isolate_low_information = previous_gap >= gap_limit
         elif self._context_bool(ctx, "topic_shift_guard_enabled", True):
-            recent_rows = await self.store.recent_timeline(
+            recent_rows = await self._recent_timeline_cached(
                 limit=self._context_int(ctx, "topic_shift_guard_recent_events", 6),
                 scope=ctx.scope,
                 session_id=ctx.session_id,
@@ -12526,6 +12851,8 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 ctx, req, event=event, injection=injection, slot_map=slot_map,
                 strategy_id="existing.search_context_slots",
                 retrieval_info=retrieval_path_info,
+                preloaded_core_memories=core_memories if static_core_revision else None,
+                preloaded_core_revision=static_core_revision,
             )
         else:
             self._mark_memory_companion_injection_state(event, req, injected=False, conversation_memory=False, slot_map=slot_map)
@@ -12563,6 +12890,8 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
     async def _validate_reply_memory_refs(
         self, ctx: SessionContext, refs: list[dict[str, str]], slot_map: dict[str, list[Any]],
         *, timeline_reads: list[dict[str, str]] | None = None,
+        preloaded_core_memories: list[MemoryRecord] | None = None,
+        preloaded_core_revision: str = "",
     ) -> tuple[bool, str]:
         revision = await self.store.memory_revision()
         records = await self.store.get_memories_by_ids([ref["id"] for ref in refs]) if refs else {}
@@ -12586,7 +12915,14 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             if record.memory_type == "core_memory" or (record.metadata or {}).get("core_memory") is True
         }
         if core_ids:
-            allowed_core = {record.id for record in await self.core_memories_for_context(ctx)}
+            if (
+                preloaded_core_memories is not None
+                and preloaded_core_revision
+                and preloaded_core_revision == revision
+            ):
+                allowed_core = {record.id for record in preloaded_core_memories}
+            else:
+                allowed_core = {record.id for record in await self.core_memories_for_context(ctx)}
             if not core_ids.issubset(allowed_core):
                 return False, revision
         for ref in refs:
@@ -12624,6 +12960,8 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         self, ctx: SessionContext, req: Any, *, event: Any, injection: str,
         slot_map: dict[str, list[Any]], strategy_id: str,
         retrieval_info: dict[str, Any] | None = None,
+        preloaded_core_memories: list[MemoryRecord] | None = None,
+        preloaded_core_revision: str = "",
     ) -> bool:
         remove_temp_text(req, MEMORY_COMPANION_INJECTION_HEADER, MEMORY_COMPANION_INJECTION_FOOTER)
         self._mark_memory_companion_injection_state(event, req, injected=False, conversation_memory=False, slot_map=slot_map)
@@ -12645,7 +12983,14 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             )
             return False
         timeline_reads = []
-        current, revision = await self._validate_reply_memory_refs(ctx, refs, slot_map, timeline_reads=timeline_reads)
+        current, revision = await self._validate_reply_memory_refs(
+            ctx,
+            refs,
+            slot_map,
+            timeline_reads=timeline_reads,
+            preloaded_core_memories=preloaded_core_memories,
+            preloaded_core_revision=preloaded_core_revision,
+        )
         if not current:
             self._mark_memory_companion_injection_state(
                 event, req, injected=False, conversation_memory=False, slot_map=slot_map,
@@ -12868,7 +13213,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         logger.info("%s", clip(summary))
 
     async def _previous_context_gap_minutes(self, ctx: SessionContext) -> float | None:
-        rows = await self.store.recent_timeline(
+        rows = await self._recent_timeline_cached(
             limit=1,
             scope=ctx.scope,
             session_id=ctx.session_id,
@@ -13154,7 +13499,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         event_limit = max(8, min(80, self._context_int(ctx, "recent_fact_guard_event_limit", 24)))
         max_items = max(1, min(8, self._context_int(ctx, "recent_fact_guard_max_items", 4)))
         ttl_hours = max(1, min(24, self._context_int(ctx, "recent_fact_guard_hours", 3)))
-        rows = await self.store.recent_timeline(
+        rows = await self._recent_timeline_cached(
             limit=event_limit,
             scope=ctx.scope,
             session_id=ctx.session_id,
@@ -13461,7 +13806,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             if text:
                 rows.append({"event_type": "bot_response" if role == "assistant" else "user_message", "content": text})
         if not rows:
-            rows = await self.store.recent_timeline(
+            rows = await self._recent_timeline_cached(
                 limit=limit, scope=ctx.scope, session_id=ctx.session_id, entity_id=ctx.current_target_id,
                 bot_id=ctx.bot_id,
             )
@@ -14853,7 +15198,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         reaction = self._classify_memory_reaction(ctx.message_text)
         if not reaction:
             return
-        rows = await self.store.recent_timeline(
+        rows = await self._recent_timeline_cached(
             limit=8,
             scope=ctx.scope,
             session_id=ctx.session_id,
@@ -16639,6 +16984,18 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             self._database_initialized = True
             return True
 
+    def _initialize_capture_runtime_sync(self) -> Any:
+        with self._database_init_lock:
+            if getattr(self, "_closing", False) or getattr(self, "_closed", False):
+                return None
+            if self.capture is not None:
+                return self.capture
+            from .capture_runtime import CaptureRuntime
+
+            runtime = CaptureRuntime(self)
+            self.capture = runtime
+            return runtime
+
     async def initialize_database(self) -> bool:
         """Initialize or upgrade databases without blocking AstrBot's loop."""
         if self._closing or self._closed:
@@ -16656,8 +17013,14 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         if self._closing or self._closed:
             return False
         if self.capture is None:
-            from .capture_runtime import CaptureRuntime
-
-            self.capture = CaptureRuntime(self)
+            capture_task = getattr(self, "_capture_init_task", None)
+            if capture_task is None or capture_task.done():
+                capture_task = asyncio.create_task(
+                    asyncio.to_thread(self._initialize_capture_runtime_sync)
+                )
+                self._capture_init_task = capture_task
+            await asyncio.shield(capture_task)
+        if self._closing or self._closed:
+            return False
         self._ensure_summary_recovery_dispatcher()
         return True

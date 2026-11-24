@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -2410,6 +2411,152 @@ class MemoryCompanionBridge:
         except ScopedStoreError as exc:
             return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
         return {"ok": True, "state": "ready", **result}
+
+    async def bind_namespace_migration_epoch_async(
+        self,
+        capability: Any,
+        *,
+        operation_id: str,
+        expected_previous_epoch: str,
+        migration_epoch: str,
+        policy_version: str,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.bind_namespace_migration_epoch,
+            capability,
+            operation_id=operation_id,
+            expected_previous_epoch=expected_previous_epoch,
+            migration_epoch=migration_epoch,
+            policy_version=policy_version,
+        )
+
+    async def upsert_scoped_record_async(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        record_kind: str,
+        record_id: str,
+        revision: int,
+        payload: dict[str, Any],
+        event_id: str,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.upsert_scoped_record,
+            capability,
+            namespace,
+            record_kind=record_kind,
+            record_id=record_id,
+            revision=revision,
+            payload=payload,
+            event_id=event_id,
+        )
+
+    async def read_scoped_record_async(
+        self, capability: Any, namespace: Any, *, record_kind: str, record_id: str
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.read_scoped_record,
+            capability,
+            namespace,
+            record_kind=record_kind,
+            record_id=record_id,
+        )
+
+    async def list_scoped_records_async(
+        self, capability: Any, namespace: Any, *, record_kind: str, limit: int = 100
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.list_scoped_records,
+            capability,
+            namespace,
+            record_kind=record_kind,
+            limit=limit,
+        )
+
+    async def tombstone_scoped_record_async(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        record_kind: str,
+        record_id: str,
+        revision: int,
+        event_id: str,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.tombstone_scoped_record,
+            capability,
+            namespace,
+            record_kind=record_kind,
+            record_id=record_id,
+            revision=revision,
+            event_id=event_id,
+        )
+
+    async def tombstone_scoped_namespace_async(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        operation_id: str,
+        reason_code: str,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.tombstone_scoped_namespace,
+            capability,
+            namespace,
+            operation_id=operation_id,
+            reason_code=reason_code,
+        )
+
+    async def tombstone_scoped_identity_scopes_async(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        operation_id: str,
+        reason_code: str,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.tombstone_scoped_identity_scopes,
+            capability,
+            namespace,
+            operation_id=operation_id,
+            reason_code=reason_code,
+        )
+
+    async def erase_scoped_group_scopes_async(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        operation_id: str,
+        reason_code: str = "group_reset",
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.erase_scoped_group_scopes,
+            capability,
+            namespace,
+            operation_id=operation_id,
+            reason_code=reason_code,
+        )
+
+    async def erase_scoped_persona_scopes_async(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        operation_id: str,
+        reason_code: str = "persona_reset",
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.erase_scoped_persona_scopes,
+            capability,
+            namespace,
+            operation_id=operation_id,
+            reason_code=reason_code,
+        )
 
     def capability_status(self) -> dict[str, Any]:
         """Return the bounded C4 cache state without probing storage."""

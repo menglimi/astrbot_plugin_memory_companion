@@ -222,6 +222,8 @@ MEMORY_VISIBILITY_FILTERS = {
 }
 UI_ENDPOINT_EXPOSURE = {
     "/maintenance/summary_admission": {"exposure": "advanced", "reason": "管理员通过受保护的维护入口暂停、限量试跑或恢复记忆整理"},
+    "/maintenance/db_health": {"exposure": "advanced", "reason": "管理员查看数据库体积、向量精度分布与索引体检状态"},
+    "/maintenance/db_optimize": {"exposure": "advanced", "reason": "管理员执行一键数据库瘦身、旧向量精度转码与增量回收"},
     "/ui/capabilities": {"exposure": "internal", "reason": "前端启动时用于自校验，不作为业务按钮"},
     "/memory/visibility": {"exposure": "compat", "reason": "由统一 memory/update 表单覆盖"},
     "/memory/lifecycle": {"exposure": "compat", "reason": "由统一 memory/update 表单覆盖"},
@@ -349,6 +351,7 @@ UI_READ_ENDPOINTS = frozenset(
         "/maintenance/audit/status",
         "/maintenance/summary_batches",
         "/maintenance/summary_status",
+        "/maintenance/db_health",
         "/import/livingmemory/preview",
         "/persona-state",
         # 双方法路由：GET 只读状态，POST 才落盘，按请求方法分档。
@@ -383,6 +386,7 @@ UI_WRITE_ENDPOINTS = frozenset(
         "/maintenance/release_summary_batch",
         "/maintenance/release_summary_batches",
         "/maintenance/summary_admission",
+        "/maintenance/db_optimize",
         "/ui-preferences/save",
         # 双方法路由的写分支（GET 分支只读，见 UI_READ_ENDPOINTS）。
         "/operations/preset",
@@ -536,6 +540,8 @@ class PluginPageApi:
             ("/maintenance/summary_batches", self.summary_batches, ["GET"], "MemoryCompanion Page list quarantined summary batches"),
             ("/maintenance/summary_status", self.summary_status, ["GET"], "MemoryCompanion Page read-only recovery waits"),
             ("/maintenance/summary_admission", self.summary_admission, ["POST"], "MemoryCompanion Page control summary admission"),
+            ("/maintenance/db_health", self.db_health, ["GET"], "MemoryCompanion Page database health snapshot"),
+            ("/maintenance/db_optimize", self.db_optimize, ["POST"], "MemoryCompanion Page database shrink and optimize"),
             ("/maintenance/release_summary_batches", self.release_summary_batches, ["POST"], "MemoryCompanion Page bulk release quarantined summary batches"),
             ("/import/livingmemory/preview", self.import_preview, ["GET"], "MemoryCompanion Page import preview"),
             ("/import/livingmemory/run", self.import_run, ["POST"], "MemoryCompanion Page import run"),
@@ -1308,8 +1314,13 @@ class PluginPageApi:
 
     async def bots(self):
         """按 Bot 归属列出记忆条数，并尽量带上人格设定里的名字。"""
-        stats = await self.plugin.service.store.stats()
-        owners = stats.get("by_owner_bot") or {}
+        store = self.plugin.service.store
+        owner_counts_fn = getattr(store, "owner_bot_counts", None)
+        if callable(owner_counts_fn):
+            owners = await owner_counts_fn()
+        else:
+            stats = await store.stats()
+            owners = stats.get("by_owner_bot") or {}
         persona_name = self._current_persona_name()
         bots: list[dict[str, Any]] = []
         for key, count in owners.items():
@@ -2021,7 +2032,7 @@ class PluginPageApi:
         if scope == "all":
             scope = ""
         records = await self.plugin.service.store.list_memories(
-            limit=max(limit * 2, 50),
+            limit=max(limit * 2, 50) if scope == "external" else limit,
             include_pending=False,
             query=query,
             memory_type="" if memory_types else requested_type,
@@ -4221,6 +4232,30 @@ class PluginPageApi:
             "stop_reason": state.get("stop_reason", ""),
         }})
 
+    async def db_health(self):
+        """Return read-only database size, vector precision, FTS, and vacuum health."""
+        if not self._is_bound_dashboard_admin():
+            return self._admin_required_response()
+        health = await self.plugin.service.database_health_snapshot()
+        return self._ok({"health": health})
+
+    async def db_optimize(self):
+        """Run one-click database slimming: precision transcode, orphan cleanup, vacuum, optimize."""
+        if self._dashboard_admin_state() != "allowed":
+            return self._admin_required_response()
+        payload = await self._json()
+        raw_precision = clean_text(payload.get("target_precision") or payload.get("vector_precision"), 32).lower()
+        if raw_precision and raw_precision not in {"float32", "float16"}:
+            return self._err("target_precision 必须为 float32 或 float16", 400)
+        transcode_limit = max(0, min(100000, self._int(payload.get("transcode_limit"), 20000)))
+        run_full_vacuum = bool(payload.get("run_full_vacuum", False))
+        result = await self.plugin.service.optimize_and_shrink_database(
+            target_precision=raw_precision,
+            transcode_limit=transcode_limit,
+            run_full_vacuum=run_full_vacuum,
+        )
+        return self._ok({"data": result})
+
     async def maintenance(self):
         result = await self.plugin.service.sleep_maintenance(reason="page_maintenance")
         return self._ok({"data": result})
@@ -4514,8 +4549,19 @@ class PluginPageApi:
 
     def _load_config_schema(self) -> dict[str, Any]:
         path = Path(__file__).with_name("_conf_schema.json")
+        try:
+            stat = path.stat()
+            cache_key = (str(path), stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            cache_key = None
+        cached = getattr(self, "_config_schema_cache", None)
+        if cache_key is not None and isinstance(cached, tuple) and cached[0] == cache_key:
+            return cached[1]
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
+        result = data if isinstance(data, dict) else {}
+        if cache_key is not None:
+            self._config_schema_cache = (cache_key, result)
+        return result
 
     def _schema_config_values(self, schema: dict[str, Any]) -> dict[str, dict[str, Any]]:
         result: dict[str, dict[str, Any]] = {}

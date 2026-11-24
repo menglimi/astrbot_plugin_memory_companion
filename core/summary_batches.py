@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -16,9 +17,23 @@ class SummaryBatchStore:
 
     BUDGET_RETRY_REASON = "budget"
 
+    @contextmanager
+    def _summary_read_conn(self):
+        """Use the store's non-blocking dedicated reader when available."""
+        read_conn = getattr(self, "_read_conn_sync", None)
+        if callable(read_conn):
+            with read_conn() as conn:
+                yield conn
+            return
+        with self._lock:
+            yield self._conn
+
     @staticmethod
-    def _summary_content_clause(*, unsummarized: bool = False) -> str:
+    def _summary_content_clause(*, unsummarized: bool = False, all_timeline_nonempty: bool = False) -> str:
         pending = "AND t.summarized_at=''" if unsummarized else ""
+        if all_timeline_nonempty:
+            return f"""EXISTS(SELECT 1 FROM summary_batch_events e JOIN timeline t ON t.id=e.event_id
+                WHERE e.batch_id=b.id {pending})"""
         return f"""EXISTS(SELECT 1 FROM summary_batch_events e JOIN timeline t ON t.id=e.event_id
             WHERE e.batch_id=b.id {pending}
               AND trim(COALESCE(t.content,''),char(9)||char(10)||char(13)||' ')<>'')"""
@@ -335,8 +350,8 @@ class SummaryBatchStore:
     async def oldest_due_summary_batches(self, *, limit: int = 5) -> list[dict[str, Any]]:
         """Freeze a globally oldest bounded trial manifest, including one session's multiple batches."""
         def read():
-            with self._lock:
-                rows = self._conn.execute(
+            with self._summary_read_conn() as conn:
+                rows = conn.execute(
                     f"""SELECT b.* FROM summary_batches b
                         WHERE b.state IN ('pending','retry_pending')
                           AND EXISTS(SELECT 1 FROM summary_batch_events e WHERE e.batch_id=b.id)
@@ -436,12 +451,12 @@ class SummaryBatchStore:
     async def summary_recovery_sessions(self, *, limit=1, after_session_id="", exclude_session_ids=()):
         """Discover quiet sessions with due batches or unassigned originals."""
         def read():
-            with self._lock:
+            with self._summary_read_conn() as conn:
                 excluded = sorted(set(exclude_session_ids))
                 exclusion = ""
                 if excluded:
                     exclusion = "WHERE session_id NOT IN (" + ",".join("?" for _ in excluded) + ")"
-                rows = self._conn.execute(
+                rows = conn.execute(
                     f"""SELECT session_id, scope, MIN(created_at) AS created_at FROM (
                         SELECT b.session_id,b.scope,b.created_at FROM summary_batches b
                         WHERE b.state IN ('pending','retry_pending')
@@ -476,8 +491,8 @@ class SummaryBatchStore:
 
         def read():
             cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec='seconds')
-            with self._lock:
-                calls = self._conn.execute(
+            with self._summary_read_conn() as conn:
+                calls = conn.execute(
                     'SELECT COUNT(*) FROM summary_batch_calls WHERE session_id=? AND automatic=1 AND attempted_at>?',
                     (session_id, cutoff),
                 ).fetchone()[0]
@@ -1057,17 +1072,17 @@ class SummaryBatchStore:
 
     async def summary_progress(self) -> dict[str, Any]:
         def read():
-            with self._lock:
-                counts = dict(self._conn.execute('SELECT state,COUNT(*) FROM summary_batches GROUP BY state').fetchall())
-                pending = self._conn.execute('''SELECT COUNT(*) FROM summary_batches b
+            with self._summary_read_conn() as conn:
+                counts = dict(conn.execute('SELECT state,COUNT(*) FROM summary_batches GROUP BY state').fetchall())
+                pending = conn.execute('''SELECT COUNT(*) FROM summary_batches b
                     WHERE b.state IN ('pending','retry_pending')
                     AND EXISTS(SELECT 1 FROM summary_batch_events e WHERE e.batch_id=b.id)''').fetchone()[0]
-                timeline = self._conn.execute('SELECT COUNT(*),MAX(created_at) FROM timeline').fetchone()
-                memories = self._conn.execute("SELECT COUNT(*),MAX(created_at) FROM memories WHERE memory_type='conversation_summary' AND review_status!='pending'").fetchone()
-                legacy = self._conn.execute('SELECT COUNT(*) FROM summary_failures').fetchone()[0]
+                timeline = conn.execute('SELECT COUNT(*),MAX(created_at) FROM timeline').fetchone()
+                memories = conn.execute("SELECT COUNT(*),MAX(created_at) FROM memories WHERE memory_type='conversation_summary' AND review_status!='pending'").fetchone()
+                legacy = conn.execute('SELECT COUNT(*) FROM summary_failures').fetchone()[0]
                 # Quarantined batches own their events permanently, so report
                 # how many raw events are frozen behind human review.
-                frozen = self._conn.execute('''SELECT COUNT(*) FROM summary_batch_events e
+                frozen = conn.execute('''SELECT COUNT(*) FROM summary_batch_events e
                     JOIN summary_batches b ON b.id=e.batch_id WHERE b.state='quarantined' ''').fetchone()[0]
                 return {'raw_events': timeline[0], 'last_recorded_at': timeline[1] or '',
                         'conversation_memories': memories[0], 'last_summary_at': memories[1] or '',
@@ -1081,36 +1096,57 @@ class SummaryBatchStore:
     async def summary_status_snapshot(self, *, max_events: int) -> dict[str, Any]:
         """Internal read-only snapshot; source identity never crosses the page API.
 
-        Read the queue, ownership and call ledger under one store lock. Do not
-        create batches, migrate failures, reserve calls or advance retry times.
+        Read the queue, ownership and call ledger under one consistent read
+        snapshot without blocking the store write lock. Do not create batches,
+        migrate failures, reserve calls or advance retry times.
         """
         def read():
-            with self._lock:
+            with self._summary_read_conn() as conn:
                 meaningful = "trim(COALESCE(t.content,''),char(9)||char(10)||char(13)||' ')<>''"
-                active = f"b.state IN ('pending','retry_pending') AND {self._summary_content_clause(unsummarized=True)}"
-                batches = [dict(row) for row in self._conn.execute(f"""
+                # 4 KiB partial index idx_timeline_empty_content covers empty rows;
+                # when zero empty rows exist (normal production state), raw_events and
+                # batch state counts skip reading 60 MiB of timeline.content pages.
+                empty_events = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM timeline "
+                        "WHERE trim(COALESCE(content,''),char(9)||char(10)||char(13)||' ')=''"
+                    ).fetchone()[0]
+                    or 0
+                )
+                all_nonempty = empty_events == 0
+                active = (
+                    "b.state IN ('pending','retry_pending') AND "
+                    f"{self._summary_content_clause(unsummarized=True, all_timeline_nonempty=all_nonempty)}"
+                )
+                batches = [dict(row) for row in conn.execute(f"""
                     SELECT b.*, {self._due_clause('b')} AS due
                     FROM summary_batches b WHERE {active} ORDER BY b.created_at,b.id
                     """, self._due_params()).fetchall()]
                 by_batch = {batch['id']: [] for batch in batches}
-                for row in self._conn.execute(f"""
-                    SELECT e.batch_id,t.id,t.event_type,t.session_id,t.scope,
-                           t.subject_id,t.object_id,t.metadata
-                    FROM summary_batch_events e JOIN timeline t ON t.id=e.event_id
-                    JOIN summary_batches b ON b.id=e.batch_id WHERE {active}
-                    ORDER BY e.batch_id,t.created_at,t.id
-                    """).fetchall():
-                    by_batch[row['batch_id']].append(dict(row))
+                if by_batch:
+                    batch_ids = list(by_batch.keys())
+                    for offset in range(0, len(batch_ids), 500):
+                        chunk = batch_ids[offset : offset + 500]
+                        placeholders = ",".join("?" for _ in chunk)
+                        for row in conn.execute(f"""
+                            SELECT e.batch_id,t.id,t.event_type,t.session_id,t.scope,
+                                   t.subject_id,t.object_id,t.metadata
+                            FROM summary_batch_events e JOIN timeline t ON t.id=e.event_id
+                            WHERE e.batch_id IN ({placeholders})
+                            ORDER BY e.batch_id,t.created_at,t.id
+                            """, chunk).fetchall():
+                            by_batch[row['batch_id']].append(dict(row))
                 cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec='seconds')
-                budgets = {row['session_id']: int(row['calls']) for row in self._conn.execute("""
+                budgets = {row['session_id']: int(row['calls']) for row in conn.execute("""
                     SELECT session_id,COUNT(*) AS calls FROM summary_batch_calls
                     WHERE automatic=1 AND attempted_at>? GROUP BY session_id
                     """, (cutoff,)).fetchall()}
                 originals = {}
-                for row in self._conn.execute(f"""
+                originals_content_clause = "" if all_nonempty else f"AND {meaningful}"
+                for row in conn.execute(f"""
                     SELECT t.id,t.event_type,t.session_id,t.scope,t.subject_id,t.object_id,
                            t.metadata,t.occurred_at,t.created_at
-                    FROM timeline t WHERE t.summarized_at='' AND {meaningful}
+                    FROM timeline t WHERE t.summarized_at='' {originals_content_clause}
                       AND NOT EXISTS(SELECT 1 FROM summary_batch_events e WHERE e.event_id=t.id)
                     ORDER BY COALESCE(julianday(NULLIF(t.occurred_at,'')),
                         julianday(NULLIF(t.created_at,'')),0),t.created_at,t.id
@@ -1120,15 +1156,16 @@ class SummaryBatchStore:
                     window['total'] += 1
                     if len(window['rows']) < max(1, max_events):
                         window['rows'].append(dict(row))
-                counts = dict(self._conn.execute(f"""
+                counts = dict(conn.execute(f"""
                     SELECT b.state,COUNT(*) FROM summary_batches b
-                    WHERE {self._summary_content_clause()} GROUP BY b.state
+                    WHERE {self._summary_content_clause(all_timeline_nonempty=all_nonempty)} GROUP BY b.state
                     """).fetchall())
-                memories = dict(self._conn.execute("""SELECT CASE WHEN review_status IN ('auto','manual')
+                memories = dict(conn.execute("""SELECT CASE WHEN review_status IN ('auto','manual')
                         THEN 'adopted' ELSE review_status END AS status,COUNT(*) FROM memories
                     WHERE memory_type='conversation_summary' AND lifecycle!='archived'
                     GROUP BY status""").fetchall())
-                raw_events = self._conn.execute(f"SELECT COUNT(*) FROM timeline t WHERE {meaningful}").fetchone()[0]
+                total_events = int(conn.execute("SELECT COUNT(*) FROM timeline").fetchone()[0] or 0)
+                raw_events = max(0, total_events - empty_events)
                 return {'batches': batches, 'sources': by_batch, 'budgets': budgets,
                         'originals': originals, 'counts': counts, 'memories': memories,
                         'raw_events': int(raw_events)}

@@ -21,6 +21,15 @@ class ConfigView:
         "retrieval.keyword_fallback_min_fts_candidates": (
             "retrieval_advanced.keyword_fallback_min_fts_candidates",
         ),
+        "retrieval.vector_precision": ("retrieval_advanced.vector_precision",),
+        "retrieval_advanced.vector_precision": (
+            "retrieval_advanced.vector_storage_precision",
+            "retrieval.vector_precision",
+        ),
+        "retrieval_advanced.vector_storage_precision": (
+            "retrieval_advanced.vector_precision",
+            "retrieval.vector_precision",
+        ),
         # conversation_memory → conversation_memory_advanced
         "conversation_memory.recent_events_for_followup": ("conversation_memory_advanced.recent_events_for_followup",),
         "conversation_memory.time_window_timeline_limit": ("conversation_memory_advanced.time_window_timeline_limit",),

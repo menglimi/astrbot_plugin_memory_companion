@@ -233,17 +233,23 @@ class VectorScanUsesItsOwnReadPathTests(_StoreCase):
         self.assertTrue(self.store.shutdown_state()["vector_read_conn_closed"])
 
     def test_dedicated_read_connections_apply_read_pragmas(self) -> None:
+        from astrbot_plugin_memory_companion.core.store import _sqlite_connection_pragmas
+
+        expected = _sqlite_connection_pragmas(role="read")
         for getter in (
             self.store._read_connection_for_bundle,
             self.store._timeline_read_connection,
             self.store._vector_read_connection,
         ):
             conn, _lock = getter()
-            self.assertEqual(-65536, conn.execute("PRAGMA cache_size").fetchone()[0], getter.__name__)
+            self.assertEqual(expected["cache_size"], conn.execute("PRAGMA cache_size").fetchone()[0], getter.__name__)
             self.assertEqual(2, conn.execute("PRAGMA temp_store").fetchone()[0], getter.__name__)
-            self.assertEqual(268435456, conn.execute("PRAGMA mmap_size").fetchone()[0], getter.__name__)
+            self.assertEqual(expected["mmap_size"], conn.execute("PRAGMA mmap_size").fetchone()[0], getter.__name__)
 
     def test_dedicated_read_connection_ignores_unsupported_read_pragma(self) -> None:
+        from astrbot_plugin_memory_companion.core.store import _sqlite_connection_pragmas
+
+        expected = _sqlite_connection_pragmas(role="read")
         real_connect = sqlite3.connect
 
         class _RejectMmapConn:
@@ -270,7 +276,7 @@ class VectorScanUsesItsOwnReadPathTests(_StoreCase):
         ):
             conn = self.store._open_dedicated_read_connection()
         try:
-            self.assertEqual(-65536, conn.execute("PRAGMA cache_size").fetchone()[0])
+            self.assertEqual(expected["cache_size"], conn.execute("PRAGMA cache_size").fetchone()[0])
             self.assertEqual(2, conn.execute("PRAGMA temp_store").fetchone()[0])
         finally:
             conn.close()
@@ -280,14 +286,10 @@ class VectorScanUsesItsOwnReadPathTests(_StoreCase):
 
 
 class _LargeSnapshotCase(_StoreCase):
-    """A2 的合成夹具：16384 维 × 512 行 ≈ 66MB，正好越过旧的 64MB 阈值。
-
-    真实库是 4096 维 × 11223 行 ≈ 350MB；把维度放大、行数缩小可以在 1.5 秒内
-    造出同样「超过旧阈值」的字节规模，测试不必依赖生产数据。
-    """
+    """A2 的合成夹具：16384 维 × 1024 行 ≈ 66MB（float32 精度），正好越过旧的 64MB 阈值。"""
 
     DIMENSION = 16384
-    ROWS = 512
+    ROWS = 1024
 
     def setUp(self) -> None:
         super().setUp()

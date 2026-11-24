@@ -165,9 +165,12 @@ class CandidateBundleStoreTests(unittest.IsolatedAsyncioTestCase):
         bridge_row = _memory("bridge-index", "Bot Personal archive reference [schedule_fragment]")
         bridge_row.source_plugin = "bot_personal_bridge"
         store._insert_memory_sync(bridge_row)
+        bridge_rowid = store._conn.execute(
+            "SELECT rowid FROM memories WHERE id=?", (bridge_row.id,)
+        ).fetchone()[0]
         store._conn.execute(
-            "INSERT INTO memory_fts(memory_id, search_text) VALUES(?, ?)",
-            (bridge_row.id, bridge_row.content),
+            "INSERT INTO memory_fts(rowid, search_text) VALUES(?, ?)",
+            (bridge_rowid, bridge_row.content),
         )
         store._conn.execute(
             """INSERT INTO memory_embeddings(
@@ -183,7 +186,8 @@ class CandidateBundleStoreTests(unittest.IsolatedAsyncioTestCase):
             "SELECT 1 FROM memories WHERE id=?", (bridge_row.id,)
         ).fetchone())
         self.assertIsNone(store._conn.execute(
-            "SELECT 1 FROM memory_fts WHERE memory_id=?", (bridge_row.id,)
+            "SELECT rowid FROM memory_fts WHERE memory_fts MATCH 'schedule_fragment' AND rowid=?",
+            (bridge_rowid,),
         ).fetchone())
         self.assertIsNone(store._conn.execute(
             "SELECT 1 FROM memory_embeddings WHERE memory_id=?", (bridge_row.id,)

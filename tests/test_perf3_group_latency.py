@@ -410,7 +410,7 @@ class VectorCrossRevisionAndTimeIntentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, info["embedding_invalid"])
         self.assertEqual([mid for _, mid in expected], [m.id for m in memories])
         for exp_score, mid in expected:
-            self.assertAlmostEqual(exp_score, scores[mid], places=12)
+            self.assertAlmostEqual(exp_score, scores[mid], places=5)
 
     async def test_cross_revision_reuse_refreshes_when_embedding_updated_at_changes(self) -> None:
         rec1 = _make_record("emb-upd-1")
@@ -708,7 +708,13 @@ class LockContentionCaptureAndReplyChainTests(unittest.IsolatedAsyncioTestCase):
             store.initialize()
             try:
                 r1 = _make_record("kw-content", content="今天讨论了黑神话悟空攻略", session_id="onebot_qq:GroupMessage:g1")
-                r2 = _make_record("kw-meta", content="普通对话记录", metadata={"canonical_summary": "包含只狼隐藏结局"}, session_id="")
+                r2 = _make_record(
+                    "kw-meta",
+                    content="普通对话记录",
+                    tags=["只狼隐藏结局"],
+                    metadata={"canonical_summary": "包含只狼隐藏结局"},
+                    session_id="",
+                )
                 r3 = _make_record("kw-other", content="无关内容")
                 for rec in (r1, r2, r3):
                     store._insert_memory_sync(rec)

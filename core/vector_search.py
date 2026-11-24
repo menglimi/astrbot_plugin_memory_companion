@@ -16,7 +16,8 @@ Two invariants keep this module honest:
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass, field
+import copy
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from functools import lru_cache
 import heapq
@@ -24,11 +25,19 @@ import inspect
 import math
 import sqlite3
 import struct
+import threading
 import time
+import weakref
 from typing import Any, Callable, Iterable
 
 from .memory_atom import row_value
-from .models import MemoryRecord, clean_text, memory_embedding_text_hash
+from .models import (
+    MemoryRecord,
+    clean_text,
+    is_memory_placeholder,
+    memory_embedding_text_hash,
+)
+from .profile_quality import PROFILE_MEMORY_TYPES
 
 
 # Retention budget for published snapshots. 64MB used to be hard-coded here,
@@ -45,6 +54,181 @@ BLOCK_BYTES = 4 * 1024 * 1024
 CACHE_ENTRIES = 4
 _MAX_DELTA_SYNC_ROWS = 2000
 _SELECTION_CACHE_MAX_ENTRIES = 32
+_SCORE_STRIP_ROWS = 512
+
+_PRECISION_TO_DTYPE: dict[str, str] = {
+    "float64": "<f8",
+    "float32": "<f4",
+    "float16": "<f2",
+}
+_DTYPE_ITEMSIZE: dict[str, int] = {
+    "<f8": 8,
+    "<f4": 4,
+    "<f2": 2,
+}
+_DTYPE_STRUCT_CODE: dict[str, str] = {
+    "<f8": "d",
+    "<f4": "f",
+    "<f2": "e",
+}
+_ITEMSIZE_TO_DTYPE: dict[int, str] = {
+    8: "<f8",
+    4: "<f4",
+    2: "<f2",
+}
+
+# Only keep lightweight scalar metadata fields needed for visibility, ACL,
+# profile-quality, and lifecycle checks inside long-lived VectorCorpus entries.
+_CORPUS_KEEP_METADATA_KEYS: frozenset[str] = frozenset({
+    "owner_bot_id",
+    "persona_id",
+    "core_memory",
+    "valid_from",
+    "valid_to",
+    "expires_at",
+    "decay_mode",
+    "validity_status",
+    "sensitivity",
+    "durability",
+    "salience",
+    "reinforcement_score",
+    "open_loop_weight",
+    "promise_weight",
+    "emotional_debt_weight",
+    "start_at",
+    "end_at",
+    "summarizer",
+    "summary_schema_version",
+    "archive_ref",
+    "placeholder",
+    "profile_state",
+    "status",
+    "conflict_reason",
+    "conflicts_with",
+    "profile_conflict",
+    "profile_dimension",
+    "dimension",
+    "profile_value",
+    "value",
+    "normalized_value",
+    "kind",
+    "profile_cardinality",
+    "extraction_quality",
+    "extraction_quality_score",
+    "evidence_strength",
+    "evidence_count",
+    "independent_evidence_count",
+    "extractor",
+    "producer_kind",
+})
+
+_SHARED_QUERY_VECTOR_CACHE_LOCK = threading.Lock()
+_SHARED_QUERY_VECTOR_CACHE: OrderedDict[tuple[int, str, str, str], tuple[Any, float, tuple[float, ...]]] = OrderedDict()
+_SHARED_QUERY_VECTOR_CACHE_MAX_ENTRIES = 256
+
+
+def _target_corpus_precision(store: Any) -> str:
+    from .store import DEFAULT_VECTOR_PRECISION, normalize_vector_precision
+
+    return normalize_vector_precision(
+        getattr(store, "vector_storage_precision", DEFAULT_VECTOR_PRECISION)
+    )
+
+
+def _precision_to_dtype(precision: str) -> str:
+    return _PRECISION_TO_DTYPE.get(str(precision or "").strip().lower(), "<f4")
+
+
+def _dtype_itemsize(dtype: str) -> int:
+    return _DTYPE_ITEMSIZE.get(dtype, 4)
+
+
+def _detect_blob_dtype(byte_length: int, dimension: int) -> str:
+    if dimension <= 0 or byte_length <= 0 or byte_length % dimension != 0:
+        return ""
+    return _ITEMSIZE_TO_DTYPE.get(byte_length // dimension, "")
+
+
+def _slim_corpus_memory(memory: MemoryRecord) -> MemoryRecord:
+    """Drop bulky content/evidence/metadata from cached corpus eligibility stubs."""
+    raw_meta = memory.metadata if type(memory.metadata) is dict else (memory.metadata if isinstance(memory.metadata, dict) else {})
+    slim_meta = (
+        {k: v for k, v in raw_meta.items() if k in _CORPUS_KEEP_METADATA_KEYS}
+        if raw_meta
+        else {}
+    )
+    mem_type = clean_text(getattr(memory, "memory_type", ""), 80).lower()
+    keep_content = (
+        mem_type in PROFILE_MEMORY_TYPES
+        or bool(slim_meta.get("profile_state"))
+        or is_memory_placeholder(memory)
+    )
+    clone_slim = getattr(memory, "clone_slim", None)
+    if callable(clone_slim):
+        return clone_slim(keep_content=keep_content, slim_meta=slim_meta)
+    slim = copy.copy(memory)
+    if not keep_content:
+        slim.content = ""
+    slim.evidence = []
+    slim.metadata = slim_meta
+    return slim
+
+
+def get_shared_query_embedding(
+    provider: Any,
+    provider_id: str,
+    text: str,
+    ttl_seconds: float,
+) -> list[float]:
+    """Look up a recently computed query embedding shared across engines/services."""
+    if provider is None or ttl_seconds <= 0 or not text:
+        return []
+    cache_key = (id(provider), type(provider).__qualname__, str(provider_id or ""), text)
+    now = time.monotonic()
+    with _SHARED_QUERY_VECTOR_CACHE_LOCK:
+        entry = _SHARED_QUERY_VECTOR_CACHE.get(cache_key)
+        if entry is None:
+            return []
+        provider_ref, stored_at, vector = entry
+        if provider_ref is not None and provider_ref() is not provider:
+            _SHARED_QUERY_VECTOR_CACHE.pop(cache_key, None)
+            return []
+        if now - stored_at > ttl_seconds:
+            _SHARED_QUERY_VECTOR_CACHE.pop(cache_key, None)
+            return []
+        _SHARED_QUERY_VECTOR_CACHE.move_to_end(cache_key)
+        return list(vector)
+
+
+def put_shared_query_embedding(
+    provider: Any,
+    provider_id: str,
+    text: str,
+    vector: Iterable[float],
+) -> None:
+    """Store a normalized query embedding in the bounded process-wide LRU cache."""
+    if provider is None or not text:
+        return
+    try:
+        provider_ref: Any = weakref.ref(provider)
+    except TypeError:
+        provider_ref = None
+    values = tuple(float(v) for v in vector)
+    if not values:
+        return
+    cache_key = (id(provider), type(provider).__qualname__, str(provider_id or ""), text)
+    now = time.monotonic()
+    with _SHARED_QUERY_VECTOR_CACHE_LOCK:
+        _SHARED_QUERY_VECTOR_CACHE[cache_key] = (provider_ref, now, values)
+        _SHARED_QUERY_VECTOR_CACHE.move_to_end(cache_key)
+        while len(_SHARED_QUERY_VECTOR_CACHE) > _SHARED_QUERY_VECTOR_CACHE_MAX_ENTRIES:
+            _SHARED_QUERY_VECTOR_CACHE.popitem(last=False)
+
+
+def clear_shared_query_embedding_cache() -> None:
+    """Clear the process-wide shared query embedding cache."""
+    with _SHARED_QUERY_VECTOR_CACHE_LOCK:
+        _SHARED_QUERY_VECTOR_CACHE.clear()
 
 
 def bounded_cache_bytes(megabytes: Any) -> int:
@@ -124,24 +308,243 @@ class VectorRef:
     embedding_updated_at: str = ""
 
 
-@dataclass(frozen=True, slots=True)
+def _refs_overhead_bytes(refs: tuple[VectorRef, ...]) -> int:
+    return sum(
+        256
+        + len(r.memory_id.encode("utf-8"))
+        + len(r.text_hash)
+        + len(r.updated_at)
+        + len(r.memory_type)
+        + len(r.time_ranges) * 32
+        + len(r.embedding_updated_at)
+        for r in refs
+    )
+
+
 class VectorBlock:
-    refs: tuple[VectorRef, ...]
-    values: bytes  # Immutable float64 buffer; numpy views cannot mutate it.
-    dimension: int
+    """Compact read-only vector block supporting owned numpy arrays and zero-copy views."""
+
+    __slots__ = (
+        "refs",
+        "_values",
+        "dimension",
+        "dtype",
+        "_matrix",
+        "parent_block",
+        "row_indices",
+        "_byte_size",
+        "_owned_bytes",
+    )
+
+    def __init__(
+        self,
+        refs: tuple[VectorRef, ...],
+        values: bytes = b"",
+        dimension: int = 0,
+        *,
+        dtype: str = "",
+        matrix: Any = None,
+        parent_block: "VectorBlock | None" = None,
+        row_indices: Any = None,
+    ) -> None:
+        self.refs: tuple[VectorRef, ...] = tuple(refs)
+        self.dimension: int = int(dimension)
+        self.parent_block: VectorBlock | None = parent_block
+        self.row_indices: Any = row_indices
+        self._matrix: Any = matrix
+        self._values: bytes = b""
+
+        if parent_block is not None:
+            resolved_dtype = dtype or parent_block.dtype or "<f4"
+            if self.dimension <= 0:
+                self.dimension = parent_block.dimension
+        elif matrix is not None:
+            resolved_dtype = dtype or getattr(matrix.dtype, "str", "<f4")
+            if resolved_dtype not in _DTYPE_ITEMSIZE:
+                resolved_dtype = "<f4"
+            if self.dimension <= 0 and getattr(matrix, "ndim", 0) == 2:
+                self.dimension = int(matrix.shape[1])
+            try:
+                matrix.flags.writeable = False
+            except Exception:
+                pass
+        else:
+            raw_bytes = bytes(values) if not isinstance(values, bytes) else values
+            self._values = raw_bytes
+            if dtype and dtype in _DTYPE_ITEMSIZE:
+                resolved_dtype = dtype
+            else:
+                detected = ""
+                if self.refs and self.dimension > 0:
+                    total_elems = len(self.refs) * self.dimension
+                    if total_elems > 0 and len(raw_bytes) % total_elems == 0:
+                        detected = _ITEMSIZE_TO_DTYPE.get(len(raw_bytes) // total_elems, "")
+                resolved_dtype = detected or "<f4"
+
+        self.dtype: str = resolved_dtype
+        itemsize = _dtype_itemsize(resolved_dtype)
+        ref_overhead = _refs_overhead_bytes(self.refs)
+
+        if parent_block is not None:
+            logical_vec_bytes = len(self.refs) * max(0, self.dimension) * itemsize
+            if isinstance(row_indices, slice):
+                idx_bytes = 64
+            elif hasattr(row_indices, "nbytes"):
+                idx_bytes = int(row_indices.nbytes)
+            else:
+                idx_bytes = len(self.refs) * 8
+            self._byte_size = logical_vec_bytes + ref_overhead
+            self._owned_bytes = idx_bytes + ref_overhead
+        elif matrix is not None:
+            vec_bytes = int(matrix.nbytes)
+            self._byte_size = vec_bytes + ref_overhead
+            self._owned_bytes = self._byte_size
+        else:
+            self._byte_size = len(self._values) + ref_overhead
+            self._owned_bytes = self._byte_size
+
+    @classmethod
+    def from_array(
+        cls,
+        refs: tuple[VectorRef, ...],
+        array: Any,
+        *,
+        dtype: str = "",
+    ) -> "VectorBlock":
+        np = _numpy()
+        arr = array
+        if np is not None:
+            target = dtype or getattr(arr.dtype, "str", "<f4")
+            if target not in _DTYPE_ITEMSIZE:
+                target = "<f4"
+            if arr.dtype.str != target or not arr.flags.c_contiguous:
+                arr = np.ascontiguousarray(arr, dtype=target)
+            arr.flags.writeable = False
+            dim = int(arr.shape[1]) if arr.ndim == 2 else 0
+            return cls(tuple(refs), b"", dim, dtype=target, matrix=arr)
+        return cls(tuple(refs), bytes(array), 0, dtype=dtype or "<f4")
+
+    @classmethod
+    def from_view(
+        cls,
+        refs: tuple[VectorRef, ...],
+        parent_block: "VectorBlock",
+        row_indices: list[int] | tuple[int, ...],
+    ) -> "VectorBlock":
+        # Flatten nested view references so every view points directly at its root corpus block.
+        root = parent_block
+        resolved_indices: list[int] = [int(i) for i in row_indices]
+        while root.parent_block is not None:
+            parent_idx = root.row_indices
+            if isinstance(parent_idx, slice):
+                start = parent_idx.start or 0
+                step = parent_idx.step or 1
+                resolved_indices = [start + i * step for i in resolved_indices]
+            else:
+                resolved_indices = [int(parent_idx[i]) for i in resolved_indices]
+            root = root.parent_block
+
+        indices_obj: Any
+        if resolved_indices and (
+            resolved_indices[-1] - resolved_indices[0] + 1 == len(resolved_indices)
+            and all(
+                resolved_indices[pos] == resolved_indices[0] + pos
+                for pos in range(1, len(resolved_indices))
+            )
+        ):
+            indices_obj = slice(resolved_indices[0], resolved_indices[-1] + 1)
+        else:
+            np = _numpy()
+            if np is not None:
+                arr = np.asarray(resolved_indices, dtype=np.int32)
+                arr.flags.writeable = False
+                indices_obj = arr
+            else:
+                indices_obj = tuple(resolved_indices)
+
+        return cls(
+            tuple(refs),
+            b"",
+            root.dimension,
+            dtype=root.dtype,
+            parent_block=root,
+            row_indices=indices_obj,
+        )
+
+    @property
+    def is_view(self) -> bool:
+        return self.parent_block is not None
 
     @property
     def byte_size(self) -> int:
-        return len(self.values) + sum(
-            256
-            + len(r.memory_id.encode("utf-8"))
-            + len(r.text_hash)
-            + len(r.updated_at)
-            + len(r.memory_type)
-            + len(r.time_ranges) * 32
-            + len(r.embedding_updated_at)
-            for r in self.refs
-        )
+        return self._byte_size
+
+    @property
+    def owned_bytes(self) -> int:
+        return self._owned_bytes
+
+    @property
+    def matrix(self) -> Any:
+        if self._matrix is not None:
+            return self._matrix
+        np = _numpy()
+        if np is None:
+            return None
+        if self.parent_block is not None:
+            parent_mat = self.parent_block.matrix
+            if parent_mat is None:
+                return None
+            return parent_mat[self.row_indices]
+        if not self.refs or self.dimension <= 0:
+            mat = np.empty((0, max(0, self.dimension)), dtype=self.dtype)
+            mat.flags.writeable = False
+            self._matrix = mat
+            return mat
+        mat = np.frombuffer(self._values, dtype=self.dtype).reshape(len(self.refs), self.dimension)
+        self._matrix = mat
+        return mat
+
+    @property
+    def values(self) -> bytes:
+        if self._values:
+            return self._values
+        if not self.refs or self.dimension <= 0:
+            return b""
+        if self._matrix is not None:
+            return self._matrix.tobytes()
+        if self.parent_block is not None:
+            np = _numpy()
+            if np is not None:
+                parent_mat = self.parent_block.matrix
+                if parent_mat is not None:
+                    return np.ascontiguousarray(parent_mat[self.row_indices]).tobytes()
+            parent_raw = memoryview(self.parent_block.values)
+            row_bytes = self.dimension * _dtype_itemsize(self.dtype)
+            if isinstance(self.row_indices, slice):
+                start, stop, step = self.row_indices.indices(len(self.parent_block.refs))
+                if step == 1:
+                    return bytes(parent_raw[start * row_bytes : stop * row_bytes])
+                idxs = range(start, stop, step)
+            else:
+                idxs = self.row_indices
+            return b"".join(parent_raw[int(idx) * row_bytes : (int(idx) + 1) * row_bytes] for idx in idxs)
+        return b""
+
+    def row_slice_bytes(self, row_index: int) -> memoryview | bytes:
+        """Return a single row's raw bytes without copying the entire parent block."""
+        if self.parent_block is not None:
+            if isinstance(self.row_indices, slice):
+                parent_idx = (self.row_indices.start or 0) + row_index * (self.row_indices.step or 1)
+            else:
+                parent_idx = int(self.row_indices[row_index])
+            return self.parent_block.row_slice_bytes(parent_idx)
+        row_bytes = self.dimension * _dtype_itemsize(self.dtype)
+        if self._values:
+            start = row_index * row_bytes
+            return memoryview(self._values)[start : start + row_bytes]
+        if self._matrix is not None:
+            return memoryview(self._matrix[row_index]).cast("B")
+        return b""
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,10 +559,15 @@ class VectorSnapshot:
     # ``blocks`` alone; ``candidate_ids`` is what makes that subset computable.
     complete: bool = True
     candidate_ids: frozenset[str] | None = None
+    precision: str = "float32"
 
     @property
     def retained_ids(self) -> frozenset[str]:
         return frozenset(ref.memory_id for block in self.blocks for ref in block.refs)
+
+    @property
+    def owned_bytes(self) -> int:
+        return sum(block.owned_bytes for block in self.blocks)
 
 
 @dataclass(slots=True)
@@ -187,11 +595,12 @@ class SelectionCacheEntry:
 class VectorCorpus:
     """Process-local shared vector corpus invariant across authorization keys."""
 
-    corpus_key: tuple[str, int, bool, int]
+    corpus_key: tuple[str, int, bool, int, str]
     corpus_revision: int | None
     retrieval_revision: str
     last_change_seq: int
     batch_size: int
+    precision: str = "float32"
     entries: dict[str, CorpusEntry] = field(default_factory=dict)
     bad_status: dict[str, str] = field(default_factory=dict)
     vector_blocks: list[VectorBlock] = field(default_factory=list)
@@ -209,6 +618,7 @@ class VectorCorpus:
             retrieval_revision=self.retrieval_revision,
             last_change_seq=self.last_change_seq,
             batch_size=self.batch_size,
+            precision=self.precision,
             entries=dict(self.entries),
             bad_status=dict(self.bad_status),
             vector_blocks=list(self.vector_blocks),
@@ -231,89 +641,204 @@ def _numpy() -> Any:
 
 
 def block_scores(block: VectorBlock, query: list[float]) -> list[float]:
+    if not block.refs or block.dimension <= 0:
+        return []
     np = _numpy()
     if np is not None:
-        matrix = np.frombuffer(block.values, dtype="<f8").reshape(-1, block.dimension)
-        # Avoid launching a BLAS thread team for each small matrix/vector product.
-        return np.einsum("ij,j->i", matrix, np.asarray(query), optimize=False).tolist()
-    rows = struct.iter_unpack(f"<{block.dimension}d", block.values)
+        if block.is_view:
+            parent = block.parent_block
+            assert parent is not None
+            parent_mat = parent.matrix
+            indices = block.row_indices
+            count = len(block.refs)
+            if parent.dtype == "<f8":
+                q64 = np.asarray(query, dtype=np.float64)
+                if isinstance(indices, slice) or count <= _SCORE_STRIP_ROWS:
+                    return (parent_mat[indices] @ q64).tolist()
+                out64 = np.empty(count, dtype=np.float64)
+                for start in range(0, count, _SCORE_STRIP_ROWS):
+                    end = min(count, start + _SCORE_STRIP_ROWS)
+                    out64[start:end] = parent_mat[indices[start:end]] @ q64
+                return out64.tolist()
+
+            q32 = np.asarray(query, dtype=np.float32)
+            if isinstance(indices, slice):
+                sub = parent_mat[indices]
+                if sub.dtype == np.float32:
+                    return (sub @ q32).tolist()
+                if count <= _SCORE_STRIP_ROWS:
+                    return (sub.astype(np.float32, copy=False) @ q32).tolist()
+                out32 = np.empty(count, dtype=np.float32)
+                for start in range(0, count, _SCORE_STRIP_ROWS):
+                    end = min(count, start + _SCORE_STRIP_ROWS)
+                    out32[start:end] = sub[start:end].astype(np.float32, copy=False) @ q32
+                return out32.tolist()
+
+            if count <= _SCORE_STRIP_ROWS:
+                strip = parent_mat[indices]
+                if strip.dtype != np.float32:
+                    strip = strip.astype(np.float32, copy=False)
+                return (strip @ q32).tolist()
+            out32 = np.empty(count, dtype=np.float32)
+            for start in range(0, count, _SCORE_STRIP_ROWS):
+                end = min(count, start + _SCORE_STRIP_ROWS)
+                strip = parent_mat[indices[start:end]]
+                if strip.dtype != np.float32:
+                    strip = strip.astype(np.float32, copy=False)
+                out32[start:end] = strip @ q32
+            return out32.tolist()
+
+        mat = block.matrix
+        if mat.dtype == np.float32:
+            q32 = np.asarray(query, dtype=np.float32)
+            return (mat @ q32).tolist()
+        if mat.dtype == np.float16:
+            q32 = np.asarray(query, dtype=np.float32)
+            count = int(mat.shape[0])
+            if count <= _SCORE_STRIP_ROWS:
+                return (mat.astype(np.float32, copy=False) @ q32).tolist()
+            out32 = np.empty(count, dtype=np.float32)
+            for start in range(0, count, _SCORE_STRIP_ROWS):
+                end = min(count, start + _SCORE_STRIP_ROWS)
+                out32[start:end] = mat[start:end].astype(np.float32, copy=False) @ q32
+            return out32.tolist()
+        q64 = np.asarray(query, dtype=np.float64)
+        return (mat @ q64).tolist()
+
+    code = _DTYPE_STRUCT_CODE.get(block.dtype, "f")
+    rows = struct.iter_unpack(f"<{block.dimension}{code}", block.values)
     return [math.fsum(a * b for a, b in zip(row, query)) for row in rows]
 
 
-def _normalized_bytes(raw: Any, dimension: int) -> tuple[bytes, str]:
+def _normalized_bytes(
+    raw: Any,
+    dimension: int,
+    *,
+    target_dtype: str = "<f4",
+) -> tuple[bytes, str]:
     from .store import _normalize_embedding_vector_values, _unpack_embedding_vector
 
+    out_dtype = target_dtype if target_dtype in _DTYPE_ITEMSIZE else "<f4"
+    out_code = _DTYPE_STRUCT_CODE[out_dtype]
+
     if isinstance(raw, (bytes, bytearray, memoryview)):
-        if len(raw) != dimension * 8:
-            return b"", "embedding_invalid"
-        np = _numpy()
-        if np is not None:
-            vector = np.frombuffer(raw, dtype="<f8")
-            if not np.isfinite(vector).all():
+        in_dtype = _detect_blob_dtype(len(raw), dimension)
+        if not in_dtype:
+            if len(raw) >= 2 and bytes(raw[:1]) == b"[":
+                pass
+            else:
                 return b"", "embedding_invalid"
-            scale = float(np.max(np.abs(vector)))
-            if not scale:
+        else:
+            np = _numpy()
+            if np is not None:
+                vector = np.frombuffer(raw, dtype=in_dtype)
+                if in_dtype == "<f2":
+                    vector = vector.astype(np.float32)
+                if not np.isfinite(vector).all():
+                    return b"", "embedding_invalid"
+                scale = float(np.max(np.abs(vector)))
+                if not scale:
+                    return b"", "embedding_invalid"
+                # Scaling prevents overflow without Python per-component conversion.
+                scaled = vector / scale
+                norm = float(np.sqrt(np.dot(scaled, scaled)))
+                if not math.isfinite(norm) or norm <= 0.0:
+                    return b"", "embedding_invalid"
+                return (scaled / norm).astype(out_dtype, copy=False).tobytes(), ""
+            in_code = _DTYPE_STRUCT_CODE[in_dtype]
+            unpacked = list(struct.unpack(f"<{dimension}{in_code}", raw))
+            vector = _normalize_embedding_vector_values(unpacked)
+            if not vector:
                 return b"", "embedding_invalid"
-            # Scaling prevents overflow without Python per-component conversion.
-            scaled = vector / scale
-            norm = float(np.sqrt(np.einsum("i,i->", scaled, scaled)))
-            return (scaled / norm).astype("<f8", copy=False).tobytes(), ""
-    vector = _normalize_embedding_vector_values(_unpack_embedding_vector(raw))
+            return struct.pack(f"<{dimension}{out_code}", *vector), ""
+
+    vector = _normalize_embedding_vector_values(_unpack_embedding_vector(raw, dimension=dimension))
     if not vector:
         return b"", "embedding_invalid"
     if len(vector) != dimension:
         return b"", "embedding_dim_mismatch"
-    return struct.pack(f"<{dimension}d", *vector), ""
+    return struct.pack(f"<{dimension}{out_code}", *vector), ""
 
 
 def _normalize_blob_batch(
     blobs: list[bytes | bytearray | memoryview],
     dimension: int,
     np: Any,
+    *,
+    input_dtype: str = "",
+    target_dtype: str = "<f4",
 ) -> tuple[list[memoryview | None], list[str]]:
-    """Batch-normalize fixed-length float64 BLOBs into one contiguous numpy buffer."""
+    """Batch-normalize fixed-length float64/float32/float16 BLOBs into target precision."""
     count = len(blobs)
     if count == 0 or dimension <= 0:
         return [None] * count, ["embedding_invalid"] * count
-    row_bytes = dimension * 8
-    mat = np.empty((count, dimension), dtype="<f8")
-    raw_view = mat.view(np.uint8).reshape(count, row_bytes)
-    for idx, blob in enumerate(blobs):
-        raw_view[idx] = np.frombuffer(blob, dtype=np.uint8)
-    finite_mask = np.isfinite(mat).all(axis=1)
-    scales = np.max(np.abs(mat), axis=1)
+
+    in_dtype = input_dtype if input_dtype in _DTYPE_ITEMSIZE else _detect_blob_dtype(len(blobs[0]), dimension)
+    if not in_dtype:
+        return [None] * count, ["embedding_invalid"] * count
+    out_dtype = target_dtype if target_dtype in _DTYPE_ITEMSIZE else "<f4"
+
+    in_row_bytes = dimension * _dtype_itemsize(in_dtype)
+    out_row_bytes = dimension * _dtype_itemsize(out_dtype)
+
+    for blob in blobs:
+        if len(blob) != in_row_bytes:
+            return [None] * count, ["embedding_invalid"] * count
+
+    raw_mat = np.frombuffer(b"".join(blobs), dtype=in_dtype).reshape(count, dimension)
+
+    # Normalize float16 inputs in float32 to prevent squaring overflow/underflow;
+    # downcast normal finite non-underflowing float64 inputs to float32 before
+    # normalization to halve SIMD/memory bandwidth when targeting float32/float16.
+    # Tiny non-zero float64 vectors (e.g. ~1e-50) that underflow to 0.0 in float32
+    # or overflow/non-finite inputs fall back to exact float64 scaling.
+    if in_dtype == "<f8" and out_dtype in ("<f4", "<f2"):
+        work_mat = raw_mat.astype(np.float32)
+        if (
+            not np.isfinite(work_mat).all()
+            or not (np.max(np.abs(work_mat), axis=1) > 0.0).all()
+        ):
+            work_mat = raw_mat.copy()
+    elif in_dtype == "<f2":
+        work_mat = raw_mat.astype(np.float32)
+    else:
+        work_mat = raw_mat.copy()
+    finite_mask = np.isfinite(work_mat).all(axis=1)
+    scales = np.max(np.abs(work_mat), axis=1)
     valid_mask = finite_mask & (scales > 0.0)
     results: list[memoryview | None] = [None] * count
     errors: list[str] = ["embedding_invalid"] * count
 
     if valid_mask.all():
-        mat /= scales[:, None]
-        norms = np.sqrt(np.einsum("ij,ij->i", mat, mat))
+        work_mat /= scales[:, None]
+        norms = np.sqrt(np.einsum("ij,ij->i", work_mat, work_mat))
         norm_valid = np.isfinite(norms) & (norms > 0.0)
         if norm_valid.all():
-            mat /= norms[:, None]
-            mv = memoryview(mat.tobytes())
+            work_mat /= norms[:, None]
+            out_mat = np.ascontiguousarray(work_mat.astype(out_dtype, copy=False))
+            mv = memoryview(out_mat).cast("B")
             for idx in range(count):
-                start = idx * row_bytes
-                results[idx] = mv[start : start + row_bytes]
+                start = idx * out_row_bytes
+                results[idx] = mv[start : start + out_row_bytes]
                 errors[idx] = ""
             return results, errors
         keep = np.flatnonzero(norm_valid)
         if len(keep) == 0:
             return results, errors
-        kept_mat = mat[keep]
+        kept_mat = work_mat[keep]
         kept_mat /= norms[keep, None]
-        mv = memoryview(kept_mat.astype("<f8", copy=False).tobytes())
+        out_mat = np.ascontiguousarray(kept_mat.astype(out_dtype, copy=False))
+        mv = memoryview(out_mat).cast("B")
         for out_idx, src_idx in enumerate(keep.tolist()):
-            start = out_idx * row_bytes
-            results[src_idx] = mv[start : start + row_bytes]
+            start = out_idx * out_row_bytes
+            results[src_idx] = mv[start : start + out_row_bytes]
             errors[src_idx] = ""
         return results, errors
 
     valid_indices = np.flatnonzero(valid_mask)
     if len(valid_indices) == 0:
         return results, errors
-    valid_mat = mat[valid_indices]
+    valid_mat = work_mat[valid_indices]
     valid_mat /= scales[valid_indices, None]
     norms = np.sqrt(np.einsum("ij,ij->i", valid_mat, valid_mat))
     norm_valid = np.isfinite(norms) & (norms > 0.0)
@@ -325,10 +850,11 @@ def _normalize_blob_batch(
         valid_mat = valid_mat[keep]
         norms = norms[keep]
     valid_mat /= norms[:, None]
-    mv = memoryview(valid_mat.astype("<f8", copy=False).tobytes())
+    out_mat = np.ascontiguousarray(valid_mat.astype(out_dtype, copy=False))
+    mv = memoryview(out_mat).cast("B")
     for out_idx, src_idx in enumerate(valid_indices.tolist()):
-        start = out_idx * row_bytes
-        results[src_idx] = mv[start : start + row_bytes]
+        start = out_idx * out_row_bytes
+        results[src_idx] = mv[start : start + out_row_bytes]
         errors[src_idx] = ""
     return results, errors
 
@@ -430,7 +956,7 @@ def _memory_select_columns(conn: Any) -> str:
 
 
 def _row_batches(conn: Any, provider_id: str, where: str, batch_size: int,
-                 restrict_ids: tuple[str, ...] = ()) -> Any:
+                 restrict_ids: tuple[str, ...] = (), *, include_vector: bool = False) -> Any:
     """Yield row batches from the candidate join, optionally restricted to ids.
 
     The full scan is one cursor; the restricted re-read splits the id list into
@@ -438,9 +964,10 @@ def _row_batches(conn: Any, provider_id: str, where: str, batch_size: int,
     cap (the same limit the payload reads already honour).
     """
     m_cols = _memory_select_columns(conn)
+    vec_col = ", e.vector AS embedding_vector" if include_vector else ""
     columns = (f"SELECT {m_cols}, e.dimension AS embedding_dimension, "
-               "e.text_hash AS embedding_text_hash, "
-               "e.updated_at AS embedding_updated_at FROM memory_embeddings e "
+               f"e.text_hash AS embedding_text_hash, "
+               f"e.updated_at AS embedding_updated_at{vec_col} FROM memory_embeddings e "
                "JOIN memories m ON m.id=e.memory_id")
     if not restrict_ids:
         cursor = conn.execute(f"{columns} WHERE {where}", (provider_id,))
@@ -458,7 +985,20 @@ def _row_batches(conn: Any, provider_id: str, where: str, batch_size: int,
             yield rows
 
 
-ReusableRow = tuple[str, str, str, bytes, int, int]
+ReusableRow = tuple[str, str, str, VectorBlock, int]
+
+
+def _resolve_root_row(block: VectorBlock, index: int) -> tuple[VectorBlock, int]:
+    root = block
+    idx = index
+    while root.parent_block is not None:
+        p_idx = root.row_indices
+        if isinstance(p_idx, slice):
+            idx = (p_idx.start or 0) + idx * (p_idx.step or 1)
+        else:
+            idx = int(p_idx[idx])
+        root = root.parent_block
+    return root, idx
 
 
 def _collect_reusable_rows(
@@ -469,17 +1009,9 @@ def _collect_reusable_rows(
     dimension: int,
     max_text_chars: int,
     exclude_key: tuple | None = None,
+    target_dtype: str = "<f4",
 ) -> dict[str, ReusableRow]:
-    """Index normalized vector slices from cached snapshots.
-
-    When ``revision`` is ``None``, slices are collected across revisions so a
-    database write only re-normalizes rows whose ``text_hash``,
-    ``updated_at``, or ``embedding_updated_at`` actually changed.  Stores
-    zero-copy ``(text_hash, updated_at, embedding_updated_at, block.values,
-    offset, row_bytes)`` references into already-cached ``VectorBlock.values``
-    buffers.
-    """
-    row_bytes = dimension * 8
+    """Index normalized vector rows from cached snapshots without copying bytes."""
     reusable: dict[str, ReusableRow] = {}
     for cached_key, snapshot in cache.items():
         if cached_key == exclude_key:
@@ -491,17 +1023,16 @@ def _collect_reusable_rows(
         if cached_key[0] != provider_id or cached_key[1] != dimension or cached_key[3] != max_text_chars:
             continue
         for block in snapshot.blocks:
-            if block.dimension != dimension or len(block.values) != len(block.refs) * row_bytes:
+            if block.dimension != dimension or block.dtype != target_dtype:
                 continue
-            buf = block.values
             for index, ref in enumerate(block.refs):
+                root_block, root_idx = _resolve_root_row(block, index)
                 reusable[ref.memory_id] = (
                     ref.text_hash,
                     ref.updated_at,
                     ref.embedding_updated_at,
-                    buf,
-                    index * row_bytes,
-                    row_bytes,
+                    root_block,
+                    root_idx,
                 )
     return reusable
 
@@ -509,24 +1040,24 @@ def _collect_reusable_rows(
 def _collect_corpus_reusable_rows(
     corpus: VectorCorpus | None,
     dimension: int,
+    *,
+    target_dtype: str = "<f4",
 ) -> dict[str, ReusableRow]:
-    """Index retained normalized slices from an existing ``VectorCorpus``."""
+    """Index retained normalized rows from an existing ``VectorCorpus``."""
     if corpus is None or not corpus.vector_blocks:
         return {}
-    row_bytes = dimension * 8
     reusable: dict[str, ReusableRow] = {}
     for block in corpus.vector_blocks:
-        if block.dimension != dimension or len(block.values) != len(block.refs) * row_bytes:
+        if block.dimension != dimension or block.dtype != target_dtype:
             continue
-        buf = block.values
         for index, ref in enumerate(block.refs):
+            root_block, root_idx = _resolve_root_row(block, index)
             reusable[ref.memory_id] = (
                 ref.text_hash,
                 ref.updated_at,
                 ref.embedding_updated_at,
-                buf,
-                index * row_bytes,
-                row_bytes,
+                root_block,
+                root_idx,
             )
     return reusable
 
@@ -567,10 +1098,12 @@ def _normalize_ref_payloads(
     np: Any,
     check_cancelled: Callable[[], None],
     counts: dict[str, int],
+    *,
+    target_dtype: str = "<f4",
+    inline_payloads: dict[str, Any] | None = None,
 ) -> tuple[list[VectorRef], list[bytes | memoryview]]:
     """Fetch uncached vector BLOBs in batches and return normalized row buffers."""
-    row_bytes = dimension * 8
-    reused_slices: list[memoryview | None] = []
+    reused_slices: list[bytes | memoryview | None] = []
     missing_refs: list[VectorRef] = []
     if reusable_rows:
         for ref in allowed:
@@ -581,9 +1114,7 @@ def _normalize_ref_payloads(
                 and cached_row[1] == ref.updated_at
                 and cached_row[2] == ref.embedding_updated_at
             ):
-                reused_slices.append(
-                    memoryview(cached_row[3])[cached_row[4] : cached_row[4] + cached_row[5]]
-                )
+                reused_slices.append(cached_row[3].row_slice_bytes(cached_row[4]))
             else:
                 reused_slices.append(None)
                 missing_refs.append(ref)
@@ -591,9 +1122,18 @@ def _normalize_ref_payloads(
         missing_refs = allowed
 
     payloads: dict[str, Any] = {}
-    for offset in range(0, len(missing_refs), 900):
+    if inline_payloads:
+        fetch_refs: list[VectorRef] = []
+        for ref in missing_refs:
+            if ref.memory_id in inline_payloads:
+                payloads[ref.memory_id] = inline_payloads[ref.memory_id]
+            else:
+                fetch_refs.append(ref)
+    else:
+        fetch_refs = missing_refs
+    for offset in range(0, len(fetch_refs), 900):
         check_cancelled()
-        part = missing_refs[offset : offset + 900]
+        part = fetch_refs[offset : offset + 900]
         placeholders = ",".join("?" for _ in part)
         payloads.update(
             dict(
@@ -608,22 +1148,32 @@ def _normalize_ref_payloads(
     batch_packed: dict[int, memoryview] = {}
     batch_errors: dict[int, str] = {}
     if np is not None and missing_refs:
-        blob_positions: list[int] = []
-        blob_values: list[bytes | bytearray | memoryview] = []
+        grouped_positions: dict[str, list[int]] = {}
+        grouped_values: dict[str, list[bytes | bytearray | memoryview]] = {}
         for idx, ref in enumerate(allowed):
             if reused_slices and reused_slices[idx] is not None:
                 continue
             raw = payloads.get(ref.memory_id)
-            if isinstance(raw, (bytes, bytearray, memoryview)) and len(raw) == row_bytes:
-                blob_positions.append(idx)
-                blob_values.append(raw)
-        if len(blob_values) >= 8:
-            normed_slices, norm_errors = _normalize_blob_batch(blob_values, dimension, np)
-            for pos, slice_val, err in zip(blob_positions, normed_slices, norm_errors):
-                if err:
-                    batch_errors[pos] = err
-                elif slice_val is not None:
-                    batch_packed[pos] = slice_val
+            if isinstance(raw, (bytes, bytearray, memoryview)):
+                in_dtype = _detect_blob_dtype(len(raw), dimension)
+                if in_dtype:
+                    grouped_positions.setdefault(in_dtype, []).append(idx)
+                    grouped_values.setdefault(in_dtype, []).append(raw)
+        for in_dtype, blob_values in grouped_values.items():
+            if len(blob_values) >= 8:
+                blob_positions = grouped_positions[in_dtype]
+                normed_slices, norm_errors = _normalize_blob_batch(
+                    blob_values,
+                    dimension,
+                    np,
+                    input_dtype=in_dtype,
+                    target_dtype=target_dtype,
+                )
+                for pos, slice_val, err in zip(blob_positions, normed_slices, norm_errors):
+                    if err:
+                        batch_errors[pos] = err
+                    elif slice_val is not None:
+                        batch_packed[pos] = slice_val
 
     refs: list[VectorRef] = []
     chunks: list[bytes | memoryview] = []
@@ -638,7 +1188,11 @@ def _normalize_ref_payloads(
         elif idx in batch_packed:
             packed = batch_packed[idx]
         else:
-            packed, error = _normalized_bytes(payloads.get(ref.memory_id), dimension)
+            packed, error = _normalized_bytes(
+                payloads.get(ref.memory_id),
+                dimension,
+                target_dtype=target_dtype,
+            )
             if error:
                 counts[error] += 1
                 continue
@@ -664,6 +1218,7 @@ def _build_blocks(
     restrict_ids: tuple[str, ...] = (),
     reusable_rows: dict[str, ReusableRow] | None = None,
     expected_revision: str = "",
+    target_dtype: str = "<f4",
 ) -> tuple[list[VectorBlock], float, bool, frozenset[str], int]:
     """Scan candidate rows, score every block, and retain as many as fit.
 
@@ -719,6 +1274,7 @@ def _build_blocks(
             np,
             check_cancelled,
             counts,
+            target_dtype=target_dtype,
         )
         if not refs:
             continue
@@ -728,7 +1284,7 @@ def _build_blocks(
             part_chunks = chunks[start:end]
             for ref in part_refs:
                 admitted.add(ref.memory_id)
-            block = VectorBlock(tuple(part_refs), b"".join(part_chunks), dimension)
+            block = VectorBlock(tuple(part_refs), b"".join(part_chunks), dimension, dtype=target_dtype)
             accept(block)
             blocks, retained, evicted = _retain_blocks(blocks, budget, block=block, retained=retained)
             if evicted:
@@ -857,10 +1413,11 @@ def _append_corpus_blocks(
     if not refs:
         return
     step = max(1, corpus.batch_size)
+    target_dtype = _precision_to_dtype(corpus.precision)
     for start in range(0, len(refs), step):
         part_refs = tuple(refs[start : start + step])
         part_chunks = chunks[start : start + step]
-        block = VectorBlock(part_refs, b"".join(part_chunks), dimension)
+        block = VectorBlock(part_refs, b"".join(part_chunks), dimension, dtype=target_dtype)
         if on_block is not None:
             on_block(block)
         corpus.vector_blocks, corpus.vector_bytes, evicted = _retain_blocks(
@@ -897,7 +1454,6 @@ def _remove_ids_from_corpus(corpus: VectorCorpus, remove_ids: set[str], dimensio
     if not any(mid in corpus.vector_index for mid in remove_ids):
         return
     updated_blocks: list[VectorBlock] = []
-    row_bytes = dimension * 8
     np = _numpy()
     for block in corpus.vector_blocks:
         keep_indices = [idx for idx, ref in enumerate(block.refs) if ref.memory_id not in remove_ids]
@@ -908,12 +1464,14 @@ def _remove_ids_from_corpus(corpus: VectorCorpus, remove_ids: set[str], dimensio
             continue
         kept_refs = tuple(block.refs[idx] for idx in keep_indices)
         if np is not None:
-            mat = np.frombuffer(block.values, dtype="<f8").reshape(len(block.refs), dimension)
-            kept_bytes = mat[keep_indices].tobytes()
+            mat = block.matrix
+            kept_arr = np.ascontiguousarray(mat[keep_indices])
+            updated_blocks.append(VectorBlock.from_array(kept_refs, kept_arr, dtype=block.dtype))
         else:
+            row_bytes = dimension * _dtype_itemsize(block.dtype)
             mv = memoryview(block.values)
             kept_bytes = b"".join(mv[idx * row_bytes : (idx + 1) * row_bytes] for idx in keep_indices)
-        updated_blocks.append(VectorBlock(kept_refs, kept_bytes, dimension))
+            updated_blocks.append(VectorBlock(kept_refs, kept_bytes, dimension, dtype=block.dtype))
     corpus.vector_blocks = updated_blocks
     _rebuild_vector_index(corpus)
 
@@ -954,6 +1512,7 @@ def _populate_corpus_from_rows(
     """Scan ``memories JOIN memory_embeddings`` and populate ``corpus`` entries & vectors."""
     parse_row, hash_memory = _make_row_parser(store)
     np = _numpy()
+    target_dtype = _precision_to_dtype(corpus.precision)
     fetch_batch = max(corpus.batch_size, 900) if (corpus.batch_size >= 8 and not restrict_ids) else corpus.batch_size
     eligible_ids: set[str] = set()
     freshly_normalized_ids: set[str] = set()
@@ -967,9 +1526,18 @@ def _populate_corpus_from_rows(
         "embedding_unauthorized_or_inactive": 0,
         "embedding_reused_rows": 0,
     }
-    for rows in _row_batches(conn, provider_id, where, fetch_batch, restrict_ids):
+    fetch_inline_vectors = not reusable_rows
+    for rows in _row_batches(
+        conn,
+        provider_id,
+        where,
+        fetch_batch,
+        restrict_ids,
+        include_vector=fetch_inline_vectors,
+    ):
         check_cancelled()
         to_normalize: list[VectorRef] = []
+        batch_inline_payloads: dict[str, Any] | None = {} if fetch_inline_vectors else None
         for row in rows:
             counts["embedding_scanned_rows"] += 1
             memory = parse_row(row, expected_revision)
@@ -1001,10 +1569,13 @@ def _populate_corpus_from_rows(
                 memory_time_ranges(memory),
                 str(row_value(row, "embedding_updated_at", "") or ""),
             )
-            corpus.entries[mid] = CorpusEntry(ref=ref, memory=memory, valid_from_ts=vf_ts, valid_to_ts=vt_ts)
-            if materialize_all or (eligible is not None and eligible(memory)):
+            slim_memory = _slim_corpus_memory(memory)
+            corpus.entries[mid] = CorpusEntry(ref=ref, memory=slim_memory, valid_from_ts=vf_ts, valid_to_ts=vt_ts)
+            if materialize_all or (eligible is not None and eligible(slim_memory)):
                 counts["embedding_candidates"] += 1
                 to_normalize.append(ref)
+                if batch_inline_payloads is not None:
+                    batch_inline_payloads[mid] = row["embedding_vector"]
             else:
                 counts["embedding_unauthorized_or_inactive"] += 1
         if to_normalize:
@@ -1018,6 +1589,8 @@ def _populate_corpus_from_rows(
                 np,
                 check_cancelled,
                 norm_counts,
+                target_dtype=target_dtype,
+                inline_payloads=batch_inline_payloads,
             )
             counts["embedding_reused_rows"] += norm_counts["embedding_reused_rows"]
             counts["embedding_invalid"] += norm_counts["embedding_invalid"]
@@ -1107,9 +1680,7 @@ def _build_snapshot_blocks_from_corpus(
     *,
     step_size: int | None = None,
 ) -> tuple[list[VectorBlock], bool, frozenset[str], int]:
-    """Slice contiguous normalized rows from ``corpus`` into snapshot ``VectorBlock``s."""
-    np = _numpy()
-    row_bytes = dimension * 8
+    """Build zero-copy snapshot ``VectorBlock`` views over ``corpus`` without copying vectors."""
     selected_set = set(selected_ids)
     blocks: list[VectorBlock] = []
     admitted: set[str] = set()
@@ -1117,8 +1688,6 @@ def _build_snapshot_blocks_from_corpus(
     retained = 0
     step = max(1, step_size if step_size is not None else corpus.batch_size)
 
-    # Group selected IDs by corpus block to reuse whole blocks zero-copy or
-    # extract contiguous slices via numpy without touching SQLite.
     by_block: dict[int, list[int]] = {}
     for mid in selected_ids:
         pos = corpus.vector_index.get(mid)
@@ -1126,9 +1695,6 @@ def _build_snapshot_blocks_from_corpus(
             continue
         blk_idx, row_idx = pos
         by_block.setdefault(blk_idx, []).append(row_idx)
-
-    pending_refs: list[VectorRef] = []
-    pending_slices: list[bytes | memoryview] = []
 
     def emit_block(block: VectorBlock) -> None:
         nonlocal blocks, retained, truncated
@@ -1139,48 +1705,18 @@ def _build_snapshot_blocks_from_corpus(
         if evicted:
             truncated = True
 
-    def flush_pending() -> None:
-        nonlocal pending_refs, pending_slices
-        if not pending_refs:
-            return
-        while pending_refs:
-            take = min(step, len(pending_refs))
-            chunk_refs = tuple(pending_refs[:take])
-            chunk_slices = pending_slices[:take]
-            del pending_refs[:take]
-            del pending_slices[:take]
-            emit_block(VectorBlock(chunk_refs, b"".join(chunk_slices), dimension))
-
     for blk_idx, cblock in enumerate(corpus.vector_blocks):
         local_rows = by_block.get(blk_idx)
         if not local_rows:
             continue
-        if len(local_rows) == len(cblock.refs) and len(cblock.refs) <= step and not pending_refs:
-            # Zero-copy reuse when every row in the corpus block is eligible.
+        if len(local_rows) == len(cblock.refs) and len(cblock.refs) <= step:
             if all(ref.memory_id in selected_set for ref in cblock.refs):
                 emit_block(cblock)
                 continue
-        if np is not None:
-            mat = np.frombuffer(cblock.values, dtype="<f8").reshape(len(cblock.refs), dimension)
-            for start in range(0, len(local_rows), step):
-                part = local_rows[start : start + step]
-                part_refs = [cblock.refs[idx] for idx in part]
-                part_bytes = mat[part].tobytes()
-                if not pending_refs and len(part_refs) == step:
-                    emit_block(VectorBlock(tuple(part_refs), part_bytes, dimension))
-                else:
-                    pending_refs.extend(part_refs)
-                    pending_slices.append(part_bytes)
-                    if len(pending_refs) >= step:
-                        flush_pending()
-        else:
-            mv = memoryview(cblock.values)
-            for idx in local_rows:
-                pending_refs.append(cblock.refs[idx])
-                pending_slices.append(mv[idx * row_bytes : (idx + 1) * row_bytes])
-                if len(pending_refs) >= step:
-                    flush_pending()
-    flush_pending()
+        for start in range(0, len(local_rows), step):
+            part = local_rows[start : start + step]
+            part_refs = tuple(cblock.refs[idx] for idx in part)
+            emit_block(VectorBlock.from_view(part_refs, cblock, part))
     return blocks, truncated, frozenset(admitted), retained
 
 
@@ -1204,6 +1740,9 @@ def prewarm_vector_corpus_sync(
     with store._vector_search_lock:
         check_cancelled()
         search_cache, corpus_cache = _ensure_store_vector_caches(store)
+        target_precision = _target_corpus_precision(store)
+        target_dtype = _precision_to_dtype(target_precision)
+        itemsize = _dtype_itemsize(target_dtype)
         conn, lock = store._vector_read_connection()
         with lock:
             conn.execute("BEGIN")
@@ -1231,9 +1770,15 @@ def prewarm_vector_corpus_sync(
                 if not resolved_provider or resolved_dim <= 0:
                     return {"warmed": False, "reason": "invalid_embedding_shape"}
 
-                safe_batch = min(max(1, batch_size), max(1, BLOCK_BYTES // (8 * resolved_dim)))
+                safe_batch = min(max(1, batch_size), max(1, BLOCK_BYTES // (itemsize * resolved_dim)))
                 budget = cache_budget_bytes(store)
-                corpus_key = (resolved_provider, resolved_dim, bool(include_pending), max_text_chars)
+                corpus_key = (
+                    resolved_provider,
+                    resolved_dim,
+                    bool(include_pending),
+                    max_text_chars,
+                    target_precision,
+                )
                 rev, corpus_rev, _acl_rev, min_seq, max_seq, chg_count = _read_corpus_revisions(conn)
                 existing = corpus_cache.get(corpus_key)
                 if existing is not None and not existing.partial_evicted and existing.eager_vectors:
@@ -1248,11 +1793,12 @@ def prewarm_vector_corpus_sync(
                             "reused": True,
                             "provider_id": resolved_provider,
                             "dimension": resolved_dim,
+                            "precision": target_precision,
                             "rows": len(existing.entries),
                             "partial": existing.partial_evicted,
                         }
 
-                reusable = _collect_corpus_reusable_rows(existing, resolved_dim)
+                reusable = _collect_corpus_reusable_rows(existing, resolved_dim, target_dtype=target_dtype)
                 if search_cache:
                     snap_reusable = _collect_reusable_rows(
                         search_cache,
@@ -1260,6 +1806,7 @@ def prewarm_vector_corpus_sync(
                         provider_id=resolved_provider,
                         dimension=resolved_dim,
                         max_text_chars=max_text_chars,
+                        target_dtype=target_dtype,
                     )
                     if snap_reusable:
                         snap_reusable.update(reusable)
@@ -1271,6 +1818,7 @@ def prewarm_vector_corpus_sync(
                     retrieval_revision=rev,
                     last_change_seq=max_seq,
                     batch_size=safe_batch,
+                    precision=target_precision,
                     eager_vectors=True,
                 )
                 where = _candidate_where(store, include_pending)
@@ -1301,8 +1849,10 @@ def prewarm_vector_corpus_sync(
             "reused": False,
             "provider_id": resolved_provider,
             "dimension": resolved_dim,
+            "precision": target_precision,
             "rows": len(corpus.entries),
             "blocks": len(corpus.vector_blocks),
+            "vector_bytes": corpus.vector_bytes,
             "partial": corpus.partial_evicted,
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
         }
@@ -1341,6 +1891,7 @@ def _search_via_warm_corpus(
         return None
     changed_ids, new_last_seq = delta
     working = corpus.clone_for_update()
+    target_dtype = _precision_to_dtype(working.precision)
     where = _candidate_where(store, include_pending)
     freshly_normalized_ids: set[str] = set()
     delta_rows = len(changed_ids)
@@ -1403,6 +1954,7 @@ def _search_via_warm_corpus(
             _numpy(),
             check_cancelled,
             norm_counts,
+            target_dtype=target_dtype,
         )
         valid_new_ids = {r.memory_id for r in new_refs}
         newly_invalid = 0
@@ -1459,6 +2011,7 @@ def _search_via_warm_corpus(
         retained,
         complete=not truncated,
         candidate_ids=None if not truncated else admitted,
+        precision=working.precision,
     )
     return working, publish, delta_rows, reused_rows, valid_until
 
@@ -1468,7 +2021,8 @@ def _build_corpus_cold_snapshot(
     conn: Any,
     corpus: VectorCorpus | None,
     *,
-    corpus_key: tuple[str, int, bool, int],
+    corpus_key: tuple[str, int, bool, int, str],
+    target_precision: str,
     provider_id: str,
     dimension: int,
     batch_size: int,
@@ -1490,6 +2044,7 @@ def _build_corpus_cold_snapshot(
 ) -> tuple[VectorCorpus | None, VectorSnapshot, int, float]:
     """Perform a full corpus scan and build both ``VectorSnapshot`` and ``VectorCorpus``."""
     where = _candidate_where(store, include_pending)
+    target_dtype = _precision_to_dtype(target_precision)
     if corpus is None or not corpus.partial_evicted:
         working = VectorCorpus(
             corpus_key=corpus_key,
@@ -1497,6 +2052,7 @@ def _build_corpus_cold_snapshot(
             retrieval_revision=revision,
             last_change_seq=max_seq,
             batch_size=batch_size,
+            precision=target_precision,
             eager_vectors=bool(corpus.eager_vectors) if corpus is not None else False,
         )
         eligible_ids, _fresh, pop_counts, valid_until = _populate_corpus_from_rows(
@@ -1541,6 +2097,7 @@ def _build_corpus_cold_snapshot(
             retained,
             complete=not truncated,
             candidate_ids=None if not truncated else admitted,
+            precision=target_precision,
         )
         if not working.partial_evicted:
             working.selection_cache[
@@ -1574,6 +2131,7 @@ def _build_corpus_cold_snapshot(
         where,
         reusable_rows=reusable_rows,
         expected_revision=expected_revision,
+        target_dtype=target_dtype,
     )
     reused_rows = counts.pop("embedding_reused_rows", 0)
     publish = VectorSnapshot(
@@ -1584,6 +2142,7 @@ def _build_corpus_cold_snapshot(
         retained,
         complete=not truncated,
         candidate_ids=None if not truncated else admitted,
+        precision=target_precision,
     )
     return None, publish, reused_rows, valid_until
 
@@ -1599,9 +2158,12 @@ def search_embeddings_sync(
 ) -> tuple[list[MemoryRecord], dict[str, float], dict[str, Any]]:
     started = time.perf_counter()
     dimension = len(query)
-    batch_size = min(max(1, batch_size), max(1, BLOCK_BYTES // (8 * dimension)))
+    target_precision = _target_corpus_precision(store)
+    target_dtype = _precision_to_dtype(target_precision)
+    itemsize = _dtype_itemsize(target_dtype)
+    batch_size = min(max(1, batch_size), max(1, BLOCK_BYTES // (itemsize * dimension)))
     key = (provider_id, dimension, bool(include_pending), max_text_chars, authorization_key)
-    corpus_key = (provider_id, dimension, bool(include_pending), max_text_chars)
+    corpus_key = (provider_id, dimension, bool(include_pending), max_text_chars, target_precision)
     budget = cache_budget_bytes(store)
     excluded_types = frozenset(excluded_memory_types) if excluded_memory_types else frozenset()
     selected: list[tuple[float, VectorRef]] = []
@@ -1655,6 +2217,7 @@ def search_embeddings_sync(
                     cached is not None
                     and cached.revision == revision
                     and cached.valid_until > selection_time
+                    and getattr(cached, "precision", target_precision) == target_precision
                 )
                 corpus = corpus_cache.get(corpus_key)
                 if corpus is not None:
@@ -1677,9 +2240,14 @@ def search_embeddings_sync(
                         dimension=dimension,
                         max_text_chars=max_text_chars,
                         exclude_key=key if cache_hit else None,
+                        target_dtype=target_dtype,
                     )
                     if corpus is not None and corpus.vector_blocks:
-                        corpus_reusable = _collect_corpus_reusable_rows(corpus, dimension)
+                        corpus_reusable = _collect_corpus_reusable_rows(
+                            corpus,
+                            dimension,
+                            target_dtype=target_dtype,
+                        )
                         if collected:
                             corpus_reusable.update(collected)
                         collected = corpus_reusable
@@ -1687,7 +2255,11 @@ def search_embeddings_sync(
                     return reusable
 
                 for cached_key, value in list(search_cache.items()):
-                    if value.revision != revision or value.valid_until <= selection_time:
+                    if (
+                        value.revision != revision
+                        or value.valid_until <= selection_time
+                        or getattr(value, "precision", target_precision) != target_precision
+                    ):
                         evicted_snapshots[cached_key] = value
                         del search_cache[cached_key]
                 snapshot = cached if cache_hit else None
@@ -1715,6 +2287,7 @@ def search_embeddings_sync(
                                 trimmed_bytes,
                                 complete=trimmed_complete,
                                 candidate_ids=None if trimmed_complete else all_candidates,
+                                precision=getattr(cached, "precision", target_precision),
                             )
                             publish = snapshot
                     counts.update(dict(snapshot.counts))
@@ -1733,6 +2306,7 @@ def search_embeddings_sync(
                                 _candidate_where(store, include_pending), missing,
                                 reusable_rows=get_reusable(),
                                 expected_revision=expected_revision,
+                                target_dtype=target_dtype,
                             )
                             reread_rows = len(admitted)
                             reused_rows = scratch.pop("embedding_reused_rows", 0)
@@ -1777,6 +2351,7 @@ def search_embeddings_sync(
                             conn,
                             corpus,
                             corpus_key=corpus_key,
+                            target_precision=target_precision,
                             provider_id=provider_id,
                             dimension=dimension,
                             batch_size=batch_size,
@@ -1854,6 +2429,8 @@ def search_embeddings_sync(
             "embedding_reread_rows": reread_rows,
             "embedding_reused_rows": reused_rows,
             "embedding_snapshot_budget_bytes": budget,
+            "embedding_snapshot_owned_bytes": target.owned_bytes if target is not None else 0,
+            "embedding_vector_precision": target_precision,
             "embedding_rows_materialized": len(memories),
             "embedding_batch_size": batch_size,
             "embedding_snapshot_rows": snapshot_rows_out,

@@ -482,14 +482,14 @@ class MemoryAtomV2Tests(unittest.TestCase):
         store.initialize()
 
         row = store._conn.execute(
-            "SELECT content,metadata,canonical_key,content_fingerprint FROM memories WHERE id='legacy-secret'"
+            "SELECT rowid, content,metadata,canonical_key,content_fingerprint FROM memories WHERE id='legacy-secret'"
         ).fetchone()
-        fts = store._conn.execute(
-            "SELECT search_text FROM memory_fts WHERE memory_id='legacy-secret'"
+        secret_fts_hit = store._conn.execute(
+            "SELECT rowid FROM memory_fts WHERE memory_fts MATCH '\"legacy-plain-secret\"'"
         ).fetchone()
         self.assertNotIn("legacy-plain-secret", row["content"])
         self.assertNotIn("legacy-meta-secret", row["metadata"])
-        self.assertNotIn("legacy-plain-secret", fts["search_text"])
+        self.assertIsNone(secret_fts_hit)
         self.assertNotEqual(old_keys["canonical_key"], row["canonical_key"])
         self.assertNotEqual(old_keys["content_fingerprint"], row["content_fingerprint"])
         self.assertEqual(

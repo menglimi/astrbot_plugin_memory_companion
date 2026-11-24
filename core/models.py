@@ -8,6 +8,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+try:
+    import msgspec as _msgspec
+    _MSGSPEC_DECODE = _msgspec.json.decode
+    _MSGSPEC_DECODE_ERR = _msgspec.DecodeError
+except Exception:
+    _MSGSPEC_DECODE = None
+    _MSGSPEC_DECODE_ERR = ValueError
+
 from .memory_atom import (
     clamp_score,
     durability_for_memory_type,
@@ -32,14 +40,17 @@ def new_id(prefix: str) -> str:
 
 
 _PERSON_ID_RE = re.compile(r"person_[0-9a-f]{24}")
+_ARCHIVE_REF_RE = re.compile(r"bot personal archive reference \[[^\]]+\]")
 
 
 def clean_text(value: Any, limit: int = 2000) -> str:
     if value is None:
         return ""
-    text = value if isinstance(value, str) else str(value)
+    text = value if type(value) is str else str(value)
     if not text:
         return ""
+    if len(text) <= limit and text.isascii() and " " not in text and text.isprintable():
+        return text
     text = " ".join(text.split())
     if len(text) > limit:
         return text[: max(0, limit - 1)].rstrip() + "…"
@@ -67,11 +78,19 @@ def is_memory_placeholder(memory: Any) -> bool:
     memory document.  The content check also catches rows written by older
     versions before ``source_plugin`` was standardized.
     """
-    source_plugin = clean_text(getattr(memory, "source_plugin", ""), 120).casefold()
-    if source_plugin == "bot_personal_bridge":
-        return True
-    content = clean_text(getattr(memory, "content", ""), 400).casefold()
-    return bool(re.fullmatch(r"bot personal archive reference \[[^\]]+\]", content))
+    raw_plugin = getattr(memory, "source_plugin", "")
+    if raw_plugin:
+        if raw_plugin == "bot_personal_bridge":
+            return True
+        if clean_text(raw_plugin, 120).casefold() == "bot_personal_bridge":
+            return True
+    raw_content = getattr(memory, "content", "")
+    if not raw_content:
+        return False
+    if type(raw_content) is str and "bot" not in raw_content and "Bot" not in raw_content and "BOT" not in raw_content:
+        return False
+    content = clean_text(raw_content, 400).casefold()
+    return _ARCHIVE_REF_RE.fullmatch(content) is not None
 
 
 def clamp_float(value: Any, low: float = 0.0, high: float = 1.0, default: float = 0.0) -> float:
@@ -89,6 +108,17 @@ def json_dumps(value: Any) -> str:
 def json_loads(value: Any, fallback: Any) -> Any:
     if not value:
         return fallback
+    if value == "{}":
+        return {}
+    if value == "[]":
+        return []
+    if _MSGSPEC_DECODE is not None and isinstance(value, (str, bytes, bytearray, memoryview)):
+        try:
+            return _MSGSPEC_DECODE(value)
+        except _MSGSPEC_DECODE_ERR:
+            pass
+        except Exception:
+            pass
     try:
         return json.loads(value)
     except Exception:
@@ -370,6 +400,80 @@ class MemoryRecord:
 
     @classmethod
     def _from_row_raw(cls, row: Any) -> "MemoryRecord":
+        if type(row) is dict:
+            g = row.get
+        elif row is None:
+            g = {}.get
+        else:
+            try:
+                g = dict(row).get
+            except (TypeError, ValueError):
+                return cls._from_row_raw_fallback(row)
+        metadata = json_loads(g("metadata", "{}"), {})
+        if type(metadata) is not dict:
+            metadata = {}
+        tags_raw = g("tags", "[]")
+        tags = json_loads(tags_raw, [])
+        if type(tags) is not list:
+            tags = []
+        return cls(
+            id=g("id", ""),
+            memory_type=g("memory_type", "observation"),
+            subject=EntityRef(
+                g("subject_kind", "user"),
+                g("subject_id", ""),
+                g("subject_name", ""),
+                g("subject_role", "unknown"),
+            ),
+            object=EntityRef(
+                g("object_kind", "user"),
+                g("object_id", ""),
+                g("object_name", ""),
+                g("object_role", "unknown"),
+            ),
+            scope=g("scope", "unknown"),
+            session_id=g("session_id", ""),
+            platform=g("platform", ""),
+            message_id=g("message_id", ""),
+            group_id=g("group_id", ""),
+            visibility=g("visibility", "internal"),
+            sayability=g("sayability", "indirect"),
+            reality_level=g("reality_level", "imported_summary"),
+            lifecycle=g("lifecycle", "raw_event"),
+            content=g("content", ""),
+            evidence=g("evidence", ""),
+            confidence=float(g("confidence", 0.5) or 0.0),
+            importance=float(g("importance", 0.3) or 0.0),
+            owner_bot_id=g("owner_bot_id", ""),
+            subject_person_id=g("subject_person_id", ""),
+            identity_assurance=g("identity_assurance", ""),
+            validity_status=g("validity_status", "active"),
+            valid_from=g("valid_from", ""),
+            valid_to=g("valid_to", ""),
+            salience=float(g("salience", 0.3) or 0.0),
+            durability=g("durability", "normal"),
+            sensitivity=g("sensitivity", "private"),
+            reinforcement_score=float(g("reinforcement_score", 0.0) or 0.0),
+            injection_count=int(g("injection_count", 0) or 0),
+            last_injected_at=g("last_injected_at", ""),
+            canonical_key=g("canonical_key", ""),
+            review_status=g("review_status", "auto"),
+            tags=tags,
+            metadata=metadata,
+            created_at=g("created_at", ""),
+            updated_at=g("updated_at", ""),
+            occurred_at=g("occurred_at", ""),
+            last_accessed_at=g("last_accessed_at", ""),
+            access_count=int(g("access_count", 0) or 0),
+            source_plugin=g("source_plugin", "memory_companion"),
+            import_batch_id=g("import_batch_id", ""),
+            content_fingerprint=g("content_fingerprint", ""),
+            merged_count=int(g("merged_count", 1) or 1),
+            supersedes_id=g("supersedes_id", ""),
+        )
+
+    @classmethod
+    def _from_row_raw_fallback(cls, row: Any) -> "MemoryRecord":
         metadata = json_loads(row_value(row, "metadata", "{}"), {})
         if not isinstance(metadata, dict):
             metadata = {}
@@ -451,6 +555,59 @@ class MemoryRecord:
         record = cls._from_row_raw(row)
         record.tags = [clean_text(tag, 80) for tag in record.tags if clean_text(tag, 80)]
         return record
+
+    def clone_slim(
+        self,
+        *,
+        keep_content: bool,
+        slim_meta: dict[str, Any],
+    ) -> "MemoryRecord":
+        """Fast slot-copy variant for lightweight vector corpus eligibility stubs."""
+        return MemoryRecord(
+            id=self.id,
+            memory_type=self.memory_type,
+            subject=self.subject,
+            object=self.object,
+            scope=self.scope,
+            session_id=self.session_id,
+            platform=self.platform,
+            message_id=self.message_id,
+            group_id=self.group_id,
+            visibility=self.visibility,
+            sayability=self.sayability,
+            reality_level=self.reality_level,
+            lifecycle=self.lifecycle,
+            content=self.content if keep_content else "",
+            evidence=[],
+            confidence=self.confidence,
+            importance=self.importance,
+            owner_bot_id=self.owner_bot_id,
+            validity_status=self.validity_status,
+            valid_from=self.valid_from,
+            valid_to=self.valid_to,
+            salience=self.salience,
+            durability=self.durability,
+            sensitivity=self.sensitivity,
+            reinforcement_score=self.reinforcement_score,
+            injection_count=self.injection_count,
+            last_injected_at=self.last_injected_at,
+            canonical_key=self.canonical_key,
+            review_status=self.review_status,
+            tags=self.tags,
+            metadata=slim_meta,
+            created_at=self.created_at,
+            updated_at=self.updated_at,
+            occurred_at=self.occurred_at,
+            last_accessed_at=self.last_accessed_at,
+            access_count=self.access_count,
+            source_plugin=self.source_plugin,
+            import_batch_id=self.import_batch_id,
+            content_fingerprint=self.content_fingerprint,
+            merged_count=self.merged_count,
+            supersedes_id=self.supersedes_id,
+            subject_person_id=self.subject_person_id,
+            identity_assurance=self.identity_assurance,
+        )
 
 
 @dataclass(slots=True)

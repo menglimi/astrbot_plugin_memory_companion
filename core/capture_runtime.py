@@ -5,6 +5,7 @@ import asyncio
 from datetime import datetime, timezone
 import json
 import secrets
+import time
 
 from .astrbot_compat import logger
 from .models import SessionContext, utc_now
@@ -36,6 +37,8 @@ class CaptureRuntime:
         self.wake = asyncio.Event()
         self.task = None
         self.last_error = ''
+        self._last_purge_at = 0.0
+        self._purge_interval_seconds = 600.0
 
     def start(self):
         if self.task is None or self.task.done():
@@ -146,12 +149,15 @@ class CaptureRuntime:
     async def loop(self):
         while not getattr(self.service,'_closing',False):
             self.wake.clear()
-            try:
-                await _in_thread(self.store.purge_expired)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.last_error=type(exc).__name__
+            now_mono = time.monotonic()
+            if self._last_purge_at <= 0.0 or (now_mono - self._last_purge_at) >= self._purge_interval_seconds:
+                self._last_purge_at = now_mono
+                try:
+                    await _in_thread(self.store.purge_expired)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.last_error=type(exc).__name__
             try:
                 rows=await _in_thread(self.store.due)
             except asyncio.CancelledError:
@@ -218,7 +224,8 @@ class CaptureRuntime:
         try:
             result=await asyncio.to_thread(run_sync)
             setattr(event,'_memory_capture_receipt',result)
-            self.wake.set()
+            if not isinstance(result, dict) or result.get('status') not in {'committed', 'excluded'}:
+                self.wake.set()
             return result
         except (ValueError,UnicodeError) as exc:
             result={'status':'held','reason':str(exc),'durably_staged':False}
