@@ -1092,6 +1092,40 @@ test("performance view and migrate DB health card: render semantic markup and ze
   assert.ok(migHtml.includes("磁盘剩余空间不足 2.2 倍主库大小"));
   assert.ok(migHtml.includes("最近一次瘦身结果"));
   assert.ok(migHtml.includes("增量无损回收"));
+  assert.ok(
+    migHtml.includes("仅整理向量存储、清理已归档/无主向量索引与超期内部回执，绝不删除任何记忆、聊天原文、人物关系或配置"),
+    "体检卡瘦身说明必须明确提示绝不删除任何业务数据"
+  );
+
+  // Also verify scoped disk_preflight warning renders when primary preflight passes
+  const scopedWarnHtml = migViews.migrate.render({
+    preset: { preset: "standard" },
+    dbHealth: {
+      ok: true,
+      health: {
+        configured_vector_precision: "float32",
+        primary: {
+          total_bytes: 10485760,
+          files: { db_bytes: 10485760, wal_bytes: 0 },
+          freelist_bytes: 0,
+          freelist_count: 0,
+          auto_vacuum: 2,
+          vector_precision: "float32",
+          embeddings: { total_rows: 0, float64_rows: 0, float32_rows: 0, float16_rows: 0, json_rows: 0, archived_orphan_rows: 0, vector_bytes: 0, estimated_transcode_savings_bytes: 0 },
+          disk_preflight: { ok: true, available_free_bytes: 512 * 1048576, required_free_bytes: 96 * 1048576 },
+          recommendations: [],
+        },
+        scoped: {
+          total_bytes: 4194304,
+          disk_preflight: { ok: false, reason: "disk_usage_unavailable", message: "无法读取副库磁盘剩余空间，已安全阻断副库全量 VACUUM。" },
+        },
+      },
+    },
+    dbShrinkReport: null,
+    output: null,
+  });
+  assert.ok(scopedWarnHtml.includes("副库深度压缩空间预检未通过"));
+  assert.ok(scopedWarnHtml.includes("无法读取副库磁盘剩余空间"));
 
   // 3) Verify new CSS section 8 has ZERO hardcoded hex colors and covers mobile touch & narrow-screen rules
   const sec8Idx = cssSource.indexOf("/* ---------- 8. 性能调优视图与数据库体检瘦身卡片");
@@ -1288,6 +1322,7 @@ test("performance save triggers inPlace refresh; migrate DB health & shrink upda
   const migViews = {};
   const migGoCalls = [];
   const migToasts = [];
+  const confirmCalls = [];
   let healthFetchCount = 0;
   let optimizePayloads = [];
 
@@ -1412,7 +1447,10 @@ test("performance save triggers inPlace refresh; migrate DB health & shrink upda
       return { ok: true };
     },
     withBusy: async (_t, fn) => fn(),
-    showInlineConfirmation: async () => true,
+    showInlineConfirmation: async (title, msg, confirmLabel) => {
+      confirmCalls.push({ title, msg, confirmLabel });
+      return true;
+    },
     toast: (msg, tone) => migToasts.push({ msg, tone }),
     invalidatePool: () => {},
     prefersReducedMotion: () => false,
@@ -1443,9 +1481,14 @@ test("performance save triggers inPlace refresh; migrate DB health & shrink upda
   assert.equal(lmPathInput.value, "/data/livingmemory.db");
   assert.equal(releaseBatchInput.value, "sb_keep_me_99");
 
-  // 3) Click 深度整理压缩 -> partial update, zero go(), form values still intact
+  // 3) Click 深度整理压缩 -> partial update, zero go(), form values still intact, confirmation explicitly states non-destructive
   await slotButtons.dbShrinkFullBtn.handlers.click();
   assert.equal(migGoCalls.length, 0, "深度压缩不得触发整页 go('migrate')");
+  assert.equal(confirmCalls.length, 1);
+  assert.ok(
+    confirmCalls[0].msg.includes("仅整理向量存储、清理已归档/无主向量索引与超期内部回执，绝不删除任何记忆、聊天原文、人物关系或配置"),
+    "深度压缩确认弹窗必须明确注明绝不删除任何业务数据"
+  );
   assert.equal(optimizePayloads.length, 2);
   assert.equal(optimizePayloads[1].run_full_vacuum, true);
   assert.ok(migrateOutputSlot.innerHTML.includes("full_vacuum_incremental_enabled"));

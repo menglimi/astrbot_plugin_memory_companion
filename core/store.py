@@ -18124,22 +18124,30 @@ class MemoryStore(SummaryBatchStore):
             return None
 
     def _full_vacuum_disk_preflight(self, db_bytes: int) -> dict[str, Any]:
-        """Pre-flight disk check for full VACUUM: require >= 2.2x primary DB + 64 MiB free."""
+        """Pre-flight disk check for full VACUUM: require >= 2.2x primary DB + 64 MiB free (fail-closed)."""
         size_bytes = max(0, int(db_bytes))
         required_free_bytes = int(math.ceil(size_bytes * 2.2)) + 64 * 1024 * 1024
         available_free_bytes = self._available_disk_bytes()
         if available_free_bytes is None:
+            req_mb = required_free_bytes / (1024 * 1024)
             return {
-                "ok": True,
+                "ok": False,
+                "reason": "disk_usage_unavailable",
                 "db_bytes": size_bytes,
                 "required_free_bytes": required_free_bytes,
                 "available_free_bytes": None,
-                "message": "",
+                "message": (
+                    f"无法读取磁盘剩余空间，出于安全保护已阻断深度整理压缩（全量 VACUUM，"
+                    f"需确认至少预留 2.2 倍主库空间 + 64 MiB，约 {req_mb:.1f} MiB）。"
+                    f"建议先改用「一键常规无损瘦身」。"
+                ),
             }
         ok = available_free_bytes >= required_free_bytes
         if ok:
+            reason = ""
             message = ""
         else:
+            reason = "insufficient_disk_space"
             db_mb = size_bytes / (1024 * 1024)
             req_mb = required_free_bytes / (1024 * 1024)
             free_mb = available_free_bytes / (1024 * 1024)
@@ -18150,6 +18158,7 @@ class MemoryStore(SummaryBatchStore):
             )
         return {
             "ok": ok,
+            "reason": reason,
             "db_bytes": size_bytes,
             "required_free_bytes": required_free_bytes,
             "available_free_bytes": available_free_bytes,
@@ -18292,9 +18301,10 @@ class MemoryStore(SummaryBatchStore):
         before_total = int(before.get("db_bytes", 0)) + int(before.get("wal_bytes", 0)) + int(before.get("shm_bytes", 0))
         disk_preflight = self._full_vacuum_disk_preflight(int(before.get("db_bytes", 0)))
         if run_full_vacuum and not disk_preflight["ok"]:
+            preflight_code = str(disk_preflight.get("reason") or "insufficient_disk_space")
             return {
                 "ok": False,
-                "error_code": "insufficient_disk_space",
+                "error_code": preflight_code,
                 "error": disk_preflight["message"],
                 "disk_preflight": disk_preflight,
                 "transcode": {
@@ -18307,7 +18317,7 @@ class MemoryStore(SummaryBatchStore):
                     "bytes_after": 0,
                     "bytes_saved": 0,
                 },
-                "vacuum_mode": "full_vacuum_blocked_insufficient_disk_space",
+                "vacuum_mode": f"full_vacuum_blocked_{preflight_code}",
                 "fts_rebuilt": [],
                 "before_bytes": before_total,
                 "after_bytes": before_total,
@@ -18349,7 +18359,8 @@ class MemoryStore(SummaryBatchStore):
                     max(int(before.get("db_bytes", 0)), int(current_files.get("db_bytes", 0)))
                 )
                 if not disk_preflight["ok"]:
-                    vacuum_mode = "full_vacuum_blocked_insufficient_disk_space"
+                    preflight_code = str(disk_preflight.get("reason") or "insufficient_disk_space")
+                    vacuum_mode = f"full_vacuum_blocked_{preflight_code}"
                     blocked_after_transcode = disk_preflight
                 else:
                     mem_bounds_before: tuple[int, int | None, int | None] | None = None
@@ -18403,9 +18414,10 @@ class MemoryStore(SummaryBatchStore):
         after = self._database_file_snapshot()
         after_total = int(after.get("db_bytes", 0)) + int(after.get("wal_bytes", 0)) + int(after.get("shm_bytes", 0))
         if blocked_after_transcode is not None:
+            blocked_code = str(blocked_after_transcode.get("reason") or "insufficient_disk_space")
             return {
                 "ok": False,
-                "error_code": "insufficient_disk_space",
+                "error_code": blocked_code,
                 "error": blocked_after_transcode["message"],
                 "disk_preflight": blocked_after_transcode,
                 "transcode": transcode,

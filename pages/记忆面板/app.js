@@ -3505,6 +3505,7 @@ function describeVacuumMode(mode) {
   if (!text || text === "none") return "无须回收";
   if (text === "incremental_vacuum") return "增量无损回收";
   if (text === "full_vacuum_incremental_enabled") return "深度压缩（全量 VACUUM）并开启增量回收";
+  if (text.indexOf("disk_usage_unavailable") >= 0) return "无法读取磁盘余量已安全取消深度压缩";
   if (text.indexOf("insufficient_disk_space") >= 0) return "磁盘剩余空间不足已取消深度压缩";
   return text;
 }
@@ -3592,12 +3593,19 @@ function renderDbHealthCard(dbHealthRes, shrinkReport) {
     ? '<ul class="db-rec-list">' + recs.map((item) => "<li>" + esc(item) + "</li>").join("") + "</ul>"
     : '<div class="db-rec-ok">数据库体积与索引状态健康，当前无需强制整理。</div>';
 
+  const scopedPreflight = scoped.disk_preflight || null;
   let preflightHtml = "";
   if (preflight && preflight.ok === false) {
     preflightHtml =
       '<div class="db-preflight-warn">' +
         "<b>深度压缩空间预检未通过</b>" +
-        "<span>" + esc(preflight.message || "磁盘剩余空间不足 2.2 倍主库大小 + 64 MiB，已阻止全量 VACUUM。") + "</span>" +
+        "<span>" + esc(preflight.message || "磁盘剩余空间不足 2.2 倍主库大小 + 64 MiB 或无法读取余量，已安全阻断全量 VACUUM。") + "</span>" +
+      "</div>";
+  } else if (scopedPreflight && scopedPreflight.ok === false) {
+    preflightHtml =
+      '<div class="db-preflight-warn">' +
+        "<b>副库深度压缩空间预检未通过</b>" +
+        "<span>" + esc(scopedPreflight.message || "副库磁盘剩余空间不足 2.2 倍副库大小 + 64 MiB 或无法读取余量，已安全阻断副库全量 VACUUM。") + "</span>" +
       "</div>";
   } else if (preflight && preflight.available_free_bytes != null) {
     preflightHtml =
@@ -3615,7 +3623,7 @@ function renderDbHealthCard(dbHealthRes, shrinkReport) {
       '<div class="db-shrink-report">' +
         '<b>最近一次瘦身结果：' + esc(fmtBytes(pRes.before_bytes)) + " → " + esc(fmtBytes(pRes.after_bytes)) +
         "（释放 " + esc(fmtBytes(pRes.bytes_reclaimed)) + "）</b>" +
-        "<span>转码向量 " + esc(fmtInt(tc.transcoded || 0)) + " 条 · 清理孤儿 " + esc(fmtInt(tc.purged_orphans || 0)) +
+        "<span>转码向量 " + esc(fmtInt(tc.transcoded || 0)) + " 条 · 清理已归档/无主向量索引 " + esc(fmtInt(tc.purged_orphans || 0)) +
         " 条 · 回收方式：" + esc(describeVacuumMode(pRes.vacuum_mode)) + "</span>" +
         (shrinkReport.notice ? '<span class="db-shrink-notice">' + esc(shrinkReport.notice) + "</span>" : "") +
       "</div>";
@@ -3627,7 +3635,7 @@ function renderDbHealthCard(dbHealthRes, shrinkReport) {
         '<button class="btn is-primary" type="button" id="dbShrinkRegularBtn">一键常规无损瘦身（推荐）</button>' +
         '<button class="btn is-warn-outline" type="button" id="dbShrinkFullBtn">深度整理压缩（全量 VACUUM）</button>' +
       "</div>" +
-      '<div class="db-action-hint">常规瘦身在线执行不卡聊天（转码旧向量 + 清理孤儿 + 增量回收 + 截断 WAL）；深度压缩会重建主库文件彻底归还硬盘空间，期间写入短暂暂停数秒。</div>' +
+      '<div class="db-action-hint">常规瘦身在线执行不卡聊天：仅整理向量存储、清理已归档/无主向量索引与超期内部回执，绝不删除任何记忆、聊天原文、人物关系或配置；深度压缩会重建主库文件彻底归还硬盘空间（同样绝不删除任何业务数据），期间写入短暂暂停数秒。</div>' +
     "</div>";
 
   return (
@@ -3801,7 +3809,7 @@ defineView("migrate", {
       if (fullVacuum) {
         const confirmed = await showInlineConfirmation(
           "确认执行深度整理压缩（全量 VACUUM）",
-          "将重写整座记忆主库并开启增量回收，以彻底归还空闲磁盘空间。执行期间记忆写入会短暂暂停数秒（不影响日常聊天放行），且系统会自动检查磁盘剩余空间 ≥ 2.2 倍主库大小 + 64 MiB。确定继续？",
+          "将重写记忆主库并开启增量回收，以彻底归还空闲磁盘空间。仅整理向量存储、清理已归档/无主向量索引与超期内部回执，绝不删除任何记忆、聊天原文、人物关系或配置。执行期间记忆写入会短暂暂停数秒（不影响日常聊天放行），且系统会对主库与副库分别预检磁盘剩余空间 ≥ 2.2 倍库大小 + 64 MiB（无法读取磁盘余量时将自动安全阻断）。确定继续？",
           "开始深度压缩"
         );
         if (!confirmed) return;

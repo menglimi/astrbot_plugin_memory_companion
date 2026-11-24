@@ -466,6 +466,93 @@ class StoreHotReloadDiskGuardAndApiTests(unittest.IsolatedAsyncioTestCase):
                 release.set()
                 first = await first_task
                 self.assertTrue(first["ok"])
+
+            # 3) Disk usage probe failure (None / OSError) -> fail-closed blocks full VACUUM, regular slimming works
+            with patch.object(service.store, "_available_disk_bytes", return_value=None):
+                health_unavail = await service.database_health_snapshot()
+                self.assertFalse(health_unavail["primary"]["disk_preflight"]["ok"])
+                self.assertEqual("disk_usage_unavailable", health_unavail["primary"]["disk_preflight"]["reason"])
+                self.assertIn("无法读取磁盘剩余空间", health_unavail["primary"]["disk_preflight"]["message"])
+                self.assertIn("一键常规无损瘦身", health_unavail["primary"]["disk_preflight"]["message"])
+
+                blocked_unavail = await service.optimize_and_shrink_database(
+                    transcode_limit=0,
+                    run_full_vacuum=True,
+                )
+                self.assertFalse(blocked_unavail["ok"])
+                self.assertEqual("disk_usage_unavailable", blocked_unavail["error_code"])
+                self.assertEqual(
+                    "full_vacuum_blocked_disk_usage_unavailable",
+                    blocked_unavail["primary"]["vacuum_mode"],
+                )
+                self.assertIn("一键常规无损瘦身", blocked_unavail["error"])
+
+                regular_unavail = await service.optimize_and_shrink_database(
+                    transcode_limit=0,
+                    run_full_vacuum=False,
+                )
+                self.assertTrue(regular_unavail["ok"])
+
+            # 4) Scoped store (req041_scoped.db) full VACUUM enforces independent 2.2x + 64 MiB & fail-closed preflight
+            scoped = service.scoped_store
+            with scoped._transaction() as conn:
+                conn.execute(
+                    """INSERT INTO scoped_records(
+                           namespace_scope, record_kind, record_id, revision,
+                           payload_json, payload_hash, policy_version, migration_epoch,
+                           deleted, erased, updated_at
+                       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)""",
+                    ("ns:test", "memory", "rec-keep-1", 1, '{"text":"keep"}', "hash1", "v1", "ep1", 1.0),
+                )
+
+            def _seed_old_scoped_op(event_id: str) -> None:
+                with scoped._transaction() as conn:
+                    conn.execute(
+                        """INSERT INTO scoped_operations(
+                               event_id, migration_epoch, request_hash, result_code, created_at
+                           ) VALUES(?, ?, ?, ?, ?)""",
+                        (event_id, "ep1", "rh1", "ok", 1.0),
+                    )
+
+            _seed_old_scoped_op("op-old-low")
+            with patch.object(scoped, "_available_disk_bytes", return_value=8 * 1024 * 1024):
+                scoped_health_low = scoped.health_snapshot()
+                self.assertFalse(scoped_health_low["disk_preflight"]["ok"])
+                self.assertEqual("insufficient_disk_space", scoped_health_low["disk_preflight"]["reason"])
+
+                scoped_low = scoped.prune_expired_operations(run_full_vacuum=True)
+                self.assertEqual(1, scoped_low["deleted_operations"])
+                self.assertFalse(scoped_low["disk_preflight"]["ok"])
+                self.assertEqual("full_vacuum_blocked_insufficient_disk_space", scoped_low["vacuum_mode"])
+                self.assertEqual("insufficient_disk_space", scoped_low["vacuum_skipped_reason"])
+                self.assertIn("2.2", scoped_low["vacuum_skipped_message"])
+
+            _seed_old_scoped_op("op-old-none")
+            with patch.object(scoped, "_available_disk_bytes", return_value=None):
+                scoped_health_none = scoped.health_snapshot()
+                self.assertFalse(scoped_health_none["disk_preflight"]["ok"])
+                self.assertEqual("disk_usage_unavailable", scoped_health_none["disk_preflight"]["reason"])
+
+                scoped_none = scoped.prune_expired_operations(run_full_vacuum=True)
+                self.assertEqual(1, scoped_none["deleted_operations"])
+                self.assertFalse(scoped_none["disk_preflight"]["ok"])
+                self.assertEqual("full_vacuum_blocked_disk_usage_unavailable", scoped_none["vacuum_mode"])
+                self.assertEqual("disk_usage_unavailable", scoped_none["vacuum_skipped_reason"])
+
+            _seed_old_scoped_op("op-old-ok")
+            with patch.object(scoped, "_available_disk_bytes", return_value=512 * 1024 * 1024):
+                scoped_ok = scoped.prune_expired_operations(run_full_vacuum=True)
+                self.assertEqual(1, scoped_ok["deleted_operations"])
+                self.assertTrue(scoped_ok["disk_preflight"]["ok"])
+                self.assertTrue(scoped_ok["vacuumed"])
+                self.assertEqual("full_vacuum_incremental_enabled", scoped_ok["vacuum_mode"])
+
+            # Verify business data in scoped_records is untouched across all prune/vacuum paths
+            with scoped._connection() as conn:
+                kept = conn.execute(
+                    "SELECT COUNT(*) FROM scoped_records WHERE record_id='rec-keep-1'"
+                ).fetchone()[0]
+                self.assertEqual(1, int(kept))
         finally:
             service.close()
 
