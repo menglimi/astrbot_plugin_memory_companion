@@ -41,7 +41,8 @@ class CaptureRuntime:
         default_enabled = config.bool('memory_capture.source_capture_enabled', True) if config is not None else True
         retention_days = config.int('memory_capture.source_retention_days', 7) if config is not None else 7
         self.store = SourceCapture(service.store, default_enabled=default_enabled,
-                                   retention_seconds=max(0, retention_days) * 86400)
+                                   retention_seconds=max(0, retention_days) * 86400,
+                                   surface_rules=getattr(service, '_source_surface_rules', None))
         self.generation = secrets.token_hex(16)
         self.store.activate(self.generation)
         self.wake = asyncio.Event()

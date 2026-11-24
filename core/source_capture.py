@@ -99,11 +99,14 @@ def initialize(db):
 
 
 class SourceCapture:
-    def __init__(self, store, *, default_enabled=True, retention_seconds=DEFAULT_RETENTION_SECONDS):
+    def __init__(self, store, *, default_enabled=True, retention_seconds=DEFAULT_RETENTION_SECONDS, surface_rules=None):
         self.store = store
         self.db = store._conn
         self.default_enabled = bool(default_enabled)
         self.retention_seconds = max(0, int(retention_seconds))
+        # Callable returning {known_prefixes, known_platforms}; None keeps the
+        # built-in set, which is the behaviour before registration existed.
+        self._surface_rules = surface_rules
         with store._lock:
             self.installation = self.db.execute("SELECT value FROM capture_runtime WHERE key='installation'").fetchone()[0]
             self._digest_key = bytes.fromhex(self.db.execute("SELECT value FROM capture_runtime WHERE key='digest_key'").fetchone()[0])
@@ -398,7 +401,12 @@ class SourceCapture:
             'redaction': payload['redaction'],
             'capture_processing': payload['processing'],
         }
-        merge_source_surface(metadata, identity['message'], identity['platform'])
+        merge_source_surface(
+            metadata,
+            identity['message'],
+            identity['platform'],
+            **(self._surface_rules() if callable(self._surface_rules) else {}),
+        )
         if default_participant_id and not metadata.get('participant_user_id'):
             metadata['participant_user_id'] = default_participant_id
         params = dict(

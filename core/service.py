@@ -142,7 +142,12 @@ from .vector_search import bounded_cache_bytes
 from .source_query import query_sources, source_visible
 from .source_discovery import discover_sources as run_source_discovery
 from .source_evidence import record_source_read, message_source_version, remember_source_reads
-from .source_surface import aggregate_source_surface, source_surface_metadata
+from .source_surface import (
+    aggregate_source_surface,
+    parse_surface_weights,
+    source_surface_metadata,
+    source_surface_rules,
+)
 from .source_semantic import (
     acknowledge_dirty as acknowledge_semantic_dirty,
     build_semantic_window,
@@ -2715,7 +2720,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 "memory_id": memory_id,
                 "message_id": clean_text(ctx.message_id, 120),
                 "memory_companion_injection_state": injection_state,
-                **source_surface_metadata(ctx.message_id, ctx.platform),
+                **source_surface_metadata(ctx.message_id, ctx.platform, **self._source_surface_rules()),
                 **self._cross_window_event_metadata(ctx),
             },
         )
@@ -2795,7 +2800,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         metadata: dict[str, Any] = {
             "source": clean_text(source, 80),
             "conversation_memory": True,
-            **source_surface_metadata(ctx.message_id, ctx.platform),
+            **source_surface_metadata(ctx.message_id, ctx.platform, **self._source_surface_rules()),
         }
         rows = recent_rows
         if rows is None:
@@ -8062,7 +8067,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 metadata={
                     "summary_batch_id": batch_id,
                     "summary_refs": payload.get("summary_refs", []),
-                    **aggregate_source_surface(rows),
+                    **aggregate_source_surface(rows, **self._source_surface_rules()),
                     "summary_event_count": len(rows),
                     "unsummarized_total": total,
                     "start_at": start_at,
@@ -8185,7 +8190,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             metadata={
                 "summary_batch_id": batch_id,
                 "summary_event_count": len(rows),
-                **aggregate_source_surface(rows),
+                **aggregate_source_surface(rows, **self._source_surface_rules()),
                 "degraded_summary": True,
                 "summary_validation_error": clean_text(feedback, 1800),
                 "quality_warnings": list(
@@ -9190,6 +9195,33 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
     async def list_core_memory_blocks(self) -> list[MemoryRecord]:
         return await self.store.list_core_memories(limit=1000)
 
+    def _source_surface_rules(self) -> dict[str, dict[str, str]]:
+        """Registry from ``memory_capture.source_surfaces`` as helper kwargs.
+
+        Empty or unparsable configuration yields the built-in set, so the
+        default behaviour is byte-for-byte the one from before registration
+        existed. The parsed maps are memoised on the raw value: re-parsing the
+        same JSON for every captured message would be pure waste.
+        """
+        raw = self.config.get("memory_capture.source_surfaces", "")
+        cached = getattr(self, "_source_surface_rules_cache", None)
+        if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == raw:
+            return cached[1]
+        prefixes, platforms = source_surface_rules(raw)
+        rules = {"known_prefixes": prefixes, "known_platforms": platforms}
+        self._source_surface_rules_cache = (raw, rules)
+        return rules
+
+    def _source_surface_weights(self) -> dict[str, float]:
+        """Explicit per-surface multipliers from ``retrieval_advanced.source_surface_weights``.
+
+        The scoring side asks for this map once per recall; an empty map means
+        "no explicit weights", which is the default and never discounts a row.
+        """
+        return parse_surface_weights(
+            self.config.get("retrieval_advanced.source_surface_weights", "")
+        )
+
     async def _core_source_surface_metadata(self, refs: Any) -> dict[str, Any]:
         """Derive source_surface for a distilled core memory from its source refs.
 
@@ -9222,7 +9254,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             }
             for memory_id, record in (records or {}).items()
         ]
-        return aggregate_source_surface(rows)
+        return aggregate_source_surface(rows, **self._source_surface_rules())
 
     async def save_core_memory_block(self, payload: dict[str, Any], *, auto_distilled: bool = False) -> dict[str, Any]:
         label = clean_text(payload.get("label"), 80)
@@ -10067,7 +10099,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 metadata={
                     "tool": "memory_companion_remember",
                     "note_type": note_type,
-                    **source_surface_metadata(ctx.message_id, ctx.platform),
+                    **source_surface_metadata(ctx.message_id, ctx.platform, **self._source_surface_rules()),
                     "owner_bot_id": self._bot_subject_id(ctx),
                     **memory_proposal.as_metadata(),
                     "persona_id": ctx.persona_id,
