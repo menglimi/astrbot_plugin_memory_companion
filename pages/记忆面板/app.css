@@ -4111,7 +4111,7 @@ html[data-ui-mode="cinema"] .cfg-search-tag.is-fuzzy {
   flex-direction: column;
   gap: 7px;
   min-width: 0;
-  flex: 1 1 380px;
+  flex: 1 1 min(380px, 100%);
 }
 
 .perf-hw-chips {
@@ -4615,7 +4615,7 @@ html[data-ui-mode="cinema"] .cfg-search-tag.is-fuzzy {
   flex-direction: column;
   gap: 4px;
   min-width: 0;
-  flex: 1 1 320px;
+  flex: 1 1 min(320px, 100%);
 }
 
 .perf-db-strip-title {
@@ -4915,8 +4915,99 @@ html[data-ui-mode="cinema"] .cfg-search-tag.is-fuzzy {
     grid-template-columns: minmax(0, 1fr);
   }
   .perf-param-ctrl {
-    align-items: flex-start;
+    align-items: stretch;
     min-width: 0;
+    width: 100%;
+  }
+  .perf-param-ctrl select {
+    width: 100%;
+    max-width: 100%;
+    min-height: 36px;
+  }
+  .perf-num-wrap {
+    width: 100%;
+  }
+  .perf-num-wrap input {
+    flex: 1 1 auto;
+    width: auto;
+    min-width: 0;
+    min-height: 36px;
+  }
+  .perf-reset-one {
+    min-height: 36px;
+    align-self: flex-start;
+  }
+}
+
+@media (max-width: 640px) {
+  .db-health-card .card-head,
+  .perf-main-card .card-head {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .db-health-card .card-head-actions,
+  .perf-main-card .card-head-actions {
+    width: 100%;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+  .perf-status-pill {
+    white-space: normal;
+    height: auto;
+    min-height: 38px;
+    width: 100%;
+    line-height: 1.4;
+    padding: 8px 12px;
+  }
+  .db-action-btns {
+    width: 100%;
+  }
+  .db-action-btns .btn {
+    white-space: normal;
+    height: auto;
+    min-height: 38px;
+    width: 100%;
+    padding: 8px 12px;
+    line-height: 1.35;
+    text-align: center;
+  }
+  .perf-save-actions {
+    width: 100%;
+  }
+  .perf-save-actions .btn,
+  .perf-switch-choices .btn {
+    white-space: normal;
+    height: auto;
+    min-height: 38px;
+    padding: 8px 12px;
+    line-height: 1.35;
+  }
+  .perf-save-actions .btn.is-primary,
+  .perf-db-strip .btn {
+    width: 100%;
+    white-space: normal;
+    height: auto;
+    min-height: 38px;
+    padding: 8px 12px;
+  }
+}
+
+@media (max-width: 520px) {
+  .db-kpi-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .db-kpi {
+    min-width: 0;
+  }
+  .db-kpi-val {
+    font-size: 16px;
+    overflow-wrap: anywhere;
+  }
+}
+
+@media (max-width: 340px) {
+  .db-kpi-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 

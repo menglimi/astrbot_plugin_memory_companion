@@ -1093,9 +1093,14 @@ test("performance view and migrate DB health card: render semantic markup and ze
   assert.ok(migHtml.includes("最近一次瘦身结果"));
   assert.ok(migHtml.includes("增量无损回收"));
 
-  // 3) Verify new CSS section 8 has ZERO hardcoded hex colors
+  // 3) Verify new CSS section 8 has ZERO hardcoded hex colors and covers mobile touch & narrow-screen rules
   const sec8Idx = cssSource.indexOf("/* ---------- 8. 性能调优视图与数据库体检瘦身卡片");
   assert.ok(sec8Idx > 0, "app.css 应包含第 8 节性能调优与数据库体检样式");
   const sec8Css = cssSource.slice(sec8Idx);
   assert.equal(sec8Css.match(/#[0-9a-fA-F]{3,8}\b/g), null, "新增性能调优与数据库体检 CSS 严禁包含硬编码色值");
+  assert.ok(sec8Css.includes("@media (max-width: 520px)") && sec8Css.includes("repeat(2, minmax(0, 1fr))"), "<=520px .db-kpi-grid 应为 2 列网格");
+  assert.ok(sec8Css.includes("@media (max-width: 340px)") && sec8Css.includes("grid-template-columns: minmax(0, 1fr)"), "<=340px .db-kpi-grid 应退化为单列");
+  assert.ok(sec8Css.includes(".db-action-btns .btn") && sec8Css.includes("min-height: 38px"), "移动端长文案瘦身按钮应允许换行且触控高 >=38px");
+  assert.ok(sec8Css.includes(".perf-param-ctrl select") && sec8Css.includes("min-height: 36px"), "移动端参数下拉与输入框应满宽且触控高 >=36px");
+  assert.ok(sec8Css.includes(".db-health-card .card-head-actions"), "移动端数据库体检卡片按钮组应允许折行");
 });
