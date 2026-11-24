@@ -81,6 +81,7 @@ from .forward_extractor import (
     format_forward_timeline_text,
     format_single_card_text,
     group_separate_card_entries,
+    normalize_forward_timestamp,
     split_distinct_card_entries,
     strip_forward_digest_segments,
 )
@@ -2903,6 +2904,9 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         own_text: str,
         source: str,
     ) -> list[str]:
+        message_at = normalize_forward_timestamp(
+            getattr(getattr(event, "message_obj", None), "timestamp", None)
+        )
         recent_rows = await self.store.recent_timeline(
             limit=max(32, len(parsed_forwards.cards) * 2 + 16),
             scope=ctx.scope,
@@ -2983,7 +2987,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 object_id=ctx.current_target_id,
                 content=content,
                 metadata=event_metadata,
-                occurred_at=occurred_at,
+                occurred_at=occurred_at or message_at,
             )
             if captured_id:
                 if clean_msg_id:

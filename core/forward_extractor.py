@@ -107,7 +107,7 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _normalize_timestamp(value: Any) -> str:
+def normalize_forward_timestamp(value: Any) -> str:
     if value in (None, ""):
         return ""
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -121,7 +121,7 @@ def _normalize_timestamp(value: Any) -> str:
     if not text:
         return ""
     if text.isdigit():
-        return _normalize_timestamp(int(text))
+        return normalize_forward_timestamp(int(text))
     try:
         dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
         if dt.utcoffset() is None:
@@ -265,7 +265,7 @@ def _normalize_cached_payload(raw: Any) -> ParsedForwards | None:
                 DEFAULT_CARD_MAX_CHARS,
             )
             title = clean_text(item.get("title") or "", 160)
-            ts = _normalize_timestamp(
+            ts = normalize_forward_timestamp(
                 item.get("timestamp") or item.get("occurred_at") or item.get("message_at") or ""
             )
             raw_imgs = item.get("image_urls")
@@ -790,7 +790,9 @@ async def extract_forwards(
         getattr(getattr(event, "message_obj", None), "message_id", "") or "",
         120,
     )
-    outer_ts = _normalize_timestamp(getattr(getattr(event, "message_obj", None), "timestamp", None))
+    outer_ts = normalize_forward_timestamp(
+        getattr(getattr(event, "message_obj", None), "timestamp", None)
+    )
     deadline_mono = time.monotonic() + safe_timeout
 
     budget: dict[str, Any] = {

@@ -580,6 +580,10 @@ async def test_observer_captures_eight_separate_pure_forwards_with_bounds_and_de
         entity_id="u_alice",
     )
     assert len(rows) == 8
+    assert {row["occurred_at"] for row in rows} == {
+        datetime.fromtimestamp(base_ts + i, timezone.utc).isoformat()
+        for i in range(1, 9)
+    }
     for row in rows:
         assert row["content"].startswith("[合并转发聊天记录(3条)]")
         assert len(row["content"]) <= TIMELINE_FORWARD_MAX_CHARS
