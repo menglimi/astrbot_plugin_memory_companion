@@ -21,6 +21,7 @@ from .tool_schema import project_tool_schema
 PROFILE = "memory.local-query-session.v1"
 PROFILE_V3 = "memory.local-query-session.v3"
 TOOL_NAME = "memory_companion_query"
+DISCOVER_TOOL_NAME = "memory_companion_discover_sources"
 OPERATIONS = ("recall", "sources", "navigate", "events")
 OPERATIONS_V3 = (*OPERATIONS, "discover")
 SOURCE_DISCOVERY_PROFILE = "memory.local-source-discovery.v1"
@@ -753,12 +754,18 @@ def offer_query_tool(service: Any, req: Any, ctx: Any, event: Any) -> None:
         req.func_tool = clone
     wrapper = next((t for t in tools if t.name == TOOL_NAME and getattr(t, "active", True)), None)
     if wrapper is None:
+        if any(getattr(t, "name", "") == DISCOVER_TOOL_NAME for t in tools):
+            clone = copy(toolset)
+            clone.tools = [t for t in tools if getattr(t, "name", "") != DISCOVER_TOOL_NAME]
+            req.func_tool = clone
         return
     bound = wrapper.parameters.get("properties", {}).get("operation", {}).get("enum", [])
     source_tools = tools
     if not enabled(service) or not service._memory_reconstruction_enabled(ctx) or "status" not in bound:
         clone = copy(toolset)
-        clone.tools = [t for t in source_tools if t.name != TOOL_NAME]
+        clone.tools = [
+            t for t in source_tools if getattr(t, "name", "") not in {TOOL_NAME, DISCOVER_TOOL_NAME}
+        ]
         req.func_tool = clone
         return
     allowed = [op for op in OPERATIONS if any(t.name == "memory_companion_" + op and getattr(t, "active", True)
@@ -770,7 +777,9 @@ def offer_query_tool(service: Any, req: Any, ctx: Any, event: Any) -> None:
         allowed.append("discover")
     if not allowed or event is None:
         clone = copy(toolset)
-        clone.tools = [t for t in source_tools if t.name != TOOL_NAME]
+        clone.tools = [
+            t for t in source_tools if getattr(t, "name", "") not in {TOOL_NAME, DISCOVER_TOOL_NAME}
+        ]
         req.func_tool = clone
         return
     projected = copy(wrapper)
@@ -808,7 +817,11 @@ def offer_query_tool(service: Any, req: Any, ctx: Any, event: Any) -> None:
                 event._memory_query_notes = service._reconstruction_budget_key(event, ctx)
     projected.parameters = project_tool_schema(projected.parameters)
     clone = copy(toolset)
-    clone.tools = [projected if t is wrapper else t for t in tools]
+    clone.tools = [
+        projected if t is wrapper else t
+        for t in tools
+        if discover_available or getattr(t, "name", "") != DISCOVER_TOOL_NAME
+    ]
     req.func_tool = clone
     turn_key = service._reconstruction_budget_key(event, ctx)
     event._memory_query_operations = (turn_key, {"status", *allowed})

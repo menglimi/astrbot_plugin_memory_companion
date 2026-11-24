@@ -1598,19 +1598,23 @@ class RetrievalEngine:
             return True
         metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
         candidate_ranges: list[tuple[datetime, datetime]] = []
-        start_at = self._parse_time(clean_text(metadata.get("start_at"), 80))
-        end_at = self._parse_time(clean_text(metadata.get("end_at"), 80))
-        if start_at is not None or end_at is not None:
-            start = start_at or end_at
-            end = end_at or start_at
-            if start is not None and end is not None:
-                if end <= start:
-                    end = start + timedelta(days=1)
-                candidate_ranges.append((start, end))
-        for value in (memory.occurred_at, memory.created_at, memory.updated_at):
-            dt = self._parse_time(value)
-            if dt is not None:
-                candidate_ranges.append((dt, dt + timedelta(seconds=1)))
+        for start_key, end_key in (("start_at", "end_at"), ("source_start_at", "source_end_at")):
+            start_at = self._parse_time(clean_text(metadata.get(start_key), 80))
+            end_at = self._parse_time(clean_text(metadata.get(end_key), 80))
+            if start_at is not None or end_at is not None:
+                start = start_at or end_at
+                end = end_at or start_at
+                if start is not None and end is not None:
+                    if end <= start:
+                        end = start + timedelta(days=1)
+                    candidate_ranges.append((start, end))
+        # Match actual event occurrence time (falling back to created_at only
+        # when occurred_at is absent). Never include updated_at: background
+        # decay/maintenance touches updated_at on old memories and must not
+        # pull last month's records into "today".
+        occurred_dt = self._parse_time(memory.occurred_at) or self._parse_time(memory.created_at)
+        if occurred_dt is not None:
+            candidate_ranges.append((occurred_dt, occurred_dt + timedelta(seconds=1)))
         if not candidate_ranges:
             return False
         return any(start < window_end and end > window_start for start, end in candidate_ranges)

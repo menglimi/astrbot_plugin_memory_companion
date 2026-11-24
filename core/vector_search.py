@@ -96,19 +96,21 @@ def memory_time_ranges(memory: MemoryRecord) -> tuple[tuple[float, float], ...]:
     """Extract time overlap intervals identical to ``_memory_overlaps_time_window``."""
     metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
     ranges: list[tuple[float, float]] = []
-    start_at = parse_iso_timestamp(metadata.get("start_at"))
-    end_at = parse_iso_timestamp(metadata.get("end_at"))
-    if start_at is not None or end_at is not None:
-        start = start_at if start_at is not None else end_at
-        end = end_at if end_at is not None else start_at
-        if start is not None and end is not None:
-            if end <= start:
-                end = start + 86400.0
-            ranges.append((start, end))
-    for value in (memory.occurred_at, memory.created_at, memory.updated_at):
-        ts = parse_iso_timestamp(value)
-        if ts is not None:
-            ranges.append((ts, ts + 1.0))
+    for start_key, end_key in (("start_at", "end_at"), ("source_start_at", "source_end_at")):
+        start_at = parse_iso_timestamp(metadata.get(start_key))
+        end_at = parse_iso_timestamp(metadata.get(end_key))
+        if start_at is not None or end_at is not None:
+            start = start_at if start_at is not None else end_at
+            end = end_at if end_at is not None else start_at
+            if start is not None and end is not None:
+                if end <= start:
+                    end = start + 86400.0
+                ranges.append((start, end))
+    occurred_ts = parse_iso_timestamp(memory.occurred_at)
+    if occurred_ts is None:
+        occurred_ts = parse_iso_timestamp(memory.created_at)
+    if occurred_ts is not None:
+        ranges.append((occurred_ts, occurred_ts + 1.0))
     return tuple(ranges)
 
 

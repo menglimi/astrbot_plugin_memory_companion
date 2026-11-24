@@ -50,7 +50,7 @@ DYNAMIC_FAMILIES: dict[str, tuple[str, ...]] = {
         # core/service.py: _context_bool/_context_int(f"conversation_memory.{key}")
         # 经 core/config.py 的 ALIASES 落到 *_advanced，共 16 项
         "cross_window_group_to_private_enabled", "cross_window_private_to_group_enabled",
-        "cross_window_group_to_group_enabled",
+        "cross_window_group_to_group_enabled", "cross_window_excluded_groups",
         "cross_window_recent_continuity_enabled", "cross_window_recent_event_limit",
         "cross_window_recent_minutes", "group_actor_relevance_guard_enabled",
         "low_information_gap_minutes", "low_information_guard_enabled",

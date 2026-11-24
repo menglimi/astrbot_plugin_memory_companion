@@ -5407,6 +5407,8 @@ class MemoryStore(SummaryBatchStore):
                     canonical.review_status = record.review_status
                     canonical.content = record.content
                     canonical.sayability = record.sayability
+                    canonical.durability = record.durability
+                    canonical.valid_to = ""
                 merged_metadata = dict(
                     canonical.metadata if isinstance(canonical.metadata, dict) else {}
                 )
@@ -9799,6 +9801,78 @@ class MemoryStore(SummaryBatchStore):
             occurred_at,
         )
 
+    _TIMELINE_DISPLAY_BACKFILL_KEYS = (
+        "sender_name",
+        "participant_user_id",
+        "participant_user_name",
+        "source_group_id",
+        "source_group_name",
+        "reply_chain",
+    )
+
+    def _backfill_timeline_display_metadata_in_tx(
+        self,
+        row_id: str,
+        raw_existing_meta: Any,
+        incoming_metadata: dict[str, Any],
+    ) -> bool:
+        """Fill missing display metadata on a deduplicated timeline row without touching capture fields."""
+        if not row_id or not isinstance(incoming_metadata, dict):
+            return False
+        existing_meta = (
+            dict(raw_existing_meta)
+            if isinstance(raw_existing_meta, dict)
+            else json_loads(raw_existing_meta, {})
+        )
+        if not isinstance(existing_meta, dict):
+            existing_meta = {}
+        changed = False
+        for key in self._TIMELINE_DISPLAY_BACKFILL_KEYS:
+            incoming_val = incoming_metadata.get(key)
+            if incoming_val in ("", None, [], {}):
+                continue
+            if existing_meta.get(key) in ("", None, [], {}):
+                existing_meta[key] = incoming_val
+                changed = True
+        if not changed:
+            return False
+        self._conn.execute(
+            "UPDATE timeline SET metadata=? WHERE id=?",
+            (json_dumps(redact_sensitive_value(existing_meta)), row_id),
+        )
+        return True
+
+    async def backfill_timeline_display_metadata(
+        self,
+        row_id: str,
+        incoming_metadata: dict[str, Any],
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._guard_operation_sync,
+            self._backfill_timeline_display_metadata_sync,
+            clean_text(row_id, 160),
+            incoming_metadata or {},
+        )
+
+    def _backfill_timeline_display_metadata_sync(
+        self,
+        row_id: str,
+        incoming_metadata: dict[str, Any],
+    ) -> bool:
+        if not row_id or not isinstance(incoming_metadata, dict):
+            return False
+        with self._lock:
+            with self._transaction_sync():
+                row = self._conn.execute(
+                    "SELECT metadata FROM timeline WHERE id=?",
+                    (row_id,),
+                ).fetchone()
+                if not row:
+                    return False
+                return self._backfill_timeline_display_metadata_in_tx(
+                    row_id, row["metadata"], incoming_metadata,
+                )
+
     def _add_timeline_event_sync(
         self,
         event_type: str,
@@ -9820,9 +9894,12 @@ class MemoryStore(SummaryBatchStore):
         event_type = clean_text(event_type, 80)
         session_id = clean_text(session_id, 200)
         subject_id = clean_text(subject_id, 120)
+        object_id_clean = clean_text(object_id, 120)
         message_id = clean_text(metadata.get("message_id"), 120)
+        platform_key = clean_text(metadata.get("platform"), 80).lower()
+        persona_key = clean_text(metadata.get("persona_id"), 96)
         dedupe_key = (
-            stable_fingerprint("timeline", event_type, session_id, subject_id, message_id)
+            stable_fingerprint("timeline", event_type, platform_key, session_id, subject_id, message_id)
             if message_id
             else ""
         )
@@ -9830,9 +9907,45 @@ class MemoryStore(SummaryBatchStore):
             with self._transaction_sync():
                 from .message_sources import suppressed
                 if suppressed(self._conn, source_id=row_id, event_type=event_type, scope=clean_text(scope, 40),
-                              session_id=session_id, subject_id=subject_id, object_id=clean_text(object_id, 120),
+                              session_id=session_id, subject_id=subject_id, object_id=object_id_clean,
                               message_id=message_id, metadata=metadata):
                     return ""
+                if message_id:
+                    match_clauses = [
+                        "event_type=?",
+                        "session_id=?",
+                        "subject_id=?",
+                        "message_id=?",
+                    ]
+                    match_params: list[Any] = [event_type, session_id, subject_id, message_id]
+                    if object_id_clean:
+                        match_clauses.append("object_id=?")
+                        match_params.append(object_id_clean)
+                    if owner_bot_id:
+                        match_clauses.append("(bot_id='' OR bot_id=?)")
+                        match_params.append(owner_bot_id)
+                    if platform_key:
+                        match_clauses.append(
+                            "LOWER(COALESCE(CASE WHEN json_valid(metadata) "
+                            "THEN json_extract(metadata, '$.platform') ELSE '' END, '')) IN ('', ?)"
+                        )
+                        match_params.append(platform_key)
+                    if persona_key and persona_key != "legacy":
+                        match_clauses.append(
+                            "COALESCE(CASE WHEN json_valid(metadata) "
+                            "THEN json_extract(metadata, '$.persona_id') ELSE '' END, '') IN ('', 'legacy', ?)"
+                        )
+                        match_params.append(persona_key)
+                    existing_msg = self._conn.execute(
+                        f"SELECT id, metadata FROM timeline WHERE {' AND '.join(match_clauses)} LIMIT 1",
+                        match_params,
+                    ).fetchone()
+                    if existing_msg:
+                        existing_id = clean_text(existing_msg["id"], 120)
+                        self._backfill_timeline_display_metadata_in_tx(
+                            existing_id, existing_msg["metadata"], metadata,
+                        )
+                        return existing_id
                 cur = self._conn.execute(
                     """
                     INSERT OR IGNORE INTO timeline(
@@ -11277,6 +11390,9 @@ class MemoryStore(SummaryBatchStore):
         since_at: str,
         limit: int = 48,
         bot_id: str = "",
+        subject_id: str = "",
+        include_bot_responses: bool = True,
+        excluded_group_ids: tuple[str, ...] = (),
     ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
             self._recent_cross_window_timeline_sync,
@@ -11285,6 +11401,9 @@ class MemoryStore(SummaryBatchStore):
             since_at,
             limit,
             bot_id,
+            subject_id,
+            include_bot_responses,
+            excluded_group_ids,
         )
 
     def _recent_cross_window_timeline_sync(
@@ -11294,15 +11413,58 @@ class MemoryStore(SummaryBatchStore):
         since_at: str,
         limit: int,
         bot_id: str = "",
+        subject_id: str = "",
+        include_bot_responses: bool = True,
+        excluded_group_ids: tuple[str, ...] = (),
     ) -> list[dict[str, Any]]:
         scope = clean_text(source_scope, 40)
         session_id = clean_text(current_session_id, 200)
         cutoff = clean_text(since_at, 80)
         owner_bot = clean_text(bot_id, 120)
+        target_subject = clean_text(subject_id, 120)
         if scope not in {"private", "group"} or not session_id or not cutoff:
             return []
         event_time_sql = _timeline_time_sql()
         bot_clause, bot_params = self._bot_scope_clause("bot_id", owner_bot)
+        params: list[Any] = [scope, session_id, cutoff]
+        if not include_bot_responses:
+            event_filter = "AND event_type = 'user_message'"
+            if target_subject:
+                event_filter += " AND subject_id = ?"
+                params.append(target_subject)
+        elif target_subject:
+            participant_expr = (
+                "COALESCE(CASE WHEN json_valid(metadata) "
+                "THEN json_extract(metadata, '$.participant_user_id') ELSE '' END, '')"
+            )
+            if owner_bot:
+                event_filter = (
+                    "AND ("
+                    "(event_type = 'user_message' AND subject_id = ?) "
+                    "OR (event_type = 'bot_response' AND subject_id IN (?, 'self') "
+                    f"AND (object_id = ? OR {participant_expr} = ?))"
+                    ")"
+                )
+                params.extend([target_subject, owner_bot, target_subject, target_subject])
+            else:
+                event_filter = (
+                    "AND ("
+                    "(event_type = 'user_message' AND subject_id = ?) "
+                    f"OR (event_type = 'bot_response' AND (object_id = ? OR {participant_expr} = ?))"
+                    ")"
+                )
+                params.extend([target_subject, target_subject, target_subject])
+        else:
+            event_filter = "AND event_type IN ('user_message', 'bot_response')"
+        excluded_clause = ""
+        if scope == "group" and excluded_group_ids:
+            excluded = sorted({clean_text(g, 120) for g in excluded_group_ids if clean_text(g, 120)})
+            if excluded:
+                marks = ",".join("?" for _ in excluded)
+                excluded_clause = f" AND object_id NOT IN ({marks})"
+                params.extend(excluded)
+        params.extend(bot_params)
+        params.append(max(1, min(240, int(limit or 48))))
         conn, lock = self._timeline_read_connection()
         with lock:
             rows = conn.execute(
@@ -11311,11 +11473,11 @@ class MemoryStore(SummaryBatchStore):
                 WHERE scope=?
                   AND session_id!=?
                   AND {event_time_sql} >= julianday(?)
-                  AND event_type IN ('user_message', 'bot_response'){bot_clause}
+                  {event_filter}{excluded_clause}{bot_clause}
                 ORDER BY {event_time_sql} DESC, created_at DESC, id DESC
                 LIMIT ?
                 """,
-                (scope, session_id, cutoff, *bot_params, max(1, min(240, int(limit or 48)))),
+                params,
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -11381,6 +11543,114 @@ class MemoryStore(SummaryBatchStore):
             ).fetchall()
         return [dict(row) for row in rows]
 
+    async def authorized_group_self_timeline_window(
+        self,
+        *,
+        start_at: str,
+        end_at: str,
+        user_id: str,
+        limit: int = 12,
+        bot_id: str = "",
+        platform: str = "",
+        persona_id: str = "",
+        allow_all_groups: bool = False,
+        allowed_group_ids: tuple[str, ...] = (),
+        denied_group_ids: tuple[str, ...] = (),
+    ) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._authorized_group_self_timeline_window_sync,
+            start_at,
+            end_at,
+            user_id,
+            limit,
+            bot_id,
+            platform,
+            persona_id,
+            allow_all_groups,
+            allowed_group_ids,
+            denied_group_ids,
+        )
+
+    def _authorized_group_self_timeline_window_sync(
+        self,
+        start_at: str,
+        end_at: str,
+        user_id: str,
+        limit: int,
+        bot_id: str = "",
+        platform: str = "",
+        persona_id: str = "",
+        allow_all_groups: bool = False,
+        allowed_group_ids: tuple[str, ...] = (),
+        denied_group_ids: tuple[str, ...] = (),
+    ) -> list[dict[str, Any]]:
+        sender = clean_text(user_id, 120)
+        if not sender:
+            return []
+        denied = sorted({clean_text(g, 120) for g in denied_group_ids if clean_text(g, 120)})
+        allowed = sorted(
+            {clean_text(g, 120) for g in allowed_group_ids if clean_text(g, 120)} - set(denied)
+        )
+        if not allow_all_groups and not allowed:
+            return []
+        event_time_sql = _timeline_time_sql()
+        meta_expr = "CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END"
+        participant_expr = f"COALESCE(json_extract({meta_expr}, '$.participant_user_id'), '')"
+        platform_expr = f"LOWER(COALESCE(json_extract({meta_expr}, '$.platform'), ''))"
+        owner_bot_expr = f"COALESCE(json_extract({meta_expr}, '$.owner_bot_id'), '')"
+        meta_bot_expr = f"COALESCE(json_extract({meta_expr}, '$.bot_id'), '')"
+        persona_expr = f"COALESCE(json_extract({meta_expr}, '$.persona_id'), '')"
+        clauses = [
+            f"{event_time_sql} >= julianday(?)",
+            f"{event_time_sql} < julianday(?)",
+            "scope='group'",
+            "event_type='user_message'",
+            "subject_id=?",
+            f"{participant_expr} IN ('', ?)",
+            f"{persona_expr} IN ('', 'legacy', ?)",
+            "object_id!=''",
+        ]
+        params: list[Any] = [
+            clean_text(start_at, 80),
+            clean_text(end_at, 80),
+            sender,
+            sender,
+            clean_text(persona_id, 96),
+        ]
+        if allow_all_groups:
+            if denied:
+                marks = ",".join("?" for _ in denied)
+                clauses.append(f"object_id NOT IN ({marks})")
+                params.extend(denied)
+        else:
+            marks = ",".join("?" for _ in allowed)
+            clauses.append(f"object_id IN ({marks})")
+            params.extend(allowed)
+        plat = clean_text(platform, 80).lower()
+        if plat:
+            clauses.append(f"{platform_expr} IN ('', ?)")
+            params.append(plat)
+        owner_bot = clean_text(bot_id, 120)
+        if owner_bot:
+            clauses.append(f"{owner_bot_expr} IN ('', ?)")
+            clauses.append(f"{meta_bot_expr} IN ('', ?)")
+            params.extend([owner_bot, owner_bot])
+        bot_clause, bot_params = self._bot_scope_clause("bot_id", owner_bot)
+        where = " AND ".join(clauses) + bot_clause
+        params.extend(bot_params)
+        with self._read_conn_sync() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM timeline
+                WHERE {where}
+                ORDER BY {event_time_sql} DESC, created_at DESC, id DESC
+                LIMIT ?
+                """,
+                params + [max(1, int(limit or 1))],
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     async def source_revision(self) -> str:
         return await self._run_recoverable_database_operation(self._source_revision_sync)
 
@@ -11408,16 +11678,18 @@ class MemoryStore(SummaryBatchStore):
     async def query_source_page(
         self, ctx: Any, query: SourceQuery, *, limit: int,
         boundary: list[Any] | None = None, expected_revision: str | None = None,
+        group_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return await self._run_recoverable_database_operation(
-            self._query_source_page_sync, ctx, query, limit, boundary, expected_revision,
+            self._query_source_page_sync, ctx, query, limit, boundary, expected_revision, group_policy,
         )
 
     def _query_source_page_sync(
         self, ctx: Any, query: SourceQuery, limit: int,
         boundary: list[Any] | None, expected_revision: str | None,
+        group_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        partition, owner_params = source_partition(ctx)
+        partition, owner_params = source_partition(ctx, group_policy=group_policy)
         limit = max(1, min(int(limit), 12))
         conn, lock = self._read_connection_for_bundle()
         with lock:
@@ -11456,19 +11728,29 @@ class MemoryStore(SummaryBatchStore):
                 def key(row: dict[str, Any]) -> list[Any]:
                     return [row["source_sort_time"], row["created_at"], row["id"]]
 
-                def select(edge: list[Any] | None, *, ascending: bool, count: int) -> tuple[list[dict[str, Any]], bool]:
+                def select(
+                    edge: list[Any] | None,
+                    *,
+                    ascending: bool,
+                    count: int,
+                    session_filter: str = "",
+                ) -> tuple[list[dict[str, Any]], bool]:
                     nonlocal read_count
                     edge_clause = ""
                     edge_params: list[Any] = []
+                    if session_filter:
+                        edge_clause += " AND t.session_id=?"
+                        edge_params.append(session_filter)
                     if edge:
-                        edge_clause = f" AND ({order_columns}) {'>' if ascending else '<'} (?,?,?)"
+                        edge_clause += f" AND ({order_columns}) {'>' if ascending else '<'} (?,?,?)"
                         if query.action == "context":
                             # The inclusive scalar bound enables the time index; the tuple remains exact.
                             edge_clause = (
-                                f" AND julianday(t.occurred_at) {'>=' if ascending else '<='} ?"
-                                + edge_clause
+                                (f" AND t.session_id=?" if session_filter else "")
+                                + f" AND julianday(t.occurred_at) {'>=' if ascending else '<='} ?"
+                                + f" AND ({order_columns}) {'>' if ascending else '<'} (?,?,?)"
                             )
-                            edge_params.append(edge[0])
+                            edge_params = ([session_filter] if session_filter else []) + [edge[0]]
                     sort = "ASC" if ascending else "DESC"
                     order = ",".join(column + " " + sort for column in order_columns.split(","))
                     found = [dict(row) for row in conn.execute(
@@ -11488,22 +11770,37 @@ class MemoryStore(SummaryBatchStore):
                     if anchor is None:
                         raise SourceQueryError("source_unavailable")
                     read_count += 1
-                    anchor_key = key(dict(anchor))
+                    anchor_dict = dict(anchor)
+                    anchor_key = key(anchor_dict)
+                    context_session = (
+                        clean_text(anchor_dict.get("session_id"), 200)
+                        if isinstance(group_policy, dict) and group_policy.get("enabled")
+                        else ""
+                    )
                     if query.action == "read":
-                        rows = [dict(anchor)]
+                        rows = [anchor_dict]
                     elif query.direction == "around":
                         before_count = (limit - 1) // 2
                         after_count = limit - 1 - before_count
-                        before, more_before = select(anchor_key, ascending=False, count=before_count)
-                        after, more_after = select(anchor_key, ascending=True, count=after_count)
-                        rows = [*reversed(before), dict(anchor), *after]
+                        before, more_before = select(
+                            anchor_key, ascending=False, count=before_count, session_filter=context_session,
+                        )
+                        after, more_after = select(
+                            anchor_key, ascending=True, count=after_count, session_filter=context_session,
+                        )
+                        rows = [*reversed(before), anchor_dict, *after]
                         if more_before:
                             continuations["before"] = key(before[-1]) if before else anchor_key
                         if more_after:
                             continuations["after"] = key(after[-1]) if after else anchor_key
                     else:
                         ascending = query.direction == "after"
-                        rows, more = select(boundary or anchor_key, ascending=ascending, count=limit)
+                        rows, more = select(
+                            boundary or anchor_key,
+                            ascending=ascending,
+                            count=limit,
+                            session_filter=context_session,
+                        )
                         if more and rows:
                             continuations[query.direction] = key(rows[-1])
                         if not ascending:
@@ -11525,16 +11822,18 @@ class MemoryStore(SummaryBatchStore):
     async def query_source_range_batch(
         self, ctx: Any, *, start_at: str, end_at: str, limit: int,
         boundary: list[Any] | None = None, expected_revision: str | None = None,
+        group_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return await self._run_recoverable_database_operation(
-            self._query_source_range_batch_sync, ctx, start_at, end_at, limit, boundary, expected_revision,
+            self._query_source_range_batch_sync, ctx, start_at, end_at, limit, boundary, expected_revision, group_policy,
         )
 
     def _query_source_range_batch_sync(
         self, ctx: Any, start_at: str, end_at: str, limit: int,
         boundary: list[Any] | None, expected_revision: str | None,
+        group_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        partition, params = source_partition(ctx)
+        partition, params = source_partition(ctx, group_policy=group_policy)
         limit = max(1, min(256, int(limit)))
         conn, lock = self._read_connection_for_bundle()
         with lock:
@@ -12584,7 +12883,8 @@ class MemoryStore(SummaryBatchStore):
         if not start or not end:
             return []
         where = f"lifecycle != 'archived' AND {self._recallable_memory_sql()}"
-        params: list[Any] = [start, end, start, end, start, end]
+        time_sql = _memory_time_sql(include_updated=False)
+        params: list[Any] = [start, end]
         if not include_pending:
             where += " AND review_status != 'pending'"
         return conn.execute(
@@ -12592,13 +12892,10 @@ class MemoryStore(SummaryBatchStore):
             SELECT *
             FROM memories
             WHERE {where}
-              AND (
-                (julianday(occurred_at) >= julianday(?) AND julianday(occurred_at) < julianday(?))
-                OR (julianday(created_at) >= julianday(?) AND julianday(created_at) < julianday(?))
-                OR (julianday(updated_at) >= julianday(?) AND julianday(updated_at) < julianday(?))
-              )
+              AND {time_sql} >= julianday(?)
+              AND {time_sql} < julianday(?)
             ORDER BY
-                {_memory_time_sql(include_updated=True)} DESC,
+                {time_sql} DESC,
                 importance DESC
             LIMIT ?
             """,

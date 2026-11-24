@@ -33,7 +33,9 @@ from .assertions import (
     ASSERTION_MEMORY_TYPE,
     CROSS_SCENE_DIMENSIONS,
     MAX_ASSERTIONS_PER_BATCH,
+    SITUATIONAL_ASSERTION_TTL_DAYS,
     assertion_is_promotable,
+    assertion_is_short_term_visible,
     cardinality_for,
     normalize_assertion,
 )
@@ -1818,7 +1820,16 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         record = self.classifier.from_user_message(ctx)
         if not record:
             return
-        if await self._timeline_already_has_message(ctx, "user_message"):
+        existing_id = await self._existing_timeline_message_id(ctx, "user_message")
+        if existing_id:
+            await self.store.backfill_timeline_display_metadata(
+                existing_id,
+                {
+                    "sender_name": ctx.user_name,
+                    **self._cross_window_event_metadata(ctx),
+                    **self._reply_chain_metadata(reply_chain),
+                },
+            )
             return
         event_metadata = await self._conversation_memory_metadata(ctx, source="group_conversation_observer")
         event_metadata.update(
@@ -7312,6 +7323,9 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             # Manual runs get a bounded new round, without resetting automatic counters.
             round_calls = 0
             provider_failed = False
+            style_repair_attempted = False
+            best_valid_payload: dict[str, Any] | None = None
+            best_valid_attempt: dict[str, Any] = {}
             lease_token = secrets.token_urlsafe(24)
             try:
                 while attempt_index < len(summary_attempts) and round_calls < max_calls:
@@ -7324,10 +7338,14 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                         lease_token=lease_token,
                         preserve_lease=bool(
                             not force
-                            and payload
-                            and self.summarizer.compose_memory_content(payload)
+                            and (payload or best_valid_payload)
+                            and self.summarizer.compose_memory_content(payload or best_valid_payload or {})
                         ),
                     ):
+                        if best_valid_payload is not None:
+                            payload = best_valid_payload
+                            used_summary = best_valid_attempt
+                            content = self.summarizer.compose_memory_content(payload)
                         break
                     round_calls += 1
                     # Keep the last provider body while a repair attempt is in
@@ -7346,14 +7364,54 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                         content = self.summarizer.compose_memory_content(payload or {})
                         used_summary = attempt
                         if not errors:
+                            quality_now = self.summarizer.summary_quality(payload or {})
+                            if best_valid_payload is not None and (
+                                not content or quality_now != "normal"
+                            ):
+                                payload = best_valid_payload
+                                used_summary = best_valid_attempt
+                                content = self.summarizer.compose_memory_content(payload)
+                                break
+                            style_repair = self.summarizer.repairable_style_warnings(payload or {})
+                            if (
+                                style_repair
+                                and not style_repair_attempted
+                                and round_calls < max_calls
+                                and content
+                                and quality_now == "normal"
+                            ):
+                                best_valid_payload = payload
+                                best_valid_attempt = attempt
+                                style_repair_attempted = True
+                                repair = True
+                                feedback = "; ".join(style_repair)
+                                previous_response = json_dumps(payload or {})
+                                continue
+                            break
+                        if best_valid_payload is not None:
+                            # A lightweight style repair returned validation errors;
+                            # keep the already-valid first payload instead of demoting.
+                            payload = best_valid_payload
+                            used_summary = best_valid_attempt
+                            content = self.summarizer.compose_memory_content(payload)
                             break
                         feedback = "; ".join(errors)
                         previous_response = json_dumps(payload or {})
                     except SummaryFormatError as exc:
+                        if best_valid_payload is not None:
+                            payload = best_valid_payload
+                            used_summary = best_valid_attempt
+                            content = self.summarizer.compose_memory_content(payload)
+                            break
                         provider_failed = True
                         feedback = self._describe_exception(exc)
                         previous_response = exc.response
                     except Exception as exc:
+                        if best_valid_payload is not None:
+                            payload = best_valid_payload
+                            used_summary = best_valid_attempt
+                            content = self.summarizer.compose_memory_content(payload)
+                            break
                         # A failed request has no model output to repair.
                         # Try each fallback once, then wait for the next round.
                         request_error = self._describe_exception(exc)
@@ -7538,6 +7596,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 ] + [clean_text(topic, 80) for topic in (payload or {}).get("topics", [])[:5]],
                 owner_bot_id=self._bot_subject_id(ctx),
                 valid_to=candidate_valid_to,
+                occurred_at=end_at or start_at,
                 durability="normal" if evidence_gate_passed else "short",
                 sensitivity="internal",
                 metadata={
@@ -7558,6 +7617,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                     "evidence_gate_passed": evidence_gate_passed,
                     "raw_timeline_preserved": not evidence_gate_passed,
                     "quality_warnings": list((payload or {}).get("_quality_warnings") or []),
+                    "style_warnings": self.summarizer.style_warnings(payload or {}),
                     "canonical_summary": clean_text((payload or {}).get("canonical_summary"), 2000),
                     "persona_summary": clean_text((payload or {}).get("persona_summary") or (payload or {}).get("summary"), 2000),
                     "topics": (payload or {}).get("topics", []),
@@ -7622,6 +7682,11 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         in the panel and reviewable, but never injected as a stable memory.
         """
         body = self.summarizer.compose_memory_content(payload or {})
+        candidate_occurred_at = clean_text(
+            (rows[-1].get("occurred_at") if rows else "")
+            or (rows[0].get("occurred_at") if rows else ""),
+            80,
+        )
         valid_days = max(
             1,
             self.config.int("memory_summary.candidate_valid_days", 30),
@@ -7653,6 +7718,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             tags=["summary", "evidence_candidate", "summary_validation_failed", ctx.scope],
             owner_bot_id=self._bot_subject_id(ctx),
             valid_to=(datetime.now(timezone.utc) + timedelta(days=valid_days)).isoformat(timespec="seconds"),
+            occurred_at=candidate_occurred_at,
             durability="short",
             sensitivity="internal",
             metadata={
@@ -7741,7 +7807,23 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 if clean_text(row.get("content"), 2000)
             ]
             promotable = assertion_is_promotable(assertion, evidence)
-            record = self._assertion_record(subject_ctx, assertion, summary_memory_id, evidence, promotable)
+            short_term_visible = (
+                (not promotable) and assertion_is_short_term_visible(assertion, evidence)
+            )
+            cited_occurred_at = ""
+            for row in reversed(cited):
+                cited_occurred_at = clean_text(row.get("occurred_at") or row.get("created_at"), 80)
+                if cited_occurred_at:
+                    break
+            record = self._assertion_record(
+                subject_ctx,
+                assertion,
+                summary_memory_id,
+                evidence,
+                promotable,
+                short_term_visible=short_term_visible,
+                occurred_at=cited_occurred_at,
+            )
             try:
                 result = await self.store.upsert_assertion(record)
             except Exception as exc:
@@ -7801,6 +7883,9 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         summary_memory_id: str,
         evidence: list[str],
         promotable: bool,
+        *,
+        short_term_visible: bool = False,
+        occurred_at: str = "",
     ) -> MemoryRecord:
         """Build one assertion row, scoped exactly like the conversation it came from.
 
@@ -7814,6 +7899,22 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         value = assertion["value"]
         qualifier = assertion["qualifier"]
         content = f"{qualifier}：{value}" if qualifier else value
+        short_term_auto = (not promotable) and bool(short_term_visible)
+        visible_auto = promotable or short_term_auto
+        valid_to = (
+            (datetime.now(timezone.utc) + timedelta(days=SITUATIONAL_ASSERTION_TTL_DAYS)).isoformat(
+                timespec="seconds"
+            )
+            if short_term_auto
+            else ""
+        )
+        profile_state = (
+            "active" if promotable else ("short_term_active" if short_term_auto else "candidate")
+        )
+        quality_score = 0.78 if promotable else (0.68 if short_term_auto else 0.5)
+        extra_meta: dict[str, Any] = {}
+        if short_term_auto:
+            extra_meta["situational_ttl_days"] = SITUATIONAL_ASSERTION_TTL_DAYS
         return MemoryRecord(
             id=self.stable_id(
                 "assertion", self._bot_subject_id(ctx), ctx.platform, ctx.scope,
@@ -7833,18 +7934,20 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             lifecycle="stable_memory" if promotable else "short_term_candidate",
             content=content,
             evidence="\n".join(evidence),
-            confidence=0.78 if promotable else 0.5,
-            importance=0.6 if promotable else 0.3,
-            review_status="auto" if promotable else "pending",
+            confidence=quality_score,
+            importance=0.6 if promotable else (0.55 if short_term_auto else 0.3),
+            review_status="auto" if visible_auto else "pending",
             tags=[
                 "assertion",
                 dimension,
                 assertion["polarity"],
-                "long_term" if promotable else "evidence_candidate",
+                "long_term" if promotable else ("short_term_situational" if short_term_auto else "evidence_candidate"),
             ],
             owner_bot_id=self._bot_subject_id(ctx),
             subject_person_id=ctx.subject_person_id,
             identity_assurance=ctx.identity_assurance,
+            valid_to=valid_to,
+            occurred_at=occurred_at,
             durability="normal" if promotable else "short",
             sensitivity="internal",
             metadata={
@@ -7853,15 +7956,16 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 "profile_value": value,
                 "normalized_value": assertion["normalized_value"],
                 "profile_cardinality": cardinality_for(dimension),
-                "profile_state": "active" if promotable else "candidate",
+                "profile_state": profile_state,
                 "assertion_durability": assertion["durability"],
                 "assertion_evidence_refs": list(assertion["refs"]),
                 "assertion_source_summary_id": summary_memory_id,
                 "assertion_cross_scene": cross_scene,
                 "assertion_extractor": "summary_assertion_v1",
-                "extraction_quality_score": 0.78 if promotable else 0.5,
+                "extraction_quality_score": quality_score,
                 "owner_bot_id": self._bot_subject_id(ctx),
                 "policy_version": "memory_assertion_v1",
+                **extra_meta,
             },
         )
 
@@ -9912,11 +10016,16 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             turn_token,
         ]).encode("utf-8")).hexdigest()
 
+    _SOURCE_FALLBACK_BUDGET = 2
+    _RECONSTRUCTION_HARD_STEP_CEILING = 8
+
     async def _reserve_reconstruction_step(
         self,
         event: Any,
         ctx: SessionContext,
         signature: str,
+        *,
+        allow_source_fallback: bool = False,
     ) -> dict[str, Any]:
         now = time.monotonic()
         max_steps = self._reconstruction_max_steps()
@@ -9943,7 +10052,13 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
 
             state = self._reconstruction_states.setdefault(
                 key,
-                {"steps": 0, "signatures": set(), "last_seen": now},
+                {
+                    "steps": 0,
+                    "source_steps": 0,
+                    "non_source_steps": 0,
+                    "signatures": set(),
+                    "last_seen": now,
+                },
             )
             if len(self._reconstruction_states) > self._RECONSTRUCTION_STATE_MAX:
                 for stale_key, _stale_state in sorted(
@@ -9961,6 +10076,8 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 signatures = set()
                 state["signatures"] = signatures
             steps = max(0, int(state.get("steps") or 0))
+            source_steps = max(0, int(state.get("source_steps") or 0))
+            non_source_steps = max(0, int(state.get("non_source_steps") or 0))
             if signature in signatures:
                 return {
                     "accepted": False,
@@ -9970,7 +10087,16 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                     "max_steps": max_steps,
                     "remaining_steps": max(0, max_steps - steps),
                 }
-            if steps >= max_steps:
+            # Reserve a dedicated fallback budget (up to 2 steps) for
+            # memory_companion_sources when other navigation tools consumed the
+            # shared turn budget before sources could run.
+            can_use_source_fallback = (
+                allow_source_fallback
+                and non_source_steps > 0
+                and source_steps < self._SOURCE_FALLBACK_BUDGET
+                and steps < self._RECONSTRUCTION_HARD_STEP_CEILING
+            )
+            if steps >= max_steps and not can_use_source_fallback:
                 return {
                     "accepted": False,
                     "error": "navigation step budget exhausted",
@@ -9982,6 +10108,25 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             signatures.add(signature)
             steps += 1
             state["steps"] = steps
+            if allow_source_fallback:
+                source_steps += 1
+                state["source_steps"] = source_steps
+            else:
+                non_source_steps += 1
+                state["non_source_steps"] = non_source_steps
+            shared_remaining = max(0, max_steps - steps)
+            fallback_remaining = (
+                max(
+                    0,
+                    min(
+                        self._SOURCE_FALLBACK_BUDGET - source_steps,
+                        self._RECONSTRUCTION_HARD_STEP_CEILING - steps,
+                    ),
+                )
+                if allow_source_fallback and non_source_steps > 0
+                else 0
+            )
+            remaining_steps = min(7, max(shared_remaining, fallback_remaining))
             note_budget(self, {"accepted": True})
             return {
                 "accepted": True,
@@ -9989,7 +10134,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 "duplicate": False,
                 "step": steps,
                 "max_steps": max_steps,
-                "remaining_steps": max(0, max_steps - steps),
+                "remaining_steps": remaining_steps,
             }
 
     async def _navigate_search(
@@ -10175,11 +10320,16 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
     def _serialize_navigation_source(
         self, ctx: SessionContext, row: dict[str, Any], *, excerpt_offset: int = 0,
         terms: tuple[str, ...] = (), excerpt_limit: int = 800, prepared_text: str | None = None,
+        group_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         metadata = json_loads(row.get("metadata"), {})
-        if not isinstance(metadata, dict) or not source_visible(ctx, row, metadata):
+        if not isinstance(metadata, dict) or not source_visible(ctx, row, metadata, group_policy=group_policy):
             return None
-        text = prepared_text if prepared_text is not None else self._navigation_source_text(ctx, row)
+        text = (
+            prepared_text
+            if prepared_text is not None
+            else self._navigation_source_text(ctx, row, group_policy=group_policy)
+        )
         if not text:
             return None
         if terms:
@@ -10207,9 +10357,15 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             "capture_truncated": metadata.get("capture_truncated") if isinstance(metadata.get("capture_truncated"), bool) else None,
         }
 
-    def _navigation_source_text(self, ctx: SessionContext, row: dict[str, Any]) -> str | None:
+    def _navigation_source_text(
+        self,
+        ctx: SessionContext,
+        row: dict[str, Any],
+        *,
+        group_policy: dict[str, Any] | None = None,
+    ) -> str | None:
         metadata = json_loads(row.get("metadata"), {})
-        if not isinstance(metadata, dict) or not source_visible(ctx, row, metadata):
+        if not isinstance(metadata, dict) or not source_visible(ctx, row, metadata, group_policy=group_policy):
             return None
         captured = metadata.get("capture_profile") == "memory.source-capture.v1"
         text = (row.get("content") or "") if captured else self.injection._redact_sensitive_text(row.get("content") or "")
@@ -11565,7 +11721,10 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             value = self.config.get(f"conversation_memory.{scope}.{key}", marker)
             if value is not marker:
                 return value
-        return self.config.get(f"conversation_memory.{key}", default)
+        value = self.config.get(f"conversation_memory.{key}", marker)
+        if value is not marker:
+            return value
+        return self.config.get(f"conversation_memory_advanced.{key}", default)
 
     def _context_bool(self, ctx: SessionContext, key: str, default: bool) -> bool:
         value = self._context_value(ctx, key, default)
@@ -12800,6 +12959,62 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         )
         return bool(private_then_group or group_then_private or private_in_group)
 
+    def _cross_window_excluded_groups(self, ctx: SessionContext) -> frozenset[str]:
+        raw = self._context_value(ctx, "cross_window_excluded_groups", "")
+        if isinstance(raw, (list, tuple, set, frozenset)):
+            items = [clean_text(item, 120) for item in raw]
+        else:
+            items = [clean_text(part, 120) for part in re.split(r"[,，;；\s]+", str(raw or ""))]
+        return frozenset(item for item in items if item)
+
+    async def _authorized_private_group_read_policy(self, ctx: SessionContext) -> dict[str, Any]:
+        """Resolve whether a private reader may read only their own messages from authorized groups."""
+        empty = {
+            "enabled": False,
+            "allow_all_groups": False,
+            "allowed_groups": frozenset(),
+            "denied_groups": frozenset(),
+        }
+        if (
+            ctx.scope != "private"
+            or ctx.strict_session_only
+            or not clean_text(ctx.user_id, 120)
+            or not clean_text(ctx.bot_id, 120)
+            or not clean_text(ctx.platform, 80)
+        ):
+            return empty
+        excluded = self._cross_window_excluded_groups(ctx)
+        allow_all = self.config.bool("visibility.allow_group_public_in_private", False)
+        denied: set[str] = set(excluded)
+        allowed: set[str] = set()
+        if self.config.bool("visibility.enable_acl_rules", True):
+            if (
+                not self.config.bool("scope_control.private_topology_enabled", True)
+                or not self.config.bool("scope_control.group_topology_enabled", True)
+            ):
+                return empty
+            rules = await self.store.list_acl_rules(
+                owner_scope="group",
+                reader_scope="private",
+                reader_id=clean_text(ctx.user_id, 120),
+                enabled_only=True,
+            )
+            for rule in rules:
+                owner_id = clean_text(rule.get("owner_id"), 120)
+                if not owner_id:
+                    continue
+                if clean_text(rule.get("effect"), 20).lower() == "deny":
+                    denied.add(owner_id)
+                else:
+                    allowed.add(owner_id)
+        effective_allowed = frozenset(allowed - denied)
+        return {
+            "enabled": bool(allow_all or effective_allowed),
+            "allow_all_groups": allow_all,
+            "allowed_groups": effective_allowed,
+            "denied_groups": frozenset(denied),
+        }
+
     async def _recent_cross_window_context(self, ctx: SessionContext) -> str:
         if not self._context_bool(ctx, "cross_window_recent_continuity_enabled", True):
             return ""
@@ -12812,94 +13027,123 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         if not current_session_id or not current_user_id or not current_bot_id or not current_platform:
             return ""
 
+        excluded_groups = self._cross_window_excluded_groups(ctx)
+        current_group_id = clean_text(ctx.group_id, 120) or session_target_id(current_session_id, "group")
+        routes: list[tuple[str, str, bool]] = []
         if ctx.scope == "private":
-            if not self._context_bool(ctx, "cross_window_group_to_private_enabled", True):
-                return ""
-            source_scope = "group"
-            direction = "近期群聊到当前私聊"
+            if self._context_bool(ctx, "cross_window_group_to_private_enabled", True):
+                routes.append(("group", "近期群聊到当前私聊", True))
         elif ctx.scope == "group":
-            if (self._context_bool(ctx, "cross_window_private_to_group_enabled", True)
-                    and self._message_explicitly_shares_private_context(ctx.message_text)):
-                source_scope = "private"
-                direction = "经当前用户本轮明确授权，从近期私聊到当前群聊"
-            elif self._context_bool(ctx, "cross_window_group_to_group_enabled", True):
-                source_scope = "group"
-                direction = "同一用户近期在其他群的公开发言到当前群"
-            else:
-                return ""
-        else:
+            if (
+                self._context_bool(ctx, "cross_window_private_to_group_enabled", True)
+                and self._message_explicitly_shares_private_context(ctx.message_text)
+            ):
+                routes.append(("private", "经当前用户本轮明确授权，从近期私聊到当前群聊", True))
+            if (
+                self._context_bool(ctx, "cross_window_group_to_group_enabled", True)
+                and (not current_group_id or current_group_id not in excluded_groups)
+            ):
+                routes.append(("group", "同一用户近期在其他群的公开发言到当前群", False))
+        if not routes:
             return ""
 
         ttl_minutes = max(1, min(24 * 60, self._context_int(ctx, "cross_window_recent_minutes", 30)))
         event_limit = max(1, min(12, self._context_int(ctx, "cross_window_recent_event_limit", 6)))
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=ttl_minutes)
-        rows = await self.store.recent_cross_window_timeline(
-            source_scope=source_scope,
-            current_session_id=current_session_id,
-            since_at=cutoff.isoformat(timespec="seconds"),
-            limit=max(32, event_limit * 8),
-            bot_id=ctx.bot_id,
-        )
-        if not rows:
-            return ""
 
-        selected: list[dict[str, Any]] = []
-        for row in rows:
-            raw_metadata = row.get("metadata")
-            metadata = raw_metadata if isinstance(raw_metadata, dict) else json_loads(raw_metadata, {})
-            if not isinstance(metadata, dict):
-                continue
-            if clean_text(metadata.get("owner_bot_id"), 120) != current_bot_id:
-                continue
-            if clean_text(metadata.get("platform"), 80).lower() != current_platform:
-                continue
-            if clean_text(metadata.get("participant_user_id"), 120) != current_user_id:
-                continue
-
-            event_type = clean_text(row.get("event_type"), 40)
-            subject_id = clean_text(row.get("subject_id"), 120)
-            if source_scope == "group" and ctx.scope == "group" and event_type == "bot_response":
-                # Group-to-group continuity carries only the same user's public
-                # words; the bot's own replies from another group stay there.
-                continue
-            if event_type == "user_message":
-                if subject_id != current_user_id:
-                    continue
-                speaker = "当前用户"
-            elif event_type == "bot_response":
-                if subject_id not in {current_bot_id, "self"}:
-                    continue
-                speaker = "Bot"
-            else:
-                continue
-
-            occurred_at = self._parse_utc_datetime(
-                clean_text(row.get("occurred_at") or row.get("created_at"), 80)
+        for source_scope, direction, include_bot_responses in routes:
+            rows = await self.store.recent_cross_window_timeline(
+                source_scope=source_scope,
+                current_session_id=current_session_id,
+                since_at=cutoff.isoformat(timespec="seconds"),
+                limit=max(32, event_limit * 8),
+                bot_id=ctx.bot_id,
+                subject_id=current_user_id,
+                include_bot_responses=include_bot_responses,
+                excluded_group_ids=tuple(excluded_groups) if source_scope == "group" else (),
             )
-            if occurred_at is None or occurred_at < cutoff:
+            if not rows:
                 continue
-            visible = self._sanitize_visible_timeline_text(row.get("content"))
-            snippet = self._recent_fact_direct_text(visible)
-            snippet = self.injection._redact_sensitive_text(snippet)
-            if not snippet:
-                continue
-            selected.append(
-                {
-                    "occurred_at": occurred_at,
-                    "speaker": speaker,
-                    "text": clean_text(snippet, 160),
-                }
-            )
-            if len(selected) >= event_limit:
-                break
 
-        if not selected:
-            return ""
-        lines = [f"方向：{direction}；有效窗口：近 {ttl_minutes} 分钟；仅含当前用户与同一 Bot 的片段。"]
-        for item in reversed(selected):
-            local_time = item["occurred_at"].astimezone(local_tz()).strftime("%H:%M")
-            lines.append(f"{local_time} {item['speaker']}：{item['text']}")
-        return clean_text(" | ".join(lines), 1100)
+            selected: list[dict[str, Any]] = []
+            for row in rows:
+                raw_metadata = row.get("metadata")
+                metadata = raw_metadata if isinstance(raw_metadata, dict) else json_loads(raw_metadata, {})
+                if not isinstance(metadata, dict):
+                    continue
+                if clean_text(metadata.get("owner_bot_id"), 120) != current_bot_id:
+                    continue
+                if clean_text(metadata.get("platform"), 80).lower() != current_platform:
+                    continue
+                participant_id = clean_text(metadata.get("participant_user_id"), 120)
+                if source_scope == "group" and excluded_groups:
+                    source_group_id = (
+                        clean_text(row.get("object_id"), 120)
+                        or session_target_id(clean_text(row.get("session_id"), 200), "group")
+                    )
+                    if source_group_id and source_group_id in excluded_groups:
+                        continue
+
+                event_type = clean_text(row.get("event_type"), 40)
+                subject_id = clean_text(row.get("subject_id"), 120)
+                if not include_bot_responses and event_type == "bot_response":
+                    # Group-to-group continuity carries only the same user's public
+                    # words; the bot's own replies from another group stay there.
+                    continue
+                if event_type == "user_message":
+                    if subject_id != current_user_id:
+                        continue
+                    if participant_id and participant_id != current_user_id:
+                        continue
+                    speaker = "当前用户"
+                elif event_type == "bot_response":
+                    if subject_id not in {current_bot_id, "self"}:
+                        continue
+                    if participant_id != current_user_id:
+                        if not (
+                            source_scope == "private"
+                            and not participant_id
+                            and clean_text(row.get("object_id"), 120) == current_user_id
+                        ):
+                            continue
+                    speaker = "Bot"
+                else:
+                    continue
+
+                occurred_at = self._parse_utc_datetime(
+                    clean_text(row.get("occurred_at") or row.get("created_at"), 80)
+                )
+                if occurred_at is None or occurred_at < cutoff:
+                    continue
+                visible = self._sanitize_visible_timeline_text(row.get("content"))
+                snippet = self._recent_fact_direct_text(visible)
+                snippet = self.injection._redact_sensitive_text(snippet)
+                if not snippet:
+                    continue
+                selected.append(
+                    {
+                        "occurred_at": occurred_at,
+                        "speaker": speaker,
+                        "text": clean_text(snippet, 160),
+                    }
+                )
+                if len(selected) >= event_limit:
+                    break
+
+            if not selected:
+                continue
+            scope_note = (
+                "仅含当前用户本人在其他群的公开发言片段（不含 Bot 回复与他人发言）。"
+                if not include_bot_responses
+                else "仅含当前用户与同一 Bot 的片段。"
+            )
+            lines = [f"方向：{direction}；有效窗口：近 {ttl_minutes} 分钟；{scope_note}"]
+            for item in reversed(selected):
+                local_time = item["occurred_at"].astimezone(local_tz()).strftime("%H:%M")
+                lines.append(f"{local_time} {item['speaker']}：{item['text']}")
+            return clean_text(" | ".join(lines), 1100)
+
+        return ""
 
     async def _recent_fact_guard_context(self, ctx: SessionContext) -> str:
         if ctx.scope != "private" or not ctx.session_id or not ctx.user_id:
@@ -15441,6 +15685,64 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             entity_id=ctx.current_target_id,
             bot_id=ctx.bot_id,
         )
+        if ctx.scope == "private":
+            group_policy = await self._authorized_private_group_read_policy(ctx)
+            if group_policy["enabled"]:
+                group_rows = await self.store.authorized_group_self_timeline_window(
+                    start_at=time_intent.start_at,
+                    end_at=time_intent.end_at,
+                    user_id=ctx.user_id,
+                    limit=limit,
+                    bot_id=ctx.bot_id,
+                    platform=ctx.platform,
+                    persona_id=ctx.persona_id,
+                    allow_all_groups=group_policy["allow_all_groups"],
+                    allowed_group_ids=tuple(group_policy["allowed_groups"]),
+                    denied_group_ids=tuple(group_policy["denied_groups"]),
+                )
+                sender_id = clean_text(ctx.user_id, 120)
+                current_bot_id = clean_text(ctx.bot_id, 120)
+                current_persona_id = clean_text(ctx.persona_id, 96)
+                merged_by_id: dict[str, dict[str, Any]] = {
+                    clean_text(row.get("id"), 160): row
+                    for row in rows
+                    if clean_text(row.get("id"), 160)
+                }
+                for row in group_rows:
+                    row_id = clean_text(row.get("id"), 160)
+                    if not row_id or row_id in merged_by_id:
+                        continue
+                    if clean_text(row.get("event_type"), 40) != "user_message":
+                        continue
+                    if clean_text(row.get("subject_id"), 120) != sender_id:
+                        continue
+                    raw_meta = row.get("metadata")
+                    meta = raw_meta if isinstance(raw_meta, dict) else json_loads(raw_meta, {})
+                    meta = meta if isinstance(meta, dict) else {}
+                    participant_id = clean_text(meta.get("participant_user_id"), 120)
+                    if participant_id and participant_id != sender_id:
+                        continue
+                    row_owner_bot = clean_text(meta.get("owner_bot_id"), 120)
+                    if row_owner_bot == "self":
+                        continue
+                    if current_bot_id and row_owner_bot and row_owner_bot != current_bot_id:
+                        continue
+                    row_meta_bot = clean_text(meta.get("bot_id"), 120)
+                    if current_bot_id and row_meta_bot and row_meta_bot != current_bot_id:
+                        continue
+                    row_persona = clean_text(meta.get("persona_id"), 96)
+                    if row_persona not in {"", "legacy", current_persona_id}:
+                        continue
+                    merged_by_id[row_id] = row
+
+                def _row_sort_key(item: dict[str, Any]) -> tuple[float, str, str]:
+                    moment = self._parse_utc_datetime(
+                        clean_text(item.get("occurred_at") or item.get("created_at"), 80)
+                    )
+                    ts = moment.timestamp() if moment is not None else float("-inf")
+                    return ts, clean_text(item.get("created_at"), 80), clean_text(item.get("id"), 160)
+
+                rows = sorted(merged_by_id.values(), key=_row_sort_key, reverse=True)[:limit]
         items: list[SearchResult] = []
         for row in reversed(rows):
             record = self._timeline_row_as_memory(ctx, row)
@@ -15457,7 +15759,9 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             return None
         event_type = clean_text(row.get("event_type"), 60)
         subject_id = clean_text(row.get("subject_id"), 120)
-        metadata = json_loads(row.get("metadata"), {})
+        raw_metadata = row.get("metadata")
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else json_loads(raw_metadata, {})
+        metadata = metadata if isinstance(metadata, dict) else {}
         sender_name = clean_text(metadata.get("sender_name"), 120)
         if event_type == "bot_response" or subject_id == "self":
             subject = self._bot_entity(ctx)
@@ -15465,17 +15769,31 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         else:
             subject = EntityRef(kind="user", id=subject_id, name=sender_name, role="timeline_speaker")
             prefix = sender_name or subject_id or "用户"
+        row_scope = clean_text(row.get("scope"), 40) or ctx.scope
+        row_session_id = clean_text(row.get("session_id"), 200) or ctx.session_id
+        cross_window_group_self = ctx.scope == "private" and row_scope == "group"
+        row_group_id = (
+            clean_text(row.get("object_id"), 120) or session_target_id(row_session_id, "group")
+            if row_scope == "group"
+            else ctx.group_id
+        )
         occurred = clean_text(str(row.get("occurred_at") or row.get("created_at") or ""), 80)
+        extra_meta = {"cross_window_group_self": True} if cross_window_group_self else {}
         return MemoryRecord(
             id=f"timeline_{clean_text(row.get('id'), 100)}",
             memory_type="timeline_event",
             subject=subject,
-            object=EntityRef(kind="group" if ctx.scope == "group" else "user", id=ctx.current_target_id, name=ctx.group_name or ctx.user_name, role="current_window"),
-            scope=ctx.scope,
-            session_id=ctx.session_id,
+            object=EntityRef(
+                kind="group" if row_scope == "group" else "user",
+                id=row_group_id if row_scope == "group" else ctx.current_target_id,
+                name=ctx.group_name if row_scope == "group" and not cross_window_group_self else ("" if cross_window_group_self else ctx.user_name),
+                role="authorized_group_self" if cross_window_group_self else "current_window",
+            ),
+            scope=row_scope,
+            session_id=row_session_id,
             platform=clean_text(metadata.get("platform"), 80) or ctx.platform,
-            group_id=ctx.group_id,
-            visibility="group_public" if ctx.scope == "group" else "private_pair",
+            group_id=row_group_id,
+            visibility="group_public" if row_scope == "group" else "private_pair",
             sayability="indirect",
             reality_level="observed_utterance",
             lifecycle="raw_event",
@@ -15484,11 +15802,12 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             confidence=0.74,
             importance=0.42,
             review_status="auto",
-            tags=["timeline", ctx.scope, event_type],
+            tags=["timeline", row_scope, event_type],
             metadata={"source": "time_window_timeline", "event_type": event_type,
                       "source_ref": f"timeline:{clean_text(row.get('id'), 100)}",
                       "owner_bot_id": clean_text(metadata.get("owner_bot_id"), 120),
-                      "persona_id": clean_text(metadata.get("persona_id"), 120)},
+                      "persona_id": clean_text(metadata.get("persona_id"), 120),
+                      **extra_meta},
             created_at=clean_text(str(row.get("created_at") or occurred), 80),
             updated_at=clean_text(str(row.get("created_at") or occurred), 80),
             occurred_at=occurred,
