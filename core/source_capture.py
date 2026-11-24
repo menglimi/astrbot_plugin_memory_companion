@@ -15,6 +15,7 @@ import time
 
 from .models import utc_now
 from .sensitive_data import redact_sensitive_text
+from .source_surface import merge_source_surface
 from .message_sources import suppressed
 from .source_evidence import message_source_version
 
@@ -397,6 +398,7 @@ class SourceCapture:
             'redaction': payload['redaction'],
             'capture_processing': payload['processing'],
         }
+        merge_source_surface(metadata, identity['message'], identity['platform'])
         if default_participant_id and not metadata.get('participant_user_id'):
             metadata['participant_user_id'] = default_participant_id
         params = dict(
