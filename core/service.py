@@ -125,6 +125,11 @@ from .operations import (
     detect_preset,
     persist_runtime_config,
 )
+from .performance_tuning import (
+    MemoryPerformancePlan,
+    build_performance_config_updates,
+    resolve_performance_plan,
+)
 from .provenance import observed_from_companion_snapshot
 from .provenance_store import ProvenanceLedger, load_or_create_integrity_key
 from .portrait_service import PortraitService
@@ -513,15 +518,101 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
     # missed write-path update self-heals within one interval.
     _ACL_RECONCILE_INTERVAL_SECONDS = 60.0
 
+    def performance_plan(self) -> MemoryPerformancePlan:
+        """Resolve the current 12-parameter performance plan (preset + sparse overrides + Anti-OOM)."""
+        plan = resolve_performance_plan(self.config)
+        self._performance_plan = plan
+        return plan
+
     def _configured_vector_precision(self) -> str:
-        return normalize_vector_precision(
-            self.config.get("retrieval_advanced.vector_precision", DEFAULT_VECTOR_PRECISION)
-        )
+        return normalize_vector_precision(self.performance_plan().vector_precision)
 
     def _sync_store_vector_precision(self) -> str:
         precision = self._configured_vector_precision()
         self.store.vector_storage_precision = precision
         return precision
+
+    def _performance_db_summary_sync(self) -> dict[str, Any]:
+        files = self.store._database_file_snapshot()
+        primary_total = (
+            int(files.get("db_bytes", 0))
+            + int(files.get("wal_bytes", 0))
+            + int(files.get("shm_bytes", 0))
+        )
+        scoped_bytes = 0
+        try:
+            scoped_health = self.scoped_store.health_snapshot()
+            if isinstance(scoped_health, dict):
+                scoped_bytes = int(scoped_health.get("total_bytes", 0) or 0)
+        except Exception:
+            scoped_bytes = 0
+        return {
+            "primary_db_bytes": int(files.get("db_bytes", 0)),
+            "wal_bytes": int(files.get("wal_bytes", 0)),
+            "shm_bytes": int(files.get("shm_bytes", 0)),
+            "primary_total_bytes": primary_total,
+            "scoped_total_bytes": scoped_bytes,
+            "grand_total_bytes": primary_total + scoped_bytes,
+        }
+
+    def refresh_performance_tuning(self) -> dict[str, Any]:
+        """Hot-apply the active performance plan to store PRAGMAs, read pool, and runtime knobs."""
+        plan = self.performance_plan()
+        store_reload = self.store.apply_performance_plan(plan)
+        self.store.vector_snapshot_cache_bytes = bounded_cache_bytes(
+            plan.vector_snapshot_cache_mb
+        )
+        self._background_grace_seconds = max(0, int(plan.background_grace_seconds))
+        next_concurrency = max(1, int(plan.embedding_background_concurrency))
+        if next_concurrency != getattr(self, "_embedding_background_concurrency", 0):
+            self._embedding_background_concurrency = next_concurrency
+            self._embedding_background_semaphore = asyncio.Semaphore(next_concurrency)
+        self._retrieval_result_cache.clear()
+        return {
+            **store_reload,
+            "vector_snapshot_cache_mb": plan.vector_snapshot_cache_mb,
+            "embedding_background_concurrency": next_concurrency,
+            "wal_checkpoint_min_bytes": plan.wal_checkpoint_min_bytes,
+            "hook_request_budget_seconds": plan.hook_request_budget_seconds,
+            "recall_latency_budget_ms": plan.recall_latency_budget_ms,
+        }
+
+    async def get_performance_tuning_snapshot(self) -> dict[str, Any]:
+        """Return hardware detection, active 5-tier plan, sparse overrides, and DB size summary."""
+        plan = self.performance_plan()
+        try:
+            db_summary = await asyncio.to_thread(self._performance_db_summary_sync)
+        except Exception:
+            db_summary = {}
+        return plan.to_api_payload(db_summary=db_summary)
+
+    async def apply_performance_tuning(
+        self,
+        *,
+        profile: str | None = None,
+        overrides: dict[str, Any] | None = None,
+        preserve_overrides: bool = True,
+        reset_overrides: bool = False,
+    ) -> dict[str, Any]:
+        """Persist performance profile/overrides and hot-reload store and runtime parameters."""
+        raw = self.config.raw
+        if not isinstance(raw, dict):
+            raise RuntimeError("runtime config is not writable")
+        updated, plan = build_performance_config_updates(
+            raw,
+            profile=profile,
+            overrides=overrides,
+            preserve_overrides=preserve_overrides,
+            reset_overrides=reset_overrides,
+        )
+        config_path = persist_runtime_config(raw, updated)
+        hot_reload = self.refresh_performance_tuning()
+        hot_reload["config_path"] = config_path
+        try:
+            db_summary = await asyncio.to_thread(self._performance_db_summary_sync)
+        except Exception:
+            db_summary = {}
+        return plan.to_api_payload(db_summary=db_summary, hot_reload=hot_reload)
 
     async def _recent_timeline_cached(
         self,
@@ -619,13 +710,23 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         # 避开 AstrBot 核心加载完插件后执行的 SQLAlchemy 连接池迁移窗口，
         # 防止插件后台线程的高频 DB 并发撞上核心 deque 迭代（RuntimeError: deque mutated during iteration）。
         self._service_created_at = time.monotonic()
+        self._performance_plan: MemoryPerformancePlan = resolve_performance_plan(self.config)
         self._background_grace_seconds = max(
             0,
-            self.config.int("startup.background_grace_seconds", 60),
+            self.config.int(
+                "startup.background_grace_seconds",
+                self._performance_plan.background_grace_seconds,
+            ),
         )
 
-        self.store = MemoryStore(self.data_dir / "memory_companion.db")
+        self.store = MemoryStore(
+            self.data_dir / "memory_companion.db",
+            performance_plan=self._performance_plan,
+        )
         self._sync_store_vector_precision()
+        self.store.vector_snapshot_cache_bytes = bounded_cache_bytes(
+            self._performance_plan.vector_snapshot_cache_mb
+        )
         self.scoped_store = ScopedStore(
             self.data_dir / "req041_scoped.db",
             initialize=False,
@@ -692,6 +793,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         self._SUMMARY_LOCK_TTL: float = 600.0  # 10 minutes
         self._decay_lock = asyncio.Lock()
         self._core_distill_lock = asyncio.Lock()
+        self._db_optimize_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._portrait_dispatch_task: asyncio.Task[Any] | None = None
         self._maintenance_dispatch_task: asyncio.Task[Any] | None = None
@@ -738,8 +840,11 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         self._embedding_memory_inflight: set[str] = set()
         self._embedding_backfill_last_run: dict[str, float] = {}
         self._embedding_backfill_offsets: dict[str, int] = {}
+        self._embedding_background_concurrency = max(
+            1, int(self._performance_plan.embedding_background_concurrency)
+        )
         self._embedding_background_semaphore = asyncio.Semaphore(
-            max(1, self.config.int("retrieval.embedding_background_concurrency", 2))
+            self._embedding_background_concurrency
         )
         # 前台来源语义查询等待槽位时，后台建库主动让步，避免历史回填长期占满
         # 共享 embedding 并发额度。
@@ -2240,16 +2345,16 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             60,
             self.config.int("maintenance.wal_checkpoint_interval_seconds", 1800),
         )
-        min_wal_bytes = max(
-            1024 * 1024,
-            self.config.int("maintenance.wal_checkpoint_min_bytes", 8 * 1024 * 1024),
-        )
         await asyncio.sleep(max(30, interval_seconds // 6))
         while (
             not self._closing
             and not self._closed
             and self.config.bool("maintenance.wal_checkpoint_enabled", True)
         ):
+            min_wal_bytes = max(
+                1024 * 1024,
+                self.performance_plan().wal_checkpoint_min_bytes,
+            )
             try:
                 self._wal_checkpoint_status["state"] = "running"
                 result = await self.store.wal_checkpoint_truncate(min_wal_bytes=min_wal_bytes)
@@ -5201,8 +5306,9 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             mode = "auto"
         # 向量快照的保留预算走既有的 retrieval_advanced 读取路径，每轮读一次，
         # 面板改完下一轮就生效（与上面那些 config 读取完全同构）。
+        perf_plan = self.performance_plan()
         self.store.vector_snapshot_cache_bytes = bounded_cache_bytes(
-            self.config.int("retrieval_advanced.vector_snapshot_cache_mb", 512)
+            self.config.int("retrieval_advanced.vector_snapshot_cache_mb", perf_plan.vector_snapshot_cache_mb)
         )
         self._sync_store_vector_precision()
         provider = None
@@ -5228,7 +5334,10 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 self.config.int("retrieval.rerank_timeout_ms", MAX_MODEL_CALL_TIMEOUT_MS)
             ),
             rerank_circuit_breaker=self._configured_rerank_circuit_breaker(),
-            latency_budget_ms=self.config.int("retrieval_advanced.recall_latency_budget_ms", 1800),
+            latency_budget_ms=self.config.int(
+                "retrieval_advanced.recall_latency_budget_ms",
+                perf_plan.recall_latency_budget_ms,
+            ),
             query_vector_cache_ttl_seconds=self.config.float(
                 "retrieval_advanced.query_vector_cache_ttl_seconds", 120.0
             ),
@@ -5932,10 +6041,14 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             return False
         if not self.config.bool("retrieval.embedding_enabled", False):
             return False
-        if not self.config.bool("retrieval_advanced.startup_vector_warmup_enabled", True):
+        perf_plan = self.performance_plan()
+        if not perf_plan.startup_vector_warmup_enabled:
             return False
         self.store.vector_snapshot_cache_bytes = bounded_cache_bytes(
-            self.config.int("retrieval_advanced.vector_snapshot_cache_mb", 512)
+            self.config.int(
+                "retrieval_advanced.vector_snapshot_cache_mb",
+                perf_plan.vector_snapshot_cache_mb,
+            )
         )
         self._sync_store_vector_precision()
         if settle_seconds is None:
@@ -6534,7 +6647,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                     )
                 )
                 provider_calls += 1
-                await self._acquire_source_semantic_background_slot()
+                sem = await self._acquire_source_semantic_background_slot()
                 try:
                     vector = await self._embed_text_with_provider(
                         provider, spec["input_text"], provider_id=provider_id,
@@ -6542,7 +6655,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                         input_limit=int(configuration["window_max_chars"]),
                     )
                 finally:
-                    self._embedding_background_semaphore.release()
+                    sem.release()
                 if self._source_semantic_build_configuration(ctx, provider_id) != configuration:
                     return {"complete": False, "provider_calls": provider_calls, "error": "configuration_changed"}
                 vector = self._normalize_embedding_vector(vector)
@@ -6572,15 +6685,16 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         )
         return {"complete": completed, "provider_calls": provider_calls}
 
-    async def _acquire_source_semantic_background_slot(self) -> None:
+    async def _acquire_source_semantic_background_slot(self) -> asyncio.Semaphore:
         """Acquire a shared embedding slot while yielding to waiting queries."""
         while True:
             while self._source_semantic_query_waiters:
                 await asyncio.sleep(0.01)
-            await self._embedding_background_semaphore.acquire()
-            if not self._source_semantic_query_waiters:
-                return
-            self._embedding_background_semaphore.release()
+            sem = self._embedding_background_semaphore
+            await sem.acquire()
+            if not self._source_semantic_query_waiters and sem is self._embedding_background_semaphore:
+                return sem
+            sem.release()
 
     @staticmethod
     def _source_semantic_position(source: Mapping[str, Any]) -> tuple[float, str, str]:
@@ -6755,7 +6869,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         text_hash = self._memory_embedding_text_hash(record)
         if not text or not text_hash:
             return False
-        await self._acquire_source_semantic_background_slot()
+        sem = await self._acquire_source_semantic_background_slot()
         try:
             try:
                 vector = await self._embed_text_with_provider(provider, text, provider_id=provider_id)
@@ -6781,7 +6895,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 )
                 return False
         finally:
-            self._embedding_background_semaphore.release()
+            sem.release()
 
     async def _embed_text_with_provider(
         self,
@@ -11482,70 +11596,94 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         run_full_vacuum: bool = False,
     ) -> dict[str, Any]:
         """One-click database slimming: precision transcode, orphan cleanup, vacuum, PRAGMA optimize."""
-        configured_precision = self._sync_store_vector_precision()
-        precision = normalize_vector_precision(target_precision or configured_precision)
-        override_temporary = precision != configured_precision
-        primary_result = await self.store.optimize_and_shrink(
-            target_precision=precision,
-            transcode_limit=max(0, int(transcode_limit)),
-            run_full_vacuum=bool(run_full_vacuum),
-        )
-        try:
-            scoped_prune = await asyncio.to_thread(
-                self.scoped_store.prune_expired_operations,
-                older_than_seconds=14 * 86400.0,
-                limit=20000,
+        lock = getattr(self, "_db_optimize_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._db_optimize_lock = lock
+        if lock.locked():
+            return {
+                "ok": False,
+                "error_code": "db_optimize_in_progress",
+                "error": "已有数据库瘦身任务正在运行中，请等待本次完成后再试。",
+            }
+        async with lock:
+            configured_precision = self._sync_store_vector_precision()
+            precision = normalize_vector_precision(target_precision or configured_precision)
+            override_temporary = precision != configured_precision
+            primary_result = await self.store.optimize_and_shrink(
+                target_precision=precision,
+                transcode_limit=max(0, int(transcode_limit)),
                 run_full_vacuum=bool(run_full_vacuum),
             )
-        except Exception as exc:
-            scoped_prune = {"error": self._describe_exception(exc)}
-        capture_prune: dict[str, Any] = {"skipped": True}
-        if getattr(self, "capture", None) is not None:
+            if isinstance(primary_result, dict) and primary_result.get("ok") is False:
+                health = await self.database_health_snapshot()
+                return {
+                    "ok": False,
+                    "error_code": str(primary_result.get("error_code") or "db_optimize_failed"),
+                    "error": str(primary_result.get("error") or "数据库深度压缩未能执行"),
+                    "disk_preflight": primary_result.get("disk_preflight"),
+                    "target_precision": precision,
+                    "configured_vector_precision": configured_precision,
+                    "precision_override_temporary": override_temporary,
+                    "primary": primary_result,
+                    "health": health,
+                }
             try:
-                removed_capture_ops = await asyncio.to_thread(
-                    self.capture.store.prune_completed_operations,
-                    older_than_seconds=7 * 86400.0,
-                    limit=10000,
+                scoped_prune = await asyncio.to_thread(
+                    self.scoped_store.prune_expired_operations,
+                    older_than_seconds=14 * 86400.0,
+                    limit=20000,
+                    run_full_vacuum=bool(run_full_vacuum),
                 )
-                capture_prune = {"deleted": int(removed_capture_ops or 0)}
             except Exception as exc:
-                capture_prune = {"error": self._describe_exception(exc)}
-        token_pruned = 0
-        if isinstance(self._token_usage, dict):
-            token_pruned = self._prune_token_usage_by_hour(self._token_usage)
-            if token_pruned > 0:
-                self._save_token_usage(force=True)
-        primary_transcode = primary_result.get("transcode") if isinstance(primary_result, dict) else None
-        if (
-            isinstance(primary_transcode, dict)
-            and (
-                int(primary_transcode.get("transcoded", 0) or 0) > 0
-                or int(primary_transcode.get("purged_orphans", 0) or 0) > 0
+                scoped_prune = {"error": self._describe_exception(exc)}
+            capture_prune: dict[str, Any] = {"skipped": True}
+            if getattr(self, "capture", None) is not None:
+                try:
+                    removed_capture_ops = await asyncio.to_thread(
+                        self.capture.store.prune_completed_operations,
+                        older_than_seconds=7 * 86400.0,
+                        limit=10000,
+                    )
+                    capture_prune = {"deleted": int(removed_capture_ops or 0)}
+                except Exception as exc:
+                    capture_prune = {"error": self._describe_exception(exc)}
+            token_pruned = 0
+            if isinstance(self._token_usage, dict):
+                token_pruned = self._prune_token_usage_by_hour(self._token_usage)
+                if token_pruned > 0:
+                    self._save_token_usage(force=True)
+            primary_transcode = primary_result.get("transcode") if isinstance(primary_result, dict) else None
+            if (
+                isinstance(primary_transcode, dict)
+                and (
+                    int(primary_transcode.get("transcoded", 0) or 0) > 0
+                    or int(primary_transcode.get("purged_orphans", 0) or 0) > 0
+                )
+            ):
+                try:
+                    self.schedule_startup_vector_warmup(settle_seconds=1.0)
+                except Exception:
+                    pass
+            health = await self.database_health_snapshot()
+            notice = (
+                f"本次仅按 {precision} 执行一次性转码；当前配置的向量存储精度仍为 {configured_precision}，"
+                f"如需长期保持 {precision}，请在「检索进阶 → 向量存储精度」或「性能调优」中保存配置。"
+                if override_temporary
+                else ""
             )
-        ):
-            try:
-                self.schedule_startup_vector_warmup(settle_seconds=1.0)
-            except Exception:
-                pass
-        health = await self.database_health_snapshot()
-        notice = (
-            f"本次仅按 {precision} 执行一次性转码；当前配置的向量存储精度仍为 {configured_precision}，"
-            f"如需长期保持 {precision}，请在「检索进阶 → 向量存储精度」保存配置。"
-            if override_temporary
-            else ""
-        )
-        return {
-            "ok": True,
-            "target_precision": precision,
-            "configured_vector_precision": configured_precision,
-            "precision_override_temporary": override_temporary,
-            "notice": notice,
-            "primary": primary_result,
-            "scoped_prune": scoped_prune,
-            "capture_prune": capture_prune,
-            "token_usage_hours_pruned": token_pruned,
-            "health": health,
-        }
+            return {
+                "ok": True,
+                "target_precision": precision,
+                "configured_vector_precision": configured_precision,
+                "precision_override_temporary": override_temporary,
+                "notice": notice,
+                "primary": primary_result,
+                "scoped_prune": scoped_prune,
+                "capture_prune": capture_prune,
+                "token_usage_hours_pruned": token_pruned,
+                "health": health,
+            }
 
     async def _backfill_knowledge_graph(self) -> dict[str, Any]:
         if not self.config.bool("knowledge_graph.enabled", True):

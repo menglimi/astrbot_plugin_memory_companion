@@ -268,7 +268,8 @@ class MemoryCompanionPlugin(Star):
         """钩子熔断预算（秒）。
 
         配置项在 _conf_schema.json 的 memory_injection 段下；早期版本读的是顶层同名
-        键，嵌套配置下恒为 0、熔断永不生效。这里先读嵌套键，读不到再回退旧键。
+        键，嵌套配置下恒为 0、熔断永不生效。这里先读嵌套键，读不到再回退旧键；若
+        显式指定了非 auto 性能档位且未单独设置本键，则跟随性能档位的等待预算。
         """
         config = self.service.config
         for key in (
@@ -278,13 +279,18 @@ class MemoryCompanionPlugin(Star):
             budget = config.float(key, 0.0)
             if budget > 0:
                 return budget
+        profile = str(config.get("performance.profile", "") or "").strip().lower()
+        if profile in {"eco", "balanced", "turbo", "compat"}:
+            from .core.performance_tuning import resolve_performance_plan
+
+            return resolve_performance_plan(config).hook_request_budget_seconds
         return 0.0
 
     @filter.on_llm_request(priority=-20)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         """LLM 请求前钩子：注入记忆上下文，支持可配置的熔断预算。
 
-        预算只覆盖插件自身工作（默认 1 秒，上限 3 秒），不含记忆 Provider 的
+        预算只覆盖插件自身工作（默认 1 秒，上限 8 秒），不含记忆 Provider 的
         模型调用等待。
         """
         if getattr(self, "_terminated", False) or getattr(self, "_init_failed", False):

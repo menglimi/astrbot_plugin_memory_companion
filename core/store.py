@@ -11,6 +11,7 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
 import re
+import shutil
 import sqlite3
 import struct
 import tempfile
@@ -68,6 +69,7 @@ from .profile_quality import normalize_profile_value, profile_quality_decision
 from .portrait_namespace import portrait_scope_kind, portrait_scope_persona
 from .sensitive_data import redact_sensitive_text, redact_sensitive_value
 from .source_query import SourceQuery, SourceQueryError, source_partition
+from .performance_tuning import MemoryPerformancePlan
 
 
 _ACL_UNSET = object()
@@ -729,9 +731,16 @@ class MemoryStore(SummaryBatchStore):
         }
     )
 
-    def __init__(self, db_path: Path, *, read_only: bool = False):
+    def __init__(
+        self,
+        db_path: Path,
+        *,
+        read_only: bool = False,
+        performance_plan: MemoryPerformancePlan | None = None,
+    ):
         self.db_path = Path(db_path)
         self._read_only = bool(read_only)
+        self._performance_plan: MemoryPerformancePlan | None = performance_plan
         if self._read_only:
             if not self.db_path.is_file():
                 raise FileNotFoundError(
@@ -747,7 +756,7 @@ class MemoryStore(SummaryBatchStore):
         self._read_lock = threading.RLock()
         # 硬件自适应常驻 LIFO 只读连接池：低配 1-2G 保持 2 路瘦身，中高配扩展至 4-12 路，
         # 面板并发 10+ GET 突发时零排队且完全不与主写锁或 live timeline/vector 读连接争抢。
-        self._read_pool_max: int = _read_pool_capacity()
+        self._read_pool_max: int = self._effective_read_pool_capacity()
         self._read_pool_idle: list[sqlite3.Connection] = []
         self._read_pool_all: set[sqlite3.Connection] = set()
         self._read_pool_conn_gen: dict[sqlite3.Connection, int] = {}
@@ -825,17 +834,83 @@ class MemoryStore(SummaryBatchStore):
         self._schema_ready = False
         self.last_schema_backup_path = ""
 
-    def _apply_memory_pragmas(self, connection: sqlite3.Connection, *, role: str) -> None:
+    def _effective_sqlite_pragmas(self, *, role: str) -> dict[str, Any]:
+        plan = getattr(self, "_performance_plan", None)
+        if plan is not None:
+            return plan.sqlite_pragmas()
         pragmas = _sqlite_connection_pragmas(role=role)
-        for statement in (
+        pragmas.setdefault("synchronous", "NORMAL")
+        return pragmas
+
+    def _effective_read_pool_capacity(self) -> int:
+        plan = getattr(self, "_performance_plan", None)
+        if plan is not None:
+            return max(1, int(plan.sqlite_read_pool_size))
+        return _read_pool_capacity()
+
+    def _apply_memory_pragmas(self, connection: sqlite3.Connection, *, role: str) -> None:
+        pragmas = self._effective_sqlite_pragmas(role=role)
+        statements = [
             f"PRAGMA cache_size={int(pragmas['cache_size'])}",
             f"PRAGMA temp_store={pragmas['temp_store']}",
             f"PRAGMA mmap_size={int(pragmas['mmap_size'])}",
-        ):
+        ]
+        if role == "main" and not self._read_only:
+            sync_mode = str(pragmas.get("synchronous", "NORMAL") or "NORMAL").upper()
+            if sync_mode not in {"NORMAL", "FULL"}:
+                sync_mode = "NORMAL"
+            statements.append(f"PRAGMA synchronous={sync_mode}")
+        for statement in statements:
             try:
                 connection.execute(statement)
             except sqlite3.OperationalError:
                 pass
+
+    def apply_performance_plan(self, plan: MemoryPerformancePlan) -> dict[str, Any]:
+        """Hot-reload SQLite PRAGMAs and roll over LIFO read-pool generation safely."""
+        self._performance_plan = plan
+        self.vector_storage_precision = plan.vector_precision
+        if not self._closed:
+            with self._lock:
+                if not self._closed:
+                    self._apply_memory_pragmas(self._conn, role="main")
+            for conn_attr, lock_attr in (
+                ("_read_conn", "_read_lock"),
+                ("_timeline_read_conn", "_timeline_read_lock"),
+                ("_vector_read_conn", "_vector_read_lock"),
+            ):
+                lock = getattr(self, lock_attr)
+                with lock:
+                    conn = getattr(self, conn_attr, None)
+                    if conn is not None and not self._closed:
+                        self._apply_memory_pragmas(conn, role="read")
+
+        idle_to_close: list[sqlite3.Connection] = []
+        with self._read_pool_cond:
+            self._read_pool_max = max(1, int(plan.sqlite_read_pool_size))
+            self._read_pool_generation += 1
+            new_generation = self._read_pool_generation
+            idle_to_close = list(self._read_pool_idle)
+            self._read_pool_idle.clear()
+            for conn in idle_to_close:
+                self._read_pool_all.discard(conn)
+                self._read_pool_conn_gen.pop(conn, None)
+            self._read_pool_cond.notify_all()
+        for conn in idle_to_close:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+        return {
+            "read_pool_generation": new_generation,
+            "read_pool_max": self._read_pool_max,
+            "idle_connections_recycled": len(idle_to_close),
+            "cache_size_mb": plan.sqlite_cache_size_mb,
+            "mmap_size_mb": plan.sqlite_mmap_size_mb,
+            "synchronous": plan.sqlite_synchronous,
+            "vector_precision": plan.vector_precision,
+        }
 
     def _open_connection(self) -> sqlite3.Connection:
         database = str(self.db_path)
@@ -854,7 +929,6 @@ class MemoryStore(SummaryBatchStore):
         connection.execute("PRAGMA busy_timeout=3000")
         if not self._read_only:
             connection.execute("PRAGMA wal_autocheckpoint=500")
-            connection.execute("PRAGMA synchronous=NORMAL")
         self._apply_memory_pragmas(connection, role="main")
         return connection
 
@@ -18042,6 +18116,46 @@ class MemoryStore(SummaryBatchStore):
             "bytes_saved": max(0, bytes_before - bytes_after),
         }
 
+    def _available_disk_bytes(self) -> int | None:
+        try:
+            target_dir = self.db_path.parent if self.db_path.parent.exists() else Path(".")
+            return int(shutil.disk_usage(target_dir).free)
+        except OSError:
+            return None
+
+    def _full_vacuum_disk_preflight(self, db_bytes: int) -> dict[str, Any]:
+        """Pre-flight disk check for full VACUUM: require >= 2.2x primary DB + 64 MiB free."""
+        size_bytes = max(0, int(db_bytes))
+        required_free_bytes = int(math.ceil(size_bytes * 2.2)) + 64 * 1024 * 1024
+        available_free_bytes = self._available_disk_bytes()
+        if available_free_bytes is None:
+            return {
+                "ok": True,
+                "db_bytes": size_bytes,
+                "required_free_bytes": required_free_bytes,
+                "available_free_bytes": None,
+                "message": "",
+            }
+        ok = available_free_bytes >= required_free_bytes
+        if ok:
+            message = ""
+        else:
+            db_mb = size_bytes / (1024 * 1024)
+            req_mb = required_free_bytes / (1024 * 1024)
+            free_mb = available_free_bytes / (1024 * 1024)
+            message = (
+                f"磁盘剩余空间不足，已安全取消深度整理压缩（全量 VACUUM）。"
+                f"当前主库约 {db_mb:.1f} MiB，深度压缩需至少预留 2.2 倍主库空间 + 64 MiB（约 {req_mb:.1f} MiB），"
+                f"当前磁盘仅剩约 {free_mb:.1f} MiB。建议先清理磁盘空间，或先使用「一键常规无损瘦身」。"
+            )
+        return {
+            "ok": ok,
+            "db_bytes": size_bytes,
+            "required_free_bytes": required_free_bytes,
+            "available_free_bytes": available_free_bytes,
+            "message": message,
+        }
+
     async def database_health_snapshot(self) -> dict[str, Any]:
         return await asyncio.to_thread(self._database_health_snapshot_sync)
 
@@ -18051,6 +18165,7 @@ class MemoryStore(SummaryBatchStore):
         )
         target_elem_bytes = vector_precision_element_bytes(target_precision)
         files = self._database_file_snapshot()
+        disk_preflight = self._full_vacuum_disk_preflight(int(files.get("db_bytes", 0)))
         with self._read_conn_sync() as conn:
             page_size = int(conn.execute("PRAGMA page_size").fetchone()[0] or 4096)
             page_count = int(conn.execute("PRAGMA page_count").fetchone()[0] or 0)
@@ -18129,6 +18244,7 @@ class MemoryStore(SummaryBatchStore):
             "fts_schema_version": clean_text(fts_meta["value"], 64) if fts_meta else "legacy",
             "fts_uses_rowid": bool(self._fts_uses_rowid),
             "has_legacy_content_index": has_legacy_content_index,
+            "disk_preflight": disk_preflight,
             "recommendations": recommendations,
         }
 
@@ -18174,6 +18290,29 @@ class MemoryStore(SummaryBatchStore):
         )
         before = self._database_file_snapshot()
         before_total = int(before.get("db_bytes", 0)) + int(before.get("wal_bytes", 0)) + int(before.get("shm_bytes", 0))
+        disk_preflight = self._full_vacuum_disk_preflight(int(before.get("db_bytes", 0)))
+        if run_full_vacuum and not disk_preflight["ok"]:
+            return {
+                "ok": False,
+                "error_code": "insufficient_disk_space",
+                "error": disk_preflight["message"],
+                "disk_preflight": disk_preflight,
+                "transcode": {
+                    "skipped": True,
+                    "target_precision": precision,
+                    "transcoded": 0,
+                    "purged_orphans": 0,
+                    "skipped_invalid": 0,
+                    "bytes_before": 0,
+                    "bytes_after": 0,
+                    "bytes_saved": 0,
+                },
+                "vacuum_mode": "full_vacuum_blocked_insufficient_disk_space",
+                "fts_rebuilt": [],
+                "before_bytes": before_total,
+                "after_bytes": before_total,
+                "bytes_reclaimed": 0,
+            }
         if transcode_limit is not None and int(transcode_limit) == 0:
             transcode = {
                 "skipped": True,
@@ -18194,6 +18333,7 @@ class MemoryStore(SummaryBatchStore):
             )
         vacuum_mode = "none"
         fts_rebuilt: list[str] = []
+        blocked_after_transcode: dict[str, Any] | None = None
         with self._lock:
             try:
                 self._conn.execute("PRAGMA optimize")
@@ -18204,44 +18344,52 @@ class MemoryStore(SummaryBatchStore):
             except sqlite3.OperationalError:
                 auto_vacuum = 0
             if run_full_vacuum:
-                mem_bounds_before: tuple[int, int | None, int | None] | None = None
-                tl_bounds_before: tuple[int, int | None, int | None] | None = None
-                try:
-                    if self._fts_enabled and self._fts_uses_rowid:
-                        mem_bounds_before = self._table_rowid_bounds_sync("memories")
-                    if self._source_fts_enabled:
-                        tl_bounds_before = self._table_rowid_bounds_sync("timeline")
-                except sqlite3.OperationalError:
-                    mem_bounds_before = None
-                    tl_bounds_before = None
-                try:
-                    if auto_vacuum != 2:
-                        self._conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
-                    self._conn.execute("VACUUM")
-                    vacuum_mode = "full_vacuum_incremental_enabled"
-                except sqlite3.OperationalError as exc:
-                    vacuum_mode = f"full_vacuum_skipped:{clean_text(exc, 80)}"
+                current_files = self._database_file_snapshot()
+                disk_preflight = self._full_vacuum_disk_preflight(
+                    max(int(before.get("db_bytes", 0)), int(current_files.get("db_bytes", 0)))
+                )
+                if not disk_preflight["ok"]:
+                    vacuum_mode = "full_vacuum_blocked_insufficient_disk_space"
+                    blocked_after_transcode = disk_preflight
                 else:
-                    # Guard implicit rowid-keyed FTS5 tables in case a SQLite build
-                    # compacts implicit rowids during VACUUM.
-                    if mem_bounds_before is not None:
-                        try:
-                            if self._table_rowid_bounds_sync("memories") != mem_bounds_before:
-                                self._rebuild_memory_fts_sync()
-                                self._conn.commit()
-                                fts_rebuilt.append("memory_fts")
-                        except sqlite3.OperationalError:
-                            pass
-                    if tl_bounds_before is not None:
-                        try:
-                            if self._table_rowid_bounds_sync("timeline") != tl_bounds_before:
-                                with self._transaction_sync():
-                                    self._conn.execute(
-                                        "INSERT INTO timeline_source_fts(timeline_source_fts) VALUES('rebuild')"
-                                    )
-                                fts_rebuilt.append("timeline_source_fts")
-                        except sqlite3.OperationalError:
-                            pass
+                    mem_bounds_before: tuple[int, int | None, int | None] | None = None
+                    tl_bounds_before: tuple[int, int | None, int | None] | None = None
+                    try:
+                        if self._fts_enabled and self._fts_uses_rowid:
+                            mem_bounds_before = self._table_rowid_bounds_sync("memories")
+                        if self._source_fts_enabled:
+                            tl_bounds_before = self._table_rowid_bounds_sync("timeline")
+                    except sqlite3.OperationalError:
+                        mem_bounds_before = None
+                        tl_bounds_before = None
+                    try:
+                        if auto_vacuum != 2:
+                            self._conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                        self._conn.execute("VACUUM")
+                        vacuum_mode = "full_vacuum_incremental_enabled"
+                    except sqlite3.OperationalError as exc:
+                        vacuum_mode = f"full_vacuum_skipped:{clean_text(exc, 80)}"
+                    else:
+                        # Guard implicit rowid-keyed FTS5 tables in case a SQLite build
+                        # compacts implicit rowids during VACUUM.
+                        if mem_bounds_before is not None:
+                            try:
+                                if self._table_rowid_bounds_sync("memories") != mem_bounds_before:
+                                    self._rebuild_memory_fts_sync()
+                                    self._conn.commit()
+                                    fts_rebuilt.append("memory_fts")
+                            except sqlite3.OperationalError:
+                                pass
+                        if tl_bounds_before is not None:
+                            try:
+                                if self._table_rowid_bounds_sync("timeline") != tl_bounds_before:
+                                    with self._transaction_sync():
+                                        self._conn.execute(
+                                            "INSERT INTO timeline_source_fts(timeline_source_fts) VALUES('rebuild')"
+                                        )
+                                    fts_rebuilt.append("timeline_source_fts")
+                            except sqlite3.OperationalError:
+                                pass
             elif auto_vacuum == 2 and vacuum_pages > 0:
                 try:
                     self._conn.execute(f"PRAGMA incremental_vacuum({max(1, int(vacuum_pages))})")
@@ -18254,8 +18402,22 @@ class MemoryStore(SummaryBatchStore):
                 pass
         after = self._database_file_snapshot()
         after_total = int(after.get("db_bytes", 0)) + int(after.get("wal_bytes", 0)) + int(after.get("shm_bytes", 0))
+        if blocked_after_transcode is not None:
+            return {
+                "ok": False,
+                "error_code": "insufficient_disk_space",
+                "error": blocked_after_transcode["message"],
+                "disk_preflight": blocked_after_transcode,
+                "transcode": transcode,
+                "vacuum_mode": vacuum_mode,
+                "fts_rebuilt": fts_rebuilt,
+                "before_bytes": before_total,
+                "after_bytes": after_total,
+                "bytes_reclaimed": max(0, before_total - after_total),
+            }
         return {
             "ok": True,
+            "disk_preflight": disk_preflight,
             "transcode": transcode,
             "vacuum_mode": vacuum_mode,
             "fts_rebuilt": fts_rebuilt,
