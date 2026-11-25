@@ -2824,11 +2824,18 @@ html, body { transition: background-color 0.3s var(--ease), color 0.3s var(--eas
 
 /* ---------- 4. 移动端 ---------- */
 @media (max-width: 640px) {
-  .shell { display: block; height: auto; min-height: 100vh; }
+  html, body {
+    height: auto;
+    min-height: 100%;
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+  .shell { display: block; height: auto; min-height: 100dvh; }
   .rail {
     position: fixed; inset: auto 0 0 0; z-index: 40;
     flex-direction: row; align-items: stretch;
-    height: 58px; padding: 0 4px;
+    height: calc(58px + env(safe-area-inset-bottom));
+    padding: 0 4px env(safe-area-inset-bottom);
     border-right: 0; border-top: 1px solid var(--border);
     background: var(--bg-rail);
   }
@@ -2847,32 +2854,37 @@ html, body { transition: background-color 0.3s var(--ease), color 0.3s var(--eas
   .nav-item.is-active::before { display: none; }
   .nav-icon { width: 18px; height: 18px; }
   .nav-subs {
-    position: fixed; left: 0; right: 0; bottom: 58px; z-index: 41;
+    position: fixed; left: 0; right: 0; bottom: calc(58px + env(safe-area-inset-bottom)); z-index: 41;
     display: none; grid-template-rows: none;
     background: var(--bg-rail); border-top: 1px solid var(--border);
     padding: 6px 8px 8px; box-shadow: 0 -12px 30px rgba(0, 0, 0, 0.22);
   }
   .nav-group.is-open .nav-subs { display: block; }
   .nav-subs-inner { flex-direction: row; overflow-x: auto; gap: 4px; padding: 0; }
-  .nav-sub { flex: none; padding: 7px 12px; border-radius: 99px; background: var(--surface-2); }
+  .nav-sub {
+    flex: none; padding: 7px 12px; border-radius: 99px; background: var(--surface-2);
+    font-size: 12.5px; line-height: 1.3; gap: 6px; white-space: nowrap; min-height: 34px;
+  }
   .nav-sub::before { display: none; }
   .rail-foot { border: 0; padding: 0 2px 0 4px; flex-direction: row; align-items: center; }
   .rail-foot .rail-status { display: none; }
   .theme-toggle { width: auto; padding: 6px 9px; }
   .theme-toggle-label { display: block; font-size: 11px; }
-  .main { padding-bottom: 66px; }
+  .main { padding-bottom: calc(66px + env(safe-area-inset-bottom)); }
   .topbar { padding: 14px 14px 12px; align-items: stretch; flex-direction: column; gap: 12px; }
   .topbar h1 { font-size: 21px; }
   .topbar-tools { width: 100%; }
   .topbar-search { flex: 1; min-width: 0; }
   .tool-btn:not(.mode-toggle) span { display: none; }
-  .content { padding: 12px 14px 28px; }
+  .content { padding: 12px 14px 28px; overflow: visible; }
   .grid.g2, .grid.g3, .grid.g4, .grid.split-2, .grid.split-3 { grid-template-columns: minmax(0, 1fr); }
   .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .card { padding: 13px 14px; border-radius: 14px; }
+  .card-head { flex-wrap: wrap; gap: 8px; }
+  .card-head-actions { width: 100%; flex-wrap: wrap; justify-content: flex-start; }
   .drawer { width: 100vw; max-width: 100vw; border-left: 0; }
   .drawer-body { padding: 14px 16px 26px; }
-  .toast { max-width: 86vw; bottom: 74px; }
+  .toast { max-width: 86vw; bottom: calc(74px + env(safe-area-inset-bottom)); }
 }
 
 /* ---------- 5. 总览 KPI 卡片视觉升级（v2.6.2） ---------- */

@@ -375,12 +375,15 @@ function personParams(extra) {
   return params;
 }
 
-async function load() {
+async function load(options) {
+  const silent = Boolean(options && options.silent);
   if (state.loading) return;
   state.loading = true;
-  loading.hidden = false;
-  empty.hidden = true;
-  grid.innerHTML = "";
+  if (!silent) {
+    loading.hidden = false;
+    empty.hidden = true;
+    grid.innerHTML = "";
+  }
   try {
     const data = await request("GET", "people", personParams({ q: state.query, sort: state.sort, limit: 120 }));
     state.items = Array.isArray(data.items) ? data.items : [];
@@ -391,9 +394,11 @@ async function load() {
     renderGrid();
   } catch (error) {
     loading.hidden = true;
-    subtitle.textContent = "没连上她…";
+    if (!silent || !state.items.length) {
+      subtitle.textContent = "没连上她…";
+      empty.hidden = false;
+    }
     toast(`翻记忆失败：${error.message || error}`);
-    empty.hidden = false;
   } finally {
     state.loading = false;
     loading.hidden = true;
@@ -510,25 +515,73 @@ function renderGrid() {
   });
 }
 
+let drawerRequestSeq = 0;
+
 function closeDrawer() {
+  drawerRequestSeq += 1;
   drawer.hidden = true;
   scrim.hidden = true;
   state.selected = null;
   state.selectedScope = { platform: "", bot_id: "" };
 }
 
-async function openPerson(userId, platform, botId) {
+async function openPerson(userId, platform, botId, options) {
+  const opts = options || {};
+  const nextPlatform = platform || "";
+  const nextBotId = botId || "";
+  const prevScope = state.selectedScope || {};
+  const sameOpenPerson =
+    !drawer.hidden &&
+    state.selected &&
+    String(state.selected.user_id || "") === String(userId || "") &&
+    (prevScope.platform || "") === nextPlatform &&
+    (prevScope.bot_id || "") === nextBotId;
+  const silent = Boolean(opts.silent) || sameOpenPerson;
+  const preserveScroll = Boolean(opts.preserveScroll || silent);
+  const prevScrollTop = preserveScroll ? (drawer.scrollTop || 0) : 0;
+  const activeEl = silent && typeof document !== "undefined" ? document.activeElement : null;
+  const prevActiveId =
+    activeEl && activeEl.id && typeof drawer.contains === "function" && drawer.contains(activeEl)
+      ? activeEl.id
+      : "";
+  const eraseInputEl = silent ? el("eraseConfirmInput") : null;
+  const prevEraseDraft = eraseInputEl ? (eraseInputEl.value || "") : "";
+
+  const reqSeq = drawerRequestSeq + 1;
+  drawerRequestSeq = reqSeq;
   drawer.hidden = false;
   scrim.hidden = false;
-  drawerBody.innerHTML = `<p class="loading">正在翻开她的记忆…</p>`;
+  if (!silent) {
+    drawerBody.innerHTML = `<p class="loading">正在翻开她的记忆…</p>`;
+    drawer.scrollTop = 0;
+  }
   // 记住这次是从哪个范围点开的：合并卡点开时是空的，表示「这个人」，
   // 后续改分量、擦除都该按人算，而不是按详情回填的某个平台。
-  state.selectedScope = { platform: platform || "", bot_id: botId || "" };
+  state.selectedScope = { platform: nextPlatform, bot_id: nextBotId };
   try {
-    const data = await request("GET", "person", { user_id: userId, platform: platform || "", bot_id: botId || "" });
+    const data = await request("GET", "person", { user_id: userId, platform: nextPlatform, bot_id: nextBotId });
+    if (reqSeq !== drawerRequestSeq || drawer.hidden) return;
     state.selected = data;
     renderDrawer(data);
+    if (silent && prevEraseDraft) {
+      const nextErase = el("eraseConfirmInput");
+      if (nextErase) nextErase.value = prevEraseDraft;
+    }
+    if (preserveScroll) {
+      drawer.scrollTop = prevScrollTop;
+    }
+    if (prevActiveId) {
+      const nextActive = el(prevActiveId);
+      if (nextActive && !nextActive.disabled && typeof nextActive.focus === "function") {
+        try { nextActive.focus({ preventScroll: true }); } catch (_) { nextActive.focus(); }
+      }
+    }
   } catch (error) {
+    if (reqSeq !== drawerRequestSeq || drawer.hidden) return;
+    if (silent) {
+      toast(`没刷新上：${error.message || error}`);
+      return;
+    }
     drawerBody.innerHTML = `<p class="loading">翻不开了：${esc(error.message || error)}</p>`;
   }
 }
@@ -639,8 +692,10 @@ async function savePerson() {
   try {
     await request("POST", "person/weight", null, payload);
     toast("记住了");
-    await load();
-    await openPerson(data.user_id, scope.platform, scope.bot_id);
+    await Promise.all([
+      load({ silent: true }),
+      openPerson(data.user_id, scope.platform, scope.bot_id, { silent: true, preserveScroll: true }),
+    ]);
   } catch (error) {
     toast(`没存上：${error.message || error}`);
   }
@@ -653,8 +708,10 @@ async function resetWeight() {
   try {
     await request("POST", "person/weight", null, { user_id: data.user_id, platform: scope.platform, bot_id: scope.bot_id, weight: null, confirm: "CONFIRM:/person/weight" });
     toast("分量交回给她自己算");
-    await load();
-    await openPerson(data.user_id, scope.platform, scope.bot_id);
+    await Promise.all([
+      load({ silent: true }),
+      openPerson(data.user_id, scope.platform, scope.bot_id, { silent: true, preserveScroll: true }),
+    ]);
   } catch (error) {
     toast(`没改成功：${error.message || error}`);
   }
@@ -704,7 +761,7 @@ async function forgetMemory(memoryId) {
     await request("POST", "memory/update", null, { id: memoryId, durability: "short" });
     toast("这条放轻了");
     const scope = personScope();
-    if (data) await openPerson(data.user_id, scope.platform, scope.bot_id);
+    if (data) await openPerson(data.user_id, scope.platform, scope.bot_id, { silent: true, preserveScroll: true });
   } catch (error) {
     toast(`没改成：${error.message || error}`);
   }

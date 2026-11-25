@@ -148,6 +148,7 @@ a:hover { text-decoration: underline; }
 }
 
 .brand { display: flex; align-items: center; gap: 14px; min-width: 0; }
+.brand > div { min-width: 0; }
 .brand h1 { margin: 0; font-size: clamp(20px, 2.4vw, 27px); letter-spacing: 0.02em; }
 .brand p { margin: 2px 0 0; color: var(--dim); font-size: 13px; }
 .heart {
@@ -163,6 +164,7 @@ a:hover { text-decoration: underline; }
   font-size: 13px; outline: none;
   transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
 }
+.tools select { max-width: 100%; min-width: 0; }
 .tools input { min-width: 230px; }
 .tools input::placeholder { color: var(--dim); }
 .tools input:focus, .tools select:focus {
@@ -235,13 +237,14 @@ main { padding: 8px clamp(18px, 4vw, 48px) 64px; }
 
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr));
   gap: 10px;
 }
 
 .card {
   position: relative;
   display: flex; flex-wrap: wrap; align-items: center; gap: 7px 10px;
+  width: 100%; min-width: 0; max-width: 100%; overflow: hidden;
   padding: 10px 13px;
   background: linear-gradient(180deg, var(--card-soft), var(--card));
   border: 1px solid var(--line);
@@ -264,13 +267,14 @@ main { padding: 8px clamp(18px, 4vw, 48px) 64px; }
   color: var(--avatar-text);
   border: 1px solid var(--line);
 }
-.who { min-width: 0; }
+.who { flex: 1 1 auto; min-width: 0; overflow: hidden; }
 .name { font-size: 16px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sub { color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-.chips { display: flex; flex: 1 1 100%; flex-wrap: wrap; gap: 5px; }
+.chips { display: flex; flex: 1 1 100%; flex-wrap: wrap; gap: 5px; min-width: 0; width: 100%; max-width: 100%; }
 .chip {
   padding: 1px 8px; border-radius: 999px; font-size: 12px;
+  max-width: 100%; overflow-wrap: anywhere;
   border: 1px solid var(--line); background: var(--chip-bg); color: var(--dim);
 }
 .chip.band { color: var(--text); border-color: var(--chip-band-line); background: var(--chip-band-bg); }
@@ -281,14 +285,19 @@ main { padding: 8px clamp(18px, 4vw, 48px) 64px; }
 .bar { flex: 1 1 100%; height: 4px; border-radius: 999px; background: var(--bar-track); overflow: hidden; }
 .bar > span { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--bar-start), var(--bar-end)); }
 
-.memories { flex: 1 1 100%; margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+.memories {
+  flex: 1 1 100%; margin: 0; padding: 0; list-style: none;
+  display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px;
+  min-width: 0; width: 100%; max-width: 100%;
+}
 .memories li {
   font-size: 12px; color: var(--quote);
-  display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden;
+  display: block; min-width: 0; max-width: 100%;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .memories li::before { content: "“"; color: var(--dim); }
 .memories li::after { content: "”"; color: var(--dim); }
-.meta { flex: 0 0 auto; margin-left: auto; font-size: 11px; color: var(--dim); }
+.meta { flex: 0 1 auto; margin-left: auto; max-width: 100%; overflow-wrap: anywhere; font-size: 11px; color: var(--dim); }
 
 .loading, .empty { padding: 56px 8px; text-align: center; color: var(--dim); }
 .empty h2 { color: var(--text); margin: 0 0 8px; font-size: 19px; }
@@ -297,9 +306,9 @@ main { padding: 8px clamp(18px, 4vw, 48px) 64px; }
 
 .scrim { position: fixed; inset: 0; background: var(--scrim); backdrop-filter: blur(2px); z-index: 40; }
 .drawer {
-  position: fixed; top: 0; right: 0; bottom: 0; width: min(520px, 100vw);
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(520px, 100%); height: 100dvh;
   background: var(--bg-soft); border-left: 1px solid var(--line);
-  padding: 24px 22px 40px; overflow-y: auto; z-index: 50;
+  padding: 24px 22px calc(40px + env(safe-area-inset-bottom)); overflow-y: auto; z-index: 50;
   box-shadow: var(--drawer-shadow);
 }
 .drawer > .close {
@@ -311,8 +320,9 @@ main { padding: 8px clamp(18px, 4vw, 48px) 64px; }
 .drawer > .close:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .person-head { display: flex; gap: 14px; align-items: center; margin: 6px 34px 14px 0; }
+.person-head > div { min-width: 0; flex: 1 1 auto; }
 .person-head .avatar { width: 56px; height: 56px; font-size: 22px; }
-.person-head h2 { margin: 0; font-size: 21px; }
+.person-head h2 { margin: 0; font-size: 21px; overflow-wrap: anywhere; }
 .person-head .sub { margin-top: 2px; }
 
 .block { margin: 20px 0 0; padding-top: 18px; border-top: 1px solid var(--line); }
@@ -381,7 +391,7 @@ main { padding: 8px clamp(18px, 4vw, 48px) 64px; }
 .detail-list li {
   padding: 12px 14px; border-radius: 12px; border: 1px solid var(--line); background: var(--drawer-card);
 }
-.detail-list .text { font-size: 13.5px; color: var(--detail-text); white-space: pre-wrap; }
+.detail-list .text { font-size: 13.5px; color: var(--detail-text); white-space: pre-wrap; overflow-wrap: anywhere; }
 .detail-list .line { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; font-size: 12px; color: var(--dim); }
 .detail-list .line button {
   background: none; border: none; color: var(--dim); cursor: pointer; font-size: 12px; padding: 0;
@@ -392,6 +402,7 @@ main { padding: 8px clamp(18px, 4vw, 48px) 64px; }
 
 .toast {
   position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+  max-width: calc(100vw - 24px); text-align: center;
   padding: 10px 18px; border-radius: 999px; z-index: 60;
   background: var(--toast-bg); border: 1px solid var(--toast-line); color: var(--toast-text); font-size: 13px;
   box-shadow: var(--toast-shadow);
@@ -1249,10 +1260,14 @@ html, body {
 }
 
 @media (max-width: 720px) {
+  .top { padding: 16px 14px 10px; gap: 12px; }
+  main { padding: 6px 14px calc(48px + env(safe-area-inset-bottom)); }
   .tools { width: 100%; }
-  .tools input { flex: 1 1 180px; min-width: 0; }
-  .grid { grid-template-columns: 1fr; }
-  .row { grid-template-columns: 1fr; gap: 4px; }
+  .tools input { flex: 1 1 100%; min-width: 0; width: 100%; }
+  .tools select { max-width: 100%; min-width: 0; }
+  .grid { grid-template-columns: minmax(0, 1fr); }
+  .row { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+  .drawer { padding: 20px 16px calc(32px + env(safe-area-inset-bottom)); }
 }
 
 @media (prefers-reduced-motion: reduce) {
