@@ -353,13 +353,35 @@ class PortableMemoryArchive:
                 return True
         return False
 
+    @staticmethod
+    def _clean_path_input(path: str) -> str:
+        raw = clean_text(path, 1024)
+        while len(raw) >= 2 and (
+            (raw[0] == raw[-1] and raw[0] in {'"', "'"})
+            or (raw[0] == "“" and raw[-1] == "”")
+            or (raw[0] == "‘" and raw[-1] == "’")
+        ):
+            raw = raw[1:-1].strip()
+        return raw
+
+    def _allowed_roots_hint(self) -> str:
+        roots: list[str] = []
+        for root in self.allowed_roots:
+            resolved = self._resolved_root(root)
+            if resolved is None:
+                continue
+            label = str(resolved)
+            if label not in roots:
+                roots.append(label)
+        return "；".join(roots[:2]) or str(self.data_dir)
+
     def _resolve_source_path(self, path: str) -> Path:
         """Resolve an archive path and refuse anything outside allowed roots."""
-        raw = clean_text(path, 1024)
+        raw = self._clean_path_input(path)
         if not raw:
-            raise ValueError("portable archive path is required")
+            raise ValueError("请填写可移植档案路径（portable archive path is required）")
         if ".." in Path(raw.replace(chr(92), "/")).parts:
-            raise ValueError("portable archive path must not contain two dots")
+            raise ValueError("路径不能包含上级目录跳转（.. / two dots）")
         candidate = Path(raw).expanduser()
         if not candidate.is_absolute():
             # Relative archive paths are resolved against the plugin data dir,
@@ -369,10 +391,12 @@ class PortableMemoryArchive:
             resolved = candidate.resolve(strict=False)
         except OSError as exc:
             raise ValueError(
-                f"portable archive path cannot be resolved: {clean_text(exc, 120)}"
+                f"路径无法解析（portable archive path cannot be resolved）: {clean_text(exc, 120)}"
             ) from exc
         if not self._is_inside_allowed_roots(resolved):
-            raise ValueError("portable archive path is outside the plugin data directory")
+            raise ValueError(
+                f"路径超出允许的插件数据目录范围（outside the plugin data directory），请将档案放到以下目录后重试：{self._allowed_roots_hint()}"
+            )
         return resolved
 
     async def export(self) -> dict[str, Any]:

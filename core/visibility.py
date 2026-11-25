@@ -133,6 +133,12 @@ class VisibilityPolicy:
             return True, "admin_search"
         if not self.platform_identity_allows(memory, ctx):
             return False, "other_platform"
+        if self.is_legacy_together_memory(memory):
+            if not self.legacy_together_private_match(memory, ctx):
+                return False, "other_legacy_together_session"
+            if memory.visibility == "bot_self" and not self.allow_self_timeline_everywhere:
+                return False, "bot_self"
+            return True, "legacy_together_private_session"
         if memory.visibility == "bot_self":
             owner_ok, owner_reason = self._bot_owner_visible(memory, ctx)
             if not owner_ok:
@@ -238,6 +244,70 @@ class VisibilityPolicy:
             return False
         return not _specific_bot_ids(memory)
 
+    @staticmethod
+    def is_legacy_together_memory(memory: MemoryRecord) -> bool:
+        return _clean_id(getattr(memory, "session_id", "")).startswith("together_companion:")
+
+    @classmethod
+    def legacy_together_private_match(cls, memory: MemoryRecord, ctx: SessionContext) -> bool:
+        """Strictly bind legacy together_companion:<user_id> memories to the same bot and private user."""
+        if not cls.is_legacy_together_memory(memory):
+            return False
+        if ctx.scope != "private" or getattr(ctx, "strict_session_only", False):
+            return False
+        if memory.scope != "private":
+            return False
+        if memory.visibility not in {"private_pair", "bot_self", "shareable"}:
+            return False
+        user_id = _clean_id(ctx.user_id)
+        bot_id = _clean_id(ctx.bot_id)
+        if not user_id or not bot_id or bot_id == "self":
+            return False
+        if _clean_id(memory.session_id) != f"together_companion:{user_id}":
+            return False
+        for entity in (memory.subject, memory.object):
+            if getattr(entity, "kind", "") == "user":
+                entity_id = _clean_id(getattr(entity, "id", ""))
+                if entity_id and entity_id != user_id:
+                    return False
+        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+        participant_user_id = _clean_id(metadata.get("participant_user_id"))
+        if participant_user_id and participant_user_id != user_id:
+            return False
+        meta_bot_id = _clean_id(metadata.get("bot_id"))
+        if meta_bot_id and meta_bot_id != "self" and meta_bot_id != bot_id:
+            return False
+        bot_ids = set(_specific_bot_ids(memory))
+        platform_id = _clean_id(getattr(memory, "platform", ""))
+        col_owner = _clean_id(getattr(memory, "owner_bot_id", ""))
+        if col_owner and platform_id and col_owner.casefold() == platform_id.casefold():
+            col_owner = ""
+        if col_owner and col_owner != "self":
+            bot_ids.add(col_owner)
+        if meta_bot_id and meta_bot_id != "self":
+            bot_ids.add(meta_bot_id)
+        if bot_ids != {bot_id}:
+            return False
+        mem_platform = platform_id.casefold()
+        ctx_platform = _clean_id(getattr(ctx, "platform", "")).casefold()
+        if mem_platform not in {"", "unknown", "default", "together_companion", ctx_platform}:
+            if _platform_family(mem_platform) != _platform_family(ctx_platform):
+                return False
+        persona_id = _clean_id(metadata.get("persona_id"))
+        if persona_id not in {"", "legacy", _clean_id(ctx.persona_id)}:
+            return False
+        memory_person_id, _ = normalize_explicit_person_binding(
+            memory.subject_person_id,
+            memory.identity_assurance,
+        )
+        context_person_id, _ = normalize_explicit_person_binding(
+            ctx.subject_person_id,
+            ctx.identity_assurance,
+        )
+        if memory_person_id and context_person_id and memory_person_id != context_person_id:
+            return False
+        return True
+
     def platform_identity_allows(self, memory: MemoryRecord, ctx: SessionContext) -> bool:
         """Whether a platform difference is backed by explicit identity evidence.
 
@@ -254,6 +324,8 @@ class VisibilityPolicy:
         * the row is an un-attributed legacy row in the reader's own window
           (see ``same_private_window``).
         """
+        if self.is_legacy_together_memory(memory):
+            return self.legacy_together_private_match(memory, ctx)
         self_platform = _platform_family(getattr(memory, "platform", ""))
         current_platform = _platform_family(getattr(ctx, "platform", ""))
         if not self_platform or not current_platform or self_platform == current_platform:

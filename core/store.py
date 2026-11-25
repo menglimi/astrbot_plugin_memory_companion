@@ -13610,6 +13610,7 @@ class MemoryStore(SummaryBatchStore):
         elif scope == "private" and user_id:
             branches.append(("scope='private' AND subject_id=?", [user_id]))
             branches.append(("scope='private' AND object_id=?", [user_id]))
+            branches.append(("scope='private' AND session_id=?", [f"together_companion:{user_id}"]))
             if subject_person_id:
                 branches.append(
                     (
@@ -14420,7 +14421,23 @@ class MemoryStore(SummaryBatchStore):
         return await self._run_recoverable_database_operation(
             self._read_authorized_linked_memories_sync, authorization, limit)
 
-    def _read_authorized_linked_memories_sync(self, authorization, limit):
+    async def read_authorized_linked_memories_by_ids(
+        self,
+        authorization,
+        memory_ids,
+        *,
+        include_core_limit: int = 0,
+    ):
+        """Filter candidate memory IDs and optional core blocks under the exact linked-read predicate."""
+        return await self._run_recoverable_database_operation(
+            self._read_authorized_linked_memories_by_ids_sync,
+            authorization,
+            list(memory_ids or ()),
+            include_core_limit,
+        )
+
+    @staticmethod
+    def _authorized_linked_where(authorization) -> tuple[str, list[Any], list[dict[str, Any]]]:
         members = authorization.get("members", [])
         persona = authorization.get("persona_id")
         reader = authorization.get("reader_user_id")
@@ -14443,8 +14460,31 @@ class MemoryStore(SummaryBatchStore):
         validity, validity_params = validity_where_clause(valid_at=utc_now())
         where = ("m.scope='private' AND m.visibility IN ('private_pair','shareable') "
                  "AND m.review_status!='pending' AND m.lifecycle='stable_memory' "
+                 "AND (m.memory_type!='core_memory' OR NOT json_valid(m.metadata) "
+                 "OR json_type(m.metadata,'$.core_enabled') IS NULL "
+                 "OR json_type(m.metadata,'$.core_enabled')='true') "
                  "AND (" + " OR ".join(clauses) + ") AND " + validity)
         params.extend(validity_params)
+        return where, params, members
+
+    @staticmethod
+    def _authorized_linked_provenance(
+        records: list[MemoryRecord],
+        members: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        provenance: dict[str, dict[str, Any]] = {}
+        for record in records:
+            member = next(m for m in members if m["session_id"] == record.session_id)
+            identity = member.get("memory_identity", {})
+            provenance[record.id] = {
+                "user_id": member["native_account_id"],
+                "owner_bot_id": identity.get("owner_bot_id", member["account_id"]),
+                "original_owner_bot_id": record.owner_bot_id,
+            }
+        return provenance
+
+    def _read_authorized_linked_memories_sync(self, authorization, limit):
+        where, params, members = self._authorized_linked_where(authorization)
         safe_limit = max(0, min(20, int(limit)))
         with self._lock:
             revision = self._memory_revision_sync()
@@ -14456,16 +14496,61 @@ class MemoryStore(SummaryBatchStore):
             if (self._memory_revision_sync() != revision or self._source_revision_sync() != source_revision):
                 raise RuntimeError("memory_summary_snapshot_changed")
         records = [MemoryRecord.from_row(row) for row in rows]
-        provenance = {}
-        for record in records:
-            member = next(m for m in members if m["session_id"] == record.session_id)
-            identity = member.get("memory_identity", {})
-            provenance[record.id] = {"user_id": member["native_account_id"],
-                "owner_bot_id": identity.get("owner_bot_id", member["account_id"]),
-                "original_owner_bot_id": record.owner_bot_id}
+        provenance = self._authorized_linked_provenance(records, members)
         return {"records": records, "provenance": provenance,
                 "type_counts": {row["memory_type"]: int(row["n"]) for row in counts},
                 "memory_revision": int(revision), "source_revision": source_revision}
+
+    def _read_authorized_linked_memories_by_ids_sync(
+        self,
+        authorization,
+        memory_ids: list[str],
+        include_core_limit: int,
+    ) -> dict[str, Any]:
+        where, params, members = self._authorized_linked_where(authorization)
+        ordered_ids = list(dict.fromkeys(clean_text(item, 120) for item in memory_ids if clean_text(item, 120)))[:64]
+        safe_core_limit = max(0, min(8, int(include_core_limit or 0)))
+        with self._lock:
+            revision = self._memory_revision_sync()
+            source_revision = self._source_revision_sync()
+            matched_rows = []
+            if ordered_ids:
+                marks = ",".join("?" for _ in ordered_ids)
+                matched_rows = self._conn.execute(
+                    f"SELECT m.* FROM memories m WHERE {where} AND m.id IN ({marks})",
+                    [*params, *ordered_ids],
+                ).fetchall()
+            core_rows = []
+            if safe_core_limit > 0:
+                core_rows = self._conn.execute(
+                    f"""
+                    SELECT m.* FROM memories m
+                    WHERE {where} AND m.memory_type='core_memory'
+                    ORDER BY
+                        CASE
+                            WHEN json_valid(m.metadata)
+                            THEN COALESCE(CAST(json_extract(m.metadata, '$.core_priority') AS INTEGER), 50)
+                            ELSE 50
+                        END DESC,
+                        m.updated_at DESC,
+                        m.id ASC
+                    LIMIT ?
+                    """,
+                    [*params, safe_core_limit],
+                ).fetchall()
+            if (self._memory_revision_sync() != revision or self._source_revision_sync() != source_revision):
+                raise RuntimeError("memory_summary_snapshot_changed")
+        matched_by_id = {row["id"]: MemoryRecord.from_row(row) for row in matched_rows}
+        matched_records = [matched_by_id[mid] for mid in ordered_ids if mid in matched_by_id]
+        core_records = [MemoryRecord.from_row(row) for row in core_rows]
+        provenance = self._authorized_linked_provenance([*core_records, *matched_records], members)
+        return {
+            "records": matched_records,
+            "core_records": core_records,
+            "provenance": provenance,
+            "memory_revision": int(revision),
+            "source_revision": source_revision,
+        }
 
     async def read_user_memory_summary_records(
         self,

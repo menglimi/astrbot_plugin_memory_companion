@@ -1504,3 +1504,115 @@ test("performance save triggers inPlace refresh; migrate DB health & shrink upda
   assert.equal(lmPathInput.value, "/data/livingmemory.db");
   assert.equal(releaseBatchInput.value, "sb_keep_me_99");
 });
+
+test("migrate view displays allowed server directories with one-click copy buttons", async () => {
+  const appSource = fs.readFileSync(APP_JS_PATH, "utf8");
+  const start = appSource.indexOf("const PRESET_LABELS =");
+  const end = appSource.indexOf("/* ============================================================\r\n   视图：待修复批次", start);
+  const endAlt = appSource.indexOf("/* ============================================================\n   视图：待修复批次", start);
+  const sliceEnd = end >= 0 ? end : endAlt;
+  assert.ok(start > 0 && sliceEnd > start, "应定位到维护与迁移视图区块");
+
+  const views = {};
+  const loadedRoutes = [];
+  const copied = [];
+  const toasts = [];
+  const sandbox = {
+    navigator: {
+      clipboard: {
+        writeText: async (text) => {
+          copied.push(text);
+        },
+      },
+    },
+    document: { createElement: () => ({}), body: { appendChild: () => {}, removeChild: () => {} } },
+    defineView: (id, cfg) => { views[id] = cfg; },
+    state: {},
+    apiTry: async (fn, fallback) => { try { return await fn(); } catch (_) { return fallback; } },
+    apiGet: async (url) => {
+      loadedRoutes.push(url);
+      if (url === "/maintenance/db_health") return { health: {} };
+      assert.equal(url, "/operations/preset");
+      return {
+        preset: { preset: "standard" },
+        allowed_import_roots: {
+          memory_data_dir: "/AstrBot/data/plugin_data/astrbot_plugin_memory_companion",
+          portable_export_dir: "/AstrBot/data/plugin_data/astrbot_plugin_memory_companion/exports",
+          plugin_data_dir: "/AstrBot/data/plugin_data",
+        },
+      };
+    },
+    apiPost: async () => ({ ok: true }),
+    compact: (v, fallback) => {
+      const t = String(v ?? "").trim();
+      return t || (fallback === undefined ? "" : fallback);
+    },
+    esc: engine.escapeHtml,
+    fmtBytes: (v) => `${Number(v) || 0} B`,
+    fmtInt: (v) => String(Math.round(Number(v) || 0)),
+    card: (_t, _s, body) => `<section>${body}</section>`,
+    emptyState: (t, s) => `<div>${t}:${s}</div>`,
+    jsonPreview: (v) => JSON.stringify(v),
+    withBusy: async (_l, fn) => fn(),
+    toast: (msg, tone) => { toasts.push({ msg, tone }); },
+    go: () => {},
+    $: () => null,
+    $$: (sel) => {
+      if (sel === "[data-copy-path]") {
+        const listeners = {};
+        return [{
+          dataset: { copyPath: "/AstrBot/data/plugin_data" },
+          addEventListener: (ev, fn) => { listeners[ev] = fn; },
+          triggerClick: () => listeners.click && listeners.click(),
+        }];
+      }
+      return [];
+    },
+    int: (v) => parseInt(v, 10) || 0,
+    showInlineConfirmation: async () => false,
+  };
+  vm.runInNewContext(appSource.slice(start, sliceEnd), sandbox);
+
+  const loaded = await views.migrate.load();
+  assert.deepEqual(loadedRoutes.sort(), ["/maintenance/db_health", "/operations/preset"]);
+  const html = views.migrate.render(loaded);
+  assert.ok(html.includes("主库总占用"));
+  assert.ok(html.includes("/AstrBot/data/plugin_data/astrbot_plugin_memory_companion/exports"));
+  assert.ok(html.includes("/AstrBot/data/plugin_data"));
+  assert.ok(html.includes("data-copy-path="));
+  assert.ok(html.includes("复制路径"));
+  assert.ok(html.includes('class="allowed-path-hint"'));
+  assert.ok(html.includes('class="allowed-path-hint-text"'));
+  assert.ok(html.includes('class="allowed-path-hint-code"'));
+  assert.ok(html.includes('class="btn is-sm allowed-path-hint-btn"'));
+  assert.ok(!/<div class="allowed-path-hint"[^>]*style=/.test(html), "允许目录提示应使用语义类而非内联样式");
+  assert.ok(!/#[0-9a-fA-F]{3,8}\b/.test(html), "渲染片段中不应包含硬编码十六进制色值");
+
+  const appCss = fs.readFileSync(path.join(PANEL_DIR, "app.css"), "utf8");
+  assert.ok(appCss.includes(".allowed-path-hint {"), "app.css 应定义 .allowed-path-hint");
+  assert.ok(appCss.includes("min-width: min(180px, 100%);"), "允许目录文案应支持窄屏防溢出");
+  assert.ok(appCss.includes("font-family: var(--font-mono);"), "路径代码应使用 --font-mono 令牌");
+  assert.ok(
+    /@media\s*\(max-width:\s*640px\)\s*\{\s*\.allowed-path-hint-btn\s*\{\s*min-height:\s*34px;/.test(appCss),
+    "移动端复制按钮应保证至少 34px 触控高度"
+  );
+
+  let copyButton = null;
+  sandbox.$$ = (sel) => {
+    if (sel === "[data-copy-path]") {
+      const listeners = {};
+      copyButton = {
+        dataset: { copyPath: "/AstrBot/data/plugin_data" },
+        addEventListener: (ev, fn) => { listeners[ev] = fn; },
+        click: () => listeners.click(),
+      };
+      return [copyButton];
+    }
+    return [];
+  };
+  views.migrate.mount({});
+  assert.ok(copyButton, "mount 应绑定复制路径按钮");
+  await copyButton.click();
+  assert.deepEqual(copied, ["/AstrBot/data/plugin_data"]);
+  assert.equal(toasts[0].tone, "ok");
+});
