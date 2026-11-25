@@ -32,8 +32,8 @@ from .core.coordination_status import build_coordination_status, project_p6_stat
 from .core.identity import normalize_session_context_fields, parse_scope_from_session
 from .core.local_time import local_tz
 from .core.memory_atom import DURABILITY_LEVELS, SENSITIVITY_LEVELS, VALIDITY_STATUSES
-from .core.absorb import RELATION_SOURCE_USER, merge_relation_profile
-from .core.models import EntityRef, SessionContext, clean_text
+from .core.absorb import ADDRESS_MAX_CHARS, NOTE_MAX_CHARS, RELATION_MAX_CHARS
+from .core.models import SessionContext, clean_text
 from .core.operations import persist_runtime_config
 from .core.person_weight import clamp_weight
 from .core.store import MemoryStoreUnavailableError
@@ -1235,12 +1235,18 @@ class PluginPageApi:
             weight = self._strict_weight(raw_weight)
             if weight is None:
                 return self._err("weight 必须是 0-100 的整数", 400)
-        label, label_error = self._bounded_payload_text(payload, "label", 40, "称呼")
-        address, address_error = self._bounded_payload_text(payload, "address", 40, "关系")
-        note, note_error = self._bounded_payload_text(payload, "note", 80, "备注")
-        error = label_error or address_error or note_error
-        if error:
-            return self._err(error, 400)
+        relation_fields: dict[str, str] = {}
+        for key, limit, title in (
+            ("label", RELATION_MAX_CHARS, "关系"),
+            ("address", ADDRESS_MAX_CHARS, "称呼"),
+            ("note", NOTE_MAX_CHARS, "备注"),
+        ):
+            if payload.get(key) is None:
+                continue
+            value, error = self._bounded_payload_text(payload, key, limit, title)
+            if error:
+                return self._err(error, 400)
+            relation_fields[f"relation_{key}"] = value
         if weight is not None:
             await store.set_person_weight(
                 user_id=user_id,
@@ -1249,24 +1255,10 @@ class PluginPageApi:
                 bot_id=bot_id,
             )
         profile_updated = False
-        if label or address or note:
-            entity = EntityRef(kind="user", id=user_id)
-            existing = await store.identity_profile(platform=platform, entity=entity)
-            hint = {
-                "relation": label,
-                "address": address,
-                "note": note,
-                "source": RELATION_SOURCE_USER,
-            }
-            merged = merge_relation_profile(existing, hint)
-            if merged != existing:
-                await store.upsert_identity(
-                    platform=platform,
-                    entity=entity,
-                    profile=merged,
-                    confidence=0.9,
-                )
-                profile_updated = True
+        if relation_fields:
+            profile_updated = await store.set_person_panel_relation(
+                user_id=user_id, platform=platform, fields=relation_fields
+            )
         detail = await store.person_panel_detail(
             user_id=user_id,
             platform=platform,

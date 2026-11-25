@@ -235,6 +235,74 @@ class PeoplePageApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("user", body["weight"]["source"])
         self.assertEqual("阿哲", body["person"]["profile"]["relation_address"])
 
+    async def test_combined_card_keeps_manual_relation_after_platform_updates(self) -> None:
+        await self._seed()
+        await self.store.person_weight(user_id="u1", platform="lark", bot_id=BOT_A)
+        person = EntityRef(kind="user", id="u1", name="小王")
+        await self.store.upsert_identity(
+            platform="",
+            entity=EntityRef(kind="user", id="u1"),
+            profile={"relation_address": "旧称呼", "relation_source": "user", "marker": "保留"},
+        )
+        api = PluginPageApi(SimpleNamespace(service=SimpleNamespace(store=self.store)))
+
+        async def save(**fields):
+            api._json = AsyncMock(return_value={"user_id": "u1", "bot_id": BOT_A, **fields})
+            with patch.object(page_api_module, "jsonify", side_effect=_fake_jsonify):
+                return (await api.person_weight_update()).payload
+
+        first = await save(address="新称呼", label="朋友", note="保留这条")
+        self.assertTrue(first["profile_updated"])
+        self.assertEqual("新称呼", first["person"]["profile"]["relation_address"])
+        second = await save(label="同事")
+        self.assertTrue(second["profile_updated"])
+        self.assertEqual("同事", second["person"]["profile"]["relation_label"])
+        self.assertEqual("保留这条", second["person"]["profile"]["relation_note"])
+        self.assertFalse((await save(weight=50))["profile_updated"])
+        self.assertTrue((await save(address="", note=""))["profile_updated"])
+        self.assertFalse((await save(address="", note=""))["profile_updated"])
+
+        with patch("astrbot_plugin_memory_companion.core.store.utc_now", return_value="2099-01-01T00:00:00+00:00"):
+            await self.store.upsert_identity(
+                platform=PLATFORM,
+                entity=person,
+                aliases=["王同学"],
+                profile={
+                    "last_session": "recent-session",
+                    "relation_address": "推断称呼",
+                    "relation_note": "平台备注",
+                    "relation_source": "context",
+                },
+            )
+
+        detail = await self.store.person_panel_detail(user_id="u1", bot_id=BOT_A)
+        self.assertEqual("小王", detail["display_name"])
+        self.assertIn("王同学", detail["aliases"])
+        self.assertEqual("recent-session", detail["profile"]["last_session"])
+        self.assertEqual("user", detail["profile"]["relation_source"])
+        self.assertEqual("同事", detail["profile"]["relation_label"])
+        self.assertEqual("", detail["profile"]["relation_address"])
+        self.assertEqual("", detail["profile"]["relation_note"])
+        listing = await self.store.list_person_cards(bot_id=BOT_A, query="同事")
+        card = listing["items"][0]
+        self.assertEqual("小王", card["display_name"])
+        self.assertEqual("同事", card["relation_label"])
+        self.assertEqual("", card["address"])
+        self.assertEqual("", card["relation_note"])
+        stored = await self.store.identity_profile(platform="", entity=person)
+        self.assertEqual("保留", stored["marker"])
+
+        scoped = await save(platform=PLATFORM, address="平台新称呼")
+        self.assertTrue(scoped["profile_updated"])
+        self.assertEqual("小王", scoped["person"]["display_name"])
+        self.assertEqual("平台新称呼", scoped["person"]["profile"]["relation_address"])
+        self.assertEqual("平台备注", scoped["person"]["profile"]["relation_note"])
+        self.assertEqual("recent-session", scoped["person"]["profile"]["last_session"])
+        scoped_detail = await self.store.person_panel_detail(user_id="u1", platform=PLATFORM)
+        self.assertIn("王同学", scoped_detail["aliases"])
+        combined = await self.store.person_panel_detail(user_id="u1")
+        self.assertEqual("", combined["profile"]["relation_address"])
+
     async def test_ui_preferences_defaults_to_people_panel(self) -> None:
         for value, expected in (("人物", "people"), ("控制台", "legacy"), ("三维终端", "modern")):
             plugin = SimpleNamespace(

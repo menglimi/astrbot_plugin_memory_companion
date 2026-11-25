@@ -215,6 +215,19 @@ const source = fs.readFileSync(process.argv[1], "utf8");
         },
       });
     }
+    if (id === "personConfirm") {
+      let onClose = null;
+      node.open = false;
+      node.showModal = () => { node.open = true; };
+      node.addEventListener = (type, fn) => { if (type === "close") onClose = fn; };
+      node.close = (value) => {
+        node.open = false;
+        if (value !== undefined) node.returnValue = value;
+        const handler = onClose;
+        onClose = null;
+        handler();
+      };
+    }
     return node;
   };
 
@@ -225,6 +238,7 @@ const source = fs.readFileSync(process.argv[1], "utf8");
   ];
   let failNextPerson = false;
   let holdPersonResolve = null;
+  const erasePosts = [];
 
   const personDetail = (uid) => ({
     user_id: uid,
@@ -265,6 +279,13 @@ const source = fs.readFileSync(process.argv[1], "utf8");
       return Promise.resolve({ success: true, data: {} });
     },
     apiPost(endpoint, body) {
+      if (endpoint === "page/ui/confirm-nonce") {
+        return Promise.resolve({ success: true, data: { confirm: "nonce-for-" + body.route } });
+      }
+      if (endpoint === "page/person/erase") {
+        erasePosts.push(body);
+        return Promise.resolve({ success: true, data: { ok: true } });
+      }
       if (endpoint === "page/person/weight") {
         weightVal = body.weight === null ? 50 : Number(body.weight);
         return Promise.resolve({ success: true, data: { ok: true } });
@@ -293,7 +314,6 @@ const source = fs.readFileSync(process.argv[1], "utf8");
     window: {
       AstrBotPluginPage: bridge,
       addEventListener() {},
-      confirm: () => true,
     },
   });
   vm.runInContext(source, ctx);
@@ -338,7 +358,9 @@ const source = fs.readFileSync(process.argv[1], "utf8");
 
   drawerBodyWrites.length = 0;
   nodes.drawer.scrollTop = 510;
-  await forgetButtons[0].dispatch("click");
+  const forget = forgetButtons[0].dispatch("click");
+  nodes.personConfirm.close("confirm");
+  await forget;
   const afterForget = {
     scrollTop: nodes.drawer.scrollTop,
     loadingFlashed: drawerBodyWrites.some((h) => h.includes('class="loading"')),
@@ -380,6 +402,20 @@ const source = fs.readFileSync(process.argv[1], "utf8");
     selectedIsNull: vm.runInContext("state.selected === null", ctx),
   };
 
+  // 6) Erase requires typed confirmation and a positive dialog response.
+  await vm.runInContext('openPerson("u1", "qq", "")', ctx);
+  await nodes.erasePersonBtn.dispatch("click");
+  const typedRequired = !nodes.personConfirm.open && erasePosts.length === 0;
+  nodes.eraseConfirmInput.value = "擦掉";
+  const cancelErase = nodes.erasePersonBtn.dispatch("click");
+  const eraseDialogOpened = nodes.personConfirm.open;
+  nodes.personConfirm.close();
+  await cancelErase;
+  const cancelWithoutWrite = erasePosts.length === 0 && !nodes.drawer.hidden;
+  const confirmErase = nodes.erasePersonBtn.dispatch("click");
+  nodes.personConfirm.close("confirm");
+  await confirmErase;
+
   process.stdout.write(JSON.stringify({
     initialShowedLoading: initialWrites.some((h) => h.includes('class="loading"')),
     initialScroll,
@@ -389,6 +425,10 @@ const source = fs.readFileSync(process.argv[1], "utf8");
     afterSilentFail,
     afterSwitchPerson,
     afterStaleClose,
+    typedRequired,
+    eraseDialogOpened,
+    cancelWithoutWrite,
+    erasePosts,
   }));
 })();
 """
@@ -431,6 +471,19 @@ const source = fs.readFileSync(process.argv[1], "utf8");
 
         self.assertTrue(out["afterStaleClose"]["drawerHidden"])
         self.assertTrue(out["afterStaleClose"]["selectedIsNull"])
+        self.assertTrue(out["typedRequired"])
+        self.assertTrue(out["eraseDialogOpened"])
+        self.assertTrue(out["cancelWithoutWrite"])
+        self.assertEqual(
+            [{
+                "user_id": "u1",
+                "platform": "qq",
+                "bot_id": "",
+                "csrf_token": "csrf-1",
+                "confirm": "nonce-for-/person/erase",
+            }],
+            out["erasePosts"],
+        )
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable
 
+from .absorb import RELATION_SOURCE_USER
 from .identity import parse_scope_from_session
 from .astrbot_compat import logger
 from .memory_tier import (
@@ -74,6 +75,7 @@ from .performance_tuning import MemoryPerformancePlan
 
 _ACL_UNSET = object()
 _RECORD_LIGHT_CACHE_MAX_ENTRIES = 16384
+_PERSON_RELATION_FIELDS = ("relation_address", "relation_label", "relation_note")
 
 
 def _text_fingerprint(value: Any) -> tuple[int, bytes]:
@@ -9480,43 +9482,119 @@ class MemoryStore(SummaryBatchStore):
     def _chunk_ids(values: list[str], size: int = 400) -> list[list[str]]:
         return [values[index : index + size] for index in range(0, len(values), size)]
 
-    def _person_identity_cards_sync(
-        self, user_ids: list[str]
-    ) -> dict[str, dict[str, Any]]:
-        cards: dict[str, dict[str, Any]] = {}
-        with self._read_conn_sync() as conn:
-            for chunk in self._chunk_ids(user_ids):
-                placeholders = ",".join("?" for _ in chunk)
-                rows = conn.execute(
-                    "SELECT entity_id, display_name, aliases, profile FROM identities "
-                    f"WHERE entity_kind='user' AND entity_id IN ({placeholders}) "
-                    "ORDER BY updated_at DESC",
-                    chunk,
-                ).fetchall()
-                for row in rows:
-                    item = dict(row)
-                    user_id = clean_text(item.get("entity_id"), 120)
-                    if not user_id:
-                        continue
-                    name = clean_text(item.get("display_name"), 80)
-                    aliases = json_loads(item.get("aliases"), [])
-                    if not isinstance(aliases, list):
-                        aliases = []
-                    profile = json_loads(item.get("profile"), {})
-                    if not isinstance(profile, dict):
-                        profile = {}
-                    existing = cards.get(user_id)
-                    if existing is None or (name and not existing.get("display_name")):
-                        cards[user_id] = {
-                            "display_name": name,
-                            "aliases": [
-                                clean_text(alias, 40)
-                                for alias in aliases
-                                if clean_text(alias, 40)
-                            ],
-                            "profile": profile,
-                        }
-        return cards
+    def _person_identity_rows_sync(
+        self, conn: sqlite3.Connection, user_ids: list[str]
+    ) -> dict[str, list[sqlite3.Row]]:
+        identities: dict[str, list[sqlite3.Row]] = {}
+        for chunk in self._chunk_ids(user_ids):
+            placeholders = ",".join("?" for _ in chunk)
+            for row in conn.execute(
+                "SELECT platform, entity_id, display_name, aliases, profile FROM identities "
+                f"WHERE entity_kind='user' AND entity_id IN ({placeholders}) "
+                "ORDER BY updated_at DESC, platform",
+                chunk,
+            ):
+                identities.setdefault(row["entity_id"], []).append(row)
+        return identities
+
+    @staticmethod
+    def _person_panel_identity(rows: list[sqlite3.Row], platform: str) -> dict[str, Any]:
+        if not rows:
+            return {}
+        named = next((row for row in rows if row["display_name"]), rows[0])
+        scoped = None
+        if platform:
+            scoped = next((row for row in rows if row["platform"] == platform), None)
+        identity = scoped if scoped is not None else named
+        aliases = json_loads(identity["aliases"], [])
+        if not aliases and not identity["display_name"]:
+            aliases = json_loads(named["aliases"], [])
+        if not isinstance(aliases, list):
+            aliases = []
+        profile = json_loads(identity["profile"], {})
+        if not isinstance(profile, dict):
+            profile = {}
+        if scoped is None:
+            # 合并卡从各平台取关系字段，优先用户填写的跨平台档案。空字符串是明确清空。
+            candidates = []
+            for row in rows:
+                other = json_loads(row["profile"], {})
+                if not isinstance(other, dict) or not any(
+                    key in other for key in _PERSON_RELATION_FIELDS
+                ):
+                    continue
+                priority = 0
+                if other.get("relation_source") == RELATION_SOURCE_USER:
+                    priority = 1 if row["platform"] else 2
+                candidates.append((priority, other))
+            if candidates:
+                candidates.sort(key=lambda item: item[0], reverse=True)
+                relation: dict[str, Any] = {}
+                for _, other in candidates:
+                    for key in _PERSON_RELATION_FIELDS:
+                        if key in other:
+                            relation.setdefault(key, other[key])
+                preferred = candidates[0][1]
+                for key in ("relation_source", "relation_seen_at"):
+                    profile.pop(key, None)
+                    if key in preferred:
+                        relation[key] = preferred[key]
+                profile.update(relation)
+        return {
+            "platform": identity["platform"],
+            "display_name": clean_text(identity["display_name"] or named["display_name"], 80),
+            "aliases": [
+                clean_text(alias, 40) for alias in aliases if clean_text(alias, 40)
+            ],
+            "profile": profile,
+        }
+
+    async def set_person_panel_relation(
+        self, *, user_id: str, platform: str, fields: dict[str, str]
+    ) -> bool:
+        """保存面板里明确提交的关系字段，保留同一身份行上的其他资料。"""
+        return await asyncio.to_thread(
+            self._set_person_panel_relation_sync, user_id, platform, fields
+        )
+
+    def _set_person_panel_relation_sync(
+        self, user_id: str, platform: str, fields: dict[str, str]
+    ) -> bool:
+        user_id = clean_text(user_id, 120)
+        platform = clean_text(platform, 40)
+        changes = {key: fields[key] for key in _PERSON_RELATION_FIELDS if key in fields}
+        if not user_id or not changes:
+            return False
+        with self._lock, self._transaction_sync():
+            row = self._conn.execute(
+                "SELECT id, profile FROM identities "
+                "WHERE entity_kind='user' AND entity_id=? AND platform=?",
+                (user_id, platform),
+            ).fetchone()
+            profile = json_loads(row["profile"], {}) if row is not None else {}
+            if not isinstance(profile, dict):
+                profile = {}
+            if row is None and platform:
+                # 导入来源可能只有分量行。首次编辑时带上详情原先显示的关系字段。
+                rows = self._person_identity_rows_sync(self._conn, [user_id]).get(user_id, [])
+                fallback = self._person_panel_identity(rows, "").get("profile", {})
+                profile = {key: fallback[key] for key in _PERSON_RELATION_FIELDS if key in fallback}
+            if profile.get("relation_source") == RELATION_SOURCE_USER and all(
+                profile.get(key) == value for key, value in changes.items()
+            ):
+                return False
+            now = utc_now()
+            profile.update(changes, relation_source=RELATION_SOURCE_USER, relation_seen_at=now)
+            if row is None:
+                self._upsert_identity_row_locked(
+                    platform, EntityRef(kind="user", id=user_id), [], profile, 0.9
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE identities SET profile=?, updated_at=? WHERE id=?",
+                    (json_dumps(profile), now, row["id"]),
+                )
+            return True
 
     def _person_memory_stats_sync(
         self, user_ids: list[str]
@@ -9679,37 +9757,7 @@ class MemoryStore(SummaryBatchStore):
                     if clean_text(row.get("user_id"), 120)
                 }
             )
-            identities: dict[str, dict[str, Any]] = {}
-            for chunk in self._chunk_ids(user_ids):
-                placeholders = ",".join("?" for _ in chunk)
-                for row in conn.execute(
-                    "SELECT entity_id, display_name, aliases, profile FROM identities "
-                    f"WHERE entity_kind='user' AND entity_id IN ({placeholders}) "
-                    "ORDER BY updated_at DESC",
-                    chunk,
-                ).fetchall():
-                    item = dict(row)
-                    user_id = clean_text(item.get("entity_id"), 120)
-                    if not user_id:
-                        continue
-                    name = clean_text(item.get("display_name"), 80)
-                    aliases = json_loads(item.get("aliases"), [])
-                    if not isinstance(aliases, list):
-                        aliases = []
-                    profile = json_loads(item.get("profile"), {})
-                    if not isinstance(profile, dict):
-                        profile = {}
-                    existing = identities.get(user_id)
-                    if existing is None or (name and not existing.get("display_name")):
-                        identities[user_id] = {
-                            "display_name": name,
-                            "aliases": [
-                                clean_text(alias, 40)
-                                for alias in aliases
-                                if clean_text(alias, 40)
-                            ],
-                            "profile": profile,
-                        }
+            identities = self._person_identity_rows_sync(conn, user_ids)
             stats: dict[tuple[str, str], dict[str, Any]] = {}
             for chunk in self._chunk_ids(user_ids):
                 placeholders = ",".join("?" for _ in chunk)
@@ -9780,10 +9828,14 @@ class MemoryStore(SummaryBatchStore):
                         bot_ids.append(item_bot)
                 for item_bot in group_bot_ids:
                     bots[item_bot] = bots.get(item_bot, 0) + 1
-                identity = identities.get(user_id, {})
-                profile = identity.get("profile")
-                if not isinstance(profile, dict):
-                    profile = {}
+                # 与人物卡打开详情时的范围一致。
+                identity_platform = (
+                    platforms[0] if len(platforms) == 1 and len(bot_ids) <= 1 else ""
+                )
+                identity = self._person_panel_identity(
+                    identities.get(user_id, []), identity_platform
+                )
+                profile = identity.get("profile", {})
                 stat = (
                     (stats.get((row_bot, user_id)) or stats.get(("", user_id)) or {})
                     if bot_id
@@ -9895,29 +9947,6 @@ class MemoryStore(SummaryBatchStore):
             self._person_panel_detail_sync, user_id, platform, bot_id, limit
         )
 
-    def _person_identity_row_sync(self, user_id: str, platform: str) -> Any:
-        """人物详情用的身份行：先按平台找，找不到就退回这个人的任意平台身份。
-
-        合并成一张卡之后，卡上只带主行的一个 platform；如果那是导入来源
-        （livingmemory 之类）的伪平台，按平台过滤查不到 identities，
-        详情页的名字、称呼、关系就会一起退化成 user_id。
-        """
-        columns = (
-            "SELECT platform, entity_id, display_name, aliases, profile, updated_at "
-            "FROM identities WHERE entity_kind='user' AND entity_id=?"
-        )
-        with self._lock:
-            if platform:
-                row = self._conn.execute(
-                    columns + " AND platform=? ORDER BY updated_at DESC LIMIT 1",
-                    (user_id, platform),
-                ).fetchone()
-                if row is not None:
-                    return row
-            return self._conn.execute(
-                columns + " ORDER BY updated_at DESC LIMIT 1", (user_id,)
-            ).fetchone()
-
     def _person_panel_detail_sync(
         self, user_id: str, platform: str, bot_id: str, limit: int
     ) -> dict[str, Any]:
@@ -9931,7 +9960,8 @@ class MemoryStore(SummaryBatchStore):
         if not user_id:
             return {"user_id": "", "state": "empty", "memories": []}
         with self._lock:
-            identity_row = self._person_identity_row_sync(user_id, platform)
+            identity_rows = self._person_identity_rows_sync(self._conn, [user_id])
+            identity = self._person_panel_identity(identity_rows.get(user_id, []), platform)
             weight_sql = "SELECT * FROM person_weights WHERE user_id=?"
             weight_params: list[Any] = [user_id]
             if bot_id:
@@ -9950,13 +9980,6 @@ class MemoryStore(SummaryBatchStore):
                     " ORDER BY weight DESC LIMIT 1",
                     (user_id,),
                 ).fetchone()
-        identity = dict(identity_row) if identity_row is not None else {}
-        profile = json_loads(identity.get("profile"), {}) if identity else {}
-        if not isinstance(profile, dict):
-            profile = {}
-        aliases = json_loads(identity.get("aliases"), []) if identity else []
-        if not isinstance(aliases, list):
-            aliases = []
         weight_item = (
             self._person_weight_to_dict(dict(weight_row))
             if weight_row is not None
@@ -10017,11 +10040,9 @@ class MemoryStore(SummaryBatchStore):
             "user_id": user_id,
             "platform": clean_text(identity.get("platform"), 40) or platform,
             "bot_id": bot_id,
-            "display_name": clean_text(identity.get("display_name"), 80) or user_id,
-            "aliases": [
-                clean_text(alias, 40) for alias in aliases if clean_text(alias, 40)
-            ],
-            "profile": profile,
+            "display_name": identity.get("display_name") or user_id,
+            "aliases": identity.get("aliases", []),
+            "profile": identity.get("profile", {}),
             "weight": weight_item,
             "total": int(total or 0),
             "state": "ok" if (total or weight_item) else "empty",

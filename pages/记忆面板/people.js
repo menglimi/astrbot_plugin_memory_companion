@@ -683,12 +683,14 @@ async function savePerson() {
     platform: scope.platform,
     bot_id: scope.bot_id,
     weight,
-    address: el("addressInput").value.trim(),
-    label: el("relationInput").value.trim(),
-    note: el("noteInput").value.trim(),
     // 危险路由的确认口令：后端按 CONFIRM:<route> 校验。
     confirm: "CONFIRM:/person/weight",
   };
+  const profile = data.profile || {};
+  for (const [field, inputId] of [["address", "addressInput"], ["label", "relationInput"], ["note", "noteInput"]]) {
+    const value = el(inputId).value.trim();
+    if (value !== (profile[`relation_${field}`] || "")) payload[field] = value;
+  }
   try {
     await request("POST", "person/weight", null, payload);
     toast("记住了");
@@ -717,6 +719,22 @@ async function resetWeight() {
   }
 }
 
+function confirmPersonAction(title, message, confirmLabel, danger = false) {
+  const dialog = el("personConfirm");
+  if (dialog.open) return Promise.resolve(false);
+  el("personConfirmTitle").textContent = title;
+  el("personConfirmMessage").textContent = message;
+  const action = el("personConfirmAction");
+  action.textContent = confirmLabel;
+  action.className = danger ? "danger" : "primary";
+  dialog.returnValue = "";
+  dialog.showModal();
+  el("personConfirmCancel").focus();
+  return new Promise((resolve) => {
+    dialog.addEventListener("close", () => resolve(dialog.returnValue === "confirm"), { once: true });
+  });
+}
+
 async function erasePerson() {
   const data = state.selected;
   if (!data) return;
@@ -731,12 +749,19 @@ async function erasePerson() {
   }
   const name = data.display_name || data.user_id;
   const scope = personScope();
+  const confirmed = await confirmPersonAction(
+    "擦掉这个人的一切",
+    `擦掉「${name}」后，分量、称呼和记得的事都无法恢复。`,
+    "擦掉",
+    true,
+  );
+  if (state.selected !== data) return;
   hint.hidden = false;
-  hint.textContent = "正在擦，别关面板…";
-  if (!window.confirm(`真的要把「${name}」从她的记忆里整个擦掉吗？分量、称呼和记得的事都会没，找不回来。`)) {
+  if (!confirmed) {
     hint.textContent = "好，那就先不擦。";
     return;
   }
+  hint.textContent = "正在擦，别关面板…";
   try {
     await request("POST", "person/erase", null, {
       user_id: data.user_id,
@@ -755,12 +780,17 @@ async function erasePerson() {
 
 async function forgetMemory(memoryId) {
   if (!memoryId) return;
-  if (!window.confirm("让她以后不再主动想起这条？原文不会丢，还能在控制台翻回来。")) return;
   const data = state.selected;
+  const scope = personScope();
+  const confirmed = await confirmPersonAction(
+    "放轻记忆",
+    "她以后不会再主动想起这条，仍可在控制台查看原文。",
+    "放轻记忆",
+  );
+  if (!confirmed || state.selected !== data) return;
   try {
     await request("POST", "memory/update", null, { id: memoryId, durability: "short" });
     toast("这条放轻了");
-    const scope = personScope();
     if (data) await openPerson(data.user_id, scope.platform, scope.bot_id, { silent: true, preserveScroll: true });
   } catch (error) {
     toast(`没改成：${error.message || error}`);
@@ -794,7 +824,9 @@ document.addEventListener("click", (event) => {
 });
 el("close").addEventListener("click", closeDrawer);
 scrim.addEventListener("click", closeDrawer);
-document.addEventListener("keydown", (event) => { if (event.key === "Escape") closeDrawer(); });
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !el("personConfirm").open) closeDrawer();
+});
 
 applyTheme(state.theme, { persist: false });
 bindBridgeContext();

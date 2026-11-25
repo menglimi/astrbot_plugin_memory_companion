@@ -83,6 +83,16 @@
     <button id="close" class="close" type="button" aria-label="关闭">×</button>
     <div id="drawerBody"></div>
   </aside>
+  <dialog id="personConfirm" class="person-confirm" aria-labelledby="personConfirmTitle" aria-describedby="personConfirmMessage">
+    <form method="dialog">
+      <h2 id="personConfirmTitle"></h2>
+      <p id="personConfirmMessage"></p>
+      <div class="actions">
+        <button id="personConfirmCancel" type="submit" value="cancel">取消</button>
+        <button id="personConfirmAction" type="submit" value="confirm"></button>
+      </div>
+    </form>
+  </dialog>
   <div id="toast" class="toast" hidden></div>
 
   <script src="/api/plugin/page/bridge-sdk.js"></script>
