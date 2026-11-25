@@ -54,6 +54,21 @@ function fmtInt(value) {
   return Math.round(parsed).toLocaleString("zh-CN");
 }
 
+function fmtBytes(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value < 0) return "-";
+  if (value === 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let idx = 0;
+  let current = value;
+  while (current >= 1024 && idx < units.length - 1) {
+    current /= 1024;
+    idx += 1;
+  }
+  const digits = idx === 0 ? 0 : current >= 100 ? 0 : current >= 10 ? 1 : 2;
+  return num(current, digits) + " " + units[idx];
+}
+
 function fmtTime(value) {
   const text = compact(value);
   if (!text) return "-";
@@ -812,7 +827,7 @@ const NAV = [
     id: "settings",
     label: "设置",
     icon: "sliders",
-    views: ["config", "acl"],
+    views: ["config", "performance", "acl"],
   },
 ];
 
@@ -893,6 +908,18 @@ async function go(viewId, options) {
   const view = VIEWS[viewId];
   if (!view || view.hidden) return;
   const opts = options || {};
+  const host = $("#content");
+  const isSameView = state.view === viewId;
+  const hasMountedChild = Boolean(host && (host.firstElementChild || (host.children && host.children.length > 0)));
+  const canInPlace = Boolean(opts.inPlace) && isSameView && hasMountedChild;
+  const prevScrollTop = canInPlace ? (host.scrollTop || 0) : 0;
+  const prevWinScrollY = canInPlace && typeof window !== "undefined" ? (window.scrollY || 0) : 0;
+  const activeEl = canInPlace && typeof document !== "undefined" ? document.activeElement : null;
+  const prevActiveId =
+    activeEl && activeEl.id && host && typeof host.contains === "function" && host.contains(activeEl)
+      ? activeEl.id
+      : "";
+
   state.view = viewId;
   state.group = findGroupOf(viewId);
   try {
@@ -910,19 +937,39 @@ async function go(viewId, options) {
 
   const token = renderToken + 1;
   renderToken = token;
-  const host = $("#content");
-  host.innerHTML = '<div class="skeleton" style="height:220px;border-radius:13px"></div>';
+  if (!canInPlace) {
+    host.innerHTML = '<div class="skeleton" style="height:220px;border-radius:13px"></div>';
+  }
 
   try {
     const payload = await view.load(opts);
     if (token !== renderToken) return;
     host.innerHTML = "";
     const node = document.createElement("div");
+    if (canInPlace && node.classList && typeof node.classList.add === "function") {
+      node.classList.add("is-inplace-refresh");
+    }
     node.innerHTML = view.render(payload, opts);
     host.appendChild(node);
     if (typeof view.mount === "function") view.mount(node, payload, opts);
+    if (canInPlace) {
+      host.scrollTop = prevScrollTop;
+      if (prevWinScrollY && typeof window !== "undefined" && typeof window.scrollTo === "function") {
+        window.scrollTo(0, prevWinScrollY);
+      }
+      if (prevActiveId) {
+        const nextActive = $("#" + prevActiveId.replace(/[^a-zA-Z0-9_-]/g, "\\$&"), node);
+        if (nextActive && !nextActive.disabled && typeof nextActive.focus === "function") {
+          try { nextActive.focus({ preventScroll: true }); } catch (err) { nextActive.focus(); }
+        }
+      }
+    }
   } catch (error) {
     if (token !== renderToken) return;
+    if (canInPlace) {
+      toast("刷新视图失败：" + (error.message || "未知错误"), "error");
+      return;
+    }
     host.innerHTML =
       '<div class="empty"><b>这个视图没能加载出来</b><span>' + esc(error.message || "未知错误") + "</span></div>";
   }
@@ -3444,23 +3491,204 @@ defineView("chatimport", {
    ============================================================ */
 const PRESET_LABELS = { light: "轻量", standard: "标准", companion: "陪伴" };
 let migrateOutput = null;
+let migrateDbShrinkReport = null;
+
+function describeAutoVacuum(mode) {
+  const n = Number(mode);
+  if (n === 2) return "增量回收已开启";
+  if (n === 1) return "全量自动回收";
+  return "未开启增量回收";
+}
+
+function describeVacuumMode(mode) {
+  const text = compact(mode);
+  if (!text || text === "none") return "无须回收";
+  if (text === "incremental_vacuum") return "增量无损回收";
+  if (text === "full_vacuum_incremental_enabled") return "深度压缩（全量 VACUUM）并开启增量回收";
+  if (text.indexOf("disk_usage_unavailable") >= 0) return "无法读取磁盘余量已安全取消深度压缩";
+  if (text.indexOf("insufficient_disk_space") >= 0) return "磁盘剩余空间不足已取消深度压缩";
+  return text;
+}
+
+function renderDbHealthCard(dbHealthRes, shrinkReport) {
+  const actions =
+    '<button class="btn is-sm" type="button" id="dbHealthRefreshBtn">刷新体检</button>' +
+    '<button class="btn is-sm" type="button" id="dbGoPerfBtn">前往性能调优 →</button>';
+
+  if (!dbHealthRes || !dbHealthRes.ok) {
+    const errText = compact(dbHealthRes && dbHealthRes.error) || "无法读取数据库体检信息";
+    const isAdminErr = /admin_required|管理员/i.test(errText);
+    const body =
+      '<div class="db-health-notice">' +
+        '<b>' + esc(isAdminErr ? "需要面板管理员身份" : "暂未获取到体检快照") + "</b>" +
+        "<p>" + esc(isAdminErr ? "请以 AstrBot 面板管理员账号登录后查看数据库体积体检与执行一键瘦身。" : errText) + "</p>" +
+      "</div>";
+    return '<div id="dbHealthCard" class="db-health-wrap">' + card("数据库体检与一键瘦身", "查看主库 / WAL / 副库占用与向量精度分布，无损释放空闲空间", body, actions, "db-health-card") + "</div>";
+  }
+
+  const health = dbHealthRes.health || {};
+  const primary = health.primary || {};
+  const files = primary.files || {};
+  const scoped = health.scoped || {};
+  const emb = primary.embeddings || {};
+  const preflight = primary.disk_preflight || null;
+  const recs = Array.isArray(primary.recommendations) ? primary.recommendations : [];
+  const targetPrecision = compact(primary.vector_precision || health.configured_vector_precision, "float32");
+
+  const kpis =
+    '<div class="db-kpi-grid">' +
+      '<div class="db-kpi">' +
+        '<span class="db-kpi-label">主库总占用</span>' +
+        '<strong class="db-kpi-val">' + esc(fmtBytes(primary.total_bytes)) + "</strong>" +
+        '<span class="db-kpi-sub">主库 ' + esc(fmtBytes(files.db_bytes)) + " · WAL " + esc(fmtBytes(files.wal_bytes)) + "</span>" +
+      "</div>" +
+      '<div class="db-kpi">' +
+        '<span class="db-kpi-label">副库占用</span>' +
+        '<strong class="db-kpi-val">' + esc(fmtBytes(scoped.total_bytes || 0)) + "</strong>" +
+        '<span class="db-kpi-sub">范围状态与操作副库</span>' +
+      "</div>" +
+      '<div class="db-kpi">' +
+        '<span class="db-kpi-label">可回收空闲页</span>' +
+        '<strong class="db-kpi-val">' + esc(fmtBytes(primary.freelist_bytes || 0)) + "</strong>" +
+        '<span class="db-kpi-sub">' + esc(fmtInt(primary.freelist_count || 0)) + " 页 · " + esc(describeAutoVacuum(primary.auto_vacuum)) + "</span>" +
+      "</div>" +
+      '<div class="db-kpi">' +
+        '<span class="db-kpi-label">预计转码可省</span>' +
+        '<strong class="db-kpi-val' + (Number(emb.estimated_transcode_savings_bytes || 0) > 0 ? " is-highlight" : "") + '">' + esc(fmtBytes(emb.estimated_transcode_savings_bytes || 0)) + "</strong>" +
+        '<span class="db-kpi-sub">当前配置精度：' + esc(targetPrecision) + "</span>" +
+      "</div>" +
+    "</div>";
+
+  const totalRows = Math.max(0, int(emb.total_rows));
+  const f64 = Math.max(0, int(emb.float64_rows));
+  const f32 = Math.max(0, int(emb.float32_rows));
+  const f16 = Math.max(0, int(emb.float16_rows));
+  const jsonRows = Math.max(0, int(emb.json_rows));
+  const orphans = Math.max(0, int(emb.archived_orphan_rows));
+  const pct = (n) => (totalRows > 0 ? Math.max(n > 0 ? 2 : 0, Math.round((n / totalRows) * 1000) / 10) : 0);
+
+  const vecBar =
+    '<div class="db-vec-section">' +
+      '<div class="db-vec-head">' +
+        '<span class="db-vec-title">向量存储精度分布（共 ' + esc(fmtInt(totalRows)) + " 条 · 约 " + esc(fmtBytes(emb.vector_bytes || 0)) + "）</span>" +
+        (orphans > 0 ? '<span class="db-vec-orphan">含 ' + esc(fmtInt(orphans)) + " 条已归档/孤儿向量可清理</span>" : '<span class="db-vec-clean">无孤儿向量残留</span>') +
+      "</div>" +
+      '<div class="db-vec-bar" aria-label="向量存储精度占比">' +
+        (totalRows > 0
+          ? (f64 > 0 ? '<i class="seg-f64" style="width:' + pct(f64) + '%" title="float64: ' + f64 + '"></i>' : "") +
+            (f32 > 0 ? '<i class="seg-f32" style="width:' + pct(f32) + '%" title="float32: ' + f32 + '"></i>' : "") +
+            (f16 > 0 ? '<i class="seg-f16" style="width:' + pct(f16) + '%" title="float16: ' + f16 + '"></i>' : "") +
+            (jsonRows > 0 ? '<i class="seg-json" style="width:' + pct(jsonRows) + '%" title="JSON: ' + jsonRows + '"></i>' : "")
+          : '<i class="seg-empty" style="width:100%"></i>') +
+      "</div>" +
+      '<div class="db-vec-legend">' +
+        '<span><em class="dot-f64"></em>旧版 float64：' + esc(fmtInt(f64)) + "</span>" +
+        '<span><em class="dot-f32"></em>标准 float32：' + esc(fmtInt(f32)) + "</span>" +
+        '<span><em class="dot-f16"></em>半精度 float16：' + esc(fmtInt(f16)) + "</span>" +
+        '<span><em class="dot-json"></em>旧 JSON：' + esc(fmtInt(jsonRows)) + "</span>" +
+      "</div>" +
+    "</div>";
+
+  const recHtml = recs.length
+    ? '<ul class="db-rec-list">' + recs.map((item) => "<li>" + esc(item) + "</li>").join("") + "</ul>"
+    : '<div class="db-rec-ok">数据库体积与索引状态健康，当前无需强制整理。</div>';
+
+  const scopedPreflight = scoped.disk_preflight || null;
+  let preflightHtml = "";
+  if (preflight && preflight.ok === false) {
+    preflightHtml =
+      '<div class="db-preflight-warn">' +
+        "<b>深度压缩空间预检未通过</b>" +
+        "<span>" + esc(preflight.message || "磁盘剩余空间不足 2.2 倍主库大小 + 64 MiB 或无法读取余量，已安全阻断全量 VACUUM。") + "</span>" +
+      "</div>";
+  } else if (scopedPreflight && scopedPreflight.ok === false) {
+    preflightHtml =
+      '<div class="db-preflight-warn">' +
+        "<b>副库深度压缩空间预检未通过</b>" +
+        "<span>" + esc(scopedPreflight.message || "副库磁盘剩余空间不足 2.2 倍副库大小 + 64 MiB 或无法读取余量，已安全阻断副库全量 VACUUM。") + "</span>" +
+      "</div>";
+  } else if (preflight && preflight.available_free_bytes != null) {
+    preflightHtml =
+      '<div class="db-preflight-ok">' +
+        "磁盘当前剩余约 " + esc(fmtBytes(preflight.available_free_bytes)) +
+        "（满足深度压缩 2.2× 安全门槛 " + esc(fmtBytes(preflight.required_free_bytes)) + "）" +
+      "</div>";
+  }
+
+  let reportHtml = "";
+  if (shrinkReport && shrinkReport.ok) {
+    const pRes = shrinkReport.primary || {};
+    const tc = pRes.transcode || {};
+    reportHtml =
+      '<div class="db-shrink-report">' +
+        '<b>最近一次瘦身结果：' + esc(fmtBytes(pRes.before_bytes)) + " → " + esc(fmtBytes(pRes.after_bytes)) +
+        "（释放 " + esc(fmtBytes(pRes.bytes_reclaimed)) + "）</b>" +
+        "<span>转码向量 " + esc(fmtInt(tc.transcoded || 0)) + " 条 · 清理已归档/无主向量索引 " + esc(fmtInt(tc.purged_orphans || 0)) +
+        " 条 · 回收方式：" + esc(describeVacuumMode(pRes.vacuum_mode)) + "</span>" +
+        (shrinkReport.notice ? '<span class="db-shrink-notice">' + esc(shrinkReport.notice) + "</span>" : "") +
+      "</div>";
+  }
+
+  const actionBar =
+    '<div class="db-action-bar">' +
+      '<div class="db-action-btns">' +
+        '<button class="btn is-primary" type="button" id="dbShrinkRegularBtn">一键常规无损瘦身（推荐）</button>' +
+        '<button class="btn is-warn-outline" type="button" id="dbShrinkFullBtn">深度整理压缩（全量 VACUUM）</button>' +
+      "</div>" +
+      '<div class="db-action-hint">常规瘦身在线执行不卡聊天：仅整理向量存储、清理已归档/无主向量索引与超期内部回执，绝不删除任何记忆、聊天原文、人物关系或配置；深度压缩会重建主库文件彻底归还硬盘空间（同样绝不删除任何业务数据），期间写入短暂暂停数秒。</div>' +
+    "</div>";
+
+  return (
+    '<div id="dbHealthCard" class="db-health-wrap">' +
+    card(
+      "数据库体检与一键瘦身",
+      "实时查看主库、WAL、副库占用与向量精度分布，一键安全释放冗余体积",
+      kpis + vecBar + recHtml + preflightHtml + reportHtml + actionBar,
+      actions,
+      "db-health-card"
+    ) +
+    "</div>"
+  );
+}
+
+function fetchDbHealthSnapshot() {
+  return apiGet("/maintenance/db_health")
+    .then((res) => ({ ok: true, health: (res && res.health) || res || null }))
+    .catch((err) => ({ ok: false, error: (err && err.message) || "数据库体检读取失败" }));
+}
+
+function renderMigrateOutputContent(output) {
+  return output
+    ? '<pre style="margin:0;font-size:11.5px;line-height:1.6;color:var(--text-2);white-space:pre-wrap;word-break:break-all">' + esc(jsonPreview(output)) + "</pre>"
+    : emptyState("还没有输出", "执行任一操作后，结果会显示在这里。");
+}
 
 defineView("migrate", {
   title: "维护与迁移",
   navLabel: "维护与迁移",
   eyebrow: "Import · Maintenance",
-  hint: "运行预设、运维诊断、可移植数据、LivingMemory 迁移与可回滚审计",
+  hint: "数据库体检瘦身、功能预设、运维诊断、可移植数据、LivingMemory 迁移与可回滚审计",
   async load() {
-    const preset = await apiTry(() => apiGet("/operations/preset"), { preset: {} });
-    return { preset: preset.preset || {}, output: migrateOutput };
+    const [preset, dbHealth] = await Promise.all([
+      apiTry(() => apiGet("/operations/preset"), { preset: {} }),
+      fetchDbHealthSnapshot(),
+    ]);
+    return {
+      preset: preset.preset || {},
+      dbHealth,
+      dbShrinkReport: migrateDbShrinkReport,
+      output: migrateOutput,
+    };
   },
   render(data) {
     const preset = data.preset || {};
     const current = compact(preset.preset) || compact(preset.current) || "-";
 
+    const dbHealthCard = renderDbHealthCard(data.dbHealth, data.dbShrinkReport);
+
     const presets =
-      '<div class="tool-block"><b>1. 运行预设</b>' +
-      "<p>轻量关闭外部检索调用；标准平衡功能与成本；陪伴提高关系与连续性记忆预算。已有 Provider 选择不会被覆盖。</p>" +
+      '<div class="tool-block"><b>1. 功能预设（轻量 / 标准 / 陪伴）</b>' +
+      "<p>控制「记多少、用哪些能力」：轻量关闭外部检索调用；标准平衡功能与成本；陪伴提高关系与连续性记忆预算。与「设置 → 性能调优」互不冲突，已有 Provider 选择不会被覆盖。</p>" +
       '<div class="tool-actions">' +
       Object.keys(PRESET_LABELS)
         .map((key) => '<button class="btn is-sm' + (current === key ? " is-primary" : "") + '" type="button" data-preset="' + key + '">' + PRESET_LABELS[key] + "</button>")
@@ -3559,20 +3787,112 @@ defineView("migrate", {
       .join("");
 
     return (
+      '<div id="dbHealthSlot">' + dbHealthCard + "</div>" +
       '<div class="grid split-2">' +
       card("维护工具", "按顺序执行更稳妥", presets + tools) +
       card(
         "输出",
         "最近一次操作结果",
-        data.output
-          ? '<pre style="margin:0;font-size:11.5px;line-height:1.6;color:var(--text-2);white-space:pre-wrap;word-break:break-all">' + esc(jsonPreview(data.output)) + "</pre>"
-          : emptyState("还没有输出", "执行任一操作后，结果会显示在这里。")
+        '<div id="migrateOutputSlot">' + renderMigrateOutputContent(data.output) + "</div>"
       ) +
       "</div>"
     );
   },
   mount(node) {
-    const run = async (label, fn) => {
+    let dbHealthRefreshBusy = false;
+    const syncMigrateOutputSlot = () => {
+      const outputSlot = $("#migrateOutputSlot", node);
+      if (outputSlot) outputSlot.innerHTML = renderMigrateOutputContent(migrateOutput);
+    };
+
+    const runDbShrink = async (fullVacuum) => {
+      if (fullVacuum) {
+        const confirmed = await showInlineConfirmation(
+          "确认执行深度整理压缩（全量 VACUUM）",
+          "将重写记忆主库并开启增量回收，以彻底归还空闲磁盘空间。仅整理向量存储、清理已归档/无主向量索引与超期内部回执，绝不删除任何记忆、聊天原文、人物关系或配置。执行期间记忆写入会短暂暂停数秒（不影响日常聊天放行），且系统会对主库与副库分别预检磁盘剩余空间 ≥ 2.2 倍库大小 + 64 MiB（无法读取磁盘余量时将自动安全阻断）。确定继续？",
+          "开始深度压缩"
+        );
+        if (!confirmed) return;
+      }
+      const label = fullVacuum ? "深度整理压缩" : "一键常规无损瘦身";
+      await withBusy(label + "中…", async () => {
+        try {
+          const res = await apiPost("/maintenance/db_optimize", { run_full_vacuum: Boolean(fullVacuum) });
+          migrateDbShrinkReport = res;
+          migrateOutput = res;
+          const reclaimed = res && res.primary ? fmtBytes(res.primary.bytes_reclaimed || 0) : "0 B";
+          toast(label + "完成（释放 " + reclaimed + "）", "ok");
+          invalidatePool();
+        } catch (error) {
+          migrateOutput = { error: error.message };
+          toast(label + "失败：" + error.message, "error");
+        }
+        syncMigrateOutputSlot();
+        await refreshDbHealthInPlace({ showToast: false });
+      });
+    };
+
+    const bindDbHealthControls = () => {
+      const slot = $("#dbHealthSlot", node) || node;
+      const refreshHealthBtn = $("#dbHealthRefreshBtn", slot);
+      if (refreshHealthBtn) {
+        refreshHealthBtn.addEventListener("click", () => refreshDbHealthInPlace({ showToast: true }));
+      }
+      const goPerfBtn = $("#dbGoPerfBtn", slot);
+      if (goPerfBtn) {
+        goPerfBtn.addEventListener("click", () => go("performance"));
+      }
+      const shrinkRegularBtn = $("#dbShrinkRegularBtn", slot);
+      if (shrinkRegularBtn) shrinkRegularBtn.addEventListener("click", () => runDbShrink(false));
+      const shrinkFullBtn = $("#dbShrinkFullBtn", slot);
+      if (shrinkFullBtn) shrinkFullBtn.addEventListener("click", () => runDbShrink(true));
+    };
+
+    const refreshDbHealthInPlace = async (opts) => {
+      if (dbHealthRefreshBusy) return;
+      dbHealthRefreshBusy = true;
+      const slot = $("#dbHealthSlot", node);
+      const refreshBtn = $("#dbHealthRefreshBtn", slot || node);
+      const prevBtnText = refreshBtn ? refreshBtn.textContent : "";
+      const activeEl = typeof document !== "undefined" ? document.activeElement : null;
+      const focusedId =
+        activeEl && activeEl.id && slot && typeof slot.contains === "function" && slot.contains(activeEl)
+          ? activeEl.id
+          : "";
+      if (refreshBtn) {
+        refreshBtn.disabled = true;
+        refreshBtn.textContent = "体检刷新中…";
+      }
+      try {
+        const nextHealth = await fetchDbHealthSnapshot();
+        if (node.isConnected === false || state.view !== "migrate") return;
+        if (slot) {
+          slot.innerHTML = renderDbHealthCard(nextHealth, migrateDbShrinkReport);
+          bindDbHealthControls();
+          if (focusedId) {
+            const nextFocused = $("#" + focusedId.replace(/[^a-zA-Z0-9_-]/g, "\\$&"), slot);
+            if (nextFocused && !nextFocused.disabled && typeof nextFocused.focus === "function") {
+              try { nextFocused.focus({ preventScroll: true }); } catch (err) { nextFocused.focus(); }
+            }
+          }
+        }
+        if (opts && opts.showToast) {
+          toast(
+            nextHealth.ok ? "数据库体检已刷新" : ("体检刷新失败：" + (nextHealth.error || "未知错误")),
+            nextHealth.ok ? "ok" : "error"
+          );
+        }
+      } finally {
+        dbHealthRefreshBusy = false;
+        const currentBtn = $("#dbHealthRefreshBtn", slot || node);
+        if (currentBtn && currentBtn === refreshBtn) {
+          currentBtn.disabled = false;
+          currentBtn.textContent = prevBtnText || "刷新体检";
+        }
+      }
+    };
+
+    const run = async (label, fn, runOpts) => {
       await withBusy(label + "…", async () => {
         try {
           migrateOutput = await fn();
@@ -3581,12 +3901,44 @@ defineView("migrate", {
           migrateOutput = { error: error.message };
           toast(label + "失败：" + error.message, "error");
         }
-        go("migrate");
+        syncMigrateOutputSlot();
+        if (runOpts && runOpts.refreshPreset) {
+          const presetRes = await apiTry(() => apiGet("/operations/preset"), null);
+          const activePreset = compact(
+            (presetRes && presetRes.preset && (presetRes.preset.preset || presetRes.preset.current)) ||
+            (migrateOutput && !migrateOutput.error && runOpts.refreshPreset)
+          );
+          if (activePreset) {
+            $$("[data-preset]", node).forEach((btn) => {
+              btn.classList.toggle("is-primary", btn.dataset.preset === activePreset);
+            });
+            const badge = $(".tool-block .badge", node);
+            if (badge) badge.textContent = "当前：" + (PRESET_LABELS[activePreset] || activePreset);
+          }
+        }
+        if (/导入|迁移|修复|维护|清空/.test(label)) {
+          await refreshDbHealthInPlace({ showToast: false });
+        }
       });
     };
 
+    bindDbHealthControls();
+
+    if (state.pendingViewFocus && state.pendingViewFocus.viewId === "migrate") {
+      const targetId = state.pendingViewFocus.target;
+      state.pendingViewFocus = null;
+      const targetEl = targetId ? $("#" + targetId, node) : null;
+      if (targetEl) {
+        requestAnimationFrame(() => {
+          try { targetEl.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "start" }); } catch (err) { /* 忽略 */ }
+          targetEl.classList.add("is-search-hit");
+          window.setTimeout(() => targetEl.classList.remove("is-search-hit"), 2200);
+        });
+      }
+    }
+
     $$("[data-preset]", node).forEach((button) => {
-      button.addEventListener("click", () => run("应用预设", () => apiPost("/operations/preset", { preset: button.dataset.preset })));
+      button.addEventListener("click", () => run("应用预设", () => apiPost("/operations/preset", { preset: button.dataset.preset }), { refreshPreset: button.dataset.preset }));
     });
 
     const bind = (id, fn, label) => {
@@ -3883,6 +4235,7 @@ const MODULE_LABELS = {
   maintenance_audit: "记忆审计",
   maintenance_decay: "记忆衰减",
   startup: "启动",
+  performance: "性能调优",
   identity: "跨平台身份",
 };
 
@@ -3959,6 +4312,13 @@ const CONFIG_COMMON_KEYS = {
   maintenance_audit: ["enabled", "max_candidates"],
   maintenance_decay: ["memory_decay_after_days", "memory_decay_idle_days", "memory_decay_gradual_enabled"],
   startup: ["background_grace_seconds"],
+  performance: [
+    "profile",
+    "sqlite_cache_size_mb",
+    "sqlite_mmap_size_mb",
+    "sqlite_read_pool_size",
+    "sqlite_synchronous",
+  ],
   identity: ["merge_platform_accounts"],
 };
 
@@ -3990,6 +4350,51 @@ const CONFIG_OPTION_LABELS = {
     float32: "标准精度（float32 · 推荐）",
     float16: "半精度省流（float16 · 空间直降 75%）",
   },
+  "performance.profile": {
+    auto: "智能自动（按机器与容器内存自动推荐）",
+    eco: "省资源（1–2G 低配云服 / Docker 容器）",
+    balanced: "均衡推荐（4–8G 日常主机）",
+    turbo: "高性能（16G+ 桌面机 / 大记忆库）",
+    compat: "慢盘 / 稳妥兼容（机械硬盘 / NAS / 弱网）",
+  },
+  "performance.sqlite_synchronous": {
+    auto: "跟随性能档位（auto）",
+    NORMAL: "NORMAL（速度与安全兼顾 · 推荐）",
+    FULL: "FULL（每次提交强刷磁盘 · 防断电）",
+  },
+};
+
+const PERFORMANCE_PROFILE_CHOICES = {
+  auto: {
+    title: "智能自动",
+    tag: "推荐",
+    code: "auto",
+    desc: "自动识别物理内存与 Docker 限额，按需分配资源",
+  },
+  eco: {
+    title: "省资源",
+    tag: "1–2G 低配",
+    code: "eco",
+    desc: "半精度向量 + 关 mmap，压低内存杜绝 OOM",
+  },
+  balanced: {
+    title: "均衡推荐",
+    tag: "4–8G 主机",
+    code: "balanced",
+    desc: "标准精度无损召回，速度与内存均衡平稳",
+  },
+  turbo: {
+    title: "高性能",
+    tag: "16G+ 大库",
+    code: "turbo",
+    desc: "大页缓存 + 最高 1GB mmap + 并发读池全开",
+  },
+  compat: {
+    title: "慢盘兼容",
+    tag: "机械盘 / 弱网",
+    code: "compat",
+    desc: "关 mmap + FULL 严格落盘 + 5 秒宽裕等待预算",
+  },
 };
 
 const VECTOR_PRECISION_CHOICES = {
@@ -4010,6 +4415,7 @@ const VECTOR_PRECISION_CHOICES = {
 const CONFIG_CHOICE_CARDS = {
   "retrieval_advanced.vector_precision": VECTOR_PRECISION_CHOICES,
   "retrieval_advanced.vector_storage_precision": VECTOR_PRECISION_CHOICES,
+  "performance.profile": PERFORMANCE_PROFILE_CHOICES,
 };
 
 function fieldOptions(item) {
@@ -4402,6 +4808,8 @@ const configSearchState = {
 };
 
 const CONFIG_SEARCH_QUICK_CHIPS = [
+  "性能调优",
+  "一键瘦身",
   "向量存储精度",
   "跨群衔接",
   "拟人化记忆",
@@ -4410,6 +4818,118 @@ const CONFIG_SEARCH_QUICK_CHIPS = [
   "总结模型",
   "待复核",
   "旧版记忆迁移",
+];
+
+const CONFIG_SEARCH_SHORTCUTS = [
+  {
+    key: "performance.tuning",
+    viewId: "performance",
+    focusTarget: "",
+    title: "性能调优（5 档一键配置）",
+    group: "快捷入口 · 设置",
+    desc: "自动识别本机/Docker 内存，在智能自动、省资源、均衡推荐、高性能、慢盘兼容间一键切换，也可展开微调 12 项底层参数。",
+    aliases: [
+      "性能调优",
+      "性能档位",
+      "省资源",
+      "均衡推荐",
+      "高性能",
+      "慢盘兼容",
+      "稳妥兼容",
+      "智能自动",
+      "低配机",
+      "机械硬盘",
+      "NAS",
+      "卡顿",
+      "OOM",
+      "防爆内存",
+      "performance",
+      "eco",
+      "balanced",
+      "turbo",
+      "compat",
+      "auto",
+    ],
+    priority: 24,
+  },
+  {
+    key: "performance.tier.auto",
+    viewId: "performance",
+    focusTarget: "tier:auto",
+    title: "性能档位 · 智能自动（默认推荐）",
+    group: "性能调优",
+    desc: "自动探测物理内存与容器 cgroup 内存上限，自动选择最稳妥档位并开启防爆限幅。",
+    aliases: ["智能自动", "自动档", "自动识别", "容器内存", "cgroup", "auto"],
+    priority: 10,
+  },
+  {
+    key: "performance.tier.eco",
+    viewId: "performance",
+    focusTarget: "tier:eco",
+    title: "性能档位 · 省资源（1–2G 低配云服 / 容器）",
+    group: "性能调优",
+    desc: "向量半精度省 75% 空间、关闭 mmap 与启动预热、缩小页缓存与并发读连接池，防止低配机器 OOM。",
+    aliases: ["省资源", "低配机", "低内存", "省内存", "1G", "2G", "容器", "Docker", "eco", "OOM"],
+    priority: 10,
+  },
+  {
+    key: "performance.tier.balanced",
+    viewId: "performance",
+    focusTarget: "tier:balanced",
+    title: "性能档位 · 均衡推荐（4–8G 日常主机）",
+    group: "性能调优",
+    desc: "标准精度无损召回，32MB 页缓存 + 256MB mmap + 3–6 路并发读池，速度与内存兼顾。",
+    aliases: ["均衡推荐", "均衡", "常规", "4G", "8G", "balanced"],
+    priority: 10,
+  },
+  {
+    key: "performance.tier.turbo",
+    viewId: "performance",
+    focusTarget: "tier:turbo",
+    title: "性能档位 · 高性能（16G+ 桌面机 / 大记忆库）",
+    group: "性能调优",
+    desc: "64MB 页缓存 + 最高 1GB 内存映射 + 6–12 路并行读连接池，海量记忆与多群高并发依然丝滑。",
+    aliases: ["高性能", "狂暴", "大内存", "16G", "32G", "大库", "多群", "turbo"],
+    priority: 10,
+  },
+  {
+    key: "performance.tier.compat",
+    viewId: "performance",
+    focusTarget: "tier:compat",
+    title: "性能档位 · 慢盘 / 稳妥兼容（机械硬盘 / NAS / 弱网）",
+    group: "性能调优",
+    desc: "关闭 mmap、开启 FULL 严格落盘保护，并将回复前记忆等待上限放宽至 5 秒减少偶发超时。",
+    aliases: ["慢盘", "慢盘兼容", "稳妥兼容", "机械硬盘", "HDD", "NAS", "弱网", "防断电", "卡顿", "compat"],
+    priority: 10,
+  },
+  {
+    key: "maintenance.db_optimize",
+    viewId: "migrate",
+    focusTarget: "dbHealthCard",
+    title: "数据库体检与一键瘦身",
+    group: "快捷入口 · 维护与迁移",
+    desc: "查看主库 / WAL / 副库体积、可回收空闲页与向量精度分布；支持一键常规无损瘦身与深度整理压缩（全量 VACUUM）。",
+    aliases: [
+      "数据库体检",
+      "一键瘦身",
+      "数据库瘦身",
+      "瘦身",
+      "体检",
+      "压缩",
+      "深度压缩",
+      "深度整理压缩",
+      "释放空间",
+      "空闲页",
+      "VACUUM",
+      "vacuum",
+      "freelist",
+      "db_health",
+      "db_optimize",
+      "省空间",
+      "转码",
+    ],
+    priority: 24,
+  },
 ];
 
 function isMacPlatform() {
@@ -4508,6 +5028,27 @@ function buildConfigSearchCatalog(data) {
         priority: isAdvanced ? 0 : 12,
       });
     }
+  }
+
+  // 附带高价值快捷操作入口（性能调优 5 档与数据库体检一键瘦身）
+  for (let s = 0; s < CONFIG_SEARCH_SHORTCUTS.length; s += 1) {
+    const sc = CONFIG_SEARCH_SHORTCUTS[s];
+    catalog.push({
+      kind: "action",
+      viewId: sc.viewId,
+      focusTarget: sc.focusTarget || "",
+      moduleId: "",
+      moduleLabel: sc.group,
+      fieldKey: "",
+      title: sc.title,
+      group: sc.group,
+      desc: sc.desc,
+      key: sc.key,
+      aliases: sc.aliases || [],
+      isAdvanced: false,
+      locked: false,
+      priority: sc.priority || 10,
+    });
   }
 
   // 附带控制台功能视图入口，便于一键切换页面
@@ -4860,6 +5401,8 @@ function renderConfigSearchResults() {
       }
       if (it.kind === "module") {
         tags.push('<span class="cfg-search-tag is-mod">模块 · ' + esc(it.fieldCount) + " 项</span>");
+      } else if (it.kind === "action") {
+        tags.push('<span class="cfg-search-tag is-mod">直达</span>');
       } else if (it.kind === "view") {
         tags.push('<span class="cfg-search-tag is-mod">视图</span>');
       } else {
@@ -4957,7 +5500,10 @@ async function activateConfigSearchHit(hit) {
   const item = hit && hit.item;
   if (!item) return;
   closeConfigSearch({ restoreFocus: false });
-  if (item.kind === "view" && item.viewId) {
+  if ((item.kind === "view" || item.kind === "action") && item.viewId) {
+    if (item.focusTarget) {
+      state.pendingViewFocus = { viewId: item.viewId, target: item.focusTarget };
+    }
     await go(item.viewId);
     return;
   }
@@ -5573,6 +6119,508 @@ defineView("acl", {
           go("acl");
         });
       });
+    }
+  },
+});
+
+/* ============================================================
+   视图：性能调优
+   ============================================================ */
+const perfUiState = {
+  draftProfile: "",
+  preserveOnSwitch: false,
+  advancedOpen: false,
+  lastHotReload: null,
+};
+
+function fmtMemMb(mb) {
+  const n = Number(mb);
+  if (!Number.isFinite(n) || n <= 0) return "未知内存";
+  if (n < 1024) return Math.round(n) + " MiB";
+  return num(n / 1024, 1) + " GiB";
+}
+
+function fmtPerfValue(param, rawVal) {
+  if (param.value_type === "bool") return rawVal ? "已开启" : "已关闭";
+  if (param.value_type === "enum") return compact(rawVal, "-");
+  const scale = Number(param.display_scale) || 1;
+  const numeric = Number(rawVal);
+  if (!Number.isFinite(numeric)) return "-";
+  const shown = scale > 1 ? num(numeric / scale, 1) : num(numeric, param.value_type === "float" ? 1 : 0);
+  return param.unit ? shown + " " + param.unit : shown;
+}
+
+function toDisplayInputValue(param, rawVal) {
+  const scale = Number(param.display_scale) || 1;
+  if (param.value_type === "int" || param.value_type === "float") {
+    const numeric = Number(rawVal);
+    if (!Number.isFinite(numeric)) return "";
+    if (scale > 1) return String(Math.round(numeric / scale));
+    return String(numeric);
+  }
+  return String(rawVal ?? "");
+}
+
+function parseInputToRawValue(param, el) {
+  if (!el) return null;
+  if (param.value_type === "bool") return Boolean(el.checked);
+  if (param.value_type === "enum") return String(el.value || "");
+  const numeric = Number(el.value);
+  if (!Number.isFinite(numeric)) return null;
+  const scale = Number(param.display_scale) || 1;
+  if (param.value_type === "int") return Math.round(numeric * scale);
+  return Math.round(numeric * 100) / 100;
+}
+
+function perfValuesEqual(param, a, b) {
+  if (param.value_type === "bool") return Boolean(a) === Boolean(b);
+  if (param.value_type === "float") return Math.abs(Number(a) - Number(b)) < 1e-6;
+  if (param.value_type === "int") return Math.round(Number(a)) === Math.round(Number(b));
+  return String(a ?? "").trim().toLowerCase() === String(b ?? "").trim().toLowerCase();
+}
+
+defineView("performance", {
+  title: "性能调优",
+  navLabel: "性能调优",
+  eyebrow: "Settings · Performance",
+  hint: "按机器配置选择 5 档统一性能策略，也可展开微调数据库与检索底层参数",
+  async load() {
+    perfUiState.draftProfile = "";
+    perfUiState.preserveOnSwitch = false;
+    const res = await apiGet("/performance/tuning");
+    return (res && res.tuning) || res || {};
+  },
+  render(data) {
+    const hw = data.hardware || {};
+    const tiers = Array.isArray(data.tiers) ? data.tiers : [];
+    const groups = Array.isArray(data.groups) ? data.groups : [];
+    const params = Array.isArray(data.params) ? data.params : [];
+    const clamped = Array.isArray(data.clamped_fields) ? data.clamped_fields : [];
+    const dbSummary = data.db_summary || {};
+    const savedProfile = compact(data.profile, "auto");
+    const activeProfile = perfUiState.draftProfile || savedProfile;
+    const effectiveTierLabel = compact(data.effective_tier_label || data.effective_tier, "均衡推荐");
+    const profileLabel = compact(data.profile_label || savedProfile, "智能自动");
+    const overrideCount = Math.max(0, int(data.override_count));
+    const switchingWithOverrides = activeProfile !== savedProfile && overrideCount > 0;
+
+    const memSourceTag = {
+      cgroup_v2: "容器 cgroup v2 限额",
+      cgroup_v1: "容器 cgroup v1 限额",
+      windows: "主机物理内存",
+      proc_meminfo: "主机物理内存",
+      sysconf: "主机物理内存",
+    }[hw.memory_source] || "自动识别";
+
+    const statusBadgeText = overrideCount > 0
+      ? "基于「" + effectiveTierLabel + "」· 已微调 " + overrideCount + " 项"
+      : savedProfile === "auto"
+      ? "智能自动 · 当前生效：" + effectiveTierLabel
+      : "当前生效：" + profileLabel;
+
+    const hero =
+      '<section class="card perf-hero">' +
+        '<div class="perf-hero-top">' +
+          '<div class="perf-hero-copy">' +
+            '<div class="perf-hw-chips">' +
+              '<span class="perf-chip is-accent">可用内存：' + esc(fmtMemMb(hw.effective_memory_mb)) + "</span>" +
+              '<span class="perf-chip">CPU：' + esc(fmtInt(hw.cpu_count || 2)) + " 核</span>" +
+              '<span class="perf-chip">' + esc(memSourceTag) + "</span>" +
+              (hw.is_32bit ? '<span class="perf-chip is-warn">32 位环境 · 自动关 mmap</span>' : "") +
+            "</div>" +
+            '<p class="perf-hero-reason">' + esc(compact(hw.recommendation_reason, "已根据当前硬件自动评估推荐性能档位。")) + "</p>" +
+            '<p class="perf-orthogonal-note">' + esc(compact(data.orthogonal_notice, "功能预设管「记多少、用哪些能力」，性能档位管「跑多快、占多少内存硬盘」，两者互不冲突。")) + "</p>" +
+          "</div>" +
+          '<div class="perf-status-pill' + (overrideCount > 0 ? " is-overridden" : "") + '">' +
+            '<span class="perf-status-dot" aria-hidden="true"></span>' +
+            '<span>' + esc(statusBadgeText) + "</span>" +
+          "</div>" +
+        "</div>" +
+      "</section>";
+
+    const clampBanner = clamped.length
+      ? '<section class="perf-clamp-banner" role="status">' +
+          '<div class="perf-clamp-head"><b>已触发防爆内存安全限幅（' + clamped.length + ' 项）</b><span>为防止低配机器 OOM 崩溃，系统已按本机可用内存自动收紧下列参数：</span></div>' +
+          '<ul class="perf-clamp-list">' +
+            clamped.map((c) => "<li>" + esc(c.reason || (c.label + " 已自动限幅")) + "</li>").join("") +
+          "</ul>" +
+        "</section>"
+      : "";
+
+    const tierCards = tiers
+      .map((tier) => {
+        const isSel = tier.id === activeProfile;
+        const isRecommended = tier.id === hw.recommended_tier;
+        const extraTag = tier.id === "auto"
+          ? "自动匹配：" + (tiers.find((t) => t.id === hw.recommended_tier)?.label || effectiveTierLabel)
+          : isRecommended
+          ? "本机推荐"
+          : tier.badge;
+        return (
+          '<button type="button" class="perf-tier-card' + (isSel ? " is-active" : "") + '"' +
+          ' role="radio" aria-checked="' + (isSel ? "true" : "false") + '"' +
+          ' data-perf-tier="' + esc(tier.id) + '">' +
+            '<div class="perf-tier-head">' +
+              '<span class="cfg-choice-dot" aria-hidden="true"></span>' +
+              '<strong class="perf-tier-title">' + esc(tier.label) + "</strong>" +
+              (extraTag ? '<span class="perf-tier-badge' + (isRecommended || tier.id === "auto" ? " is-rec" : "") + '">' + esc(extraTag) + "</span>" : "") +
+            "</div>" +
+            '<div class="perf-tier-tagline">' + esc(tier.tagline) + "</div>" +
+            '<div class="perf-tier-scene">' + esc(tier.target_scene) + "</div>" +
+            '<div class="perf-tier-highlights">' +
+              (Array.isArray(tier.highlights) ? tier.highlights.map((h) => "<span>" + esc(h) + "</span>").join("") : "") +
+            "</div>" +
+          "</button>"
+        );
+      })
+      .join("");
+
+    const switchBar =
+      '<div class="perf-switch-bar" id="perfSwitchBar"' + (switchingWithOverrides ? "" : " hidden") + ">" +
+        '<span class="perf-switch-msg">检测到当前有 <b>' + overrideCount + "</b> 项手动微调，切换到新档位时：</span>" +
+        '<div class="perf-switch-choices" role="radiogroup" aria-label="切换档位时的微调处理">' +
+          '<button type="button" class="btn is-sm' + (!perfUiState.preserveOnSwitch ? " is-primary" : "") + '" data-perf-preserve="0">全部恢复新档位默认（推荐）</button>' +
+          '<button type="button" class="btn is-sm' + (perfUiState.preserveOnSwitch ? " is-primary" : "") + '" data-perf-preserve="1">保留我的微调项</button>' +
+        "</div>" +
+      "</div>";
+
+    const renderParamControl = (param) => {
+      const id = "perf_field_" + param.key.replace(/[^a-zA-Z0-9_]/g, "_");
+      const val = param.effective_value;
+      if (param.value_type === "bool") {
+        return (
+          '<label class="switch">' +
+            '<input type="checkbox" id="' + esc(id) + '" data-perf-input="' + esc(param.key) + '"' + (val ? " checked" : "") + " />" +
+            '<span class="switch-track"></span>' +
+            '<span class="perf-switch-text">' + (val ? "已开启" : "已关闭") + "</span>" +
+          "</label>"
+        );
+      }
+      if (param.value_type === "enum") {
+        const opts = Array.isArray(param.options) ? param.options : [];
+        return (
+          '<select id="' + esc(id) + '" data-perf-input="' + esc(param.key) + '">' +
+            opts
+              .map((opt) => '<option value="' + esc(opt.value) + '"' + (String(val) === String(opt.value) ? " selected" : "") + ">" + esc(opt.label) + "</option>")
+              .join("") +
+          "</select>"
+        );
+      }
+      const scale = Number(param.display_scale) || 1;
+      const minAttr = param.min != null ? ' min="' + esc(scale > 1 ? Math.round(param.min / scale) : param.min) + '"' : "";
+      const maxAttr = param.max != null ? ' max="' + esc(scale > 1 ? Math.round(param.max / scale) : param.max) + '"' : "";
+      const stepAttr = param.step != null ? ' step="' + esc(scale > 1 ? Math.max(1, Math.round(param.step / scale)) : param.step) + '"' : "";
+      return (
+        '<div class="perf-num-wrap">' +
+          '<input type="number" id="' + esc(id) + '" data-perf-input="' + esc(param.key) + '" value="' + esc(toDisplayInputValue(param, val)) + '"' + minAttr + maxAttr + stepAttr + " />" +
+          (param.unit ? '<span class="perf-unit">' + esc(param.unit) + "</span>" : "") +
+        "</div>"
+      );
+    };
+
+    const groupsHtml = groups
+      .map((grp) => {
+        const grpParams = params.filter((p) => p.group === grp.id);
+        if (!grpParams.length) return "";
+        const rows = grpParams
+          .map((p) => {
+            const overridden = Boolean(p.overridden);
+            const isClamped = Boolean(p.clamped);
+            return (
+              '<div class="perf-param' + (overridden ? " is-overridden" : "") + (isClamped ? " is-clamped" : "") + '" data-perf-param="' + esc(p.key) + '">' +
+                '<div class="perf-param-info">' +
+                  '<div class="perf-param-head">' +
+                    '<strong class="perf-param-label">' + esc(p.label) + "</strong>" +
+                    '<span class="perf-override-pill' + (overridden ? " is-on" : "") + '" data-perf-override-pill="' + esc(p.key) + '">' +
+                      (overridden ? "● 已微调" : "跟随档位") +
+                    "</span>" +
+                    '<span class="perf-scope-pill' + (p.hot_reload ? " is-hot" : "") + '">' + esc(p.effect_scope || (p.hot_reload ? "立即生效" : "下次重启生效")) + "</span>" +
+                    (isClamped ? '<span class="perf-clamp-pill">已安全限幅</span>' : "") +
+                  "</div>" +
+                  '<div class="perf-param-summary">' + esc(p.summary) + "</div>" +
+                  '<div class="perf-param-effects">' +
+                    '<span><b>▲</b> ' + esc(p.up_effect) + "</span>" +
+                    '<span><b>▼</b> ' + esc(p.down_effect) + "</span>" +
+                  "</div>" +
+                  '<div class="perf-param-meta">' +
+                    '<span>当前生效：<b>' + esc(fmtPerfValue(p, p.effective_value)) + "</b></span>" +
+                    '<span>档位默认：' + esc(fmtPerfValue(p, p.tier_default)) + "</span>" +
+                    '<code class="mono">' + esc(p.key) + "</code>" +
+                  "</div>" +
+                "</div>" +
+                '<div class="perf-param-ctrl">' +
+                  renderParamControl(p) +
+                  '<button type="button" class="btn is-sm perf-reset-one" data-perf-reset-key="' + esc(p.key) + '"' + (overridden ? "" : " disabled") + ">恢复跟随档位</button>" +
+                "</div>" +
+              "</div>"
+            );
+          })
+          .join("");
+        return (
+          '<section class="perf-group">' +
+            '<div class="perf-group-head"><h4>' + esc(grp.label) + "</h4><span>" + esc(grp.desc) + "</span></div>" +
+            '<div class="perf-group-list">' + rows + "</div>" +
+          "</section>"
+        );
+      })
+      .join("");
+
+    const advancedDetails =
+      '<details class="config-advanced perf-advanced" id="perfAdvancedDetails"' + (perfUiState.advancedOpen ? " open" : "") + ">" +
+        "<summary>" +
+          "<span>展开高级性能微调（" + params.length + " 项）</span>" +
+          (overrideCount > 0 ? '<span class="perf-summary-badge">已微调 ' + overrideCount + " 项</span>" : '<span class="perf-summary-hint">一般选上面 5 档即可，有特殊需求再微调</span>') +
+        "</summary>" +
+        '<div class="config-advanced-body"><div class="config-advanced-inner">' +
+          '<div class="perf-adv-toolbar">' +
+            '<span>绿色标签项保存后立即热刷新连接池与缓存；灰色标签项在下次重启 AstrBot 时生效。</span>' +
+            '<button type="button" class="btn is-sm" id="perfResetAllBtn"' + (overrideCount > 0 ? "" : " disabled") + ">全部恢复档位默认</button>" +
+          "</div>" +
+          groupsHtml +
+        "</div></div>" +
+      "</details>";
+
+    const saveBar =
+      '<div class="perf-save-bar">' +
+        '<div class="perf-save-hint">' +
+          (perfUiState.lastHotReload
+            ? "上次热刷新：读连接池代次 #" + esc(fmtInt(perfUiState.lastHotReload.read_pool_generation || 0)) +
+              "（" + esc(fmtInt(perfUiState.lastHotReload.read_pool_max || 0)) + " 路 · 页缓存 " +
+              esc(fmtInt(perfUiState.lastHotReload.cache_size_mb || 0)) + " MB · mmap " +
+              esc(fmtInt(perfUiState.lastHotReload.mmap_size_mb || 0)) + " MB）"
+            : "保存后立即写入插件配置并热刷新 SQLite 缓存、并发读连接池与检索预算。") +
+        "</div>" +
+        '<div class="perf-save-actions">' +
+          '<button type="button" class="btn is-sm" id="perfResetAllFooterBtn"' + (overrideCount > 0 ? "" : " disabled") + ">全部恢复档位默认</button>" +
+          '<button type="button" class="btn is-primary" id="perfSaveBtn">保存并立即生效</button>' +
+        "</div>" +
+      "</div>";
+
+    const dbStrip =
+      '<section class="card perf-db-strip">' +
+        '<div class="perf-db-strip-copy">' +
+          '<div class="perf-db-strip-title">' + icon("db", "perf-db-icon") + "<b>数据库体积速览</b>" +
+            '<span class="perf-db-total">' + esc(fmtBytes(dbSummary.grand_total_bytes || dbSummary.primary_total_bytes || 0)) + "</span>" +
+          "</div>" +
+          '<div class="perf-db-strip-meta">' +
+            "主库 " + esc(fmtBytes(dbSummary.primary_db_bytes || 0)) +
+            " · WAL " + esc(fmtBytes(dbSummary.wal_bytes || 0)) +
+            " · 副库 " + esc(fmtBytes(dbSummary.scoped_total_bytes || 0)) +
+            " — 切换半精度 float16 或感觉库偏大时，可前往一键无损瘦身。" +
+          "</div>" +
+        "</div>" +
+        '<button type="button" class="btn is-sm" id="perfGoDbHealthBtn">前往数据库体检与一键瘦身 →</button>' +
+      "</section>";
+
+    return (
+      '<div class="perf-view">' +
+        hero +
+        clampBanner +
+        card(
+          "选择性能档位",
+          "点选最贴合你机器配置的档位；不确定时直接选「智能自动」即可",
+          '<div class="perf-tier-grid" role="radiogroup" aria-label="性能档位选择">' + tierCards + "</div>" +
+            switchBar +
+            advancedDetails +
+            saveBar,
+          "",
+          "perf-main-card"
+        ) +
+        dbStrip +
+      "</div>"
+    );
+  },
+  mount(node, data) {
+    const params = Array.isArray(data.params) ? data.params : [];
+    const paramMap = {};
+    params.forEach((p) => { paramMap[p.key] = p; });
+    const savedProfile = compact(data.profile, "auto");
+    let selectedProfile = perfUiState.draftProfile || savedProfile;
+    const overrideCount = Math.max(0, int(data.override_count));
+
+    // Track per-field edits made inside this view before clicking Save.
+    const editedOverrides = Object.assign({}, data.overrides || {});
+    const dirtyOverrides = {};
+
+    const syncTierCards = (nextProfile, shouldFocus) => {
+      selectedProfile = nextProfile;
+      perfUiState.draftProfile = nextProfile;
+      const cards = $$(".perf-tier-card", node);
+      cards.forEach((btn) => {
+        const active = btn.dataset.perfTier === nextProfile;
+        btn.classList.toggle("is-active", active);
+        btn.setAttribute("aria-checked", active ? "true" : "false");
+        if (active && shouldFocus && typeof btn.focus === "function") btn.focus();
+      });
+      const shouldShowSwitchBar = nextProfile !== savedProfile && overrideCount > 0;
+      const existingBar = $("#perfSwitchBar", node);
+      if (existingBar) {
+        existingBar.hidden = !shouldShowSwitchBar;
+      }
+    };
+
+    const tierButtons = $$(".perf-tier-card", node);
+    tierButtons.forEach((btn, idx) => {
+      btn.addEventListener("click", () => syncTierCards(btn.dataset.perfTier, false));
+      btn.addEventListener("keydown", (event) => {
+        if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+          event.preventDefault();
+          const next = tierButtons[(idx + 1) % tierButtons.length];
+          syncTierCards(next.dataset.perfTier, true);
+        } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+          event.preventDefault();
+          const prev = tierButtons[(idx - 1 + tierButtons.length) % tierButtons.length];
+          syncTierCards(prev.dataset.perfTier, true);
+        }
+      });
+    });
+
+    $$("[data-perf-preserve]", node).forEach((btn) => {
+      btn.addEventListener("click", () => {
+        perfUiState.preserveOnSwitch = btn.dataset.perfPreserve === "1";
+        $$("[data-perf-preserve]", node).forEach((b) => {
+          b.classList.toggle("is-primary", (b.dataset.perfPreserve === "1") === perfUiState.preserveOnSwitch);
+        });
+      });
+    });
+
+    const syncParamRow = (key, rawVal) => {
+      const param = paramMap[key];
+      if (!param) return;
+      const isDiff = rawVal !== null && !perfValuesEqual(param, rawVal, param.tier_default);
+      if (isDiff) {
+        editedOverrides[key] = rawVal;
+        dirtyOverrides[key] = rawVal;
+      } else {
+        editedOverrides[key] = null;
+        dirtyOverrides[key] = null;
+      }
+      const row = $('[data-perf-param="' + key.replace(/["\\]/g, "\\$&") + '"]', node);
+      if (row) row.classList.toggle("is-overridden", isDiff);
+      const pill = $('[data-perf-override-pill="' + key.replace(/["\\]/g, "\\$&") + '"]', node);
+      if (pill) {
+        pill.classList.toggle("is-on", isDiff);
+        pill.textContent = isDiff ? "● 已微调" : "跟随档位";
+      }
+      const resetBtn = $('[data-perf-reset-key="' + key.replace(/["\\]/g, "\\$&") + '"]', node);
+      if (resetBtn) resetBtn.disabled = !isDiff;
+      const anyOverridden = Object.keys(editedOverrides).some((k) => editedOverrides[k] !== null && editedOverrides[k] !== undefined);
+      const r1 = $("#perfResetAllBtn", node);
+      const r2 = $("#perfResetAllFooterBtn", node);
+      if (r1) r1.disabled = !anyOverridden;
+      if (r2) r2.disabled = !anyOverridden;
+    };
+
+    $$("[data-perf-input]", node).forEach((input) => {
+      const key = input.dataset.perfInput;
+      const param = paramMap[key];
+      if (!param) return;
+      const onChange = () => {
+        if (param.value_type === "bool") {
+          const lbl = input.parentElement && input.parentElement.querySelector(".perf-switch-text");
+          if (lbl) lbl.textContent = input.checked ? "已开启" : "已关闭";
+        }
+        syncParamRow(key, parseInputToRawValue(param, input));
+      };
+      input.addEventListener("change", onChange);
+      if (input.type === "number") input.addEventListener("input", onChange);
+    });
+
+    $$("[data-perf-reset-key]", node).forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const key = btn.dataset.perfResetKey;
+        const param = paramMap[key];
+        if (!param) return;
+        const input = $('[data-perf-input="' + key.replace(/["\\]/g, "\\$&") + '"]', node);
+        if (input) {
+          if (param.value_type === "bool") {
+            input.checked = Boolean(param.tier_default);
+            const lbl = input.parentElement && input.parentElement.querySelector(".perf-switch-text");
+            if (lbl) lbl.textContent = input.checked ? "已开启" : "已关闭";
+          } else if (param.value_type === "enum") {
+            input.value = String(param.tier_default);
+          } else {
+            input.value = toDisplayInputValue(param, param.tier_default);
+          }
+        }
+        syncParamRow(key, null);
+      });
+    });
+
+    const advDetails = $("#perfAdvancedDetails", node);
+    if (advDetails) {
+      advDetails.addEventListener("toggle", () => {
+        perfUiState.advancedOpen = Boolean(advDetails.open);
+      });
+    }
+    bindSmoothDetails(node);
+
+    const applyTuning = async (resetAll) => {
+      const profileChanged = selectedProfile !== savedProfile;
+      const payload = {
+        profile: selectedProfile,
+        reset_overrides: Boolean(resetAll),
+        preserve_overrides: resetAll ? false : (profileChanged ? Boolean(perfUiState.preserveOnSwitch) : true),
+      };
+      if (!resetAll) {
+        const sourceMap = (!profileChanged || perfUiState.preserveOnSwitch) ? editedOverrides : dirtyOverrides;
+        const delta = {};
+        Object.keys(sourceMap).forEach((k) => {
+          delta[k] = sourceMap[k];
+        });
+        if (Object.keys(delta).length) payload.overrides = delta;
+      }
+      await withBusy(resetAll ? "正在恢复档位默认…" : "正在应用性能调优…", async () => {
+        try {
+          const res = await apiPost("/performance/tuning", payload);
+          const tuning = (res && res.tuning) || res || {};
+          perfUiState.draftProfile = "";
+          perfUiState.preserveOnSwitch = false;
+          perfUiState.lastHotReload = tuning.hot_reload || null;
+          state.configSchema = null;
+          invalidatePool();
+          const clampedCount = Array.isArray(tuning.clamped_fields) ? tuning.clamped_fields.length : 0;
+          if (clampedCount > 0) {
+            toast("性能调优已生效（" + clampedCount + " 项已触发防爆内存限幅）", "ok");
+          } else {
+            toast(resetAll ? "已恢复所选档位全部默认参数" : "性能调优已保存并热生效", "ok");
+          }
+          await go("performance", { inPlace: true });
+        } catch (error) {
+          toast("性能调优保存失败：" + error.message, "error");
+        }
+      });
+    };
+
+    const saveBtn = $("#perfSaveBtn", node);
+    if (saveBtn) saveBtn.addEventListener("click", () => applyTuning(false));
+    const resetAllBtn = $("#perfResetAllBtn", node);
+    if (resetAllBtn) resetAllBtn.addEventListener("click", () => applyTuning(true));
+    const resetAllFooterBtn = $("#perfResetAllFooterBtn", node);
+    if (resetAllFooterBtn) resetAllFooterBtn.addEventListener("click", () => applyTuning(true));
+
+    const goDbBtn = $("#perfGoDbHealthBtn", node);
+    if (goDbBtn) {
+      goDbBtn.addEventListener("click", () => {
+        state.pendingViewFocus = { viewId: "migrate", target: "dbHealthCard" };
+        go("migrate");
+      });
+    }
+
+    if (state.pendingViewFocus && state.pendingViewFocus.viewId === "performance") {
+      const target = compact(state.pendingViewFocus.target);
+      state.pendingViewFocus = null;
+      if (target.startsWith("tier:")) {
+        const tierId = target.slice(5);
+        const cardEl = $('[data-perf-tier="' + tierId.replace(/["\\]/g, "\\$&") + '"]', node);
+        if (cardEl) {
+          requestAnimationFrame(() => {
+            try { cardEl.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "center" }); } catch (err) { /* 忽略 */ }
+            cardEl.classList.add("is-search-hit");
+            window.setTimeout(() => cardEl.classList.remove("is-search-hit"), 2200);
+          });
+        }
+      }
     }
   },
 });

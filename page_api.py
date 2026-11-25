@@ -161,7 +161,10 @@ UI_VIEW_ENDPOINTS = {
         "/retrieval/config/update",
         "/operations/diagnostics",
         "/operations/preset",
+        "/performance/tuning",
         "/maintenance",
+        "/maintenance/db_health",
+        "/maintenance/db_optimize",
         "/maintenance/audit/preview",
         "/maintenance/audit/status",
         "/maintenance/audit/apply",
@@ -222,8 +225,9 @@ MEMORY_VISIBILITY_FILTERS = {
 }
 UI_ENDPOINT_EXPOSURE = {
     "/maintenance/summary_admission": {"exposure": "advanced", "reason": "管理员通过受保护的维护入口暂停、限量试跑或恢复记忆整理"},
-    "/maintenance/db_health": {"exposure": "advanced", "reason": "管理员查看数据库体积、向量精度分布与索引体检状态"},
-    "/maintenance/db_optimize": {"exposure": "advanced", "reason": "管理员执行一键数据库瘦身、旧向量精度转码与增量回收"},
+    "/maintenance/db_health": {"exposure": "visible", "reason": "管理员在维护与迁移面板查看数据库体积、向量精度分布与索引体检状态"},
+    "/maintenance/db_optimize": {"exposure": "visible", "reason": "管理员在维护与迁移面板执行一键数据库瘦身、旧向量精度转码与回收"},
+    "/performance/tuning": {"exposure": "visible", "reason": "在性能调优面板选择性能档位并微调数据库与检索性能参数"},
     "/ui/capabilities": {"exposure": "internal", "reason": "前端启动时用于自校验，不作为业务按钮"},
     "/memory/visibility": {"exposure": "compat", "reason": "由统一 memory/update 表单覆盖"},
     "/memory/lifecycle": {"exposure": "compat", "reason": "由统一 memory/update 表单覆盖"},
@@ -356,6 +360,7 @@ UI_READ_ENDPOINTS = frozenset(
         "/persona-state",
         # 双方法路由：GET 只读状态，POST 才落盘，按请求方法分档。
         "/operations/preset",
+        "/performance/tuning",
         "/maintenance/sleep",
     }
 )
@@ -390,6 +395,7 @@ UI_WRITE_ENDPOINTS = frozenset(
         "/ui-preferences/save",
         # 双方法路由的写分支（GET 分支只读，见 UI_READ_ENDPOINTS）。
         "/operations/preset",
+        "/performance/tuning",
         "/maintenance/sleep",
     }
 )
@@ -503,6 +509,7 @@ class PluginPageApi:
             ("/emotion/traces", self.emotion_traces, ["GET"], "MemoryCompanion redacted emotion trace list"),
             ("/coordination/status", self.coordination_status, ["GET"], "MemoryCompanion safe coordination status"),
             ("/operations/preset", self.operations_preset, ["GET", "POST"], "MemoryCompanion operations preset"),
+            ("/performance/tuning", self.performance_tuning, ["GET", "POST"], "MemoryCompanion performance tuning profiles"),
             ("/data/export", self.data_export, ["POST"], "MemoryCompanion portable data export"),
             ("/data/import/preview", self.data_import_preview, ["GET"], "MemoryCompanion portable data preview"),
             ("/data/import/run", self.data_import_run, ["POST"], "MemoryCompanion portable data import"),
@@ -1661,6 +1668,37 @@ class PluginPageApi:
             return self._err(str(exc), 400)
         except Exception as exc:
             return self._err(f"应用预设失败: {exc}", 500)
+
+    async def performance_tuning(self):
+        """Read or update unified 5-tier performance profile and sparse overrides."""
+        if request.method == "GET":
+            try:
+                snapshot = await self.plugin.service.get_performance_tuning_snapshot()
+                return self._ok({"tuning": snapshot})
+            except Exception as exc:
+                return self._err(f"读取性能调优状态失败: {exc}", 500)
+        if self._dashboard_admin_state() == "denied":
+            return self._admin_required_response()
+        payload = await self._json()
+        raw_profile = payload.get("profile")
+        profile = clean_text(raw_profile, 32) if raw_profile is not None else None
+        raw_overrides = payload.get("overrides")
+        if raw_overrides is not None and not isinstance(raw_overrides, dict):
+            return self._err("overrides 必须是对象", 400)
+        preserve_overrides = bool(payload.get("preserve_overrides", True))
+        reset_overrides = bool(payload.get("reset_overrides", False))
+        try:
+            result = await self.plugin.service.apply_performance_tuning(
+                profile=profile,
+                overrides=raw_overrides,
+                preserve_overrides=preserve_overrides,
+                reset_overrides=reset_overrides,
+            )
+            return self._ok({"tuning": result})
+        except ValueError as exc:
+            return self._err(str(exc), 400)
+        except Exception as exc:
+            return self._err(f"应用性能调优失败: {exc}", 500)
 
     async def data_export(self):
         try:
@@ -2980,7 +3018,42 @@ class PluginPageApi:
             if key not in values or not isinstance(item_schema, dict):
                 continue
             target[key] = self._coerce_config_value(values.get(key), item_schema)
-        self._write_plugin_config({module: target})
+        if module == "performance":
+            from .core.performance_tuning import (
+                SQLITE_SENTINELS,
+                build_performance_config_updates,
+            )
+
+            next_profile = clean_text(target.get("profile"), 32).lower() or None
+            sqlite_overrides: dict[str, Any] = {}
+            for full_key in SQLITE_SENTINELS:
+                field_name = full_key.split(".", 1)[1]
+                if field_name in values:
+                    sqlite_overrides[full_key] = target.get(field_name)
+            try:
+                updated_full, _plan = build_performance_config_updates(
+                    raw,
+                    profile=next_profile,
+                    overrides=sqlite_overrides if sqlite_overrides else None,
+                    preserve_overrides=True,
+                )
+            except ValueError as exc:
+                return self._err(str(exc), 400)
+            changed_sections = {
+                sec: updated_full[sec]
+                for sec in ("performance", "retrieval_advanced", "memory_injection", "maintenance", "startup")
+                if sec in updated_full
+            }
+            self._write_plugin_config(changed_sections)
+        else:
+            self._write_plugin_config({module: target})
+        if module in {"performance", "retrieval_advanced", "memory_injection", "maintenance", "startup"}:
+            refresher = getattr(self.plugin.service, "refresh_performance_tuning", None)
+            if callable(refresher):
+                try:
+                    refresher()
+                except Exception:
+                    pass
         return self._ok(
             {
                 "module": module,
@@ -4254,6 +4327,18 @@ class PluginPageApi:
             transcode_limit=transcode_limit,
             run_full_vacuum=run_full_vacuum,
         )
+        if isinstance(result, dict) and result.get("ok") is False:
+            error_code = str(result.get("error_code") or "db_optimize_failed")
+            status = 409 if error_code == "db_optimize_in_progress" else 400
+            return self._err(
+                str(result.get("error") or "数据库瘦身未能完成"),
+                status,
+                extra={
+                    "error_code": error_code,
+                    "disk_preflight": result.get("disk_preflight"),
+                    "data": result,
+                },
+            )
         return self._ok({"data": result})
 
     async def maintenance(self):

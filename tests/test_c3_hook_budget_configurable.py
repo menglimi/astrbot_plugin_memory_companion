@@ -53,10 +53,12 @@ class HookBudgetConfigurabilityTests(unittest.TestCase):
         self.assertEqual(0.1, bounded_memory_hook_budget_seconds(0.01))
 
     def test_values_above_the_safety_cap_are_clamped(self) -> None:
-        """The cap stays: local failure must never hold a reply for long."""
+        """The cap stays: local failure must never hold a reply indefinitely."""
+        self.assertEqual(5.0, bounded_memory_hook_budget_seconds(5.0))
+        self.assertEqual(8.0, bounded_memory_hook_budget_seconds(8.0))
         self.assertEqual(MAX_MEMORY_HOOK_BUDGET_SECONDS, bounded_memory_hook_budget_seconds(30))
-        self.assertEqual(MAX_MEMORY_HOOK_BUDGET_SECONDS, bounded_memory_hook_budget_seconds(3.5))
-        self.assertLessEqual(MAX_MEMORY_HOOK_BUDGET_SECONDS, 3.0)
+        self.assertEqual(MAX_MEMORY_HOOK_BUDGET_SECONDS, bounded_memory_hook_budget_seconds(8.5))
+        self.assertLessEqual(MAX_MEMORY_HOOK_BUDGET_SECONDS, 8.0)
 
     def test_non_finite_values_are_treated_as_unset(self) -> None:
         """``inf`` is not a usable duration, so it falls back like any invalid value."""
@@ -88,8 +90,8 @@ class HookBudgetConfigurabilityTests(unittest.TestCase):
         self.assertEqual("float", entry["type"])
         self.assertEqual(DEFAULT_MEMORY_HOOK_BUDGET_SECONDS, entry["default"])
         self.assertEqual(0.0, entry["min"])
-        self.assertEqual(3.0, entry["max"])
-        self.assertEqual({"min": 0.0, "max": 3.0, "step": 0.1}, entry["slider"])
+        self.assertEqual(8.0, entry["max"])
+        self.assertEqual({"min": 0.0, "max": 8.0, "step": 0.1}, entry["slider"])
         self.assertLessEqual(entry["min"], DEFAULT_MEMORY_HOOK_BUDGET_SECONDS)
         self.assertIn(str(MAX_MEMORY_HOOK_BUDGET_SECONDS).rstrip("0").rstrip("."), entry["hint"])
 

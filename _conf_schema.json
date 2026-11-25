@@ -1565,14 +1565,14 @@
       },
       "hook_request_budget_seconds": {
         "description": "注入钩子超时预算（秒）",
-        "hint": "只计插件本地工作（身份解析、检索编排、注入拼装等），不含插件发起的模型调用等待：嵌入和重排各自最多等待 2 秒，那段时间不计入本预算。默认 1 秒，可设 0.1–3.0 秒；填 0、负数或非法值按默认 1 秒处理，低于 0.1 秒按 0.1 秒下限处理，超过 3 秒按 3 秒上限处理。预算耗尽时本轮请求照常放行，只是不再注入记忆，属于兜底安全网，不建议为消除超时提示而调大。",
+        "hint": "只计插件本地工作（身份解析、检索编排、注入拼装等），不含插件发起的模型调用等待：嵌入和重排各自最多等待 2 秒，那段时间不计入本预算。默认 1 秒，可设 0.1–8.0 秒；填 0、负数或非法值按默认 1 秒处理，低于 0.1 秒按 0.1 秒下限处理，超过 8 秒按 8 秒上限处理。机械硬盘或弱网环境可结合「性能调优」适当调大；预算耗尽时本轮请求照常放行，只是不再注入记忆，属于兜底安全网。",
         "type": "float",
         "default": 1.0,
         "min": 0.0,
-        "max": 3.0,
+        "max": 8.0,
         "slider": {
           "min": 0.0,
-          "max": 3.0,
+          "max": 8.0,
           "step": 0.1
         }
       },
@@ -3064,12 +3064,82 @@
         "type": "int",
         "default": 60,
         "min": 0,
-        "max": 200,
+        "max": 600,
         "slider": {
           "min": 0,
-          "max": 200,
+          "max": 600,
+          "step": 10
+        }
+      }
+    }
+  },
+  "performance": {
+    "type": "object",
+    "description": "性能调优",
+    "hint": "按机器配置选择 5 档性能策略（智能自动 / 省资源 / 均衡推荐 / 高性能 / 慢盘兼容），与功能预设互不冲突；也支持在面板「设置 → 性能调优」一站式微调。",
+    "items": {
+      "profile": {
+        "type": "string",
+        "description": "性能档位",
+        "hint": "控制数据库缓存、内存映射、读连接池、向量精度与回复等待保护。auto 会自动识别本机与容器 cgroup 内存限额并推荐最稳妥档位。",
+        "default": "auto",
+        "options": [
+          "auto",
+          "eco",
+          "balanced",
+          "turbo",
+          "compat"
+        ]
+      },
+      "sqlite_cache_size_mb": {
+        "type": "int",
+        "description": "SQLite 页缓存（MB）",
+        "hint": "0 表示跟随当前性能档位自动分配；手动填写 4–256 可覆盖档位，系统会自动限制不超过可用内存的 10% 以防 OOM。",
+        "default": 0,
+        "min": 0,
+        "max": 256,
+        "slider": {
+          "min": 0,
+          "max": 256,
+          "step": 4
+        }
+      },
+      "sqlite_mmap_size_mb": {
+        "type": "int",
+        "description": "SQLite 内存映射上限（MB）",
+        "hint": "-1 表示跟随当前性能档位；0 表示关闭内存映射（低配机/机械硬盘推荐）；手动填写 0–2048 会受可用内存 25% 与 32 位环境安全限幅。",
+        "default": -1,
+        "min": -1,
+        "max": 2048,
+        "slider": {
+          "min": -1,
+          "max": 2048,
+          "step": 64
+        }
+      },
+      "sqlite_read_pool_size": {
+        "type": "int",
+        "description": "SQLite 并发读连接池数",
+        "hint": "0 表示跟随当前性能档位与 CPU 核心数自动缩放；手动填写 1–12 可指定并发只读连接数，保存后热切换。",
+        "default": 0,
+        "min": 0,
+        "max": 12,
+        "slider": {
+          "min": 0,
+          "max": 12,
           "step": 1
         }
+      },
+      "sqlite_synchronous": {
+        "type": "string",
+        "description": "SQLite 落盘同步策略",
+        "hint": "auto 表示跟随当前性能档位；NORMAL 兼顾速度与 WAL 崩溃安全（推荐）；FULL 每次提交强制刷盘，适合易断电或老旧机械硬盘。",
+        "default": "auto",
+        "options": [
+          "auto",
+          "NORMAL",
+          "FULL"
+        ]
       }
     }
   },

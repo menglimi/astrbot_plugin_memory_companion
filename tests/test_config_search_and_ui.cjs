@@ -320,12 +320,12 @@ test("module config mount: choice cards update hidden input and support keyboard
   assert.equal(card32.focused, true);
 });
 
-test("module config: all 29 schema modules have pure-Chinese labels and fallback helper works", () => {
+test("module config: all 30 schema modules have pure-Chinese labels and fallback helper works", () => {
   const rt = loadAppConfigRuntime();
   const { MODULE_LABELS, moduleLabel, moduleSubtitle, CONFIG_COMMON_KEYS } = rt.exports;
   const moduleIds = Object.keys(realSchema);
 
-  assert.equal(moduleIds.length, 29);
+  assert.equal(moduleIds.length, 30);
   for (const modId of moduleIds) {
     const label = moduleLabel(modId, realSchema[modId]);
     assert.ok(MODULE_LABELS[modId], `MODULE_LABELS 缺少模块: ${modId}`);
@@ -333,6 +333,7 @@ test("module config: all 29 schema modules have pure-Chinese labels and fallback
     assert.ok(!/[A-Za-z_]/.test(label), `模块 ${modId} 侧栏中文名不应夹带英文或下划线: ${label}`);
   }
 
+  assert.equal(moduleLabel("performance", realSchema.performance), "性能调优");
   assert.equal(moduleLabel("memory_humanization", realSchema.memory_humanization), "拟人化记忆");
   assert.equal(moduleLabel("persona_memory", realSchema.persona_memory), "记得这个人");
   assert.equal(moduleLabel("identity", realSchema.identity), "跨平台身份");
@@ -859,4 +860,647 @@ test("legacy.html loads the versioned search engine before the panel app", () =>
   assert.ok(search && app, "搜索脚本和面板脚本都必须带缓存版本");
   assert.equal(search[1], app[1], "搜索脚本和面板脚本的缓存版本必须一致");
   assert.ok(search.index < app.index, "search-engine.js 必须在 app.js 之前加载");
+});
+
+test("search-engine: performance tuning tiers and DB health/slimming shortcuts are discoverable via plain-Chinese aliases", async () => {
+  const rt = loadAppConfigRuntime();
+  const { catalog } = rt.exports.buildConfigSearchCatalog({
+    schema: realSchema,
+    values: {},
+    protected_keys: [],
+    protected_modules: [],
+  });
+  const index = engine.prepare(catalog, {
+    getTitle: (it) => it.title,
+    getDesc: (it) => it.desc,
+    getKey: (it) => it.key,
+    getGroup: (it) => it.group,
+    getAliases: (it) => it.aliases,
+    getPriority: (it) => it.priority,
+  });
+
+  const perfAndDbCases = [
+    ["性能调优", "performance"],
+    ["低配机", "performance"],
+    ["机械硬盘", "performance"],
+    ["卡顿", "performance|budget"],
+    ["瘦身", "maintenance\\.db_optimize"],
+    ["体检", "maintenance\\.db_optimize"],
+    ["释放空间", "maintenance\\.db_optimize"],
+    ["VACUUM", "maintenance\\.db_optimize"],
+    ["压缩", "maintenance\\.db_optimize"],
+  ];
+
+  for (const [query, pattern] of perfAndDbCases) {
+    const hits = engine.search(index, query, { limit: 5 });
+    assert.ok(hits.length > 0, `查询「${query}」应有命中结果`);
+    const re = new RegExp(pattern, "i");
+    const top3 = hits.slice(0, 3).map((h) => h.item.key);
+    assert.ok(
+      top3.some((k) => re.test(k)),
+      `查询「${query}」Top-3 应包含 /${pattern}/，实际为: ${top3.join(", ")}`
+    );
+  }
+
+  // Clicking DB health shortcut routes cleanly to migrate view with target anchor
+  const dbHit = engine.search(index, "数据库体检", { limit: 3 }).find((h) => h.item.key === "maintenance.db_optimize");
+  assert.ok(dbHit, "「数据库体检」应命中 maintenance.db_optimize 快捷入口");
+  await rt.exports.activateConfigSearchHit(dbHit);
+  assert.equal(rt.goCalls[rt.goCalls.length - 1].view, "migrate");
+  assert.equal(rt.state.pendingViewFocus.viewId, "migrate");
+  assert.equal(rt.state.pendingViewFocus.target, "dbHealthCard");
+});
+
+test("performance view and migrate DB health card: render semantic markup and zero hardcoded hex in new CSS", () => {
+  const appSource = fs.readFileSync(APP_JS_PATH, "utf8");
+  const cssSource = fs.readFileSync(path.join(PANEL_DIR, "app.css"), "utf8");
+
+  // 1) Verify performance view renders hero, clamp banner, 5 tiers, collapsible 12 params, and DB strip
+  const perfStart = appSource.indexOf("/* ============================================================\r\n   视图：性能调优");
+  const perfAlt = appSource.indexOf("/* ============================================================\n   视图：性能调优");
+  const pStart = perfStart >= 0 ? perfStart : perfAlt;
+  const bootStart = appSource.indexOf("/* ============================================================\r\n   启动");
+  const bootAlt = appSource.indexOf("/* ============================================================\n   启动");
+  const pEnd = bootStart >= 0 ? bootStart : bootAlt;
+  assert.ok(pStart > 0 && pEnd > pStart, "应在 app.js 中找到 视图：性能调优 区块");
+
+  const views = {};
+  vm.runInNewContext(appSource.slice(pStart, pEnd), {
+    window: { setTimeout: () => 1, clearTimeout: () => {} },
+    state: { view: "performance", pendingViewFocus: null, configSchema: null },
+    defineView: (id, cfg) => { views[id] = cfg; },
+    $: () => null,
+    $$: () => [],
+    esc: engine.escapeHtml,
+    compact: (v, f) => String(v ?? "").trim() || (f === undefined ? "" : f),
+    num: (v, d) => Number(v).toFixed(d || 0).replace(/\.0+$/, ""),
+    int: (v) => Math.round(Number(v) || 0),
+    fmtInt: (v) => String(Math.round(Number(v) || 0)),
+    fmtBytes: (b) => `${Math.round(Number(b) / 1048576)} MB`,
+    icon: (name) => `<i>${name}</i>`,
+    card: (t, s, b, a, ex) => `<section class="card ${ex || ""}"><h3>${t}</h3><p>${s}</p>${b}${a || ""}</section>`,
+    apiGet: async () => ({}),
+    apiPost: async () => ({}),
+    withBusy: async (_t, fn) => fn(),
+    toast: () => {},
+    invalidatePool: () => {},
+    bindSmoothDetails: () => {},
+    prefersReducedMotion: () => false,
+    requestAnimationFrame: (fn) => fn(),
+    go: async () => {},
+  });
+
+  const sampleTuning = {
+    profile: "eco",
+    profile_label: "省资源",
+    effective_tier: "eco",
+    effective_tier_label: "省资源",
+    override_count: 1,
+    overrides: { "performance.sqlite_cache_size_mb": 102 },
+    clamped_fields: [
+      { key: "performance.sqlite_cache_size_mb", label: "数据库页缓存", reason: "防爆内存保护：已限幅至 102 MB" },
+    ],
+    hardware: {
+      effective_memory_mb: 1024,
+      cpu_count: 2,
+      memory_source: "cgroup_v2",
+      is_32bit: false,
+      recommended_tier: "eco",
+      recommendation_reason: "检测到容器内存 1.0 GiB，推荐省资源档位。",
+    },
+    tiers: [
+      { id: "auto", label: "智能自动", badge: "默认推荐", tagline: "自动识别", target_scene: "通用", highlights: ["自动识别"] },
+      { id: "eco", label: "省资源", badge: "1–2G", tagline: "低内存", target_scene: "小服", highlights: ["float16"] },
+      { id: "balanced", label: "均衡推荐", badge: "4–8G", tagline: "均衡", target_scene: "常规", highlights: ["float32"] },
+      { id: "turbo", label: "高性能", badge: "16G+", tagline: "高并发", target_scene: "大库", highlights: ["mmap"] },
+      { id: "compat", label: "慢盘兼容", badge: "HDD", tagline: "稳妥", target_scene: "机械盘", highlights: ["FULL"] },
+    ],
+    groups: [{ id: "sqlite", label: "数据库引擎", desc: "引擎参数" }],
+    params: [
+      {
+        key: "performance.sqlite_cache_size_mb",
+        group: "sqlite",
+        label: "数据库页缓存",
+        value_type: "int",
+        unit: "MB",
+        display_scale: 1,
+        min: 4,
+        max: 256,
+        step: 4,
+        hot_reload: true,
+        effect_scope: "保存后立即生效",
+        summary: "热页缓存",
+        up_effect: "调大：读盘更少",
+        down_effect: "调小：更省内存",
+        tier_default: 8,
+        effective_value: 102,
+        overridden: true,
+        clamped: { key: "performance.sqlite_cache_size_mb", reason: "已限幅" },
+      },
+    ],
+    db_summary: { primary_db_bytes: 52428800, wal_bytes: 1048576, scoped_total_bytes: 2097152, grand_total_bytes: 55574528 },
+  };
+  const perfHtml = views.performance.render(sampleTuning);
+  assert.ok(perfHtml.includes("基于「省资源」· 已微调 1 项"));
+  assert.ok(perfHtml.includes("已触发防爆内存安全限幅"));
+  assert.ok(perfHtml.includes('data-perf-tier="compat"'));
+  assert.ok(perfHtml.includes("展开高级性能微调"));
+  assert.ok(perfHtml.includes("调大：读盘更少"));
+  assert.ok(perfHtml.includes("前往数据库体检与一键瘦身"));
+
+  // 2) Verify migrate view renderDbHealthCard renders KPIs, vector bar, recommendations, preflight warning, and shrink report
+  const migStart = appSource.indexOf("/* ============================================================\r\n   视图：维护与迁移");
+  const migAlt = appSource.indexOf("/* ============================================================\n   视图：维护与迁移");
+  const mStart = migStart >= 0 ? migStart : migAlt;
+  const qStart = appSource.indexOf("/* ============================================================\r\n   视图：待修复批次");
+  const qAlt = appSource.indexOf("/* ============================================================\n   视图：待修复批次");
+  const mEnd = qStart >= 0 ? qStart : qAlt;
+  assert.ok(mStart > 0 && mEnd > mStart, "应在 app.js 中找到 视图：维护与迁移 区块");
+
+  const migViews = {};
+  vm.runInNewContext(appSource.slice(mStart, mEnd) + "\nthis.__renderDbHealthCard = renderDbHealthCard;", {
+    window: { setTimeout: () => 1, clearTimeout: () => {} },
+    state: { view: "migrate", pendingViewFocus: null },
+    defineView: (id, cfg) => { migViews[id] = cfg; },
+    $: () => null,
+    $$: () => [],
+    esc: engine.escapeHtml,
+    compact: (v, f) => String(v ?? "").trim() || (f === undefined ? "" : f),
+    int: (v) => Math.round(Number(v) || 0),
+    fmtInt: (v) => String(Math.round(Number(v) || 0)),
+    fmtBytes: (b) => `${Math.round(Number(b) / 1048576)} MB`,
+    jsonPreview: (o) => JSON.stringify(o),
+    card: (t, s, b, a, ex) => `<section class="card ${ex || ""}"><h3>${t}</h3><p>${s}</p>${b}${a || ""}</section>`,
+    emptyState: (t, s) => `<div>${t}:${s}</div>`,
+    apiTry: async (fn, fb) => fb,
+    apiGet: async () => ({}),
+    apiPost: async () => ({}),
+    withBusy: async (_t, fn) => fn(),
+    showInlineConfirmation: async () => true,
+    toast: () => {},
+    invalidatePool: () => {},
+    prefersReducedMotion: () => false,
+    requestAnimationFrame: (fn) => fn(),
+    go: async () => {},
+  });
+
+  const migHtml = migViews.migrate.render({
+    preset: { preset: "standard" },
+    dbHealth: {
+      ok: true,
+      health: {
+        configured_vector_precision: "float32",
+        primary: {
+          total_bytes: 104857600,
+          files: { db_bytes: 94371840, wal_bytes: 10485760 },
+          freelist_bytes: 12582912,
+          freelist_count: 3072,
+          auto_vacuum: 2,
+          vector_precision: "float32",
+          embeddings: {
+            total_rows: 1000,
+            float64_rows: 400,
+            float32_rows: 500,
+            float16_rows: 100,
+            json_rows: 0,
+            archived_orphan_rows: 15,
+            vector_bytes: 20971520,
+            estimated_transcode_savings_bytes: 5242880,
+          },
+          disk_preflight: { ok: false, message: "磁盘剩余空间不足 2.2 倍主库大小" },
+          recommendations: ["检测到 400 条旧版 float64 向量"],
+        },
+        scoped: { total_bytes: 4194304 },
+      },
+    },
+    dbShrinkReport: {
+      ok: true,
+      primary: {
+        before_bytes: 104857600,
+        after_bytes: 73400320,
+        bytes_reclaimed: 31457280,
+        vacuum_mode: "incremental_vacuum",
+        transcode: { transcoded: 400, purged_orphans: 15 },
+      },
+      notice: "",
+    },
+    output: null,
+  });
+  assert.ok(migHtml.includes("数据库体检与一键瘦身"));
+  assert.ok(migHtml.includes("一键常规无损瘦身（推荐）"));
+  assert.ok(migHtml.includes("深度整理压缩（全量 VACUUM）"));
+  assert.ok(migHtml.includes("磁盘剩余空间不足 2.2 倍主库大小"));
+  assert.ok(migHtml.includes("最近一次瘦身结果"));
+  assert.ok(migHtml.includes("增量无损回收"));
+  assert.ok(
+    migHtml.includes("仅整理向量存储、清理已归档/无主向量索引与超期内部回执，绝不删除任何记忆、聊天原文、人物关系或配置"),
+    "体检卡瘦身说明必须明确提示绝不删除任何业务数据"
+  );
+
+  // Also verify scoped disk_preflight warning renders when primary preflight passes
+  const scopedWarnHtml = migViews.migrate.render({
+    preset: { preset: "standard" },
+    dbHealth: {
+      ok: true,
+      health: {
+        configured_vector_precision: "float32",
+        primary: {
+          total_bytes: 10485760,
+          files: { db_bytes: 10485760, wal_bytes: 0 },
+          freelist_bytes: 0,
+          freelist_count: 0,
+          auto_vacuum: 2,
+          vector_precision: "float32",
+          embeddings: { total_rows: 0, float64_rows: 0, float32_rows: 0, float16_rows: 0, json_rows: 0, archived_orphan_rows: 0, vector_bytes: 0, estimated_transcode_savings_bytes: 0 },
+          disk_preflight: { ok: true, available_free_bytes: 512 * 1048576, required_free_bytes: 96 * 1048576 },
+          recommendations: [],
+        },
+        scoped: {
+          total_bytes: 4194304,
+          disk_preflight: { ok: false, reason: "disk_usage_unavailable", message: "无法读取副库磁盘剩余空间，已安全阻断副库全量 VACUUM。" },
+        },
+      },
+    },
+    dbShrinkReport: null,
+    output: null,
+  });
+  assert.ok(scopedWarnHtml.includes("副库深度压缩空间预检未通过"));
+  assert.ok(scopedWarnHtml.includes("无法读取副库磁盘剩余空间"));
+
+  // 3) Verify new CSS section 8 has ZERO hardcoded hex colors and covers mobile touch & narrow-screen rules
+  const sec8Idx = cssSource.indexOf("/* ---------- 8. 性能调优视图与数据库体检瘦身卡片");
+  assert.ok(sec8Idx > 0, "app.css 应包含第 8 节性能调优与数据库体检样式");
+  const sec8Css = cssSource.slice(sec8Idx);
+  assert.equal(sec8Css.match(/#[0-9a-fA-F]{3,8}\b/g), null, "新增性能调优与数据库体检 CSS 严禁包含硬编码色值");
+  assert.ok(sec8Css.includes("@media (max-width: 520px)") && sec8Css.includes("repeat(2, minmax(0, 1fr))"), "<=520px .db-kpi-grid 应为 2 列网格");
+  assert.ok(sec8Css.includes("@media (max-width: 340px)") && sec8Css.includes("grid-template-columns: minmax(0, 1fr)"), "<=340px .db-kpi-grid 应退化为单列");
+  assert.ok(sec8Css.includes(".db-action-btns .btn") && sec8Css.includes("min-height: 38px"), "移动端长文案瘦身按钮应允许换行且触控高 >=38px");
+  assert.ok(sec8Css.includes(".perf-param-ctrl select") && sec8Css.includes("min-height: 36px"), "移动端参数下拉与输入框应满宽且触控高 >=36px");
+  assert.ok(sec8Css.includes(".db-health-card .card-head-actions"), "移动端数据库体检卡片按钮组应允许折行");
+  assert.ok(sec8Css.includes(".content > .is-inplace-refresh") && sec8Css.includes("animation: none"), "原地局部刷新容器应禁用 viewIn 滑入动画重播");
+});
+
+test("go(viewId, { inPlace: true }) skips skeleton flash, suppresses viewIn animation, and preserves scroll & focus", async () => {
+  const appSource = fs.readFileSync(APP_JS_PATH, "utf8");
+  const routeStart = appSource.indexOf("/* ------------------------------------------------------------\r\n   路由");
+  const routeAlt = appSource.indexOf("/* ------------------------------------------------------------\n   路由");
+  const rStart = routeStart >= 0 ? routeStart : routeAlt;
+  const compStart = appSource.indexOf("/* ------------------------------------------------------------\r\n   组件片段");
+  const compAlt = appSource.indexOf("/* ------------------------------------------------------------\n   组件片段");
+  const rEnd = compStart >= 0 ? compStart : compAlt;
+  assert.ok(rStart > 0 && rEnd > rStart, "应在 app.js 中找到 路由 区块");
+
+  const skeletonWrites = [];
+  let innerHtmlHistory = [];
+  let mountedNode = null;
+  let focusCalls = [];
+  const makeFakeEl = (id) => {
+    const classes = new Set();
+    return {
+      id: id || "",
+      disabled: false,
+      _html: "",
+      children: [],
+      get firstElementChild() { return this.children[0] || null; },
+      get innerHTML() { return this._html; },
+      set innerHTML(v) {
+        this._html = String(v);
+        if (this.id === "content") {
+          innerHtmlHistory.push(this._html);
+          if (this._html.includes("skeleton")) skeletonWrites.push(this._html);
+        }
+        if (this._html === "") this.children = [];
+      },
+      appendChild(child) { this.children.push(child); mountedNode = child; return child; },
+      classList: {
+        add(c) { classes.add(c); },
+        contains(c) { return classes.has(c); },
+      },
+      contains(target) { return Boolean(target && target.__insideHost); },
+      scrollTop: 0,
+      focus(opts) { focusCalls.push({ id: this.id, opts }); },
+    };
+  };
+
+  const host = makeFakeEl("content");
+  const saveBtn = makeFakeEl("perfSaveBtn");
+  saveBtn.__insideHost = true;
+  const toasts = [];
+  let loadCount = 0;
+  let failNext = false;
+  let scrollToCalls = [];
+
+  const sandbox = {
+    NAV_KEY: "mc_nav",
+    VIEWS: {
+      performance: {
+        title: "性能调优",
+        eyebrow: "Settings · Performance",
+        hint: "hint",
+        async load() {
+          loadCount += 1;
+          if (failNext) throw new Error("network down");
+          return { rev: loadCount };
+        },
+        render(payload) { return `<div data-rev="${payload.rev}">rev ${payload.rev}</div>`; },
+        mount() {},
+      },
+    },
+    state: { view: "", group: "", mode: "standard" },
+    findGroupOf: () => "settings",
+    renderRail: () => {},
+    esc: engine.escapeHtml,
+    toast: (msg, tone) => toasts.push({ msg, tone }),
+    $: (sel, root) => {
+      if (sel === "#content") return host;
+      if (sel === "#perfSaveBtn" && root) return saveBtn;
+      if (sel === "#viewEyebrow" || sel === "#viewTitle" || sel === "#viewHint") return { textContent: "" };
+      return null;
+    },
+    document: {
+      title: "",
+      activeElement: null,
+      createElement: () => makeFakeEl(""),
+    },
+    window: {
+      localStorage: { setItem() {} },
+      scrollY: 0,
+      scrollTo(x, y) { scrollToCalls.push([x, y]); },
+    },
+  };
+  vm.runInNewContext(appSource.slice(rStart, rEnd) + "\nthis.__go = go;", sandbox);
+
+  // 1) Initial navigation shows skeleton and does NOT tag is-inplace-refresh
+  await sandbox.__go("performance");
+  assert.equal(skeletonWrites.length, 1);
+  assert.equal(mountedNode.classList.contains("is-inplace-refresh"), false);
+
+  // 2) In-place refresh on the same view: zero skeleton write, tagged is-inplace-refresh, restores scroll & focus
+  host.scrollTop = 345;
+  sandbox.window.scrollY = 180;
+  sandbox.document.activeElement = saveBtn;
+  await sandbox.__go("performance", { inPlace: true });
+  assert.equal(skeletonWrites.length, 1, "inPlace 刷新不得写入 220px skeleton 骨架屏");
+  assert.equal(mountedNode.classList.contains("is-inplace-refresh"), true, "inPlace 刷新容器必须带 is-inplace-refresh");
+  assert.equal(host.scrollTop, 345, "inPlace 刷新必须保留 #content scrollTop");
+  assert.deepEqual(scrollToCalls[scrollToCalls.length - 1], [0, 180], "inPlace 刷新在移动端应保留 window.scrollY");
+  assert.equal(focusCalls.length, 1);
+  assert.equal(focusCalls[0].id, "perfSaveBtn");
+
+  // 3) Reload failure during inPlace preserves existing DOM and emits an error toast
+  const prevChild = host.firstElementChild;
+  failNext = true;
+  await sandbox.__go("performance", { inPlace: true });
+  assert.equal(host.firstElementChild, prevChild, "inPlace 刷新失败时不得销毁当前页面");
+  assert.ok(toasts.some((t) => t.tone === "error" && t.msg.includes("network down")));
+});
+
+test("performance save triggers inPlace refresh; migrate DB health & shrink update in place without clearing form inputs", async () => {
+  const appSource = fs.readFileSync(APP_JS_PATH, "utf8");
+
+  // --- Part 1: performance view applyTuning calls go('performance', { inPlace: true }) ---
+  const perfStart = appSource.indexOf("/* ============================================================\r\n   视图：性能调优");
+  const perfAlt = appSource.indexOf("/* ============================================================\n   视图：性能调优");
+  const pStart = perfStart >= 0 ? perfStart : perfAlt;
+  const bootStart = appSource.indexOf("/* ============================================================\r\n   启动");
+  const bootAlt = appSource.indexOf("/* ============================================================\n   启动");
+  const pEnd = bootStart >= 0 ? bootStart : bootAlt;
+
+  const perfGoCalls = [];
+  const perfListeners = {};
+  const makeBtn = (id) => ({
+    id,
+    disabled: false,
+    textContent: "",
+    addEventListener(type, fn) { perfListeners[`${id}:${type}`] = fn; },
+  });
+  const perfViews = {};
+  vm.runInNewContext(appSource.slice(pStart, pEnd), {
+    window: { setTimeout: () => 1, clearTimeout: () => {} },
+    state: { view: "performance", pendingViewFocus: null, configSchema: {} },
+    defineView: (id, cfg) => { perfViews[id] = cfg; },
+    $: (sel) => {
+      if (sel === "#perfSaveBtn") return makeBtn("perfSaveBtn");
+      if (sel === "#perfResetAllBtn") return makeBtn("perfResetAllBtn");
+      return null;
+    },
+    $$: () => [],
+    esc: engine.escapeHtml,
+    compact: (v, f) => String(v ?? "").trim() || (f === undefined ? "" : f),
+    num: (v) => String(v),
+    int: (v) => Math.round(Number(v) || 0),
+    fmtInt: (v) => String(Math.round(Number(v) || 0)),
+    fmtBytes: (b) => `${b} B`,
+    icon: () => "",
+    card: (_t, _s, b) => b,
+    apiGet: async () => ({}),
+    apiPost: async () => ({ tuning: { hot_reload: { read_pool_generation: 2 }, clamped_fields: [] } }),
+    withBusy: async (_t, fn) => fn(),
+    toast: () => {},
+    invalidatePool: () => {},
+    bindSmoothDetails: () => {},
+    prefersReducedMotion: () => false,
+    requestAnimationFrame: (fn) => fn(),
+    go: async (viewId, opts) => { perfGoCalls.push({ viewId, opts }); },
+  });
+  perfViews.performance.mount({}, { profile: "balanced", override_count: 0, overrides: {}, params: [] });
+  await perfListeners["perfSaveBtn:click"]();
+  await perfListeners["perfResetAllBtn:click"]();
+  assert.equal(perfGoCalls.length, 2);
+  assert.equal(perfGoCalls[0].viewId, "performance");
+  assert.equal(Boolean(perfGoCalls[0].opts && perfGoCalls[0].opts.inPlace), true, "性能调优保存必须使用 inPlace 刷新");
+  assert.equal(Boolean(perfGoCalls[1].opts && perfGoCalls[1].opts.inPlace), true, "恢复档位默认必须使用 inPlace 刷新");
+
+  // --- Part 2: migrate view DB health refresh / shrink / preview preserve #portablePath, #lmPath, #releaseBatchId ---
+  const migStart = appSource.indexOf("/* ============================================================\r\n   视图：维护与迁移");
+  const migAlt = appSource.indexOf("/* ============================================================\n   视图：维护与迁移");
+  const mStart = migStart >= 0 ? migStart : migAlt;
+  const qStart = appSource.indexOf("/* ============================================================\r\n   视图：待修复批次");
+  const qAlt = appSource.indexOf("/* ============================================================\n   视图：待修复批次");
+  const mEnd = qStart >= 0 ? qStart : qAlt;
+
+  const migViews = {};
+  const migGoCalls = [];
+  const migToasts = [];
+  const confirmCalls = [];
+  let healthFetchCount = 0;
+  let optimizePayloads = [];
+
+  const makeSlotEl = (id) => ({
+    id,
+    innerHTML: "",
+    contains: () => false,
+  });
+  const dbHealthSlot = makeSlotEl("dbHealthSlot");
+  const migrateOutputSlot = makeSlotEl("migrateOutputSlot");
+  const portablePathInput = { id: "portablePath", value: "/data/my_export.jsonl" };
+  const lmPathInput = { id: "lmPath", value: "/data/livingmemory.db" };
+  const releaseBatchInput = { id: "releaseBatchId", value: "sb_keep_me_99" };
+
+  let slotButtons = {};
+  const makeSlotButton = (id) => {
+    const btn = {
+      id,
+      disabled: false,
+      textContent: id === "dbHealthRefreshBtn" ? "刷新体检" : id,
+      handlers: {},
+      addEventListener(type, fn) { this.handlers[type] = fn; },
+    };
+    slotButtons[id] = btn;
+    return btn;
+  };
+  let staticButtons = {};
+  const makeStaticButton = (id) => {
+    if (!staticButtons[id]) {
+      staticButtons[id] = {
+        id,
+        handlers: {},
+        addEventListener(type, fn) { this.handlers[type] = fn; },
+      };
+    }
+    return staticButtons[id];
+  };
+  const resetSlotButtons = () => {
+    slotButtons = {};
+    makeSlotButton("dbHealthRefreshBtn");
+    makeSlotButton("dbGoPerfBtn");
+    makeSlotButton("dbShrinkRegularBtn");
+    makeSlotButton("dbShrinkFullBtn");
+  };
+  resetSlotButtons();
+  const origSlotDesc = { value: "" };
+  Object.defineProperty(dbHealthSlot, "innerHTML", {
+    get() { return origSlotDesc.value; },
+    set(v) {
+      origSlotDesc.value = String(v);
+      resetSlotButtons();
+    },
+  });
+
+  vm.runInNewContext(appSource.slice(mStart, mEnd), {
+    window: { setTimeout: () => 1, clearTimeout: () => {} },
+    document: { activeElement: portablePathInput },
+    state: { view: "migrate", pendingViewFocus: null },
+    defineView: (id, cfg) => { migViews[id] = cfg; },
+    $: (sel, root) => {
+      if (sel === "#dbHealthSlot") return dbHealthSlot;
+      if (sel === "#migrateOutputSlot") return migrateOutputSlot;
+      if (sel === "#portablePath") return portablePathInput;
+      if (sel === "#lmPath") return lmPathInput;
+      if (sel === "#releaseBatchId") return releaseBatchInput;
+      if (sel === "#dbHealthRefreshBtn") return slotButtons.dbHealthRefreshBtn;
+      if (sel === "#dbGoPerfBtn") return slotButtons.dbGoPerfBtn;
+      if (sel === "#dbShrinkRegularBtn") return slotButtons.dbShrinkRegularBtn;
+      if (sel === "#dbShrinkFullBtn") return slotButtons.dbShrinkFullBtn;
+      if (sel.startsWith("#")) return makeStaticButton(sel.slice(1));
+      return null;
+    },
+    $$: () => [],
+    esc: engine.escapeHtml,
+    compact: (v, f) => String(v ?? "").trim() || (f === undefined ? "" : f),
+    int: (v) => Math.round(Number(v) || 0),
+    fmtInt: (v) => String(Math.round(Number(v) || 0)),
+    fmtBytes: (b) => `${Math.round(Number(b) / 1048576)} MB`,
+    jsonPreview: (o) => JSON.stringify(o),
+    card: (t, s, b, a, ex) => `<section class="card ${ex || ""}"><h3>${t}</h3><p>${s}</p>${b}${a || ""}</section>`,
+    emptyState: (t, s) => `<div>${t}:${s}</div>`,
+    apiTry: async (fn, fb) => fb,
+    apiGet: async (url) => {
+      if (url === "/maintenance/db_health") {
+        healthFetchCount += 1;
+        return {
+          health: {
+            configured_vector_precision: "float16",
+            primary: {
+              total_bytes: (100 - healthFetchCount * 10) * 1048576,
+              files: { db_bytes: 80 * 1048576, wal_bytes: 2 * 1048576 },
+              freelist_bytes: 0,
+              freelist_count: 0,
+              auto_vacuum: 2,
+              vector_precision: "float16",
+              embeddings: { total_rows: 10, float64_rows: 0, float32_rows: 0, float16_rows: 10, json_rows: 0, archived_orphan_rows: 0, vector_bytes: 1024, estimated_transcode_savings_bytes: 0 },
+              recommendations: [],
+            },
+            scoped: { total_bytes: 0 },
+          },
+        };
+      }
+      if (url.startsWith("/data/import/preview")) {
+        return { preview: true, count: 7 };
+      }
+      return {};
+    },
+    apiPost: async (url, body) => {
+      if (url === "/maintenance/db_optimize") {
+        optimizePayloads.push(body);
+        return {
+          ok: true,
+          primary: {
+            before_bytes: 90 * 1048576,
+            after_bytes: 60 * 1048576,
+            bytes_reclaimed: 30 * 1048576,
+            vacuum_mode: body.run_full_vacuum ? "full_vacuum_incremental_enabled" : "incremental_vacuum",
+            transcode: { transcoded: 12, purged_orphans: 2 },
+          },
+        };
+      }
+      return { ok: true };
+    },
+    withBusy: async (_t, fn) => fn(),
+    showInlineConfirmation: async (title, msg, confirmLabel) => {
+      confirmCalls.push({ title, msg, confirmLabel });
+      return true;
+    },
+    toast: (msg, tone) => migToasts.push({ msg, tone }),
+    invalidatePool: () => {},
+    prefersReducedMotion: () => false,
+    requestAnimationFrame: (fn) => fn(),
+    go: async (viewId, opts) => { migGoCalls.push({ viewId, opts }); },
+  });
+
+  const rootNode = { isConnected: true };
+  migViews.migrate.mount(rootNode);
+
+  // 1) Click 刷新体检 -> partial update of #dbHealthSlot only, zero go() call, form values untouched
+  await slotButtons.dbHealthRefreshBtn.handlers.click();
+  assert.equal(migGoCalls.length, 0, "点击刷新体检不得触发整页 go('migrate')");
+  assert.equal(healthFetchCount, 1);
+  assert.ok(dbHealthSlot.innerHTML.includes("90 MB"), "体检卡应原地刷新为最新体积");
+  assert.equal(portablePathInput.value, "/data/my_export.jsonl");
+  assert.equal(lmPathInput.value, "/data/livingmemory.db");
+  assert.equal(releaseBatchInput.value, "sb_keep_me_99");
+
+  // 2) Click 一键常规无损瘦身 (on the rebound button!) -> partial update of output & health slot, zero go()
+  await slotButtons.dbShrinkRegularBtn.handlers.click();
+  assert.equal(migGoCalls.length, 0, "常规瘦身不得触发整页 go('migrate')");
+  assert.equal(optimizePayloads.length, 1);
+  assert.equal(optimizePayloads[0].run_full_vacuum, false);
+  assert.ok(dbHealthSlot.innerHTML.includes("最近一次瘦身结果"), "瘦身后体检卡应原地展示瘦身报告");
+  assert.ok(migrateOutputSlot.innerHTML.includes("incremental_vacuum"), "输出区应原地更新瘦身 JSON");
+  assert.equal(portablePathInput.value, "/data/my_export.jsonl");
+  assert.equal(lmPathInput.value, "/data/livingmemory.db");
+  assert.equal(releaseBatchInput.value, "sb_keep_me_99");
+
+  // 3) Click 深度整理压缩 -> partial update, zero go(), form values still intact, confirmation explicitly states non-destructive
+  await slotButtons.dbShrinkFullBtn.handlers.click();
+  assert.equal(migGoCalls.length, 0, "深度压缩不得触发整页 go('migrate')");
+  assert.equal(confirmCalls.length, 1);
+  assert.ok(
+    confirmCalls[0].msg.includes("仅整理向量存储、清理已归档/无主向量索引与超期内部回执，绝不删除任何记忆、聊天原文、人物关系或配置"),
+    "深度压缩确认弹窗必须明确注明绝不删除任何业务数据"
+  );
+  assert.equal(optimizePayloads.length, 2);
+  assert.equal(optimizePayloads[1].run_full_vacuum, true);
+  assert.ok(migrateOutputSlot.innerHTML.includes("full_vacuum_incremental_enabled"));
+  assert.equal(portablePathInput.value, "/data/my_export.jsonl");
+  assert.equal(lmPathInput.value, "/data/livingmemory.db");
+  assert.equal(releaseBatchInput.value, "sb_keep_me_99");
+
+  // 4) Click 预览导入 -> output updates in place without wiping #portablePath / #lmPath / #releaseBatchId
+  await staticButtons.portablePreviewBtn.handlers.click();
+  assert.equal(migGoCalls.length, 0, "预览导入不得触发整页 go('migrate')");
+  assert.ok(migrateOutputSlot.innerHTML.includes("&quot;count&quot;:7"));
+  assert.equal(portablePathInput.value, "/data/my_export.jsonl");
+  assert.equal(lmPathInput.value, "/data/livingmemory.db");
+  assert.equal(releaseBatchInput.value, "sb_keep_me_99");
 });

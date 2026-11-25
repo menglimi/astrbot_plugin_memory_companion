@@ -9,7 +9,9 @@ from __future__ import annotations
 from contextlib import contextmanager
 import hashlib
 import json
+import math
 from pathlib import Path
+import shutil
 import sqlite3
 import threading
 import time
@@ -970,6 +972,55 @@ class ScopedStore:
         self._truncate_wal()
         return result
 
+    def _available_disk_bytes(self) -> int | None:
+        try:
+            target_dir = self.path.parent if self.path.parent.exists() else Path(".")
+            return int(shutil.disk_usage(target_dir).free)
+        except OSError:
+            return None
+
+    def _full_vacuum_disk_preflight(self, db_bytes: int) -> dict[str, Any]:
+        """Pre-flight disk check for scoped DB full VACUUM: require >= 2.2x DB + 64 MiB free (fail-closed)."""
+        size_bytes = max(0, int(db_bytes))
+        required_free_bytes = int(math.ceil(size_bytes * 2.2)) + 64 * 1024 * 1024
+        available_free_bytes = self._available_disk_bytes()
+        if available_free_bytes is None:
+            req_mb = required_free_bytes / (1024 * 1024)
+            return {
+                "ok": False,
+                "reason": "disk_usage_unavailable",
+                "db_bytes": size_bytes,
+                "required_free_bytes": required_free_bytes,
+                "available_free_bytes": None,
+                "message": (
+                    f"无法读取副库磁盘剩余空间，出于安全保护已阻断副库深度整理压缩（全量 VACUUM，"
+                    f"需确认至少预留 2.2 倍副库空间 + 64 MiB，约 {req_mb:.1f} MiB）。"
+                    f"建议改用「一键常规无损瘦身」。"
+                ),
+            }
+        ok = available_free_bytes >= required_free_bytes
+        if ok:
+            reason = ""
+            message = ""
+        else:
+            reason = "insufficient_disk_space"
+            db_mb = size_bytes / (1024 * 1024)
+            req_mb = required_free_bytes / (1024 * 1024)
+            free_mb = available_free_bytes / (1024 * 1024)
+            message = (
+                f"副库所在磁盘剩余空间不足，已安全阻断副库全量 VACUUM。"
+                f"当前副库约 {db_mb:.1f} MiB，需至少预留 2.2 倍副库空间 + 64 MiB（约 {req_mb:.1f} MiB），"
+                f"当前磁盘仅剩约 {free_mb:.1f} MiB。建议改用「一键常规无损瘦身」。"
+            )
+        return {
+            "ok": ok,
+            "reason": reason,
+            "db_bytes": size_bytes,
+            "required_free_bytes": required_free_bytes,
+            "available_free_bytes": available_free_bytes,
+            "message": message,
+        }
+
     def prune_expired_operations(
         self,
         *,
@@ -1002,6 +1053,8 @@ class ScopedStore:
             if removed < take:
                 break
         vacuumed = False
+        vacuum_mode = "none"
+        disk_preflight: dict[str, Any] | None = None
         with self._lock:
             with self._connection() as conn:
                 try:
@@ -1009,17 +1062,31 @@ class ScopedStore:
                 except sqlite3.OperationalError:
                     auto_vacuum = 0
                 if run_full_vacuum and (deleted_total > 0 or auto_vacuum != 2):
-                    try:
-                        if auto_vacuum != 2:
-                            conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
-                        conn.execute("VACUUM")
-                        vacuumed = True
-                    except sqlite3.OperationalError:
-                        pass
+                    db_bytes = self.path.stat().st_size if self.path.exists() else 0
+                    disk_preflight = self._full_vacuum_disk_preflight(db_bytes)
+                    if not disk_preflight["ok"]:
+                        reason = str(disk_preflight.get("reason") or "insufficient_disk_space")
+                        vacuum_mode = f"full_vacuum_blocked_{reason}"
+                        if auto_vacuum == 2 and vacuum_pages > 0:
+                            try:
+                                conn.execute(f"PRAGMA incremental_vacuum({max(1, int(vacuum_pages))})")
+                                vacuumed = True
+                            except sqlite3.OperationalError:
+                                pass
+                    else:
+                        try:
+                            if auto_vacuum != 2:
+                                conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                            conn.execute("VACUUM")
+                            vacuumed = True
+                            vacuum_mode = "full_vacuum_incremental_enabled"
+                        except sqlite3.OperationalError:
+                            vacuum_mode = "full_vacuum_skipped"
                 elif auto_vacuum == 2 and vacuum_pages > 0:
                     try:
                         conn.execute(f"PRAGMA incremental_vacuum({max(1, int(vacuum_pages))})")
                         vacuumed = True
+                        vacuum_mode = "incremental_vacuum"
                     except sqlite3.OperationalError:
                         pass
                 try:
@@ -1030,11 +1097,18 @@ class ScopedStore:
                     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 except sqlite3.OperationalError:
                     pass
-        return {
+        result: dict[str, Any] = {
             "deleted_operations": deleted_total,
             "cutoff_ts": cutoff,
             "vacuumed": vacuumed,
+            "vacuum_mode": vacuum_mode,
         }
+        if disk_preflight is not None:
+            result["disk_preflight"] = disk_preflight
+            if not disk_preflight["ok"]:
+                result["vacuum_skipped_reason"] = str(disk_preflight.get("reason") or "insufficient_disk_space")
+                result["vacuum_skipped_message"] = str(disk_preflight.get("message") or "")
+        return result
 
     def health_snapshot(self) -> dict[str, Any]:
         """Read-only storage metrics for ``req041_scoped.db``."""
@@ -1043,6 +1117,7 @@ class ScopedStore:
         shm_path = Path(f"{self.path}-shm")
         wal_bytes = wal_path.stat().st_size if wal_path.exists() else 0
         shm_bytes = shm_path.stat().st_size if shm_path.exists() else 0
+        disk_preflight = self._full_vacuum_disk_preflight(db_bytes)
         with self._connection() as conn:
             records = int(conn.execute("SELECT COUNT(*) FROM scoped_records").fetchone()[0] or 0)
             operations = int(conn.execute("SELECT COUNT(*) FROM scoped_operations").fetchone()[0] or 0)
@@ -1058,6 +1133,7 @@ class ScopedStore:
             "shm_bytes": shm_bytes,
             "total_bytes": db_bytes + wal_bytes + shm_bytes,
             "scoped_records": records,
+            "disk_preflight": disk_preflight,
             "scoped_operations": operations,
             "page_size": page_size,
             "page_count": page_count,
