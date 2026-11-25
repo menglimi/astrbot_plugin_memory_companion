@@ -142,7 +142,13 @@ from .vector_search import bounded_cache_bytes
 from .source_query import query_sources, source_visible
 from .source_discovery import discover_sources as run_source_discovery
 from .source_evidence import record_source_read, message_source_version, remember_source_reads
-from .source_surface import aggregate_source_surface, source_surface_metadata
+from .source_surface import (
+    aggregate_source_surface,
+    parse_surface_weights,
+    source_surface_metadata,
+    source_surface_rules,
+    surface_specs,
+)
 from .source_semantic import (
     acknowledge_dirty as acknowledge_semantic_dirty,
     build_semantic_window,
@@ -2715,7 +2721,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 "memory_id": memory_id,
                 "message_id": clean_text(ctx.message_id, 120),
                 "memory_companion_injection_state": injection_state,
-                **source_surface_metadata(ctx.message_id, ctx.platform),
+                **source_surface_metadata(ctx.message_id, ctx.platform, **self._source_surface_rules()),
                 **self._cross_window_event_metadata(ctx),
             },
         )
@@ -2795,7 +2801,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         metadata: dict[str, Any] = {
             "source": clean_text(source, 80),
             "conversation_memory": True,
-            **source_surface_metadata(ctx.message_id, ctx.platform),
+            **source_surface_metadata(ctx.message_id, ctx.platform, **self._source_surface_rules()),
         }
         rows = recent_rows
         if rows is None:
@@ -4875,9 +4881,44 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             "embedding_top_k": self.config.int("retrieval.embedding_top_k", 32),
             "embedding_score_threshold": self.config.float("retrieval.embedding_score_threshold", 0.34),
             "embedding_weight": self.config.float("retrieval.embedding_weight", 0.55),
+            # 这两个同样改「送进 embedding 的文本长度 / 调用期限」→ 改向量召回结果；
+            # 默认值与引擎构造处（_embedding_timeout_ms() / 1200）逐字同口径。
+            "embedding_timeout_ms": self._embedding_timeout_ms(),
+            "embedding_max_text_chars": self.config.int("retrieval.embedding_max_text_chars", 1200),
             "non_conversation_budget": self.config.int(
                 "retrieval_advanced.non_conversation_budget", 2
             ),
+            # 下面六个 retrieval_advanced 旋钮直接改打分与候选筛选（引擎构造见
+            # _retrieval_engine）。默认值与那里逐字一致；漏在缓存 key 外会让面板改完
+            # 要等 TTL 过期才生效，看起来像「改了没反应」。
+            "relax_keyword_min_hits": self.config.bool(
+                "retrieval_advanced.relax_keyword_min_hits", False
+            ),
+            "proactive_message_score_penalty": self.config.float(
+                "retrieval_advanced.proactive_message_score_penalty", 1.0
+            ),
+            "dedupe_content_ratio": self.config.float(
+                "retrieval_advanced.dedupe_content_ratio", 0.0
+            ),
+            "anchor_floor_enabled": self.config.bool(
+                "retrieval_advanced.anchor_floor_enabled", False
+            ),
+            "scope_bonus_scale": self.config.float(
+                "retrieval_advanced.scope_bonus_scale", 0.2
+            ),
+            "mmr_redundancy_weight": self.config.float(
+                "retrieval_advanced.mmr_redundancy_weight", 0.35
+            ),
+            # 来源主次三项 + 注册表：注册名集合参与「未声明来源恒 1.0」的判定，
+            # 所以它同样影响结果，必须一起进 key。
+            "source_surface_priority": str(
+                self.config.get("retrieval_advanced.source_surface_priority", "equal")
+            ),
+            "source_surface_weight": self.config.float(
+                "retrieval_advanced.source_surface_weight", 1.0
+            ),
+            "source_surface_weights": self._source_surface_weights(),
+            "source_surface_registry": list(self._source_surface_names()),
             "current_window_candidate_limit": self.config.int("retrieval.current_window_candidate_limit", 600),
             "keyword_fallback_min_fts_candidates": self.config.int(
                 "retrieval.keyword_fallback_min_fts_candidates", 80
@@ -5270,6 +5311,16 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             mmr_redundancy_weight=self.config.float(
                 "retrieval_advanced.mmr_redundancy_weight", 0.35
             ),
+            # 来源主次：priority 只能是 equal 或已注册来源名（引擎里再校验一次，
+            # 非法值回落 equal），weights 是显式覆盖表，优先于 priority+weight。
+            source_surface_priority=str(
+                self.config.get("retrieval_advanced.source_surface_priority", "equal")
+            ),
+            source_surface_weight=self.config.float(
+                "retrieval_advanced.source_surface_weight", 1.0
+            ),
+            source_surface_weights=self._source_surface_weights(),
+            source_surface_names=self._source_surface_names(),
         )
 
     async def _resolve_rerank_provider(self, ctx: SessionContext, *, mode: str) -> tuple[Any, str]:
@@ -8041,7 +8092,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 metadata={
                     "summary_batch_id": batch_id,
                     "summary_refs": payload.get("summary_refs", []),
-                    **aggregate_source_surface(rows),
+                    **aggregate_source_surface(rows, **self._source_surface_rules()),
                     "summary_event_count": len(rows),
                     "unsummarized_total": total,
                     "start_at": start_at,
@@ -8164,7 +8215,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             metadata={
                 "summary_batch_id": batch_id,
                 "summary_event_count": len(rows),
-                **aggregate_source_surface(rows),
+                **aggregate_source_surface(rows, **self._source_surface_rules()),
                 "degraded_summary": True,
                 "summary_validation_error": clean_text(feedback, 1800),
                 "quality_warnings": list(
@@ -9169,6 +9220,58 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
     async def list_core_memory_blocks(self) -> list[MemoryRecord]:
         return await self.store.list_core_memories(limit=1000)
 
+    def _config_text(self, key: str, default: str = "") -> Any:
+        """Read a dotted string config value, tolerating partial doubles.
+
+        Production configs expose ``get``; a few tests build a stand-in that
+        only implements the typed accessors (``bool``/``int``/``float``). In
+        that case fall back to the default instead of raising.
+        """
+        getter = getattr(self.config, "get", None)
+        return getter(key, default) if callable(getter) else default
+
+    def _source_surface_rules(self) -> dict[str, dict[str, str]]:
+        """Registry from ``memory_capture.source_surfaces`` as helper kwargs.
+
+        Empty or unparsable configuration yields the built-in set, so the
+        default behaviour is byte-for-byte the one from before registration
+        existed. The parsed maps are memoised on the raw value: re-parsing the
+        same JSON for every captured message would be pure waste.
+        """
+        raw = self._config_text("memory_capture.source_surfaces", "")
+        cached = getattr(self, "_source_surface_rules_cache", None)
+        if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == raw:
+            return cached[1]
+        prefixes, platforms = source_surface_rules(raw)
+        rules = {"known_prefixes": prefixes, "known_platforms": platforms}
+        self._source_surface_rules_cache = (raw, rules)
+        return rules
+
+    def _source_surface_names(self) -> tuple[str, ...]:
+        """Registered surface names: built-ins plus configured entries.
+
+        Used for two things: validating ``source_surface_priority`` (it may only
+        name a registered surface) and deciding that an undeclared-but-valid
+        label stays neutral. Memoised on the raw config value, like the rules.
+        """
+        raw = self._config_text("memory_capture.source_surfaces", "")
+        cached = getattr(self, "_source_surface_names_cache", None)
+        if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == raw:
+            return cached[1]
+        names = tuple(spec.name for spec in surface_specs(raw))
+        self._source_surface_names_cache = (raw, names)
+        return names
+
+    def _source_surface_weights(self) -> dict[str, float]:
+        """Explicit per-surface multipliers from ``retrieval_advanced.source_surface_weights``.
+
+        The scoring side asks for this map once per recall; an empty map means
+        "no explicit weights", which is the default and never discounts a row.
+        """
+        return parse_surface_weights(
+            self._config_text("retrieval_advanced.source_surface_weights", "")
+        )
+
     async def _core_source_surface_metadata(self, refs: Any) -> dict[str, Any]:
         """Derive source_surface for a distilled core memory from its source refs.
 
@@ -9201,7 +9304,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             }
             for memory_id, record in (records or {}).items()
         ]
-        return aggregate_source_surface(rows)
+        return aggregate_source_surface(rows, **self._source_surface_rules())
 
     async def save_core_memory_block(self, payload: dict[str, Any], *, auto_distilled: bool = False) -> dict[str, Any]:
         label = clean_text(payload.get("label"), 80)
@@ -10046,7 +10149,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                 metadata={
                     "tool": "memory_companion_remember",
                     "note_type": note_type,
-                    **source_surface_metadata(ctx.message_id, ctx.platform),
+                    **source_surface_metadata(ctx.message_id, ctx.platform, **self._source_surface_rules()),
                     "owner_bot_id": self._bot_subject_id(ctx),
                     **memory_proposal.as_metadata(),
                     "persona_id": ctx.persona_id,

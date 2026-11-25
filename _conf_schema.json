@@ -109,6 +109,12 @@
         "hint": "记忆捕获与来源索引的总开关（默认开启）。关闭后不再记录用户消息、Bot 回复和来源片段，用于临时停用整个捕获链路；阶段总结、管理命令和手动写入不受影响。",
         "type": "bool",
         "default": true
+      },
+      "source_surfaces": {
+        "description": "来源注册表",
+        "hint": "留空表示只用内置来源：游戏内消息按 mc- 前缀判为 minecraft，QQ 平台族判为 qq。需要接入第三方来源时填 JSON 数组，例如 [{\"name\":\"discord\",\"message_id_prefixes\":[\"dc-\"],\"platforms\":[\"discord\"]}]。name 只能用 2-32 位小写字母、数字、下划线或连字符（首字符为字母），unknown 与 mixed 是状态保留值、不能注册；message_id_prefixes 按最长前缀优先匹配；platforms 在内置 QQ 平台族之上覆盖。写错（非法 JSON、名字不合法）只会忽略该条目并回落到内置来源，不影响捕获；本项只影响之后新写入的来源标记。",
+        "type": "string",
+        "default": ""
       }
     }
   },
@@ -982,6 +988,36 @@
         "hint": "MMR 重排里“与已选结果重复”的扣分权重。越大越倾向给不同的事，越小越倾向给最相关的同一件事。默认 0.35。",
         "type": "float",
         "default": 0.35,
+        "min": 0.0,
+        "max": 1.0,
+        "slider": {
+          "min": 0.0,
+          "max": 1.0,
+          "step": 0.01
+        }
+      },
+      "source_surface_weights": {
+        "description": "按来源单独设权重",
+        "hint": "留空表示不按来源加权（默认，行为与旧版一致）。填 JSON 对象可按来源覆盖评分乘数，例如 {\"minecraft\":0.6}：键是已注册的来源名，值是 0-1 的乘数，1.0 表示不降权；mixed 与 unknown 恒为 1.0，无法覆盖。与「来源主次」配置同时存在时本项优先；写错只会忽略该条目。",
+        "type": "string",
+        "default": ""
+      },
+      "source_surface_priority": {
+        "description": "记忆来源主次",
+        "hint": "equal=不分主次（默认，行为与旧版一致）；minecraft=游戏内的事优先；qq=QQ 上的事优先。只改本项不产生效果，必须同时把下方权重降到 1.0 以下。第三方来源名也可以填（需先在「来源注册表」里声明；面板下拉只列内置项，第三方名请直接改配置文件）。未标记的旧记忆、混合来源（mixed）与未声明来源始终按 1.0 计权。",
+        "type": "string",
+        "options": [
+          "equal",
+          "minecraft",
+          "qq"
+        ],
+        "default": "equal"
+      },
+      "source_surface_weight": {
+        "description": "次要来源评分权重",
+        "hint": "次要来源记忆的评分乘数。1.0=不降权（默认，行为与旧版一致）；设 0.6 表示非主来源的评分乘 0.6、把名额让给主来源；0=完全排除次要来源。混合来源（mixed）与未标记的旧记忆不受影响；与「按来源单独设权重」同时存在时以后者为准。",
+        "type": "float",
+        "default": 1.0,
         "min": 0.0,
         "max": 1.0,
         "slider": {

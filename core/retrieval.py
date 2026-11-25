@@ -9,8 +9,9 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable, Mapping
 
+from .astrbot_compat import logger
 from .identity import session_target_id
 from .latency import (
     MAX_MODEL_CALL_TIMEOUT_MS,
@@ -29,6 +30,7 @@ from .models import (
     memory_embedding_text_hash,
 )
 from .profile_quality import PROFILE_MEMORY_TYPES, profile_quality_decision
+from .source_surface import SURFACE_MIXED, SURFACE_UNKNOWN, row_source_surface, resolve_surface_weight
 
 from .store import MemoryStore
 from .time_intent import TimeIntent
@@ -38,6 +40,10 @@ from .visibility import VisibilityPolicy
 _MMR_WHITESPACE_RE = re.compile(r"\s+")
 _MMR_LATIN_TOKEN_RE = re.compile(r"[a-z0-9_]{2,}")
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+#: Undeclared-but-valid surfaces already reported, so the warning fires once per
+#: process instead of once per recall.
+_SOURCE_SURFACE_WARNED: set[str] = set()
 
 
 @lru_cache(maxsize=512)
@@ -200,6 +206,10 @@ class RetrievalEngine:
         anchor_floor_enabled: bool = False,
         scope_bonus_scale: float = 0.2,
         mmr_redundancy_weight: float = 0.35,
+        source_surface_priority: str = "equal",
+        source_surface_weight: float = 1.0,
+        source_surface_weights: Mapping[str, float] | None = None,
+        source_surface_names: Iterable[str] | None = None,
         bm25_k1: float = 1.2,
         bm25_b: float = 0.75,
     ):
@@ -270,6 +280,37 @@ class RetrievalEngine:
         # R7：MMR 去冗余权重。0.16 太轻，高冗余的两条会一起进 top_k；
         # 默认 0.35 让「重复内容」在价值上明显低于「新信息」。
         self.mmr_redundancy_weight = max(0.0, min(1.0, float(mmr_redundancy_weight if mmr_redundancy_weight is not None else 0.35)))
+        # source_surface_*：按来源面（游戏内 / QQ / 第三方）区分主次。
+        # priority="equal"（默认）或 weight>=1.0 且没有显式权重表时完全不分主次，
+        # 评分与诊断串与旧版逐字节一致。names 是已注册来源名，未声明来源按 1.0
+        # 计权并记一条 warning，而不是被规则顺手降权。
+        self.source_surface_names = frozenset(
+            clean_text(name, 40).lower()
+            for name in (source_surface_names or ())
+            if clean_text(name, 40)
+        )
+        chosen = clean_text(source_surface_priority, 40).lower() or "equal"
+        if chosen != "equal" and chosen not in self.source_surface_names:
+            chosen = "equal"
+        self.source_surface_priority = chosen
+        try:
+            raw_surface_weight = float(source_surface_weight)
+        except (TypeError, ValueError):
+            raw_surface_weight = 1.0
+        if raw_surface_weight != raw_surface_weight:  # NaN
+            raw_surface_weight = 1.0
+        self.source_surface_weight = max(0.0, min(1.0, raw_surface_weight))
+        surface_weights: dict[str, float] = {}
+        for weight_name, weight_value in (source_surface_weights or {}).items():
+            key = clean_text(weight_name, 40).lower()
+            if not key:
+                continue
+            try:
+                surface_weights[key] = max(0.0, min(1.0, float(weight_value)))
+            except (TypeError, ValueError):
+                continue
+        self.source_surface_weights = surface_weights
+
         # R1：BM25 参数（k1 饱和、b 长度归一化）。b=0 会退化成纯词频，
         # 长文档会靠「什么词都有」占便宜，所以默认 b=0.75。
         self.bm25_k1 = max(0.0, min(8.0, float(bm25_k1 if bm25_k1 is not None else 1.2)))
@@ -3800,6 +3841,49 @@ class RetrievalEngine:
             return 0.0
         return min(0.12, 0.08 * (len(route_families) - 1))
 
+    def _source_surface_weight(self, memory: MemoryRecord) -> tuple[float, str]:
+        """Return (score_multiplier, surface) for this record's source surface.
+
+        The multiplier is 1.0 -- and the surface is "" -- whenever weighting is
+        off, so the caller stays byte-identical to the pre-weighting behaviour.
+        Rows without a usable surface, ``mixed`` rows and undeclared-but-valid
+        names are never discounted: the first two carry no single origin, and an
+        undeclared surface never opted into the priority rule. The latter is
+        reported once as a warning instead of being silently demoted.
+        """
+        if (
+            not self.source_surface_weights
+            and (self.source_surface_priority == "equal" or self.source_surface_weight >= 1.0)
+        ):
+            return 1.0, ""
+        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+        surface = row_source_surface({"metadata": metadata})
+        if not surface or surface in {SURFACE_MIXED, SURFACE_UNKNOWN}:
+            return 1.0, ""
+        if self.source_surface_names and surface not in self.source_surface_names:
+            self._warn_undeclared_surface(surface)
+            return 1.0, ""
+        weight = resolve_surface_weight(
+            surface,
+            priority=self.source_surface_priority,
+            weight=self.source_surface_weight,
+            weights=self.source_surface_weights,
+            registered=self.source_surface_names or None,
+        )
+        return weight, surface
+
+    def _warn_undeclared_surface(self, surface: str) -> None:
+        """Report an undeclared surface once per process (never per candidate)."""
+        if surface in _SOURCE_SURFACE_WARNED:
+            return
+        _SOURCE_SURFACE_WARNED.add(surface)
+        logger.warning(
+            "[MemoryCompanion] 来源面 %s 未在 source_surfaces 中声明：按 1.0 计权（不降权）。"
+            "已声明：%s",
+            surface,
+            ",".join(sorted(self.source_surface_names)) or "-",
+        )
+
     def _score(
         self,
         memory: MemoryRecord,
@@ -3915,6 +3999,12 @@ class RetrievalEngine:
         # 向量/多路召回证据才可能走到这里，importance 只按弱证据权重 0.28 计。
         lifecycle = lifecycle if lifecycle is not None else evaluate_memory_lifecycle(memory, ctx)
         score = apply_lifecycle_score(score, lifecycle)
+        source_weight, source_surface = self._source_surface_weight(memory)
+        if source_weight < 1.0:
+            score = score * source_weight
+            source_reason = f";source={source_surface};w={source_weight:.2f}"
+        else:
+            source_reason = ""
         # relax：proactive_message（主动消息原文）类记忆评分降权（默认 1.0 不降权，行为与历史版本一致）。
         if self.proactive_message_score_penalty < 1.0 and clean_text(memory.memory_type, 120).lower() == "proactive_message":
             score = score * self.proactive_message_score_penalty
@@ -3927,6 +4017,7 @@ class RetrievalEngine:
             f"reinforcement={lifecycle.reinforcement:.2f};{lifecycle.reason}"
             f"routes={'+'.join(sorted(route_families)) or '-'};route_bonus={route_bonus:.2f};"
             f"person={person_bonus:.2f}"
+            f"{source_reason}"
         )
 
     @staticmethod
