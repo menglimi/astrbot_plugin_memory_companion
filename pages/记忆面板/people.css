@@ -1276,11 +1276,51 @@ html, body {
   .top { padding: 16px 14px 10px; gap: 12px; }
   main { padding: 6px 14px calc(48px + env(safe-area-inset-bottom)); }
   .tools { width: 100%; }
+  .tools input, .tools select, .tools button, .ghost {
+    min-height: 44px;
+    height: auto;
+  }
   .tools input { flex: 1 1 100%; min-width: 0; width: 100%; }
-  .tools select { max-width: 100%; min-width: 0; }
+  .tools select { flex: 1 1 auto; max-width: 100%; min-width: 0; }
+  .tools button, .ghost { flex: 1 1 auto; justify-content: center; }
   .grid { grid-template-columns: minmax(0, 1fr); }
-  .row { grid-template-columns: minmax(0, 1fr); gap: 4px; }
-  .drawer { padding: 20px 16px calc(32px + env(safe-area-inset-bottom)); }
+  .row { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  .row input[type="text"], .row input[type="number"] { min-height: 44px; height: auto; }
+  .weight-row { flex-wrap: wrap; gap: 6px 10px; }
+  .weight-row input[type="range"] { flex: 1 1 180px; min-height: 36px; }
+  .weight-value { min-width: auto; text-align: left; }
+  .drawer { padding: 18px 16px calc(32px + env(safe-area-inset-bottom)); }
+  .drawer > .close {
+    position: sticky;
+    top: 0;
+    margin: -4px 0 -40px auto;
+    width: 44px;
+    height: 44px;
+    display: grid;
+    place-items: center;
+    z-index: 4;
+  }
+  .person-head { margin: 4px 52px 14px 0; }
+  .actions button, button.danger, .person-confirm .actions button {
+    min-height: 44px;
+    height: auto;
+    padding: 8px 14px;
+  }
+  .detail-list .line { gap: 8px 10px; }
+  .detail-list .line button {
+    min-height: 44px;
+    padding: 0 12px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--control-bg);
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+  }
+  .detail-list .line button:hover {
+    border-color: var(--accent);
+    background: var(--control-hover-bg);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

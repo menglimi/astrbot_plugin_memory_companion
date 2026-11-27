@@ -11,7 +11,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PANEL_DIR = ROOT / "pages" / "记忆面板"
+LEGACY_HTML = PANEL_DIR / "legacy.html"
 APP_CSS = PANEL_DIR / "app.css"
+APP_JS = PANEL_DIR / "app.js"
 PEOPLE_CSS = PANEL_DIR / "people.css"
 PEOPLE_JS = PANEL_DIR / "people.js"
 
@@ -38,7 +40,9 @@ def _extract_balanced_block(source: str, header_pattern: str) -> str:
 class MobileResponsivePanelCssTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        cls.legacy_html = LEGACY_HTML.read_text(encoding="utf-8")
         cls.app_css = APP_CSS.read_text(encoding="utf-8")
+        cls.app_js = APP_JS.read_text(encoding="utf-8")
         cls.people_css = PEOPLE_CSS.read_text(encoding="utf-8")
         cls.app_mobile = _extract_balanced_block(
             cls.app_css,
@@ -48,6 +52,32 @@ class MobileResponsivePanelCssTests(unittest.TestCase):
             cls.people_css,
             r"@media\s*\(max-width:\s*720px\)\s*\{",
         )
+
+    def test_compact_layout_uses_css_variables_without_specificity_hijack(self) -> None:
+        # 紧凑模式必须只通过 html:not([data-ui-mode="cinema"]) 声明 CSS 变量，
+        # 绝不能再用 html:not([data-ui-mode="cinema"]) .topbar/.content/.btn 压过移动端断点。
+        self.assertIsNone(
+            re.search(
+                r'html:not\(\[data-ui-mode="cinema"\]\)\s+\.(?:topbar|content|btn|kpi-row|card|nav-item|grid)\b',
+                self.app_css,
+            ),
+            "紧凑布局不应使用高优先级子选择器覆写，应改用 --mc-* CSS 变量",
+        )
+        for token in (
+            "--mc-content-pad:",
+            "--mc-topbar-pad:",
+            "--mc-search-h:",
+            "--mc-btn-h:",
+            "--mc-kpi-cols:",
+        ):
+            self.assertIn(token, self.app_css)
+
+        # 级联顺序必须严格为：默认紧凑变量块 -> <=900px 平板变量覆写 -> <=640px 移动端变量覆写
+        default_compact_pos = self.app_css.index('--mc-topbar-pad: 13px 20px 11px;')
+        tablet_900_pos = self.app_css.index('--mc-topbar-pad: 16px 18px 14px;')
+        mobile_640_pos = self.app_css.index('--mc-topbar-pad: 12px 14px 10px;')
+        self.assertLess(default_compact_pos, tablet_900_pos, "<=900px 变量覆写必须位于默认紧凑变量块之后")
+        self.assertLess(tablet_900_pos, mobile_640_pos, "<=640px 变量覆写必须位于 <=900px 变量覆写之后")
 
     def test_app_css_mobile_unlocks_vertical_scroll_and_safe_area(self) -> None:
         html_body = re.search(r"html,\s*body\s*\{([^}]*)\}", self.app_mobile)
@@ -62,7 +92,7 @@ class MobileResponsivePanelCssTests(unittest.TestCase):
         self.assertIsNotNone(shell_rule)
         self.assertIn("min-height: 100dvh;", shell_rule.group(1))
 
-        content_rule = re.search(r"\.content\s*\{([^}]*)\}", self.app_mobile)
+        content_rule = re.search(r"\.content,\s*html\[data-ui-mode=\"cinema\"\]\s*\.content\s*\{([^}]*)\}", self.app_mobile)
         self.assertIsNotNone(content_rule)
         self.assertIn("overflow: visible;", content_rule.group(1))
 
@@ -74,21 +104,82 @@ class MobileResponsivePanelCssTests(unittest.TestCase):
         self.assertIsNotNone(main_rule)
         self.assertIn("env(safe-area-inset-bottom)", main_rule.group(1))
 
-    def test_app_css_mobile_restores_nav_sub_label_text_and_safe_bottom_offset(self) -> None:
-        nav_subs = re.search(r"\.nav-subs\s*\{([^}]*)\}", self.app_mobile)
-        self.assertIsNotNone(nav_subs)
-        self.assertIn("bottom: calc(58px + env(safe-area-inset-bottom));", nav_subs.group(1))
+    def test_mobile_dual_row_topbar_five_slot_rail_and_inflow_subnav(self) -> None:
+        # 1) HTML 结构含顶栏操作分组、移动端主题切换按钮、流内子导航与「更多」抽屉
+        for snippet in (
+            'class="topbar-actions"',
+            'id="topbarThemeBtn"',
+            'id="mobileSubnav"',
+            'id="mobileMoreSheet"',
+        ):
+            self.assertIn(snippet, self.legacy_html)
 
-        nav_sub = re.search(r"\.nav-sub\s*\{([^}]*)\}", self.app_mobile)
-        self.assertIsNotNone(nav_sub)
-        rules = nav_sub.group(1)
-        self.assertIn("font-size: 12.5px;", rules)
-        self.assertIn("line-height: 1.3;", rules)
-        self.assertIn("gap: 6px;", rules)
-        self.assertIn("white-space: nowrap;", rules)
-        self.assertIn("min-height: 34px;", rules)
+        # 2) 顶栏双行网格：第一行标题+图标按钮不换行，第二行全宽搜索框
+        topbar = re.search(r"\.topbar\s*\{([^}]*)\}", self.app_mobile)
+        self.assertIsNotNone(topbar)
+        self.assertIn('"copy actions"', topbar.group(1))
+        self.assertIn('"search search"', topbar.group(1))
 
-    def test_app_css_mobile_wraps_card_head_and_actions(self) -> None:
+        actions_btn = re.search(r"\.topbar-actions\s+\.tool-btn\s*\{([^}]*)\}", self.app_mobile)
+        self.assertIsNotNone(actions_btn)
+        self.assertIn("min-width: 44px;", actions_btn.group(1))
+        self.assertIn("min-height: 44px;", actions_btn.group(1))
+
+        # 3) 底部导航 5 槽均分无横向滚动条，且不再使用 fixed 悬空 .nav-subs
+        rail_nav = re.search(r"\.rail-nav\s*\{([^}]*)\}", self.app_mobile)
+        self.assertIsNotNone(rail_nav)
+        self.assertIn("grid-template-columns: repeat(5, minmax(0, 1fr));", rail_nav.group(1))
+        self.assertIn("overflow: hidden;", rail_nav.group(1))
+        self.assertNotIn("position: fixed; left: 0; right: 0; bottom:", self.app_mobile)
+
+        # 4) 流内 .mobile-subnav 在 [hidden] 时隐藏，且具备足够触控高度
+        subnav = re.search(r"\.mobile-subnav\s*\{([^}]*)\}", self.app_mobile)
+        self.assertIsNotNone(subnav)
+        self.assertIn("display: flex;", subnav.group(1))
+        self.assertIn(".mobile-subnav[hidden] { display: none; }", self.app_mobile)
+        subnav_pill = re.search(r"\.mobile-subnav-pill\s*\{([^}]*)\}", self.app_mobile)
+        self.assertIsNotNone(subnav_pill)
+        self.assertIn("min-height: 40px;", subnav_pill.group(1))
+
+    def test_app_css_mobile_full_site_sweep_and_touch_targets(self) -> None:
+        # 表格滚动容器、ACL 粘性首列 + 触屏信息栏、表单/参数行/导入映射、3D 终端溢出与灯箱关闭键
+        self.assertIn(".table-scroll {", self.app_css)
+        self.assertIn("wrapResponsiveTables", self.app_js)
+
+        mx_rule = re.search(r"\.mx\s*\{([^}]*)\}", self.app_css)
+        self.assertIsNotNone(mx_rule)
+        self.assertIn("var(--mx-head-w, 138px)", mx_rule.group(1))
+        self.assertIn("var(--mx-cell-w, 68px)", mx_rule.group(1))
+
+        mx_rh = re.search(r"\.mx-rh\s*\{([^}]*)\}", self.app_css)
+        self.assertIsNotNone(mx_rh)
+        self.assertIn("position: sticky;", mx_rh.group(1))
+        self.assertIn("left: 0;", mx_rh.group(1))
+
+        # 移动端关闭悬停浮层，改用触屏信息栏
+        self.assertRegex(self.app_css, r"@media\s*\(max-width:\s*640px\),\s*\(pointer:\s*coarse\)\s*\{[^}]*\.mx-tip\s*\{\s*display:\s*none;\s*\}")
+        self.assertIn(".mx-touch-info", self.app_css)
+
+        # 设置模块目录 <=1100px 取消竖向 sticky 并横向滚动
+        cfg_1100 = _extract_balanced_block(
+            self.app_css,
+            r"\.cfg-kbd\s*\{[^}]*\}\s*@media\s*\(max-width:\s*1100px\)\s*\{",
+        )
+        self.assertIn("position: static;", cfg_1100)
+        self.assertIn("flex-direction: row;", cfg_1100)
+        self.assertIn("overflow-x: auto;", cfg_1100)
+
+        # 移动端禁止硬编码内联死宽与负外边距溢出
+        self.assertNotIn("grid-template-columns: 138px repeat(", self.app_js)
+        self.assertNotIn("grid-template-columns:minmax(0,1fr) 110px minmax(0,1fr)", self.app_js)
+        self.assertNotIn("grid-template-columns:minmax(0,1fr) 96px auto", self.app_js)
+        self.assertIn('html[data-ui-mode="cinema"] .cinema-marquee { margin: 0;', self.app_mobile)
+        self.assertIn(".terminal-scene-wrap { margin: 0;", self.app_mobile)
+        self.assertIn(".lightbox-close", self.app_css)
+        self.assertIn(".param-row > div { white-space: normal; overflow-wrap: anywhere;", self.app_mobile)
+        self.assertIn(".field.is-inline { flex-direction: column;", self.app_mobile)
+        self.assertIn("min-height: 44px;", self.app_mobile)
+
         card_head = re.search(r"\.card-head\s*\{([^}]*)\}", self.app_mobile)
         self.assertIsNotNone(card_head)
         self.assertIn("flex-wrap: wrap;", card_head.group(1))
@@ -98,6 +189,93 @@ class MobileResponsivePanelCssTests(unittest.TestCase):
         self.assertIsNotNone(head_actions)
         self.assertIn("width: 100%;", head_actions.group(1))
         self.assertIn("flex-wrap: wrap;", head_actions.group(1))
+
+    def test_app_js_mobile_subnav_only_renders_when_group_has_multiple_views(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is required for app.js mobile subnav behavior check")
+        code = r"""
+const fs = require("node:fs");
+const vm = require("node:vm");
+const railHost = { innerHTML: "" };
+const subnavHost = { hidden: true, innerHTML: "", querySelector() { return null; } };
+const moreSheet = { hidden: true, innerHTML: "", classList: { add() {}, remove() {} }, offsetWidth: 0 };
+const moreScrim = { hidden: true, classList: { add() {}, remove() {} } };
+const ctx = vm.createContext({
+  location: { search: "" },
+  URLSearchParams,
+  setTimeout,
+  clearTimeout,
+  CustomEvent: function CustomEvent(type, init) { this.type = type; this.detail = init && init.detail; },
+  document: {
+    documentElement: { dataset: { theme: "dark" } },
+    readyState: "loading",
+    addEventListener() {},
+    querySelector(sel) {
+      if (sel === "#railNav") return railHost;
+      if (sel === "#mobileSubnav") return subnavHost;
+      if (sel === "#mobileMoreSheet") return moreSheet;
+      if (sel === "#mobileMoreScrim") return moreScrim;
+      if (sel === "#themeToggleLabel") return { textContent: "" };
+      return null;
+    },
+    querySelectorAll() { return []; },
+  },
+  window: {
+    addEventListener() {},
+    dispatchEvent() {},
+    matchMedia: () => ({ matches: true }),
+    setTimeout,
+    clearTimeout,
+  },
+});
+vm.runInContext(fs.readFileSync(process.argv[1], "utf8"), ctx);
+const res = vm.runInContext(`(() => {
+  const rail = document.querySelector("#railNav");
+  const subnav = document.querySelector("#mobileSubnav");
+  const sheet = document.querySelector("#mobileMoreSheet");
+  state.group = "overview";
+  state.view = "overview";
+  renderRail();
+  const onOverview = { hidden: subnav.hidden, html: subnav.innerHTML, hasMoreBtn: rail.innerHTML.includes('id="mobileMoreBtn"') };
+
+  state.group = "library";
+  state.view = "inspect";
+  renderRail();
+  const onLibrary = { hidden: subnav.hidden, html: subnav.innerHTML };
+
+  state.group = "import";
+  state.view = "quarantine";
+  renderRail();
+  const onImport = { hidden: subnav.hidden, html: subnav.innerHTML, moreActive: rail.innerHTML.includes('mobile-more-btn is-active') };
+
+  setMobileMoreOpen(true);
+  const sheetHtml = sheet.innerHTML;
+  setMobileMoreOpen(false);
+  return { onOverview, onLibrary, onImport, sheetHtml, sheetHiddenAfterClose: sheet.hidden };
+})()`, ctx);
+process.stdout.write(JSON.stringify(res));
+"""
+        proc = subprocess.run(
+            [node, "-e", code, str(APP_JS)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        self.assertEqual(0, proc.returncode, f"Node harness failed:\n{proc.stderr}\n{proc.stdout}")
+        out = json.loads(proc.stdout)
+        self.assertTrue(out["onOverview"]["hidden"], "总览分组仅有 1 个视图，移动端不得显示悬空子导航")
+        self.assertEqual("", out["onOverview"]["html"])
+        self.assertTrue(out["onOverview"]["hasMoreBtn"])
+        self.assertFalse(out["onLibrary"]["hidden"])
+        self.assertIn('data-view="inspect"', out["onLibrary"]["html"])
+        self.assertIn("is-active", out["onLibrary"]["html"])
+        self.assertFalse(out["onImport"]["hidden"])
+        self.assertTrue(out["onImport"]["moreActive"], "进入导入/联动分组时，底部「更多」槽位应高亮")
+        self.assertIn('data-more-view="quarantine"', out["sheetHtml"])
+        self.assertIn('data-more-view="companion"', out["sheetHtml"])
+        self.assertIn('data-more-action="config-search"', out["sheetHtml"])
+        self.assertTrue(out["sheetHiddenAfterClose"])
 
     def test_people_css_prevents_grid_and_webkit_box_horizontal_overflow(self) -> None:
         self.assertIn(
@@ -141,12 +319,17 @@ class MobileResponsivePanelCssTests(unittest.TestCase):
             for decl in expected:
                 self.assertIn(decl, m.group(1), f"{selector} 缺少声明: {decl}")
 
-        # Mobile <=720px media query uses minmax(0, 1fr) and full-width search bar
+        # Mobile <=720px media query uses minmax(0, 1fr), full-width search bar, sticky 44x44 close button & 44px forget button
         self.assertIn("grid-template-columns: minmax(0, 1fr);", self.people_mobile)
         self.assertNotIn("grid-template-columns: 1fr;", self.people_mobile)
         self.assertIn("flex: 1 1 100%;", self.people_mobile)
         self.assertIn("padding: 16px 14px 10px;", self.people_mobile)
         self.assertIn("env(safe-area-inset-bottom)", self.people_mobile)
+        self.assertIn("position: sticky;", self.people_mobile)
+        self.assertIn("width: 44px;", self.people_mobile)
+        self.assertIn("height: 44px;", self.people_mobile)
+        self.assertIn(".detail-list .line button", self.people_mobile)
+        self.assertIn("min-height: 44px;", self.people_mobile)
 
     def test_people_js_drawer_mutations_refresh_in_place_and_preserve_scroll_top(self) -> None:
         node = shutil.which("node")
