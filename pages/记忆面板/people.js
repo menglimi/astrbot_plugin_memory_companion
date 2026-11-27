@@ -42,10 +42,17 @@ function resolveInitialTheme() {
   return "dark";
 }
 
+const PEOPLE_PAGE_SIZE = 48;
+
 const state = {
   items: [],
   bots: [],
   total: 0,
+  offset: 0,
+  hasMore: false,
+  loadingMore: false,
+  loadError: "",
+  loadEpoch: 0,
   query: "",
   sort: "weight",
   botId: "",
@@ -59,6 +66,7 @@ const state = {
   explicitTheme: "",
   manualThemeToggled: false,
 };
+let peopleAutoScroll = null;
 
 const el = (id) => document.getElementById(id);
 const grid = el("grid");
@@ -375,24 +383,114 @@ function personParams(extra) {
   return params;
 }
 
+function personCardHtml(item) {
+  const top = Array.isArray(item.top) ? item.top.slice(0, 1) : [];
+  const chips = [`<span class="chip band ${bandClass(item.band)}">${esc(item.band_label)}</span>`];
+  if (item.address) chips.push(`<span class="chip">叫她「${esc(item.address)}」</span>`);
+  if (item.relation_label) chips.push(`<span class="chip">${esc(item.relation_label)}</span>`);
+  // 一张卡代表一个人：这个人要是在多个 bot / 平台下都被记过，点开时
+  // 不能再按主行的 bot/平台过滤，不然详情只显示其中一份。
+  const spansRows =
+    (Array.isArray(item.platforms) ? item.platforms.length : 0) > 1 ||
+    (Array.isArray(item.bot_ids) ? item.bot_ids.length : 0) > 1;
+  const platform = spansRows ? "" : item.platform || "";
+  const botId = spansRows ? "" : item.bot_id || "";
+  return `<button class="card" type="button" data-user="${esc(item.user_id)}" data-platform="${esc(platform)}" data-bot="${esc(botId)}">
+    <div class="card-head">
+      <span class="avatar">${esc(initials(item.display_name))}</span>
+      <div class="who"><div class="name">${esc(item.display_name)}</div><div class="sub">${esc(fmtDays(item.days_since_last))}</div></div>
+    </div>
+    <div class="chips">${chips.join("")}</div>
+    <div class="bar" title="分量 ${esc(item.weight)}"><span style="width:${Math.max(3, Math.min(100, Number(item.weight) || 0))}%"></span></div>
+    <div class="meta">${item.memory_count} 件事${item.imprint_count ? ` · ${item.imprint_count} 件刻骨` : ""}</div>
+    ${top.length ? `<ul class="memories">${top.map((entry) => `<li>${esc(entry.content)}</li>`).join("")}</ul>` : ""}
+  </button>`;
+}
+
+function bindCardElements(cards) {
+  if (!cards || typeof cards.forEach !== "function") return;
+  cards.forEach((card) => {
+    if (!card || card._mcCardBound) return;
+    card._mcCardBound = true;
+    card.addEventListener("click", () => openPerson(card.dataset.user, card.dataset.platform, card.dataset.bot));
+  });
+}
+
+function refreshPeopleAutoScroll() {
+  if (peopleAutoScroll && typeof peopleAutoScroll.refresh === "function") {
+    peopleAutoScroll.refresh();
+  }
+}
+
+function resetPeopleAutoScroll() {
+  if (peopleAutoScroll && typeof peopleAutoScroll.reset === "function") {
+    peopleAutoScroll.reset();
+  }
+}
+
+async function fetchPeopleSlice(limit, offset) {
+  return request("GET", "people", personParams({
+    q: state.query,
+    sort: state.sort,
+    limit,
+    offset,
+  }));
+}
+
 async function load(options) {
   const silent = Boolean(options && options.silent);
-  if (state.loading) return;
+  if (state.loading && silent) return;
+  const epoch = ++state.loadEpoch;
   state.loading = true;
+  state.loadingMore = false;
+  state.loadError = "";
   if (!silent) {
+    state.offset = 0;
+    state.hasMore = false;
+    resetPeopleAutoScroll();
     loading.hidden = false;
     empty.hidden = true;
     grid.innerHTML = "";
   }
   try {
-    const data = await request("GET", "people", personParams({ q: state.query, sort: state.sort, limit: 120 }));
-    state.items = Array.isArray(data.items) ? data.items : [];
-    state.total = Number(data.total || state.items.length);
-    state.bots = Array.isArray(data.bots) ? data.bots : [];
+    const targetCount = silent ? Math.max(PEOPLE_PAGE_SIZE, state.items.length) : PEOPLE_PAGE_SIZE;
+    const collected = [];
+    const seen = new Set();
+    let fetchedRaw = 0;
+    let total = 0;
+    let bots = state.bots;
+    while (fetchedRaw < targetCount) {
+      const chunkLimit = Math.min(120, targetCount - fetchedRaw);
+      const data = await fetchPeopleSlice(chunkLimit, fetchedRaw);
+      if (epoch !== state.loadEpoch) return;
+      const batch = Array.isArray(data.items) ? data.items : [];
+      if (fetchedRaw === 0) {
+        total = Number(data.total || batch.length);
+        bots = Array.isArray(data.bots) ? data.bots : [];
+      } else if (data.total != null && Number.isFinite(Number(data.total))) {
+        total = Number(data.total);
+      }
+      for (const item of batch) {
+        const uid = String((item && item.user_id) || "");
+        if (uid && seen.has(uid)) continue;
+        if (uid) seen.add(uid);
+        collected.push(item);
+      }
+      fetchedRaw += batch.length;
+      if (batch.length < chunkLimit || fetchedRaw >= total) break;
+    }
+    if (epoch !== state.loadEpoch) return;
+    state.items = collected;
+    state.total = Math.max(collected.length, total);
+    state.bots = bots;
+    state.offset = fetchedRaw;
+    state.hasMore = state.offset < state.total && fetchedRaw > 0;
     renderSummary();
     renderBotFilter();
     renderGrid();
+    refreshPeopleAutoScroll();
   } catch (error) {
+    if (epoch !== state.loadEpoch) return;
     loading.hidden = true;
     if (!silent || !state.items.length) {
       subtitle.textContent = "没连上她…";
@@ -400,8 +498,52 @@ async function load(options) {
     }
     toast(`翻记忆失败：${error.message || error}`);
   } finally {
-    state.loading = false;
-    loading.hidden = true;
+    if (epoch === state.loadEpoch) {
+      state.loading = false;
+      loading.hidden = true;
+      refreshPeopleAutoScroll();
+    }
+  }
+}
+
+async function loadMore() {
+  if (state.loading || state.loadingMore || !state.hasMore) return;
+  const epoch = state.loadEpoch;
+  const reqOffset = state.offset;
+  state.loadingMore = true;
+  state.loadError = "";
+  try {
+    const data = await fetchPeopleSlice(PEOPLE_PAGE_SIZE, reqOffset);
+    if (epoch !== state.loadEpoch) return;
+    const batch = Array.isArray(data.items) ? data.items : [];
+    const seen = new Set(state.items.map((item) => String((item && item.user_id) || "")).filter(Boolean));
+    const fresh = [];
+    for (const item of batch) {
+      const uid = String((item && item.user_id) || "");
+      if (uid && seen.has(uid)) continue;
+      if (uid) seen.add(uid);
+      fresh.push(item);
+    }
+    if (data.total != null && Number.isFinite(Number(data.total))) {
+      state.total = Math.max(state.items.length + fresh.length, Number(data.total));
+    }
+    if (fresh.length) {
+      state.items = state.items.concat(fresh);
+      appendGridCards(fresh);
+    }
+    state.offset = reqOffset + batch.length;
+    state.hasMore = state.offset < state.total && batch.length > 0;
+    renderSummary();
+  } catch (error) {
+    if (epoch !== state.loadEpoch) return;
+    state.loadError = error && error.message ? error.message : String(error || "请求失败");
+    toast(`加载更多人物失败：${state.loadError}`);
+    throw error;
+  } finally {
+    if (epoch === state.loadEpoch) {
+      state.loadingMore = false;
+      refreshPeopleAutoScroll();
+    }
   }
 }
 
@@ -477,6 +619,27 @@ function renderBotFilter() {
   ).join("");
 }
 
+function appendGridCards(items) {
+  if (!items || !items.length) return;
+  const html = items.map(personCardHtml).join("");
+  if (typeof document !== "undefined" && typeof document.createElement === "function" && typeof grid.appendChild === "function") {
+    const bucket = document.createElement("div");
+    bucket.innerHTML = html;
+    const nodes = Array.from(bucket.children || []);
+    bindCardElements(nodes);
+    for (const card of nodes) grid.appendChild(card);
+    return;
+  }
+  if (typeof grid.insertAdjacentHTML === "function") {
+    grid.insertAdjacentHTML("beforeend", html);
+  } else {
+    grid.innerHTML += html;
+  }
+  if (typeof grid.querySelectorAll === "function") {
+    bindCardElements(grid.querySelectorAll(".card"));
+  }
+}
+
 function renderGrid() {
   if (!state.items.length) {
     const hasQuery = Boolean(state.query || state.botId);
@@ -487,32 +650,8 @@ function renderGrid() {
     return;
   }
   empty.hidden = true;
-  grid.innerHTML = state.items.map((item) => {
-    const top = Array.isArray(item.top) ? item.top.slice(0, 1) : [];
-    const chips = [`<span class="chip band ${bandClass(item.band)}">${esc(item.band_label)}</span>`];
-    if (item.address) chips.push(`<span class="chip">叫她「${esc(item.address)}」</span>`);
-    if (item.relation_label) chips.push(`<span class="chip">${esc(item.relation_label)}</span>`);
-    // 一张卡代表一个人：这个人要是在多个 bot / 平台下都被记过，点开时
-    // 不能再按主行的 bot/平台过滤，不然详情只显示其中一份。
-    const spansRows =
-      (Array.isArray(item.platforms) ? item.platforms.length : 0) > 1 ||
-      (Array.isArray(item.bot_ids) ? item.bot_ids.length : 0) > 1;
-    const platform = spansRows ? "" : item.platform || "";
-    const botId = spansRows ? "" : item.bot_id || "";
-    return `<button class="card" type="button" data-user="${esc(item.user_id)}" data-platform="${esc(platform)}" data-bot="${esc(botId)}">
-      <div class="card-head">
-        <span class="avatar">${esc(initials(item.display_name))}</span>
-        <div class="who"><div class="name">${esc(item.display_name)}</div><div class="sub">${esc(fmtDays(item.days_since_last))}</div></div>
-      </div>
-      <div class="chips">${chips.join("")}</div>
-      <div class="bar" title="分量 ${esc(item.weight)}"><span style="width:${Math.max(3, Math.min(100, Number(item.weight) || 0))}%"></span></div>
-      <div class="meta">${item.memory_count} 件事${item.imprint_count ? ` · ${item.imprint_count} 件刻骨` : ""}</div>
-      ${top.length ? `<ul class="memories">${top.map((entry) => `<li>${esc(entry.content)}</li>`).join("")}</ul>` : ""}
-    </button>`;
-  }).join("");
-  grid.querySelectorAll(".card").forEach((card) => {
-    card.addEventListener("click", () => openPerson(card.dataset.user, card.dataset.platform, card.dataset.bot));
-  });
+  grid.innerHTML = state.items.map(personCardHtml).join("");
+  bindCardElements(grid.querySelectorAll(".card"));
 }
 
 let drawerRequestSeq = 0;
@@ -828,8 +967,29 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !el("personConfirm").open) closeDrawer();
 });
 
+function initPeopleAutoScroll() {
+  const host = el("peopleAutoScroll");
+  if (!host || typeof window === "undefined" || !window.MemoryAutoScroll || typeof window.MemoryAutoScroll.mount !== "function") {
+    return;
+  }
+  peopleAutoScroll = window.MemoryAutoScroll.mount({
+    host,
+    scrollRoot: null,
+    itemLabel: "人",
+    getCursor: () => state.offset,
+    hasMore: () => state.hasMore,
+    isLoading: () => state.loading || state.loadingMore,
+    hasError: () => Boolean(state.loadError),
+    getErrorMessage: () => state.loadError,
+    getCount: () => state.items.length,
+    getTotal: () => state.total,
+    onLoadMore: loadMore,
+  });
+}
+
 applyTheme(state.theme, { persist: false });
 bindBridgeContext();
 loadPreferences();
+initPeopleAutoScroll();
 load();
 loadRecoveryStatus();

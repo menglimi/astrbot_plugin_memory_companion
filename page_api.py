@@ -2064,8 +2064,9 @@ class PluginPageApi:
         # 与 "profile"/"external" 一样由后续过滤决定实际可见范围。
         if scope == "all":
             scope = ""
+        extra_excludes = (PLUGIN_NAME,) if scope == "external" else None
         records = await self.plugin.service.store.list_memories(
-            limit=max(limit * 2, 50) if scope == "external" else limit,
+            limit=limit + 1,
             include_pending=False,
             query=query,
             memory_type="" if memory_types else requested_type,
@@ -2074,6 +2075,7 @@ class PluginPageApi:
             visibility="" if visibility_values else visibility,
             visibility_values=visibility_values,
             source_plugin_exclude="bot_personal_bridge",
+            source_plugin_excludes=extra_excludes,
             review_status="",
             lifecycle="" if lifecycle_values else lifecycle,
             lifecycle_values=lifecycle_values,
@@ -2090,8 +2092,18 @@ class PluginPageApi:
             record
             for record in records
             if clean_text(getattr(record, "source_plugin", ""), 120) != "bot_personal_bridge"
-        ][:limit]
-        return self._ok({"memories": [serialize_memory(record) for record in records]})
+        ]
+        has_more = len(records) > limit
+        page_records = records[:limit]
+        return self._ok(
+            {
+                "memories": [serialize_memory(record) for record in page_records],
+                "offset": offset,
+                "limit": limit,
+                "has_more": has_more,
+                "next_offset": offset + len(page_records) if has_more else None,
+            }
+        )
 
     async def memory_detail(self):
         memory_id = clean_text(request.args.get("id", ""), 120)

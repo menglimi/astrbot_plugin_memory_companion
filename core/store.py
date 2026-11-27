@@ -14238,6 +14238,7 @@ class MemoryStore(SummaryBatchStore):
         lifecycle_values: list[str] | tuple[str, ...] | None = None,
         visibility_values: list[str] | tuple[str, ...] | None = None,
         source_plugin_exclude: str = "",
+        source_plugin_excludes: list[str] | tuple[str, ...] | None = None,
         owner_bot_id: str = "",
         owner_bot_strict: bool = False,
     ) -> list[MemoryRecord]:
@@ -14259,6 +14260,7 @@ class MemoryStore(SummaryBatchStore):
             lifecycle_values,
             visibility_values,
             source_plugin_exclude,
+            source_plugin_excludes,
             owner_bot_id,
             owner_bot_strict,
         )
@@ -14281,6 +14283,7 @@ class MemoryStore(SummaryBatchStore):
         lifecycle_values: list[str] | tuple[str, ...] | None,
         visibility_values: list[str] | tuple[str, ...] | None,
         source_plugin_exclude: str,
+        source_plugin_excludes: list[str] | tuple[str, ...] | None = None,
         owner_bot_id: str = "",
         owner_bot_strict: bool = False,
     ) -> list[MemoryRecord]:
@@ -14326,9 +14329,20 @@ class MemoryStore(SummaryBatchStore):
         elif visibility:
             where += " AND visibility=?"
             params.append(clean_text(visibility, 40))
+        excluded_plugins: list[str] = []
         if source_plugin_exclude:
+            excluded_plugins.append(clean_text(source_plugin_exclude, 120))
+        for item in source_plugin_excludes or ():
+            cleaned = clean_text(item, 120)
+            if cleaned and cleaned not in excluded_plugins:
+                excluded_plugins.append(cleaned)
+        if len(excluded_plugins) == 1:
             where += " AND source_plugin != ?"
-            params.append(clean_text(source_plugin_exclude, 120))
+            params.append(excluded_plugins[0])
+        elif len(excluded_plugins) > 1:
+            marks = ",".join("?" for _ in excluded_plugins)
+            where += f" AND source_plugin NOT IN ({marks})"
+            params.extend(excluded_plugins)
         if review_status:
             where += " AND review_status=?"
             params.append(clean_text(review_status, 40))
