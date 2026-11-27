@@ -522,7 +522,8 @@ input, select, textarea { font: inherit; color: inherit; }
 /* ============================================================
    通用组件
    ============================================================ */
-.grid { display: grid; gap: var(--mc-grid-gap, 16px); }
+.grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--mc-grid-gap, 16px); }
+.content [style*="display:grid"]:not([style*="grid-template-columns"]) { grid-template-columns: minmax(0, 1fr); min-width: 0; }
 .grid.g2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .grid.g3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .grid.g4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -1961,7 +1962,7 @@ html[data-ui-mode="cinema"] .tool-btn:not(.mode-toggle) { color: #59604b; border
   background: transparent; color: rgba(36,37,31,0.56); cursor: pointer; text-align: left;
   transition: color .18s var(--ease), background .18s var(--ease), border-color .18s var(--ease);
 }
-.cinema-category span { display: grid; gap: 3px; font-size: 12px; }
+.cinema-category span { display: grid; grid-template-columns: minmax(0, 1fr); gap: 3px; font-size: 12px; }
 .cinema-category b { color: rgba(89,96,75,0.65); font: 10px var(--font-mono); letter-spacing: .1em; }
 .cinema-category em { color: rgba(36,37,31,0.4); font-style: normal; font-size: 11px; }
 .cinema-category:hover, .cinema-category.is-active { color: var(--terminal-ice); background: rgba(89,96,75,0.10); border-left-color: var(--terminal-cyan); }
@@ -1999,7 +2000,7 @@ html[data-ui-mode="cinema"] .tool-btn:not(.mode-toggle) { color: #59604b; border
 .telemetry-orbit { position:relative; display:grid; place-items:center; width:140px; height:140px; margin:28px auto 24px; }
 .ring-a { inset:9px; animation: orbit-spin 12s linear infinite; border-right-color:var(--terminal-cyan); }.ring-b { inset:25px; border-style:dashed; animation: orbit-spin 8s linear infinite reverse; border-left-color:var(--terminal-amber); }
 @keyframes orbit-spin { to { transform:rotate(360deg); } }
-.telemetry-lines { display:grid; gap:11px; }.telemetry-lines div { display:flex; justify-content:space-between; gap:8px; padding-bottom:8px; border-bottom:1px solid rgba(73,77,61,0.18); color:rgba(36,37,31,0.52); font:9px var(--font-mono); }.telemetry-lines b { color:var(--terminal-ice); font-weight:500; }
+.telemetry-lines { display:grid; grid-template-columns:minmax(0,1fr); gap:11px; }.telemetry-lines div { display:flex; justify-content:space-between; gap:8px; padding-bottom:8px; border-bottom:1px solid rgba(73,77,61,0.18); color:rgba(36,37,31,0.52); font:9px var(--font-mono); }.telemetry-lines b { color:var(--terminal-ice); font-weight:500; }
 .inspector-note { margin-top:34px; padding-left:10px; border-left:1px solid var(--terminal-amber); color:rgba(36,37,31,0.56); font-size:10px; }.inspector-note .mono { color:var(--terminal-amber); font-size:9px; }.inspector-note p { margin-top:7px; line-height:1.7; }
 .cinema-marquee { display:flex; gap:18px; overflow:hidden; white-space:nowrap; padding:10px 22px; border-top:1px solid rgba(73,77,61,0.2); color:rgba(89,96,75,0.62); font:9px var(--font-mono); letter-spacing:.1em; }
 
@@ -3639,6 +3640,7 @@ button.kpi.is-link:hover .kpi-go { opacity: 0.9; transform: none; }
 /* ---------- 1. 模块配置导航选中态与悬停层次 ---------- */
 .config-main {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 14px;
   min-width: 0;
 }

@@ -142,6 +142,16 @@ class MobileResponsivePanelCssTests(unittest.TestCase):
         self.assertIn("min-height: 40px;", subnav_pill.group(1))
 
     def test_app_css_mobile_full_site_sweep_and_touch_targets(self) -> None:
+        # 裸单列网格容器必须显式声明 grid-template-columns: minmax(0, 1fr)，
+        # 防止隐式 auto 轨道被子项撑宽在移动端被 body { overflow-x: hidden } 右侧裁切。
+        grid_rule = re.search(r"^\.grid\s*\{([^}]*)\}", self.app_css, re.M)
+        self.assertIsNotNone(grid_rule)
+        self.assertIn("grid-template-columns: minmax(0, 1fr);", grid_rule.group(1))
+        config_main_rule = re.search(r"^\.config-main\s*\{([^}]*)\}", self.app_css, re.M)
+        self.assertIsNotNone(config_main_rule)
+        self.assertIn("grid-template-columns: minmax(0, 1fr);", config_main_rule.group(1))
+        self.assertIn('[style*="display:grid"]:not([style*="grid-template-columns"])', self.app_css)
+
         # 表格滚动容器、ACL 粘性首列 + 触屏信息栏、表单/参数行/导入映射、3D 终端溢出与灯箱关闭键
         self.assertIn(".table-scroll {", self.app_css)
         self.assertIn("wrapResponsiveTables", self.app_js)
