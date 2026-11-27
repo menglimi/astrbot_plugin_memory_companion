@@ -202,7 +202,9 @@ class SummaryAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("", result["stop_reason"])
         self.assertEqual(3, len(first.calls) + len(self.provider.calls))
         self.assertEqual(3, self.service.store._conn.execute("SELECT COUNT(*) FROM summary_batch_calls WHERE automatic=1").fetchone()[0])
-        self.assertEqual(3, (await self.service.store.get_summary_batch(batch_id))["automatic_calls"])
+        # Transient provider timeout is recorded in the hourly call ledger but
+        # refunded from the per-batch quarantine counter (`automatic_calls`).
+        self.assertEqual(2, (await self.service.store.get_summary_batch(batch_id))["automatic_calls"])
         self.assertIn(event_id, self.provider.calls[-1]["prompt"])
 
     async def test_pause_waits_for_inflight_manual_work_before_freeze(self):

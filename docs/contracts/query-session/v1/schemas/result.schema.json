@@ -25,6 +25,14 @@
       "type": "string",
       "maxLength": 160
     },
+    "detail": {
+      "type": "string",
+      "maxLength": 240
+    },
+    "hint": {
+      "type": "string",
+      "maxLength": 240
+    },
     "operation_id": {
       "type": ["integer", "null"],
       "minimum": 1

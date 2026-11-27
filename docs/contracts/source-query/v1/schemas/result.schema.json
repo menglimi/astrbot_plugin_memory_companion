@@ -73,9 +73,13 @@
     "usage": {
       "type": "object"
     },
+    "detail": {
+      "type": "string",
+      "maxLength": 240
+    },
     "hint": {
       "type": "string",
-      "maxLength": 200
+      "maxLength": 240
     }
   },
   "allOf": [

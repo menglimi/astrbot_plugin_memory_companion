@@ -20,12 +20,216 @@ from .query_session import query_context
 PROFILE = "memory.local-source-query.v1"
 _EMPTY_SEARCH_HINT = "未命中，可换2-4字短词/同义词，或改用 range/range_batch 按时间段重试。"
 _EMPTY_RANGE_HINT = "该时间段无消息，可扩大起止时间或换关键词 search 重试。"
+_ALLOWED_QUERY_FIELDS = frozenset({"action", "terms", "start_at", "end_at", "source_ref", "direction", "excerpt_offset", "cursor", "limit"})
 _LEGACY_TOGETHER_SESSION_PREFIX = "together_companion:"
 _LEGACY_TOGETHER_SHARED_EVENTS = frozenset({"shared_call", "shared_watch", "shared_activity"})
 
 
 class SourceQueryError(ValueError):
     pass
+
+
+def _is_valid_tz_iso8601(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip() or len(value) > 80 or "\x00" in value:
+        return False
+    try:
+        instant = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        return instant.utcoffset() is not None
+    except ValueError:
+        return False
+
+
+def explain_source_query_error(
+    error_code: str,
+    parameters: dict[str, Any] | None = None,
+) -> tuple[str, str]:
+    """Return concise self-correcting (detail, hint) for source query rejections."""
+    params = parameters if isinstance(parameters, dict) else {}
+    action = str(params.get("action") or "search").strip() or "search"
+    code = str(error_code or "").strip()
+
+    if code == "range_requires_start_end_without_terms":
+        if params.get("terms"):
+            return (
+                f"action='{action}' 不能与 terms 同时使用",
+                f"按时间段读取请移除 terms 并提供带时区的 start_at（省略 end_at 默认查至当前）；按关键词搜索请用 action='search'。",
+            )
+        return (
+            f"action='{action}' 缺少必填的 start_at（带时区 ISO 8601 时间）",
+            "请传入带时区的 start_at（如 '2026-11-25T00:00:00+08:00'），省略 end_at 默认查至当前；若按关键词查找，请改用 action='search' 并传 terms。",
+        )
+    if code == "time_requires_iso8601_with_timezone":
+        return (
+            "start_at 或 end_at 不是带时区的 ISO 8601 时间格式",
+            "请使用带时区偏移的 ISO 8601 字符串，例如 '2026-11-25T00:00:00+08:00' 或 '2026-11-25T00:00:00Z'。",
+        )
+    if code == "time_range_reversed_or_empty":
+        return (
+            "时间区间无效：start_at 必须早于 end_at",
+            "请确保 start_at < end_at（区间为左闭右开 [start_at, end_at)），或省略 end_at 默认查至当前。",
+        )
+    if code == "search_requires_terms":
+        return (
+            "action='search' 缺少必填的非空关键词数组 terms",
+            "请传入 1-6 个短关键词数组，例如 terms=['无糖拿铁']；若按时间段浏览，请改用 action='range' 并提供 start_at。",
+        )
+    if code in {"terms_must_be_array_up_to_6", "empty_term"}:
+        return (
+            "terms 必须是包含 1-6 个非空字符串的数组",
+            "请传入 1-6 个非空短词数组，例如 terms=['关键词1', '关键词2']。",
+        )
+    if code == "context_requires_source_ref_only":
+        return (
+            f"action='{action}' 必须提供有效的 timeline:tl_... source_ref，且不能混用 terms/start_at/end_at",
+            "请先通过 search/range 获取证据中的 source_ref（格式 timeline:tl_...），再单独传给 context 或 read。",
+        )
+    if code == "read_requires_source_ref_and_offset":
+        return (
+            "action='read' 只接受 source_ref 与 excerpt_offset，不能设置 direction",
+            "请移除 direction（或保持默认 around），仅传 source_ref 和 excerpt_offset。",
+        )
+    if code == "excerpt_offset_requires_read":
+        return (
+            "excerpt_offset 仅支持与 action='read' 搭配使用",
+            "续读长消息请设 action='read' 并传 source_ref 与 excerpt_offset；其他动作请省略 excerpt_offset。",
+        )
+    if code == "source_ref_direction_require_context":
+        return (
+            "source_ref 与 direction 仅适用于 action='context' 或 action='read'",
+            "查看上下文请设 action='context'；按关键词或时间查询请移除 source_ref 与 direction。",
+        )
+    if code == "cursor_requires_no_query_parameters":
+        return (
+            "使用 cursor 翻页时不能同时传入其他查询参数",
+            "翻页时请只传 cursor 字段，不要同时传 action、terms、start_at、end_at、source_ref 或 limit。",
+        )
+    if code == "cursor_invalid":
+        return (
+            "翻页 cursor 无效、已过期或数据源已变化",
+            "请去掉 cursor，重新发起一次 search/range/range_batch 查询。",
+        )
+    if code == "unsupported_action":
+        return (
+            f"不支持的 action='{action}'",
+            "action 仅支持 'search'、'range'、'range_batch'、'context' 或 'read'。",
+        )
+    if code == "unsupported_direction":
+        return (
+            "不支持的 direction 参数值",
+            "direction 仅支持 'around'、'before' 或 'after'。",
+        )
+    if code == "unknown_parameter":
+        unknown = sorted(k for k in params if k not in _ALLOWED_QUERY_FIELDS)
+        extra = f"（{', '.join(unknown[:4])}）" if unknown else ""
+        return (
+            f"包含未定义的参数字段{extra}",
+            "仅支持 action、terms、start_at、end_at、source_ref、direction、cursor、limit、excerpt_offset。",
+        )
+    if code == "invalid_limit":
+        return (
+            "limit 必须为非负整数（0 表示使用默认值）",
+            "请传入非负整数 limit（如 10），或省略使用默认值。",
+        )
+    if code == "invalid_excerpt_offset":
+        return (
+            "excerpt_offset 必须为非负整数",
+            "请传入来自上一条结果的 next_excerpt_offset 非负整数。",
+        )
+    if code == "range_batch_requires_time_range_only":
+        return (
+            "action='range_batch' 仅接受时间区间参数 start_at 与可选 end_at",
+            "请移除 terms、source_ref、direction 和 excerpt_offset，并传入带时区的 start_at。",
+        )
+    if code == "range_batch_uses_server_budget":
+        return (
+            "action='range_batch' 由服务端控制批量预算，limit 须省略或为 0",
+            "请移除 limit（或设为 0），仅传 action='range_batch' 与带时区的 start_at。",
+        )
+    return ("", "")
+
+
+def diagnose_source_query_parameters(parameters: Any) -> tuple[str, str]:
+    """Inspect invalid raw sources parameters and return a clear (detail, hint)."""
+    if not isinstance(parameters, dict):
+        return (
+            "sources 参数必须是 JSON 对象",
+            "请传入对象参数，例如 {'action': 'search', 'terms': ['关键词']} 或 {'action': 'range', 'start_at': '2026-11-25T00:00:00+08:00'}。",
+        )
+    unknown = sorted(k for k in parameters if k not in _ALLOWED_QUERY_FIELDS)
+    if unknown:
+        return explain_source_query_error("unknown_parameter", parameters)
+    cursor = parameters.get("cursor")
+    if isinstance(cursor, str) and cursor.strip():
+        has_extra = (
+            any(parameters.get(name) for name in ("terms", "start_at", "end_at", "source_ref", "excerpt_offset", "limit"))
+            or parameters.get("action", "search") != "search"
+            or parameters.get("direction", "around") != "around"
+        )
+        if has_extra:
+            return explain_source_query_error("cursor_requires_no_query_parameters", parameters)
+    raw_action = parameters.get("action", "search")
+    if not isinstance(raw_action, str) or raw_action.strip() not in {"search", "range", "range_batch", "context", "read"}:
+        return explain_source_query_error("unsupported_action", parameters)
+    action = raw_action.strip()
+    limit = parameters.get("limit", 0)
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        return explain_source_query_error("invalid_limit", parameters)
+    offset = parameters.get("excerpt_offset", 0)
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        return explain_source_query_error("invalid_excerpt_offset", parameters)
+    direction = parameters.get("direction", "around")
+    if not isinstance(direction, str) or direction not in {"around", "before", "after"}:
+        return explain_source_query_error("unsupported_direction", parameters)
+
+    terms = parameters.get("terms")
+    if terms is not None and (
+        not isinstance(terms, list)
+        or len(terms) > 6
+        or any(not isinstance(item, str) or not item.strip() or len(item) > 80 for item in terms)
+    ):
+        return explain_source_query_error("terms_must_be_array_up_to_6", parameters)
+
+    start_at = parameters.get("start_at", "")
+    end_at = parameters.get("end_at", "")
+    source_ref = parameters.get("source_ref", "")
+    if start_at not in ("", None) and not _is_valid_tz_iso8601(start_at):
+        return explain_source_query_error("time_requires_iso8601_with_timezone", parameters)
+    if end_at not in ("", None) and not _is_valid_tz_iso8601(end_at):
+        return explain_source_query_error("time_requires_iso8601_with_timezone", parameters)
+
+    if action in {"range", "range_batch"}:
+        if action == "range_batch" and limit:
+            return explain_source_query_error("range_batch_uses_server_budget", parameters)
+        if terms:
+            return explain_source_query_error("range_requires_start_end_without_terms", parameters)
+        if source_ref or direction != "around" or offset:
+            code = "range_batch_requires_time_range_only" if action == "range_batch" else "source_ref_direction_require_context"
+            return explain_source_query_error(code, parameters)
+        if not isinstance(start_at, str) or not start_at.strip():
+            return explain_source_query_error("range_requires_start_end_without_terms", parameters)
+        if isinstance(end_at, str) and end_at.strip():
+            start_dt = datetime.fromisoformat(start_at.strip().replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(end_at.strip().replace("Z", "+00:00"))
+            if start_dt >= end_dt:
+                return explain_source_query_error("time_range_reversed_or_empty", parameters)
+    elif action == "search":
+        if source_ref or direction != "around":
+            return explain_source_query_error("source_ref_direction_require_context", parameters)
+        if offset:
+            return explain_source_query_error("excerpt_offset_requires_read", parameters)
+        if not terms:
+            return explain_source_query_error("search_requires_terms", parameters)
+    elif action in {"context", "read"}:
+        if not isinstance(source_ref, str) or not source_ref.startswith("timeline:tl_") or terms or start_at or end_at:
+            return explain_source_query_error("context_requires_source_ref_only", parameters)
+        if action == "read" and direction != "around":
+            return explain_source_query_error("read_requires_source_ref_and_offset", parameters)
+        if action == "context" and offset:
+            return explain_source_query_error("excerpt_offset_requires_read", parameters)
+    return (
+        f"sources 参数组合不符合 action='{action}' 的要求",
+        "search 传 terms；range/range_batch 传带时区 start_at（end_at 可省）；context/read 传 timeline:tl_... source_ref；翻页只传 cursor。",
+    )
 
 
 def default_range_end_at() -> str:
@@ -504,4 +708,11 @@ async def query_sources(service: Any, event: Any, *, cursor: str = "", limit: in
             result["hint"] = _EMPTY_SEARCH_HINT if query.action == "search" else _EMPTY_RANGE_HINT
         return result
     except SourceQueryError as exc:
-        return {**empty, "error": str(exc)}
+        error_code = str(exc)
+        rejected_payload = {**empty, "error": error_code}
+        detail, hint = explain_source_query_error(error_code, parameters)
+        if detail:
+            rejected_payload["detail"] = clean_text(detail, 240)
+        if hint:
+            rejected_payload["hint"] = clean_text(hint, 240)
+        return rejected_payload
