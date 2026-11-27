@@ -16,6 +16,7 @@ class SummaryBatchStore:
     """Batch queue state; the store owns the transaction and the clock."""
 
     BUDGET_RETRY_REASON = "budget"
+    TRANSIENT_RETRY_REASON = "transient"
 
     @contextmanager
     def _summary_read_conn(self):
@@ -698,6 +699,8 @@ class SummaryBatchStore:
         only_if_due=False,
         lease_token="",
         preserve_lease=None,
+        retry_reason="",
+        refund_automatic_call=False,
     ) -> bool:
         """Defer a batch, optionally preserving a newer lease or completion.
 
@@ -705,9 +708,13 @@ class SummaryBatchStore:
         can therefore be reserved or completed by the normal message path
         before recovery reports its validation result.  ``only_if_due`` makes
         that report conditional on the batch still being dispatchable at the
-        moment of the update.
+        moment of the update.  When ``refund_automatic_call`` is True (for
+        transient infrastructure errors), the call reserved for this attempt is
+        returned to ``automatic_calls`` atomically so upstream outages never
+        exhaust the content-quarantine counter.
         """
         owner_token = clean_text(lease_token, 160)
+        normalized_reason = "" if quarantine else clean_text(retry_reason, 80)
 
         def update():
             with self._lock, self._transaction_sync():
@@ -738,10 +745,12 @@ class SummaryBatchStore:
                         and current_owner == owner_token
                         and not quarantine
                     )
+                refund_sql = "automatic_calls=MAX(0,automatic_calls-1)," if refund_automatic_call and not quarantine else ""
                 cursor = self._conn.execute(
-                    f"UPDATE summary_batches SET state=?,last_error=?,next_retry_at=?,retry_reason='',lease_token=?,lease_expires_at=?,updated_at=? WHERE {where}",
+                    f"UPDATE summary_batches SET {refund_sql}state=?,last_error=?,next_retry_at=?,retry_reason=?,lease_token=?,lease_expires_at=?,updated_at=? WHERE {where}",
                     ('quarantined' if quarantine else 'retry_pending', clean_text(redact_sensitive_text(error), 1800),
-                     (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(timespec='seconds'),
+                     (datetime.now(timezone.utc) + timedelta(seconds=max(0, int(delay or 0)))).isoformat(timespec='seconds'),
+                     normalized_reason,
                      current_owner if keep_lease else '',
                      clean_text(row["lease_expires_at"], 40) if keep_lease and row else None,
                      utc_now(), *where_params),
@@ -1023,6 +1032,76 @@ class SummaryBatchStore:
         result = await self.release_quarantined_batches(mode=mode, batch_ids=ids)
         result["cutoff"] = cutoff
         return result
+
+    async def release_transient_quarantined_batches(
+        self,
+        *,
+        is_transient: Any,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Unfreeze quarantined batches whose persisted last_error is a transient fault.
+
+        Unlike manual release (which drops batch ownership), transient recovery
+        keeps ``summary_batch_events`` intact whenever unsummarized events still
+        belong to the batch so the recovery dispatcher can immediately resume
+        summarizing those exact conversations without waiting for new messages.
+        Batches with non-transient or empty errors stay quarantined untouched.
+        """
+        max_release = max(1, int(limit or 100))
+
+        def recover() -> dict[str, Any]:
+            with self._lock, self._transaction_sync():
+                rows = self._conn.execute(
+                    "SELECT id, last_error FROM summary_batches "
+                    "WHERE state='quarantined' ORDER BY updated_at ASC, id"
+                ).fetchall()
+                scanned = len(rows)
+                released_ids: list[str] = []
+                retired_empty = 0
+                now_text = utc_now()
+                for row in rows:
+                    if len(released_ids) >= max_release:
+                        break
+                    batch_id = clean_text(row["id"], 160)
+                    last_error = clean_text(row["last_error"], 1800)
+                    if not batch_id or not last_error or not bool(is_transient(last_error)):
+                        continue
+                    has_pending_events = bool(
+                        self._conn.execute(
+                            "SELECT 1 FROM summary_batch_events e "
+                            "JOIN timeline t ON t.id=e.event_id "
+                            "WHERE e.batch_id=? AND t.summarized_at='' LIMIT 1",
+                            (batch_id,),
+                        ).fetchone()
+                    )
+                    if has_pending_events:
+                        self._conn.execute(
+                            "UPDATE summary_batches SET state='retry_pending',automatic_calls=0,"
+                            "repair_used=0,next_retry_at=NULL,retry_reason='',last_error='',"
+                            "lease_token='',lease_expires_at=NULL,updated_at=? "
+                            "WHERE id=? AND state='quarantined'",
+                            (now_text, batch_id),
+                        )
+                    else:
+                        self._conn.execute("DELETE FROM summary_batch_events WHERE batch_id=?", (batch_id,))
+                        self._conn.execute(
+                            "UPDATE summary_batches SET state='completed',automatic_calls=0,"
+                            "repair_used=0,next_retry_at=NULL,retry_reason='',last_error='',"
+                            "lease_token='',lease_expires_at=NULL,updated_at=? "
+                            "WHERE id=? AND state='quarantined'",
+                            (now_text, batch_id),
+                        )
+                        retired_empty += 1
+                    released_ids.append(batch_id)
+                return {
+                    "ok": True,
+                    "scanned": scanned,
+                    "released": len(released_ids),
+                    "retired_empty": retired_empty,
+                    "batch_ids": released_ids,
+                }
+
+        return await asyncio.to_thread(recover)
 
     async def finish_summary_batch(
         self,

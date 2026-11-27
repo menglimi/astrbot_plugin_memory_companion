@@ -20,6 +20,7 @@ from .source_query import (
     _instant,
     _text,
     default_range_end_at,
+    explain_source_query_error,
     source_partition,
 )
 
@@ -46,9 +47,16 @@ def binding_matches(service: Any, event: Any, ctx: Any) -> bool:
             == service._reconstruction_budget_key(event, ctx))
 
 
-def rejected(error: str) -> dict[str, Any]:
-    return {"profile": SOURCE_QUERY_PROFILE_V2, "ok": False, "status": "rejected",
-            "error": error, "sources": [], "batch": {}, "coverage": {}, "usage": {}}
+def rejected(error: str, *, detail: str = "", hint: str = "") -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "profile": SOURCE_QUERY_PROFILE_V2, "ok": False, "status": "rejected",
+        "error": error, "sources": [], "batch": {}, "coverage": {}, "usage": {},
+    }
+    if detail:
+        payload["detail"] = detail[:240]
+    if hint:
+        payload["hint"] = hint[:240]
+    return payload
 
 
 def _parse(parameters: dict[str, Any], cursor: str, limit: Any) -> tuple[str, str]:
@@ -343,4 +351,6 @@ async def query_range_batch(service: Any, event: Any, *, cursor: str = "", limit
                                expires_at=expires_at, coverage=result["coverage"], event=event, ctx=ctx)
         return result
     except SourceQueryError as exc:
-        return rejected(str(exc))
+        error_code = str(exc)
+        detail, hint = explain_source_query_error(error_code, parameters)
+        return rejected(error_code, detail=detail, hint=hint)

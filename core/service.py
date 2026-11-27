@@ -2613,6 +2613,10 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                     await self.auto_distill_core_memory()
                 except Exception as exc:
                     logger.warning("[MemoryCompanion] 核心记忆自动沉淀失败: %s", exc)
+                try:
+                    await self.recover_transient_quarantined_batches()
+                except Exception as exc:
+                    logger.warning("[MemoryCompanion] 自动解冻瞬时错误隔离批次失败: %s", exc)
                 quarantine_days = self.config.int("memory_summary.quarantine_auto_retry_days", 7)
                 if quarantine_days > 0:
                     await self.store.reap_stale_quarantined_batches(
@@ -7260,6 +7264,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             1, min(32, self.config.int("memory_summary.recovery_sessions_per_round", 1))
         )
         self._summary_recovery_status.update(state="running", last_error="")
+        transient_unfrozen = False
         try:
             if startup_delay:
                 await asyncio.sleep(startup_delay)
@@ -7269,6 +7274,15 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                     await asyncio.sleep(poll_interval)
                     continue
                 try:
+                    if not transient_unfrozen:
+                        try:
+                            await self.recover_transient_quarantined_batches()
+                        except Exception as exc:
+                            logger.warning(
+                                "[MemoryCompanion] 恢复巡检自动解冻瞬时错误隔离批次失败: error=%s",
+                                self._describe_exception(exc),
+                            )
+                        transient_unfrozen = True
                     if self.config.int("memory_summary.max_calls_per_session_hour", 24) == 0:
                         await self.store.release_summary_budget_deferrals()
                     active_sessions = {
@@ -7643,29 +7657,61 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             self._summary_lock_ts.pop(sid, None)
             self._summary_prefer_old.pop(sid, None)
 
+    async def recover_transient_quarantined_batches(self, *, limit: int = 100) -> dict[str, Any]:
+        """Unfreeze batches historically quarantined due to transient 5xx/429/timeout faults."""
+        result = await self.store.release_transient_quarantined_batches(
+            is_transient=self._summary_failure_is_transient,
+            limit=max(1, int(limit or 100)),
+        )
+        released = int(result.get("released") or 0)
+        if released > 0:
+            logger.info(
+                "[MemoryCompanion] 启动/恢复巡检已自动解冻因瞬时错误误隔离的阶段总结批次: "
+                "released=%s retired_empty=%s scanned=%s",
+                released,
+                int(result.get("retired_empty") or 0),
+                int(result.get("scanned") or 0),
+            )
+        return result
+
     @staticmethod
     def _summary_failure_is_transient(error: Any) -> bool:
         text = clean_text(error, 1000).lower()
-        if not text:
+        if not text or text.startswith("repair:"):
             return False
         markers = (
             "connection error",
             "connectionerror",
             "apiconnectionerror",
+            "apitimeouterror",
+            "timeoutexception",
             "connecterror",
             "connecttimeout",
             "connection reset",
             "connection refused",
+            "connection aborted",
+            "connection closed",
+            "broken pipe",
+            "remote end closed",
             "server disconnected",
             "remoteprotocolerror",
             "readerror",
             "readtimeout",
             "network error",
+            "servererror",
+            "internal server error",
+            "internal_server_error",
+            "bad gateway",
+            "gateway timeout",
             "temporarily unavailable",
             "service unavailable",
+            "service_unavailable",
+            "overloaded",
             "timeout",
             "timed out",
             "rate limit",
+            "rate_limit",
+            "ratelimit",
             "too many requests",
             "payment required",
             "insufficient balance",
@@ -7675,19 +7721,79 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             "quota exceeded",
             "exceeded your current quota",
             "resource exhausted",
+            "queue full",
+            "当前无可用凭证",
+            "无可用凭证",
+            "无可用渠道",
             "连接错误",
             "连接失败",
             "连接超时",
+            "连接中断",
             "网络错误",
             "网络异常",
+            "网络中断",
             "暂时不可用",
+            "服务繁忙",
+            "服务过载",
+            "队列已满",
             "余额不足",
             "额度不足",
             "配额不足",
         )
         if any(marker in text for marker in markers):
             return True
-        return bool(re.search(r"(?:^|\D)(?:402|429|502|503|504)(?:\D|$)", text))
+        if re.search(r"(?:^|\D)(?:402|429|502|503|504)(?:\D|$)", text):
+            return True
+        return bool(
+            re.search(
+                r"(?:server\s*error|internal\s+server\s+error|http(?:/\d(?:\.\d)?)?\s+500"
+                r"|status(?:_code)?\s*[=:]\s*500|error\s*code\s*[=:]\s*500"
+                r"|\b500\s+(?:internal|server|upstream|error|service|当前无可用))",
+                text,
+            )
+        )
+
+    @classmethod
+    def _summary_exception_is_transient(cls, exc: BaseException, error_text: str = "") -> bool:
+        if isinstance(exc, SummaryFormatError):
+            return False
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
+            return True
+        status_code = getattr(exc, "status_code", None)
+        if status_code is None:
+            status_code = getattr(exc, "status", None)
+        if status_code is None:
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
+        try:
+            code = int(status_code) if status_code is not None else 0
+        except (TypeError, ValueError):
+            code = 0
+        if code in {402, 429, 500, 502, 503, 504}:
+            return True
+        if code in {400, 401, 403, 404, 422}:
+            return False
+        return cls._summary_failure_is_transient(error_text or f"{type(exc).__name__}: {exc}")
+
+    @staticmethod
+    def _parse_transient_retry_count(retry_reason: Any) -> int:
+        text = clean_text(retry_reason, 80).lower()
+        if text == "transient":
+            return 1
+        if text.startswith("transient:"):
+            try:
+                return max(0, int(text.split(":", 1)[1]))
+            except (TypeError, ValueError):
+                return 1
+        return 0
+
+    def _summary_transient_backoff_seconds(self, failure_count: int) -> int:
+        base = self._summary_transient_cooldown_seconds()
+        if base <= 0:
+            return 0
+        exponent = max(0, min(4, int(failure_count or 1) - 1))
+        cap = max(base, 3600)
+        return min(base * (2**exponent), cap)
 
     def _summary_failure_age_seconds(self, failure: dict[str, Any]) -> float:
         updated_at = self._parse_utc_datetime(str(failure.get("updated_at") or ""))
@@ -7916,6 +8022,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
             round_calls = 0
             provider_failed = False
             style_repair_attempted = False
+            transient_failures = self._parse_transient_retry_count(batch.get("retry_reason"))
             best_valid_payload: dict[str, Any] | None = None
             best_valid_attempt: dict[str, Any] = {}
             lease_token = secrets.token_urlsafe(24)
@@ -8005,11 +8112,53 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                             content = self.summarizer.compose_memory_content(payload)
                             break
                         # A failed request has no model output to repair.
-                        # Try each fallback once, then wait for the next round.
+                        # Transient infrastructure faults (429/5xx/timeout/network)
+                        # never consume quarantine attempts: immediately failover to
+                        # the next provider in this round, or cool down with
+                        # exponential backoff based on transient_retry_cooldown_minutes.
                         request_error = self._describe_exception(exc)
+                        is_transient = self._summary_exception_is_transient(exc, request_error)
                         current = await self.store.get_summary_batch(batch_id)
-                        exhausted = not force and current["automatic_calls"] >= max_calls
                         has_usable_body = bool(payload and self.summarizer.compose_memory_content(payload))
+                        if is_transient:
+                            can_continue_with_fallback = attempt_index + 1 < len(summary_attempts)
+                            if can_continue_with_fallback:
+                                await self.store.defer_summary_batch(
+                                    batch_id, request_error,
+                                    quarantine=False,
+                                    delay=0,
+                                    lease_token=lease_token if not force else "",
+                                    preserve_lease=True,
+                                    retry_reason="",
+                                    refund_automatic_call=not force,
+                                )
+                                round_calls = max(0, round_calls - 1)
+                                attempt_index += 1
+                                continue
+                            transient_failures += 1
+                            transient_delay = self._summary_transient_backoff_seconds(transient_failures)
+                            await self.store.defer_summary_batch(
+                                batch_id, request_error,
+                                quarantine=False,
+                                delay=transient_delay,
+                                lease_token=lease_token if not force else "",
+                                preserve_lease=has_usable_body,
+                                retry_reason=f"{self.store.TRANSIENT_RETRY_REASON}:{transient_failures}",
+                                refund_automatic_call=not force,
+                            )
+                            logger.warning(
+                                "[MemoryCompanion] 阶段总结遇瞬时模型/网络故障，未计入隔离次数，"
+                                "已按退避冷却延后重试: session=%s batch=%s transient_attempt=%s delay_s=%s reason=%s",
+                                ctx.session_id,
+                                batch_id,
+                                transient_failures,
+                                transient_delay,
+                                clean_text(request_error, 300),
+                            )
+                            if has_usable_body:
+                                break
+                            return ""
+                        exhausted = not force and current["automatic_calls"] >= max_calls
                         can_continue_with_fallback = (
                             attempt_index + 1 < len(summary_attempts)
                             and round_calls < max_calls
@@ -9106,14 +9255,93 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
         if current is not None:
             current_id = self._provider_runtime_id(current, fallback_type=False)
             if id(current) not in seen_provider_objects and (not current_id or current_id not in seen):
+                if current_id:
+                    seen.add(current_id)
+                seen_provider_objects.add(id(current))
                 attempts.append(
                     {
                         "source": "current_session",
-                        "provider_id": "",
+                        "provider_id": current_id,
                         "provider": current,
                     }
                 )
+        if not fallback_id and not compatibility_fallback_id:
+            for host_fallback_id in self._host_fallback_provider_ids(ctx):
+                if host_fallback_id in seen:
+                    continue
+                provider = await self._provider_by_id(host_fallback_id, ctx, "host_fallback")
+                if provider is None:
+                    continue
+                runtime_id = self._provider_runtime_id(provider, fallback_type=False)
+                identity_ids = {item for item in (host_fallback_id, runtime_id) if item}
+                if id(provider) in seen_provider_objects or identity_ids.intersection(seen):
+                    continue
+                seen.update(identity_ids)
+                seen_provider_objects.add(id(provider))
+                attempts.append(
+                    {
+                        "source": "host_fallback",
+                        "provider_id": host_fallback_id,
+                        "provider": provider,
+                    }
+                )
         return attempts
+
+    def _host_fallback_provider_ids(self, ctx: SessionContext, *, limit: int = 8) -> list[str]:
+        """Read AstrBot's configured global chat fallback provider chain."""
+        context = getattr(self, "context", None)
+        getter = getattr(context, "get_config", None)
+        if not callable(getter):
+            return []
+        cfg = None
+        session_id = clean_text(getattr(ctx, "session_id", ""), 200)
+        if session_id:
+            try:
+                cfg = getter(umo=session_id)
+            except TypeError:
+                cfg = None
+            except Exception:
+                cfg = None
+        if cfg is None:
+            try:
+                cfg = getter()
+            except Exception:
+                return []
+        if not isinstance(cfg, dict) and not hasattr(cfg, "get"):
+            return []
+
+        def _nested_get(root: Any, *keys: str) -> Any:
+            cursor = root
+            for key in keys:
+                if cursor is None:
+                    return None
+                if isinstance(cursor, dict) or hasattr(cursor, "get"):
+                    cursor = cursor.get(key)
+                else:
+                    cursor = getattr(cursor, key, None)
+            return cursor
+
+        candidate_lists = (
+            _nested_get(cfg, "agent_runner", "config", "model", "fallback_provider_ids"),
+            _nested_get(cfg, "agent_runner", "fallback_provider_ids"),
+            _nested_get(cfg, "provider_settings", "fallback_provider_ids"),
+            _nested_get(cfg, "provider_settings", "fallback_chat_providers"),
+            _nested_get(cfg, "fallback_provider_ids"),
+            _nested_get(cfg, "fallback_chat_providers"),
+        )
+        result: list[str] = []
+        for raw_list in candidate_lists:
+            if not isinstance(raw_list, (list, tuple)):
+                continue
+            for item in raw_list:
+                provider_id = clean_text(item, 120)
+                if provider_id and provider_id not in result:
+                    result.append(provider_id)
+                    if len(result) >= limit:
+                        return result
+            if result:
+                return result
+        return result
 
     async def _summary_provider(self, ctx: SessionContext) -> Any:
         attempts = await self._summary_provider_attempts(ctx)

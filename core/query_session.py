@@ -343,6 +343,33 @@ def _v3_binding_matches(service: Any, event: Any, ctx: Any) -> bool:
         return False
 
 
+def _invalid_arguments_feedback(operation: Any, params: Any, validator: Any, payload: dict[str, Any]) -> dict[str, str]:
+    """Produce concise self-correcting detail/hint for invalid_query_arguments."""
+    if operation == "sources":
+        from .source_query import diagnose_source_query_parameters
+        detail, hint = diagnose_source_query_parameters(params)
+        return {"detail": detail[:240], "hint": hint[:240]}
+    first_error = next(iter(validator.iter_errors(payload)), None)
+    if first_error is not None:
+        path = ".".join(str(part) for part in first_error.absolute_path)
+        message = str(first_error.message or "").strip()
+        detail = f"{path}: {message}" if path else message
+    else:
+        detail = f"operation='{operation}' 的参数不符合格式要求"
+    hint_map = {
+        "recall": "recall 需要非空字符串 query 与可选 1-10 的整数 top_k。",
+        "navigate": "navigate 需要合法的 action 及对应参数（query/cue/tag/memory_ids）。",
+        "events": "events 需要包含完整必填字段的 plan 对象。",
+        "discover": "discover 需要非空字符串 query，时间上下界须为带时区 ISO 8601。",
+        "status": "status 无需参数（省略或传空对象 {}）。",
+    }
+    hint = hint_map.get(
+        str(operation or ""),
+        "请核对 operation（status/recall/sources/navigate/events）及对应 parameters 对象格式。",
+    )
+    return {"detail": detail[:240], "hint": hint[:240]}
+
+
 async def execute(service: Any, event: Any, operation: str = "status", parameters: Any = None,
                   *, _notes: bool = False, query_note: Any = None) -> dict[str, Any]:
     result = {"profile": PROFILE, "ok": False, "operation": operation if operation in (*OPERATIONS, "status") else "status", "operation_id": None,
@@ -358,8 +385,13 @@ async def execute(service: Any, event: Any, operation: str = "status", parameter
     note_ids = None
     if _notes and operation == "status":
         from jsonschema import Draft202012Validator
-        if not Draft202012Validator(query_notes.status_parameters()).is_valid(params):
-            return {**result, "error": "invalid_query_arguments"}
+        status_validator = Draft202012Validator(query_notes.status_parameters())
+        if not status_validator.is_valid(params):
+            return {
+                **result,
+                "error": "invalid_query_arguments",
+                **_invalid_arguments_feedback("status", params, status_validator, params if isinstance(params, dict) else {}),
+            }
         note_ids, params = params.get("note_ids"), {}
     if _notes and query_note is not None and operation != "sources":
         return {**result, "error": "query_note_requires_sources"}
@@ -367,8 +399,13 @@ async def execute(service: Any, event: Any, operation: str = "status", parameter
         from .source_query import normalize_source_query_parameters
         params = normalize_source_query_parameters(params)
     payload = {"operation": operation, "parameters": params}
-    if not request_validator().is_valid(payload):
-        return {**result, "error": "invalid_query_arguments"}
+    validator = request_validator()
+    if not validator.is_valid(payload):
+        return {
+            **result,
+            "error": "invalid_query_arguments",
+            **_invalid_arguments_feedback(operation, params, validator, payload),
+        }
     raw_ctx = await service.identity.resolve_event_context(event)
     ctx = service._normalized_session_context(raw_ctx)
     if not service._scope_feature_enabled(ctx, "recall"):
@@ -452,8 +489,13 @@ async def execute_v3(service: Any, event: Any, operation: str = "status", parame
     note_ids = None
     if _notes and normalized_operation == "status":
         from jsonschema import Draft202012Validator
-        if not Draft202012Validator(query_notes.status_parameters()).is_valid(params):
-            return {**result, "error": "invalid_query_arguments"}
+        status_validator = Draft202012Validator(query_notes.status_parameters())
+        if not status_validator.is_valid(params):
+            return {
+                **result,
+                "error": "invalid_query_arguments",
+                **_invalid_arguments_feedback("status", params, status_validator, params if isinstance(params, dict) else {}),
+            }
         note_ids, params = params.get("note_ids"), {}
     if _notes and query_note is not None and normalized_operation != "sources":
         return {**result, "error": "query_note_requires_sources"}
@@ -461,8 +503,13 @@ async def execute_v3(service: Any, event: Any, operation: str = "status", parame
         from .source_query import normalize_source_query_parameters
         params = normalize_source_query_parameters(params)
     payload = {"operation": operation, "parameters": params}
-    if not request_validator_v3().is_valid(payload):
-        return {**result, "error": "invalid_query_arguments"}
+    validator_v3 = request_validator_v3()
+    if not validator_v3.is_valid(payload):
+        return {
+            **result,
+            "error": "invalid_query_arguments",
+            **_invalid_arguments_feedback(operation, params, validator_v3, payload),
+        }
 
     raw_ctx = await service.identity.resolve_event_context(event)
     ctx = service._normalized_session_context(raw_ctx)

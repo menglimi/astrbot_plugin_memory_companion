@@ -83,9 +83,9 @@ class SummaryBatchObservabilityTests(unittest.IsolatedAsyncioTestCase):
     def batches(self):
         return [dict(row) for row in self.service.store._conn.execute('SELECT * FROM summary_batches ORDER BY created_at,id')]
 
-    async def test_transient_failure_exhausting_the_budget_logs_the_freeze(self):
+    async def test_non_transient_failure_exhausting_the_budget_logs_the_freeze(self):
         event_id = await self.event()
-        provider = Provider([TimeoutError('503 Service Unavailable')] * 3)
+        provider = Provider([RuntimeError('400 Invalid request parameter')] * 3)
         self.use(provider, provider, provider)
 
         # The host provides its own logger object rather than a stdlib Logger, so
@@ -106,7 +106,29 @@ class SummaryBatchObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(self.ctx.session_id, warnings[0])
         self.assertIn('event_count=1', warnings[0])
         self.assertIn('calls=3', warnings[0])
-        self.assertIn('reason=TimeoutError:', warnings[0])
+        self.assertIn('reason=RuntimeError:', warnings[0])
+
+    async def test_transient_failure_cools_down_and_logs_without_quarantine(self):
+        event_id = await self.event()
+        provider = Provider([TimeoutError('503 Service Unavailable')] * 3)
+        self.use(provider, provider, provider)
+
+        test_logger = logging.getLogger('MemoryCompanion.SummaryBatchTransientTest')
+        with (
+            patch.object(service_module, 'logger', test_logger),
+            self.assertLogs(test_logger, level='WARNING') as captured,
+        ):
+            self.assertEqual('', await self.service.maybe_summarize_session(self.ctx))
+
+        batch = self.batches()[0]
+        self.assertEqual('retry_pending', batch['state'])
+        self.assertEqual(0, batch['automatic_calls'])
+        self.assertTrue(batch['retry_reason'].startswith('transient:'))
+        self.assertFalse((await self.service.store.get_timeline_by_ids([event_id]))[event_id]['summarized_at'])
+        warnings = [record.getMessage() for record in captured.records if '未计入隔离次数' in record.getMessage()]
+        self.assertEqual(1, len(warnings), warnings)
+        self.assertIn(batch['id'], warnings[0])
+        self.assertIn('TimeoutError', warnings[0])
 
     async def test_release_logs_batch_mode_event_count_and_resulting_state(self):
         event_id = await self.event()

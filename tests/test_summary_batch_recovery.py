@@ -177,7 +177,10 @@ class SummaryBatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_retries_and_fallbacks_share_persistent_batch_budget(self):
         await self.event()
-        p1, p2 = Provider([TimeoutError('timeout')] * 5), Provider([TimeoutError('timeout')] * 5)
+        p1, p2 = (
+            Provider([RuntimeError('400 Invalid request parameter')] * 5),
+            Provider([RuntimeError('400 Invalid request parameter')] * 5),
+        )
         self.use(p1, p2)
         for _ in range(5):
             await self.service.maybe_summarize_session(self.ctx)
