@@ -143,6 +143,7 @@ const ICON_PATHS = {
   tag: '<path d="M8.6 2.6H13v4.4l-6 6-4.4-4.4z"/><circle cx="10.4" cy="5.2" r="0.9"/>',
   db: '<ellipse cx="8" cy="4.2" rx="5" ry="2"/><path d="M3 4.2v7.6c0 1.1 2.2 2 5 2s5-.9 5-2V4.2"/><path d="M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>',
   search: '<circle cx="7.2" cy="7.2" r="4.5"/><path d="M10.6 10.6L14 14"/>',
+  more: '<rect x="2.6" y="2.6" width="4.4" height="4.4" rx="1.1"/><rect x="9" y="2.6" width="4.4" height="4.4" rx="1.1"/><rect x="2.6" y="9" width="4.4" height="4.4" rx="1.1"/><rect x="9" y="9" width="4.4" height="4.4" rx="1.1"/>',
 };
 
 function icon(name, cls) {
@@ -746,6 +747,11 @@ function applyTheme(theme, options = {}) {
   document.documentElement.dataset.theme = state.theme;
   const label = $("#themeToggleLabel");
   if (label) label.textContent = state.theme === "dark" ? "深色" : "浅色";
+  const topbarThemeBtn = $("#topbarThemeBtn");
+  if (topbarThemeBtn && typeof topbarThemeBtn.setAttribute === "function") {
+    topbarThemeBtn.setAttribute("aria-pressed", state.theme === "dark" ? "true" : "false");
+    topbarThemeBtn.setAttribute("title", state.theme === "dark" ? "切换到浅色主题" : "切换到深色主题");
+  }
   const meta = typeof document.querySelector === "function" ? $('meta[name="theme-color"]') : null;
   if (meta && typeof meta.setAttribute === "function") {
     meta.setAttribute("content", state.theme === "light" ? "#f6f7fa" : "#0b0d12");
@@ -845,8 +851,139 @@ function findGroupOf(viewId) {
 }
 
 /* ------------------------------------------------------------
-   侧栏渲染
+   侧栏与移动端导航渲染
    ------------------------------------------------------------ */
+const MOBILE_MORE_GROUPS = new Set(["import", "bridge"]);
+let mobileMoreOpen = false;
+
+function renderMobileSubnav() {
+  const host = $("#mobileSubnav");
+  if (!host) return;
+  const groupObj = NAV.find((item) => item.id === state.group) || null;
+  const visibleViews = groupObj
+    ? groupObj.views.filter((viewId) => {
+        const view = VIEWS[viewId];
+        return Boolean(view && !view.hidden);
+      })
+    : [];
+  if (visibleViews.length <= 1) {
+    host.hidden = true;
+    host.innerHTML = "";
+    return;
+  }
+  host.hidden = false;
+  host.innerHTML = visibleViews
+    .map((viewId) => {
+      const view = VIEWS[viewId];
+      const active = state.view === viewId;
+      return (
+        '<button class="mobile-subnav-pill' + (active ? " is-active" : "") + '" type="button" data-view="' +
+        esc(viewId) + '"' + (active ? ' aria-current="page"' : "") + ">" +
+        esc(view.navLabel || view.title) +
+        "</button>"
+      );
+    })
+    .join("");
+  const activePill = $(".mobile-subnav-pill.is-active", host);
+  if (activePill && typeof activePill.scrollIntoView === "function") {
+    try {
+      activePill.scrollIntoView({ block: "nearest", inline: "center", behavior: "auto" });
+    } catch (_) {
+      /* 忽略旧 WebView */
+    }
+  }
+}
+
+function renderMobileMoreSheet() {
+  const sheet = $("#mobileMoreSheet");
+  if (!sheet) return;
+  const groupsHtml = ["import", "bridge"]
+    .map((groupId) => {
+      const groupObj = NAV.find((item) => item.id === groupId);
+      if (!groupObj) return "";
+      const items = groupObj.views
+        .map((viewId) => {
+          const view = VIEWS[viewId];
+          if (!view || view.hidden) return "";
+          const active = state.view === viewId ? " is-active" : "";
+          return (
+            '<button class="mobile-more-item' + active + '" type="button" data-more-view="' + esc(viewId) + '">' +
+            '<span>' + esc(view.navLabel || view.title) + "</span>" +
+            "<small>" + esc(clip(view.hint || view.title, 24)) + "</small>" +
+            "</button>"
+          );
+        })
+        .join("");
+      if (!items) return "";
+      return (
+        '<div class="mobile-more-sec">' +
+        '<div class="mobile-more-sec-title">' + icon(groupObj.icon, "mobile-more-sec-icon") + "<span>" + esc(groupObj.label) + "</span></div>" +
+        '<div class="mobile-more-grid">' + items + "</div>" +
+        "</div>"
+      );
+    })
+    .join("");
+  sheet.innerHTML =
+    '<div class="mobile-more-head">' +
+      '<div><p class="eyebrow">Navigation</p><h3>更多工作区</h3></div>' +
+      '<button class="icon-btn mobile-more-close" type="button" id="mobileMoreClose" aria-label="关闭更多菜单">' +
+        '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>' +
+      "</button>" +
+    "</div>" +
+    '<div class="mobile-more-body">' +
+      groupsHtml +
+      '<div class="mobile-more-sec">' +
+        '<div class="mobile-more-sec-title">' + icon("search", "mobile-more-sec-icon") + "<span>快捷工具</span></div>" +
+        '<div class="mobile-more-actions">' +
+          '<button class="mobile-more-action" type="button" data-more-action="config-search">' + icon("search", "mobile-more-sec-icon") + "<span>搜索全部配置项</span></button>" +
+          '<a class="mobile-more-action" data-people-link href="' + esc(peopleHref()) + '">' + icon("heart", "mobile-more-sec-icon") + "<span>前往「她记得的人」</span></a>" +
+        "</div>" +
+      "</div>" +
+    "</div>";
+}
+
+function setMobileMoreOpen(open) {
+  const sheet = $("#mobileMoreSheet");
+  const scrim = $("#mobileMoreScrim");
+  const btn = $("#mobileMoreBtn");
+  mobileMoreOpen = Boolean(open);
+  if (!sheet || !scrim) return;
+  if (mobileMoreOpen) {
+    renderMobileMoreSheet();
+    scrim.hidden = false;
+    sheet.hidden = false;
+    void sheet.offsetWidth;
+    scrim.classList.add("is-open");
+    sheet.classList.add("is-open");
+    if (btn) btn.setAttribute("aria-expanded", "true");
+  } else {
+    scrim.classList.remove("is-open");
+    sheet.classList.remove("is-open");
+    if (btn) btn.setAttribute("aria-expanded", "false");
+    const hide = () => {
+      if (mobileMoreOpen) return;
+      scrim.hidden = true;
+      sheet.hidden = true;
+    };
+    if (prefersReducedMotion()) {
+      hide();
+    } else {
+      window.setTimeout(hide, 220);
+    }
+  }
+}
+
+function wrapResponsiveTables(root) {
+  if (!root || typeof root.querySelectorAll !== "function") return;
+  $$("table.table", root).forEach((tbl) => {
+    if (!tbl.parentElement || tbl.parentElement.classList.contains("table-scroll")) return;
+    const wrap = document.createElement("div");
+    wrap.className = "table-scroll";
+    tbl.parentElement.insertBefore(wrap, tbl);
+    wrap.appendChild(tbl);
+  });
+}
+
 function renderRail() {
   const host = $("#railNav");
   if (!host) return;
@@ -857,6 +994,13 @@ function renderRail() {
     '<span class="nav-label">她记得的人</span>' +
     '<span class="nav-ext" aria-hidden="true">↗</span>' +
     "</a></div>";
+  const moreActive = mobileMoreOpen || MOBILE_MORE_GROUPS.has(state.group);
+  const moreBtn =
+    '<button class="nav-item mobile-more-btn' + (moreActive ? " is-active" : "") + '" id="mobileMoreBtn" type="button" ' +
+    'aria-haspopup="dialog" aria-expanded="' + (mobileMoreOpen ? "true" : "false") + '" aria-label="更多功能">' +
+    icon("more") +
+    '<span class="nav-label">更多</span>' +
+    "</button>";
   host.innerHTML = peopleEntry + NAV.map((group) => {
     const isOpen = group.id === state.group;
     const groupIcon = icon(group.icon);
@@ -888,7 +1032,9 @@ function renderRail() {
       (hasSubs ? '<div class="nav-subs"><div class="nav-subs-inner">' + subs + "</div></div>" : "") +
       "</div>"
     );
-  }).join("");
+  }).join("") + moreBtn;
+  renderMobileSubnav();
+  if (mobileMoreOpen) renderMobileMoreSheet();
 }
 
 function setRailStatus(kind, text) {
@@ -950,6 +1096,7 @@ async function go(viewId, options) {
       node.classList.add("is-inplace-refresh");
     }
     node.innerHTML = view.render(payload, opts);
+    if (typeof wrapResponsiveTables === "function") wrapResponsiveTables(node);
     host.appendChild(node);
     if (typeof view.mount === "function") view.mount(node, payload, opts);
     if (canInPlace) {
@@ -2135,11 +2282,11 @@ defineView("inspect", {
           '<div class="pill-row">' + visPills + "</div>" +
           '<div class="pill-row">' + lifePills + "</div>" +
         "</div>" +
-        '<div style="display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap">' +
-          '<input id="inspectQuery" type="search" placeholder="按内容或证据过滤" value="' + esc(filters.q || "") + '" style="flex:1;min-width:200px;height:32px;padding:0 12px;border:1px solid var(--border);border-radius:9px;background:var(--surface-2);color:var(--text);font-size:12.5px;outline:none" />' +
+        '<div class="inspect-search-bar">' +
+          '<input id="inspectQuery" class="inspect-query-input" type="search" placeholder="按内容或证据过滤" value="' + esc(filters.q || "") + '" />' +
           '<button class="btn is-sm" type="button" id="applyQueryBtn">应用</button>' +
           '<button class="btn is-sm is-ghost" type="button" id="clearFiltersBtn">清空筛选</button>' +
-          '<span style="margin-left:auto;font-size:11.5px;color:var(--text-3)">' + fmtInt(memories.length) + " 条" + (activeChips.length ? " · " + esc(activeChips.join(" · ")) : "") + "</span>" +
+          '<span class="inspect-count">' + fmtInt(memories.length) + " 条" + (activeChips.length ? " · " + esc(activeChips.join(" · ")) : "") + "</span>" +
         "</div>" +
       "</section>" +
       '<div class="row-list" id="inspectList">' + rows + "</div>" +
@@ -2627,8 +2774,18 @@ function closeLightbox(box) {
 function openLightbox(src, caption) {
   const box = document.createElement("div");
   box.className = "lightbox";
-  box.innerHTML = '<img src="' + esc(src) + '" alt="" /><div class="lightbox-cap">' + esc(caption || "") + "</div>";
-  box.addEventListener("click", () => closeLightbox(box));
+  box.setAttribute("role", "dialog");
+  box.setAttribute("aria-modal", "true");
+  box.setAttribute("aria-label", caption || "查看图片");
+  box.innerHTML =
+    '<button class="lightbox-close" type="button" aria-label="关闭大图">×</button>' +
+    '<img src="' + esc(src) + '" alt="" />' +
+    '<div class="lightbox-cap">' + esc(caption || "") + "</div>";
+  box.addEventListener("click", (event) => {
+    if (event.target.closest(".lightbox-close") || event.target === box) {
+      closeLightbox(box);
+    }
+  });
   document.body.appendChild(box);
   if (prefersReducedMotion()) {
     box.classList.add("is-open");
@@ -3184,13 +3341,13 @@ function speakerConfirmHtml(result) {
       const role = compact(suggestion && suggestion.role) || (matches[speaker] ? "bot" : "user");
       const entity = compact(suggestion && suggestion.entity_id) || compact(matches[speaker] && (matches[speaker].entity_id || matches[speaker].id)) || "";
       return (
-        '<div class="acl-row" style="grid-template-columns:minmax(0,1fr) 110px minmax(0,1fr)">' +
+        '<div class="acl-row speaker-map-row">' +
         '<div class="acl-node"><b>' + esc(speaker) + "</b></div>" +
-        '<select data-speaker="' + esc(speaker) + '" class="speaker-role" style="height:30px;padding:0 8px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);color:var(--text);font-size:12px">' +
+        '<select data-speaker="' + esc(speaker) + '" class="speaker-role">' +
           '<option value="user"' + (role === "bot" ? "" : " selected") + ">用户</option>" +
           '<option value="bot"' + (role === "bot" ? " selected" : "") + ">Bot</option>" +
         "</select>" +
-        '<input data-speaker-id="' + esc(speaker) + '" class="speaker-entity" type="text" value="' + esc(entity) + '" placeholder="实体 ID（可留空）" style="height:30px;padding:0 8px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);color:var(--text);font-size:12px" />' +
+        '<input data-speaker-id="' + esc(speaker) + '" class="speaker-entity" type="text" value="' + esc(entity) + '" placeholder="实体 ID（可留空）" />' +
         "</div>"
       );
     })
@@ -3820,12 +3977,12 @@ defineView("migrate", {
     ]
       .map((tool) => {
         const input = tool.input
-          ? '<input id="' + tool.input + '" type="text" placeholder="' + esc(tool.placeholder || "") + '" style="height:30px;padding:0 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);color:var(--text);font-size:12px" />'
+          ? '<input id="' + tool.input + '" class="migrate-inline-input" type="text" placeholder="' + esc(tool.placeholder || "") + '" />'
           : "";
         const audits = tool.audits
-          ? '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
-            '<input id="auditLimit" type="number" min="0" max="100" value="0" style="width:92px;height:30px;padding:0 8px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);color:var(--text);font-size:12px" />' +
-            '<input id="auditBatch" type="text" placeholder="audit_..." style="flex:1;min-width:150px;height:30px;padding:0 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);color:var(--text);font-size:12px" />' +
+          ? '<div class="audit-input-row">' +
+            '<input id="auditLimit" class="audit-limit-input" type="number" min="0" max="100" value="0" />' +
+            '<input id="auditBatch" class="audit-batch-input" type="text" placeholder="audit_..." />' +
             "</div>"
           : "";
         return (
@@ -5793,7 +5950,7 @@ defineView("acl", {
     if (!shown.length) {
       matrix = emptyState("没有可展示的窗口", "调整筛选条件，或先在记忆库里产生一些窗口。");
     } else {
-      const cols = "grid-template-columns: 138px repeat(" + shown.length + ", 68px)";
+      const cols = "--mx-cols:" + shown.length;
       const headRow =
         '<div class="mx-corner">被读方 ＼ 读取方</div>' +
         shown
@@ -5835,7 +5992,8 @@ defineView("acl", {
         .join("");
       matrix =
         '<div class="mx-scroll"><div class="mx" id="mxGrid" style="' + cols + '">' + headRow + bodyRows + "</div>" +
-        '<div class="mx-tip" id="mxTip"></div></div>';
+        '<div class="mx-tip" id="mxTip"></div></div>' +
+        '<div class="mx-touch-info" id="mxTouchInfo" aria-live="polite">点按格子切换授权；左右滑动查看更多窗口</div>';
     }
 
     /* ---------- 授权密度 ---------- */
@@ -5902,13 +6060,13 @@ defineView("acl", {
             ? '<div class="row-list">' + inbound.map((rule) => ruleRow(rule, "in")).join("") + "</div>"
             : '<p class="section-note" style="margin-bottom:10px">这里还不能读到其他窗口的记忆。</p>') +
           '<div class="section-label" style="margin:14px 0 8px"><h2 style="font-size:11px">快速授权</h2></div>' +
-          '<div style="display:grid;grid-template-columns:minmax(0,1fr) 96px auto;gap:7px;align-items:center">' +
-            '<select id="aclAddTarget" style="height:32px;padding:0 9px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);color:var(--text);font-size:12px">' +
+          '<div class="acl-quick-grant">' +
+            '<select id="aclAddTarget" class="acl-select">' +
             (otherOptions || '<option value="">没有其他窗口</option>') + "</select>" +
-            '<select id="aclAddEffect" style="height:32px;padding:0 9px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);color:var(--text);font-size:12px">' +
+            '<select id="aclAddEffect" class="acl-select acl-effect">' +
               '<option value="allow">允许</option><option value="deny">拒绝</option>' +
             "</select>" +
-            '<button class="btn is-sm is-primary" type="button" id="aclAddBtn">添加</button>' +
+            '<button class="btn is-sm is-primary acl-add-btn" type="button" id="aclAddBtn">添加</button>' +
           "</div>" +
           '<p class="section-note" style="margin-top:7px">等价于在矩阵里点这一格：从「本窗口」授权给所选窗口。</p>'
         ) +
@@ -5958,13 +6116,12 @@ defineView("acl", {
         card(
           "授权矩阵",
           "行＝被读方 · 列＝读取方",
-          '<div style="display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-bottom:11px">' +
+          '<div class="acl-toolbar">' +
             '<div class="pill-row">' +
               '<button class="pill' + (aclState.onlyLinked ? "" : " is-active") + '" type="button" data-acl-filter="all">全部窗口</button>' +
               '<button class="pill' + (aclState.onlyLinked ? " is-active" : "") + '" type="button" data-acl-filter="linked">仅显示有规则</button>' +
             "</div>" +
-            '<input id="aclQuery" type="search" placeholder="搜索窗口名或 ID" value="' + esc(aclState.query) +
-              '" style="flex:1;min-width:150px;height:30px;padding:0 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);color:var(--text);font-size:12px;outline:none" />' +
+            '<input id="aclQuery" class="acl-search-input" type="search" placeholder="搜索窗口名或 ID" value="' + esc(aclState.query) + '" />' +
             (candidates.length > shown.length || aclState.expanded
               ? '<button class="pill" type="button" data-acl-filter="expand">' +
                 (aclState.expanded ? "收起" : "显示全部 " + fmtInt(candidates.length) + " 个 ›") + "</button>"
@@ -5997,18 +6154,25 @@ defineView("acl", {
   mount(node) {
     const grid = $("#mxGrid", node);
     const tip = $("#mxTip", node);
+    const touchInfo = $("#mxTouchInfo", node);
+    const describeCell = (cell) => {
+      const st = cell.dataset.state;
+      const now =
+        st === "allow"
+          ? "当前：允许读取"
+          : st === "deny"
+          ? "当前：拒绝读取"
+          : "当前：未显式授权（按双方策略判定）";
+      const next =
+        st === "allow" ? "点击改为「拒绝」" : st === "deny" ? "点击「清除规则」" : "点击授权「允许」";
+      return { title: cell.getAttribute("aria-label") || "", now, next };
+    };
 
     if (grid) {
       const clearHot = () => {
         $$(".is-hot", grid).forEach((item) => item.classList.remove("is-hot"));
       };
-      grid.addEventListener("mouseover", (event) => {
-        const cell = event.target.closest(".mx-cell");
-        if (!cell || cell.dataset.state === "self") {
-          clearHot();
-          if (tip) tip.classList.remove("is-on");
-          return;
-        }
+      const highlightCell = (cell) => {
         const r = cell.dataset.r;
         const c = cell.dataset.c;
         clearHot();
@@ -6020,24 +6184,33 @@ defineView("acl", {
         const colHead = $('.mx-ch[data-c="' + c + '"]', grid);
         if (colHead) colHead.classList.add("is-hot");
         cell.classList.add("is-hot");
+        const info = describeCell(cell);
+        if (touchInfo) {
+          touchInfo.textContent = info.title + " · " + info.now + "（" + info.next + "）";
+        }
+        return info;
+      };
+      grid.addEventListener("mouseover", (event) => {
+        const cell = event.target.closest(".mx-cell");
+        if (!cell || cell.dataset.state === "self") {
+          clearHot();
+          if (tip) tip.classList.remove("is-on");
+          return;
+        }
+        const info = highlightCell(cell);
         if (tip) {
-          const state = cell.dataset.state;
-          const now =
-            state === "allow"
-              ? "当前：允许读取"
-              : state === "deny"
-              ? "当前：拒绝读取"
-              : "当前：未显式授权（按双方策略判定）";
-          const next =
-            state === "allow" ? "点击改为「拒绝」" : state === "deny" ? "点击「清除规则」" : "点击授权「允许」";
           tip.innerHTML =
-            '<div class="tip-title">' + esc(cell.getAttribute("aria-label") || "") + "</div>" +
-            '<div class="tip-now">' + esc(now) + "</div>" +
-            '<div class="tip-hint">' + esc(next) + "</div>";
+            '<div class="tip-title">' + esc(info.title) + "</div>" +
+            '<div class="tip-now">' + esc(info.now) + "</div>" +
+            '<div class="tip-hint">' + esc(info.next) + "</div>";
           tip.style.left = cell.offsetLeft + cell.offsetWidth / 2 + "px";
           tip.style.top = cell.offsetTop + "px";
           tip.classList.add("is-on");
         }
+      });
+      grid.addEventListener("focusin", (event) => {
+        const cell = event.target.closest(".mx-cell");
+        if (cell && cell.dataset.state !== "self") highlightCell(cell);
       });
       grid.addEventListener("mouseleave", () => {
         clearHot();
@@ -6690,9 +6863,11 @@ defineView("performance", {
    启动
    ============================================================ */
 function bindShell() {
-  $("#themeToggle").addEventListener("click", () => {
+  const toggleTheme = () => {
     applyTheme(state.theme === "dark" ? "light" : "dark");
-  });
+  };
+  $("#themeToggle").addEventListener("click", toggleTheme);
+  $("#topbarThemeBtn")?.addEventListener("click", toggleTheme);
 
   const drawerNode = $("#drawer");
   if (drawerNode && !drawerNode.classList.contains("is-open")) drawerNode.inert = true;
@@ -6733,9 +6908,41 @@ function bindShell() {
   });
 
   $("#railNav").addEventListener("click", (event) => {
+    if (event.target.closest("#mobileMoreBtn")) {
+      setMobileMoreOpen(!mobileMoreOpen);
+      return;
+    }
     const item = event.target.closest("[data-view]");
     if (!item) return;
+    if (mobileMoreOpen) setMobileMoreOpen(false);
     go(item.dataset.view);
+  });
+
+  $("#mobileSubnav")?.addEventListener("click", (event) => {
+    const pill = event.target.closest("[data-view]");
+    if (!pill) return;
+    go(pill.dataset.view);
+  });
+
+  $("#mobileMoreScrim")?.addEventListener("click", () => setMobileMoreOpen(false));
+  $("#mobileMoreSheet")?.addEventListener("click", (event) => {
+    if (event.target.closest("#mobileMoreClose")) {
+      setMobileMoreOpen(false);
+      return;
+    }
+    const viewBtn = event.target.closest("[data-more-view]");
+    if (viewBtn) {
+      const targetView = viewBtn.dataset.moreView;
+      setMobileMoreOpen(false);
+      go(targetView);
+      return;
+    }
+    const actionBtn = event.target.closest("[data-more-action]");
+    if (actionBtn) {
+      const action = actionBtn.dataset.moreAction;
+      setMobileMoreOpen(false);
+      if (action === "config-search") openConfigSearch();
+    }
   });
 
   document.addEventListener("click", (event) => {
@@ -6819,6 +7026,7 @@ function bindShell() {
       }
     }
     if (event.key === "Escape") {
+      if (mobileMoreOpen) setMobileMoreOpen(false);
       closeDrawer();
       const box = $(".lightbox");
       if (box) closeLightbox(box);
