@@ -903,6 +903,19 @@ function setRailStatus(kind, text) {
    路由
    ------------------------------------------------------------ */
 let renderToken = 0;
+let activeViewCleanups = [];
+
+function registerViewCleanup(fn) {
+  if (typeof fn === "function") activeViewCleanups.push(fn);
+}
+
+function runActiveViewCleanups() {
+  const fns = activeViewCleanups;
+  activeViewCleanups = [];
+  for (const fn of fns) {
+    try { fn(); } catch (_) {}
+  }
+}
 
 async function go(viewId, options) {
   const view = VIEWS[viewId];
@@ -938,12 +951,14 @@ async function go(viewId, options) {
   const token = renderToken + 1;
   renderToken = token;
   if (!canInPlace) {
+    runActiveViewCleanups();
     host.innerHTML = '<div class="skeleton" style="height:220px;border-radius:13px"></div>';
   }
 
   try {
     const payload = await view.load(opts);
     if (token !== renderToken) return;
+    runActiveViewCleanups();
     host.innerHTML = "";
     const node = document.createElement("div");
     if (canInPlace && node.classList && typeof node.classList.add === "function") {
@@ -2034,6 +2049,41 @@ defineView("navigate", {
 /* ============================================================
    视图：记忆检视
    ============================================================ */
+const INSPECT_PAGE_SIZE = 60;
+const PROFILE_SCOPE_TYPES = new Set([
+  "profile", "user_profile", "user_habit",
+  "preference", "user_preference",
+  "relationship", "relationship_claim", "relationship_phase_summary",
+]);
+
+function buildInspectParams(filters, offset, limit) {
+  const f = filters || {};
+  const pageLimit = Math.max(1, int(limit) || INSPECT_PAGE_SIZE);
+  const pageOffset = Math.max(0, int(offset));
+  const params = ["limit=" + pageLimit, "offset=" + pageOffset];
+  if (f.scope) params.push("scope=" + encodeURIComponent(f.scope));
+  if (f.visibility) params.push("visibility=" + encodeURIComponent(f.visibility));
+  if (f.lifecycle) params.push("lifecycle=" + encodeURIComponent(f.lifecycle));
+  if (f.memoryType) params.push("memory_type=" + encodeURIComponent(f.memoryType));
+  if (f.q) params.push("q=" + encodeURIComponent(f.q));
+  if (f.ownerBot) params.push("owner_bot=" + encodeURIComponent(f.ownerBot));
+  if (f.target) {
+    if (f.scope === "group") params.push("group_id=" + encodeURIComponent(f.target));
+    else params.push("entity_id=" + encodeURIComponent(f.target));
+  }
+  // 没有指定范围时用显式 scope=all，而不是让后端默认放开全量。
+  if (!f.scope && !f.target) params.push("scope=all");
+  return params.join("&");
+}
+
+function filterInspectMemories(list, filters) {
+  const items = Array.isArray(list) ? list : [];
+  if (filters && filters.scope === "profile") {
+    return items.filter((m) => PROFILE_SCOPE_TYPES.has(compact(m.memory_type)));
+  }
+  return items;
+}
+
 defineView("inspect", {
   title: "记忆检视",
   navLabel: "记忆检视",
@@ -2043,31 +2093,28 @@ defineView("inspect", {
     const opts = options || {};
     if (opts.scope) state.filters.scope = opts.scope;
     if (opts.target) state.filters.target = opts.target;
-    const filters = state.filters;
-    const params = ["limit=120"];
-    if (filters.scope) params.push("scope=" + encodeURIComponent(filters.scope));
-    if (filters.visibility) params.push("visibility=" + encodeURIComponent(filters.visibility));
-    if (filters.lifecycle) params.push("lifecycle=" + encodeURIComponent(filters.lifecycle));
-    if (filters.memoryType) params.push("memory_type=" + encodeURIComponent(filters.memoryType));
-    if (filters.q) params.push("q=" + encodeURIComponent(filters.q));
-    if (filters.ownerBot) params.push("owner_bot=" + encodeURIComponent(filters.ownerBot));
-    if (filters.target) {
-      if (filters.scope === "group") params.push("group_id=" + encodeURIComponent(filters.target));
-      else params.push("entity_id=" + encodeURIComponent(filters.target));
-    }
-    // 没有指定范围时用显式 scope=all，而不是让后端默认放开全量。
-    if (!filters.scope && !filters.target) params.push("scope=all");
-    const botsPayload = await apiTry(() => apiGet("/bots"), { bots: [], persona: "" });
-    const result = await apiGet("/memories?" + params.join("&"));
-    let memories = Array.isArray(result.memories) ? result.memories : [];
-    if (filters.scope === "profile") {
-      memories = memories.filter((m) => [
-        "profile", "user_profile", "user_habit",
-        "preference", "user_preference",
-        "relationship", "relationship_claim", "relationship_phase_summary",
-      ].includes(compact(m.memory_type)));
-    }
-    return { memories, filters, bots: Array.isArray(botsPayload.bots) ? botsPayload.bots : [], persona: botsPayload.persona || "" };
+    const filters = Object.assign({}, state.filters);
+    const [botsPayload, result] = await Promise.all([
+      apiTry(() => apiGet("/bots"), { bots: [], persona: "" }),
+      apiGet("/memories?" + buildInspectParams(filters, 0, INSPECT_PAGE_SIZE)),
+    ]);
+    const rawList = Array.isArray(result.memories) ? result.memories : [];
+    const memories = filterInspectMemories(rawList, filters);
+    const hasMore = typeof result.has_more === "boolean"
+      ? result.has_more
+      : rawList.length >= INSPECT_PAGE_SIZE;
+    const nextOffset =
+      result.next_offset != null && Number.isFinite(Number(result.next_offset))
+        ? Math.max(0, Number(result.next_offset))
+        : rawList.length;
+    return {
+      memories,
+      filters,
+      hasMore,
+      nextOffset,
+      bots: Array.isArray(botsPayload.bots) ? botsPayload.bots : [],
+      persona: botsPayload.persona || "",
+    };
   },
   render(data) {
     const filters = data.filters || {};
@@ -2116,6 +2163,7 @@ defineView("inspect", {
     if (filters.q) activeChips.push("关键词：" + filters.q);
     if (filters.target) activeChips.push("目标：" + filters.target);
     if (filters.ownerBot) activeChips.push("Bot：" + (filters.ownerBot === "__empty__" ? "未标记归属" : filters.ownerBot));
+    const countLabel = (data.hasMore ? "已加载 " : "共 ") + fmtInt(memories.length) + " 条" + (data.hasMore ? "+" : "") + (activeChips.length ? " · " + activeChips.join(" · ") : "");
 
     const rows = memories.length
       ? memories.map((memory, index) => memoryRow(memory, index)).join("")
@@ -2139,14 +2187,45 @@ defineView("inspect", {
           '<input id="inspectQuery" type="search" placeholder="按内容或证据过滤" value="' + esc(filters.q || "") + '" style="flex:1;min-width:200px;height:32px;padding:0 12px;border:1px solid var(--border);border-radius:9px;background:var(--surface-2);color:var(--text);font-size:12.5px;outline:none" />' +
           '<button class="btn is-sm" type="button" id="applyQueryBtn">应用</button>' +
           '<button class="btn is-sm is-ghost" type="button" id="clearFiltersBtn">清空筛选</button>' +
-          '<span style="margin-left:auto;font-size:11.5px;color:var(--text-3)">' + fmtInt(memories.length) + " 条" + (activeChips.length ? " · " + esc(activeChips.join(" · ")) : "") + "</span>" +
+          '<span id="inspectCount" style="margin-left:auto;font-size:11.5px;color:var(--text-3)">' + esc(countLabel) + "</span>" +
         "</div>" +
       "</section>" +
       '<div class="row-list" id="inspectList">' + rows + "</div>" +
+      '<div id="inspectAutoScroll"></div>' +
       "</div>"
     );
   },
-  mount(node) {
+  mount(node, data) {
+    const initial = data || {};
+    const filters = Object.assign({}, initial.filters || state.filters);
+    const activeChips = [];
+    if (filters.q) activeChips.push("关键词：" + filters.q);
+    if (filters.target) activeChips.push("目标：" + filters.target);
+    if (filters.ownerBot) activeChips.push("Bot：" + (filters.ownerBot === "__empty__" ? "未标记归属" : filters.ownerBot));
+    const chipSuffix = activeChips.length ? " · " + activeChips.join(" · ") : "";
+
+    const listEl = $("#inspectList", node);
+    const countEl = $("#inspectCount", node);
+    const asHost = $("#inspectAutoScroll", node);
+
+    const seenIds = new Set();
+    let loadedCount = 0;
+    for (const item of (Array.isArray(initial.memories) ? initial.memories : [])) {
+      const id = compact(item && item.id);
+      if (id) seenIds.add(id);
+      loadedCount += 1;
+    }
+    let nextOffset = Number.isFinite(Number(initial.nextOffset)) ? Number(initial.nextOffset) : loadedCount;
+    let hasMore = Boolean(initial.hasMore);
+    let loadingMore = false;
+    let loadError = "";
+    let disposed = false;
+
+    const updateCount = () => {
+      if (!countEl) return;
+      countEl.textContent = (hasMore ? "已加载 " : "共 ") + fmtInt(loadedCount) + " 条" + (hasMore ? "+" : "") + chipSuffix;
+    };
+
     $$("[data-filter-key]", node).forEach((button) => {
       button.addEventListener("click", () => {
         const key = button.dataset.filterKey;
@@ -2169,12 +2248,85 @@ defineView("inspect", {
     const clearBtn = $("#clearFiltersBtn", node);
     if (clearBtn) {
       clearBtn.addEventListener("click", () => {
-        state.filters = { scope: "", q: "", visibility: "", lifecycle: "", memoryType: "", target: "" };
+        state.filters = { scope: "", q: "", visibility: "", lifecycle: "", memoryType: "", target: "", ownerBot: "" };
         go("inspect");
       });
     }
-    $$("[data-memory]", node).forEach((row) => {
-      row.addEventListener("click", () => openMemory(row.dataset.memory));
+    if (listEl) {
+      listEl.addEventListener("click", (event) => {
+        const row = event && event.target && typeof event.target.closest === "function"
+          ? event.target.closest("[data-memory]")
+          : null;
+        if (row && row.dataset && row.dataset.memory) openMemory(row.dataset.memory);
+      });
+    }
+
+    const loadNextPage = async () => {
+      if (disposed || loadingMore || !hasMore) return;
+      const reqOffset = nextOffset;
+      loadingMore = true;
+      loadError = "";
+      try {
+        const result = await apiGet("/memories?" + buildInspectParams(filters, reqOffset, INSPECT_PAGE_SIZE));
+        if (disposed) return;
+        const rawList = Array.isArray(result.memories) ? result.memories : [];
+        const filtered = filterInspectMemories(rawList, filters);
+        const fresh = [];
+        for (const item of filtered) {
+          const id = compact(item && item.id);
+          if (id && seenIds.has(id)) continue;
+          if (id) seenIds.add(id);
+          fresh.push(item);
+        }
+        if (fresh.length && listEl) {
+          const startIndex = loadedCount;
+          const html = fresh.map((memory, idx) => memoryRow(memory, startIndex + idx)).join("");
+          if (typeof listEl.insertAdjacentHTML === "function") {
+            listEl.insertAdjacentHTML("beforeend", html);
+          } else {
+            listEl.innerHTML += html;
+          }
+          loadedCount += fresh.length;
+        }
+        const apiHasMore = typeof result.has_more === "boolean"
+          ? result.has_more
+          : rawList.length >= INSPECT_PAGE_SIZE;
+        nextOffset =
+          result.next_offset != null && Number.isFinite(Number(result.next_offset))
+            ? Math.max(reqOffset + rawList.length, Number(result.next_offset))
+            : reqOffset + rawList.length;
+        hasMore = apiHasMore && rawList.length > 0;
+        updateCount();
+      } catch (err) {
+        if (disposed) return;
+        loadError = err && err.message ? err.message : String(err || "请求失败");
+        toast("加载更多记忆失败：" + loadError, "error");
+        throw err;
+      } finally {
+        loadingMore = false;
+      }
+    };
+
+    let autoCtrl = null;
+    if (asHost && typeof window !== "undefined" && window.MemoryAutoScroll && typeof window.MemoryAutoScroll.mount === "function") {
+      autoCtrl = window.MemoryAutoScroll.mount({
+        host: asHost,
+        scrollRoot: () => $("#content"),
+        itemLabel: "条",
+        getCursor: () => nextOffset,
+        hasMore: () => hasMore,
+        isLoading: () => loadingMore,
+        hasError: () => Boolean(loadError),
+        getErrorMessage: () => loadError,
+        getCount: () => loadedCount,
+        getTotal: () => null,
+        onLoadMore: loadNextPage,
+      });
+    }
+
+    registerViewCleanup(() => {
+      disposed = true;
+      if (autoCtrl && typeof autoCtrl.destroy === "function") autoCtrl.destroy();
     });
   },
 });
@@ -4059,10 +4211,6 @@ defineView("migrate", {
    视图：待修复批次
    ============================================================ */
 const QUARANTINE_PAGE_SIZE = 50;
-let quarantineOffset = 0;
-let queueOffset = 0;
-let processedOffset = 0;
-let quarantineTab = "quarantined";
 
 const BATCH_TAB_META = {
   quarantined: {
@@ -4082,7 +4230,31 @@ const BATCH_TAB_META = {
   },
 };
 
-const batchesView = (fixedTab, viewId, getOffset, setOffset) => {
+function renderBatchRowHtml(item, fixedTab, isRepair) {
+  return (
+    '<div class="row">' +
+    '<div class="row-main">' +
+    '<div class="row-title">' + esc(compact(item.session_id)) + "</div>" +
+    '<div class="row-sub">' + esc(compact(item.last_error) || "（无错误摘要）") + "</div>" +
+    '<div class="row-sub" style="font-family:var(--font-mono)">' + esc(item.id) + "</div>" +
+    '<div class="row-meta">' +
+    badge("事件 " + fmtInt(item.event_count), "group") +
+    badge(compact(item.scope), "fact") +
+    (fixedTab === "processed"
+      ? badge(item.state === "no_memory" ? "无新增记忆" : "已总结", item.state === "no_memory" ? "gold" : "accent")
+      : "") +
+    badge(String(item.updated_at || "").slice(0, 16), "private") +
+    "</div></div>" +
+    (isRepair
+      ? '<div class="tool-actions" style="margin-top:0">' +
+        '<button class="btn is-sm" type="button" data-q-action="retry" data-q-batch="' + esc(item.id) + '">重新排队</button>' +
+        '<button class="btn is-sm is-danger" type="button" data-q-action="discard" data-q-batch="' + esc(item.id) + '">放弃</button>' +
+        "</div>"
+      : "") + "</div>"
+  );
+}
+
+const batchesView = (fixedTab, viewId) => {
   const meta = BATCH_TAB_META[fixedTab];
   const isRepair = fixedTab === "quarantined";
   return {
@@ -4092,7 +4264,10 @@ const batchesView = (fixedTab, viewId, getOffset, setOffset) => {
     hint: meta.hint,
     async load() {
       const [batches, recovery] = await Promise.all([
-        apiTry(() => apiGet("/maintenance/summary_batches?state=" + fixedTab + "&limit=" + QUARANTINE_PAGE_SIZE + "&offset=" + getOffset()), { total: 0, legacy_failures: 0, batches: [] }),
+        apiTry(
+          () => apiGet("/maintenance/summary_batches?state=" + fixedTab + "&limit=" + QUARANTINE_PAGE_SIZE + "&offset=0"),
+          { total: 0, legacy_failures: 0, batches: [] }
+        ),
         fixedTab === "pending" ? apiTry(() => apiGet("/maintenance/summary_status"), null) : null,
       ]);
       return { ...batches, recovery: recovery && recovery.status };
@@ -4101,14 +4276,13 @@ const batchesView = (fixedTab, viewId, getOffset, setOffset) => {
       const total = int(data.total);
       const legacy = int(data.legacy_failures);
       const batches = Array.isArray(data.batches) ? data.batches : [];
-      const offset = getOffset();
-      const pageTo = offset + batches.length;
 
       const tone = isRepair ? "gold" : fixedTab === "pending" ? "accent" : "private";
       const summary =
-        '<div class="pill-row" style="gap:8px;margin-bottom:12px">' +
-        badge(meta.title + " " + fmtInt(total), tone) +
+        '<div class="pill-row" style="gap:8px;margin-bottom:12px;align-items:center">' +
+        '<span id="batchTotalBadge">' + badge(meta.title + " " + fmtInt(total), tone) + "</span>" +
         (isRepair ? badge("旧版失败记录 " + fmtInt(legacy), "fact") : "") +
+        (batches.length ? '<span class="kpi-foot" id="batchLoadedCount" style="margin-left:auto">已加载 ' + fmtInt(batches.length) + " / " + fmtInt(total) + " 批</span>" : "") +
         "</div>";
 
       const bulk = isRepair
@@ -4132,39 +4306,11 @@ const batchesView = (fixedTab, viewId, getOffset, setOffset) => {
             : '<button class="btn is-sm" type="button" data-goto="queue">看排队处理</button>') +
           "</div>";
 
-      const pager =
-        '<div class="pill-row" style="justify-content:space-between;align-items:center;margin-top:12px">' +
-        '<button class="btn is-sm" type="button" id="qPrevBtn"' + (offset <= 0 ? " disabled" : "") + ">上一页</button>" +
-        '<span class="kpi-foot">' + (batches.length ? offset + 1 + "–" + pageTo + " / " + fmtInt(total) : "无记录") + "</span>" +
-        '<button class="btn is-sm" type="button" id="qNextBtn"' + (pageTo >= total ? " disabled" : "") + ">下一页</button>" +
-        "</div>";
-
       const rows = batches.length
-        ? '<div class="row-list">' +
-          batches
-            .map((item) =>
-              '<div class="row">' +
-              '<div class="row-main">' +
-              '<div class="row-title">' + esc(compact(item.session_id)) + "</div>" +
-              '<div class="row-sub">' + esc(compact(item.last_error) || "（无错误摘要）") + "</div>" +
-              '<div class="row-sub" style="font-family:var(--font-mono)">' + esc(item.id) + "</div>" +
-              '<div class="row-meta">' +
-              badge("事件 " + fmtInt(item.event_count), "group") +
-              badge(compact(item.scope), "fact") +
-              (fixedTab === "processed"
-                ? badge(item.state === "no_memory" ? "无新增记忆" : "已总结", item.state === "no_memory" ? "gold" : "accent")
-                : "") +
-              badge(String(item.updated_at || "").slice(0, 16), "private") +
-              "</div></div>" +
-              (isRepair
-                ? '<div class="tool-actions" style="margin-top:0">' +
-                  '<button class="btn is-sm" type="button" data-q-action="retry" data-q-batch="' + esc(item.id) + '">重新排队</button>' +
-                  '<button class="btn is-sm is-danger" type="button" data-q-action="discard" data-q-batch="' + esc(item.id) + '">放弃</button>' +
-                  "</div>"
-                : "") + "</div>"
-            )
-            .join("") +
-          "</div>"
+        ? '<div class="row-list" id="batchRowsList">' +
+          batches.map((item) => renderBatchRowHtml(item, fixedTab, isRepair)).join("") +
+          "</div>" +
+          '<div id="batchAutoScroll"></div>'
         : isRepair
           ? emptyState("没有待修复批次", "被隔离的总结批次会出现在这里，可逐条或整批重新排队 / 放弃。")
           : fixedTab === "pending"
@@ -4181,12 +4327,39 @@ const batchesView = (fixedTab, viewId, getOffset, setOffset) => {
             : fixedTab === "pending"
               ? "排队等待整理的批次，只读；具体等待原因见上方整理进度，总结失败的会进入「待修复」"
               : "已完成的总结批次，仅供查阅",
-          summary + bulk + rows + pager
+          summary + bulk + rows
         ) +
         "</div>"
       );
     },
-    mount(node) {
+    mount(node, data) {
+      const initial = data || {};
+      const initialBatches = Array.isArray(initial.batches) ? initial.batches : [];
+      const seenBatchIds = new Set();
+      let loadedCount = 0;
+      for (const item of initialBatches) {
+        const id = compact(item && item.id);
+        if (id) seenBatchIds.add(id);
+        loadedCount += 1;
+      }
+      let total = Math.max(loadedCount, int(initial.total));
+      let nextOffset = initialBatches.length;
+      let hasMore = nextOffset < total && initialBatches.length > 0;
+      let loadingMore = false;
+      let loadError = "";
+      let disposed = false;
+
+      const listEl = $("#batchRowsList", node);
+      const countEl = $("#batchLoadedCount", node);
+      const totalBadgeEl = $("#batchTotalBadge", node);
+      const asHost = $("#batchAutoScroll", node);
+      const tone = isRepair ? "gold" : fixedTab === "pending" ? "accent" : "private";
+
+      const syncCounters = () => {
+        if (totalBadgeEl) totalBadgeEl.innerHTML = badge(meta.title + " " + fmtInt(total), tone);
+        if (countEl) countEl.textContent = "已加载 " + fmtInt(loadedCount) + " / " + fmtInt(total) + " 批";
+      };
+
       const run = async (label, fn, minMs) => {
         await withBusy(label + "…", async () => {
           try {
@@ -4204,12 +4377,12 @@ const batchesView = (fixedTab, viewId, getOffset, setOffset) => {
       };
       const bulkRelease = async (mode, label) => {
         const info = await apiTry(() => apiGet("/maintenance/summary_batches?state=quarantined&limit=1&offset=0"), { total: 0 });
-        const total = int(info.total);
+        const totalToRelease = int(info.total);
         let done = 0;
         let guard = 0;
         while (guard < 500) {
           guard += 1;
-          setBusyText(label + " " + done + " / " + total);
+          setBusyText(label + " " + done + " / " + totalToRelease);
           const result = await apiPost("/maintenance/release_summary_batches", { all: true, mode, limit: 10 });
           const payload = result && typeof result === "object"
             ? (result.data && typeof result.data === "object" ? result.data : result)
@@ -4218,8 +4391,8 @@ const batchesView = (fixedTab, viewId, getOffset, setOffset) => {
           if (released <= 0) break;
           done += released;
         }
-        setBusyText(label + " " + done + " / " + total + " · 完成");
-        return { data: { released: done, total } };
+        setBusyText(label + " " + done + " / " + totalToRelease + " · 完成");
+        return { data: { released: done, total: totalToRelease } };
       };
       const bind = (id, fn, label, minMs) => {
         const button = $(id, node);
@@ -4238,12 +4411,12 @@ const batchesView = (fixedTab, viewId, getOffset, setOffset) => {
           return bulkRelease("discard", "已放弃");
         }, "全部放弃", 800);
       }
-      const prev = $("#qPrevBtn", node);
-      if (prev) prev.addEventListener("click", () => { setOffset(Math.max(0, getOffset() - QUARANTINE_PAGE_SIZE)); go(viewId); });
-      const next = $("#qNextBtn", node);
-      if (next) next.addEventListener("click", () => { setOffset(getOffset() + QUARANTINE_PAGE_SIZE); go(viewId); });
-      $$("[data-q-action]", node).forEach((button) => {
-        button.addEventListener("click", () => {
+      if (listEl && isRepair) {
+        listEl.addEventListener("click", (event) => {
+          const button = event && event.target && typeof event.target.closest === "function"
+            ? event.target.closest("[data-q-action]")
+            : null;
+          if (!button) return;
           const batchId = button.dataset.qBatch;
           if (button.dataset.qAction === "discard") {
             run("放弃批次", async () => {
@@ -4255,14 +4428,79 @@ const batchesView = (fixedTab, viewId, getOffset, setOffset) => {
             run("重新排队", () => apiPost("/maintenance/release_summary_batches", { batch_ids: [batchId], mode: "retry" }));
           }
         });
+      }
+
+      const loadNextPage = async () => {
+        if (disposed || loadingMore || !hasMore) return;
+        const reqOffset = nextOffset;
+        loadingMore = true;
+        loadError = "";
+        try {
+          const result = await apiGet(
+            "/maintenance/summary_batches?state=" + fixedTab + "&limit=" + QUARANTINE_PAGE_SIZE + "&offset=" + reqOffset
+          );
+          if (disposed) return;
+          const rawList = Array.isArray(result.batches) ? result.batches : [];
+          const fresh = [];
+          for (const item of rawList) {
+            const id = compact(item && item.id);
+            if (id && seenBatchIds.has(id)) continue;
+            if (id) seenBatchIds.add(id);
+            fresh.push(item);
+          }
+          if (fresh.length && listEl) {
+            const html = fresh.map((item) => renderBatchRowHtml(item, fixedTab, isRepair)).join("");
+            if (typeof listEl.insertAdjacentHTML === "function") {
+              listEl.insertAdjacentHTML("beforeend", html);
+            } else {
+              listEl.innerHTML += html;
+            }
+            loadedCount += fresh.length;
+          }
+          if (result.total != null && Number.isFinite(Number(result.total))) {
+            total = Math.max(loadedCount, int(result.total));
+          }
+          nextOffset = reqOffset + rawList.length;
+          hasMore = nextOffset < total && rawList.length > 0;
+          syncCounters();
+        } catch (err) {
+          if (disposed) return;
+          loadError = err && err.message ? err.message : String(err || "请求失败");
+          toast("加载更多批次失败：" + loadError, "error");
+          throw err;
+        } finally {
+          loadingMore = false;
+        }
+      };
+
+      let autoCtrl = null;
+      if (asHost && typeof window !== "undefined" && window.MemoryAutoScroll && typeof window.MemoryAutoScroll.mount === "function") {
+        autoCtrl = window.MemoryAutoScroll.mount({
+          host: asHost,
+          scrollRoot: () => $("#content"),
+          itemLabel: "批",
+          getCursor: () => nextOffset,
+          hasMore: () => hasMore,
+          isLoading: () => loadingMore,
+          hasError: () => Boolean(loadError),
+          getErrorMessage: () => loadError,
+          getCount: () => loadedCount,
+          getTotal: () => total,
+          onLoadMore: loadNextPage,
+        });
+      }
+
+      registerViewCleanup(() => {
+        disposed = true;
+        if (autoCtrl && typeof autoCtrl.destroy === "function") autoCtrl.destroy();
       });
     },
   };
 };
 
-defineView("quarantine", batchesView("quarantined", "quarantine", () => quarantineOffset, (value) => { quarantineOffset = value; }));
-defineView("queue", batchesView("pending", "queue", () => queueOffset, (value) => { queueOffset = value; }));
-defineView("processed", batchesView("processed", "processed", () => processedOffset, (value) => { processedOffset = value; }));
+defineView("quarantine", batchesView("quarantined", "quarantine"));
+defineView("queue", batchesView("pending", "queue"));
+defineView("processed", batchesView("processed", "processed"));
 
 /* ============================================================
    视图：模块配置
@@ -6767,8 +7005,8 @@ function bindShell() {
       } else if (filter.indexOf("external:") === 0) {
         state.filters = { scope: "", q: "", visibility: "", lifecycle: "", memoryType: "", target: "" };
       } else if (filter.indexOf("tab:") === 0) {
-        quarantineTab = filter.slice(4) === "pending" ? "pending" : "quarantined";
-        quarantineOffset = 0;
+        go(filter.slice(4) === "pending" ? "queue" : "quarantine", options);
+        return;
       }
     }
     go(view, options);
