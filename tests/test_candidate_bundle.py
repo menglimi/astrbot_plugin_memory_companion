@@ -165,9 +165,12 @@ class CandidateBundleStoreTests(unittest.IsolatedAsyncioTestCase):
         bridge_row = _memory("bridge-index", "Bot Personal archive reference [schedule_fragment]")
         bridge_row.source_plugin = "bot_personal_bridge"
         store._insert_memory_sync(bridge_row)
+        bridge_rowid = store._conn.execute(
+            "SELECT rowid FROM memories WHERE id=?", (bridge_row.id,)
+        ).fetchone()[0]
         store._conn.execute(
-            "INSERT INTO memory_fts(memory_id, search_text) VALUES(?, ?)",
-            (bridge_row.id, bridge_row.content),
+            "INSERT INTO memory_fts(rowid, search_text) VALUES(?, ?)",
+            (bridge_rowid, bridge_row.content),
         )
         store._conn.execute(
             """INSERT INTO memory_embeddings(
@@ -183,11 +186,33 @@ class CandidateBundleStoreTests(unittest.IsolatedAsyncioTestCase):
             "SELECT 1 FROM memories WHERE id=?", (bridge_row.id,)
         ).fetchone())
         self.assertIsNone(store._conn.execute(
-            "SELECT 1 FROM memory_fts WHERE memory_id=?", (bridge_row.id,)
+            "SELECT rowid FROM memory_fts WHERE memory_fts MATCH 'schedule_fragment' AND rowid=?",
+            (bridge_rowid,),
         ).fetchone())
         self.assertIsNone(store._conn.execute(
             "SELECT 1 FROM memory_embeddings WHERE memory_id=?", (bridge_row.id,)
         ).fetchone())
+
+    def test_time_window_expression_indexes_support_each_date_predicate(self) -> None:
+        store = self.make_store()
+        expected = {
+            "occurred_at": "idx_memories_jd_occurred",
+            "created_at": "idx_memories_jd_created",
+            "updated_at": "idx_memories_jd_updated",
+        }
+
+        predicates = " OR ".join(
+            f"(julianday({column}) >= julianday(?) AND julianday({column}) < julianday(?))"
+            for column in expected
+        )
+        params = ("2026-08-25T00:00:00+00:00", "2026-08-26T00:00:00+00:00") * len(expected)
+        plan = store._conn.execute(
+            f"EXPLAIN QUERY PLAN SELECT id FROM memories WHERE {predicates}", params
+        ).fetchall()
+        plan_details = "\n".join(str(row["detail"]) for row in plan)
+
+        for index_name in expected.values():
+            self.assertIn(index_name, plan_details, plan_details)
 
     async def test_direct_candidate_filter_blocks_placeholder_memory(self) -> None:
         store = self.make_store()

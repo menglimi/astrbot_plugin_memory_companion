@@ -33,9 +33,24 @@ class RetrievalIntent:
                 values.append(text)
         return list(dict.fromkeys(values))
 
-    def format_for_injection(self, max_chars: int = 520) -> str:
+    def format_for_injection(
+        self, max_chars: int = 520, *, include_diagnostics: bool = False
+    ) -> str:
+        """把检索意图渲染成注入文本。
+
+        R12：注入正文只保留「对回复有用」的语义线索（话题/意图/对象/事实/
+        陪伴线索）。检索模式、检索关键词、Bot 心理能量这些是内部遥测，写进
+        注入文本只会诱导模型复述「我检索到…/我的心理能量是…」。它们只在
+        /mcomp explain 这类诊断入口用 include_diagnostics=True 显式索取时
+        才输出（诊断日志仍然完整）。
+        """
+
         lines: list[str] = []
-        if self.query_mode and self.query_mode != "current_message":
+        if (
+            include_diagnostics
+            and self.query_mode
+            and self.query_mode != "current_message"
+        ):
             lines.append(f"- 检索模式：{self.query_mode}")
         if self.companion_hint_status and self.companion_hint_status not in {"none", "ignored"}:
             lines.append(f"- 陪伴线索：{self.companion_hint_status}")
@@ -47,13 +62,13 @@ class RetrievalIntent:
             lines.append("- 相关对象：" + "、".join(self.entities[:8]))
         if self.facts:
             lines.append("- 检索事实：" + " / ".join(self.facts[:4]))
-        if self.keywords:
+        if include_diagnostics and self.keywords:
             lines.append("- 检索关键词：" + "、".join(self.keywords[:8]))
         if self.notes:
             lines.append("- 陪伴线索：" + " / ".join(self.notes[:3]))
         if self.companion_bot_mood:
             lines.append(f"- Bot当前情绪底色：{self.companion_bot_mood}")
-        if self.companion_bot_energy > 0:
+        if include_diagnostics and self.companion_bot_energy > 0:
             lines.append(f"- Bot心理能量：{self.companion_bot_energy:.0f}/100")
         text = "\n".join(lines)
         return clean_text(text, max_chars)

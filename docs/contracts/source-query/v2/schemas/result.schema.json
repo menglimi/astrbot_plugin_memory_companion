@@ -15,7 +15,8 @@
       "type": "object", "additionalProperties": false, "required": ["action", "start_at", "end_at"],
       "properties": {"action": {"const": "range_batch"}, "start_at": {"$ref": "#/$defs/instant"}, "end_at": {"$ref": "#/$defs/instant"}}
     },
-    "batch": {"type": "object"}, "coverage": {"type": "object"}, "usage": {"type": "object"}
+    "batch": {"type": "object"}, "coverage": {"type": "object"}, "usage": {"type": "object"},
+    "hint": {"type": "string", "maxLength": 200}
   },
   "allOf": [
     {

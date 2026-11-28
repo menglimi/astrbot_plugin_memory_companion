@@ -201,8 +201,10 @@ class ProactiveMessagePenaltyTests(unittest.TestCase):
             bot_id="b1",
             message_text="hi",
         )
-        profile = engine._query_profile("hi", [])
-        score, _reason = engine._score(memory, [], ctx, profile, {})
+        profile = engine._query_profile("天气", ["天气"])
+        # R2：无查询词时不再用 importance 兜底打分（直接 0 分/空召回），
+        # 所以这条降权用例必须带真实查询词才有分可乘。
+        score, _reason = engine._score(memory, ["天气"], ctx, profile, {})
         return score
 
     def test_proactive_message_penalty_scales_score(self) -> None:
@@ -241,6 +243,97 @@ class DedupeContentTests(unittest.TestCase):
         )
         out = engine._dedupe_by_content([a, b], 0.8)
         self.assertEqual(2, len(out))
+
+
+# 检索结果缓存是进程内 dict（TTL 45 s，见 MemoryCompanionService._RETRIEVAL_RESULT_CACHE_TTL），
+# key 由 _retrieval_cache_key() 里的 config_payload 决定。任何「改了会改结果」的旋钮一旦
+# 漏在 config_payload 外，面板改完到 TTL 过期前同一 query+ctx 仍会命中旧结果，看上去
+# 就像「改了没反应」。下面这张表给这些旋钮留档：新增同类旋钮时同步加一行。
+CACHE_KEY_SORTING_KNOBS: tuple[tuple[str, object, object], ...] = (
+    ("retrieval_advanced.relax_keyword_min_hits", False, True),
+    ("retrieval_advanced.proactive_message_score_penalty", 1.0, 0.3),
+    ("retrieval_advanced.dedupe_content_ratio", 0.0, 0.85),
+    ("retrieval_advanced.anchor_floor_enabled", False, True),
+    ("retrieval_advanced.scope_bonus_scale", 0.2, 1.0),
+    ("retrieval_advanced.mmr_redundancy_weight", 0.35, 0.8),
+    # 来源主次（task-19）：priority / weight / 显式权重表，以及参与「未声明来源恒 1.0」
+    # 判定的注册表——注册名集合变了，权重结果也会变，所以它同样必须在 key 里。
+    ("retrieval_advanced.source_surface_priority", "equal", "qq"),
+    ("retrieval_advanced.source_surface_weight", 1.0, 0.6),
+    ("retrieval_advanced.source_surface_weights", "", '{"minecraft": 0.4}'),
+    ("memory_capture.source_surfaces", "", '[{"name": "discord", "message_id_prefixes": ["dc-"]}]'),
+    # 这两个改「送进 embedding 的文本长度 / 调用期限」，超时与截断都会改向量召回结果。
+    ("retrieval.embedding_max_text_chars", 1200, 600),
+    ("retrieval.embedding_timeout_ms", 2000, 500),
+)
+
+
+class RetrievalCacheKeyCoverageTests(unittest.IsolatedAsyncioTestCase):
+    """缓存 key 必须覆盖所有会影响检索结果的 retrieval_advanced 旋钮。"""
+
+    def setUp(self) -> None:
+        self._temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp_dir.cleanup)
+        self._services: list[MemoryCompanionService] = []
+        # addCleanup 后进先出：先关服务，再删临时目录，避免 Windows 上 sqlite 句柄占着文件。
+        self.addCleanup(self._close_services)
+        self._ctx = SessionContext(
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            platform="qq",
+            user_id="u1",
+            bot_id="b1",
+            message_text="今天想做什么",
+        )
+
+    def _close_services(self) -> None:
+        for service in self._services:
+            try:
+                service.close()
+            except Exception:
+                pass
+
+    def _service(self, overrides: dict[str, object]) -> MemoryCompanionService:
+        config: dict[str, object] = {}
+        for path, value in overrides.items():
+            group, key = path.split(".", 1)
+            config.setdefault(group, {})[key] = value
+        data_dir = Path(self._temp_dir.name) / f"svc{len(self._services)}"
+        data_dir.mkdir()
+        service = MemoryCompanionService(
+            context=None,
+            config=config,
+            plugin_root=ROOT,
+            data_dir=data_dir,
+        )
+        self._services.append(service)
+        return service
+
+    async def _cache_key(self, overrides: dict[str, object]) -> str:
+        service = self._service(overrides)
+        return await service._retrieval_cache_key("slots", "今天想做什么", self._ctx, 6)
+
+    async def test_same_config_yields_same_cache_key(self) -> None:
+        """同一份配置两次算出的 key 必须相同——否则缓存永远不命中。"""
+        first = await self._cache_key({})
+        second = await self._cache_key({})
+        self.assertNotEqual("", first, "store 未就绪时 key 为空，测不出覆盖缺口")
+        self.assertEqual(first, second)
+
+    async def test_every_sorting_knob_changes_cache_key(self) -> None:
+        """改动任一影响排序的旋钮，缓存 key 必须变；不变就是面板改完要等 TTL。"""
+        baseline = await self._cache_key({})
+        self.assertNotEqual("", baseline, "store 未就绪时 key 为空，测不出覆盖缺口")
+        uncovered: list[str] = []
+        for path, _default, changed in CACHE_KEY_SORTING_KNOBS:
+            if await self._cache_key({path: changed}) == baseline:
+                uncovered.append(path)
+        self.assertEqual(
+            [],
+            uncovered,
+            "这些旋钮不在 _retrieval_cache_key 的 config_payload 里：改值不会让缓存 key 变化，"
+            "面板改完 ≤45 s 内仍返回旧结果：" + "、".join(uncovered),
+        )
 
 
 if __name__ == "__main__":

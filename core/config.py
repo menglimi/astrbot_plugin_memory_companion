@@ -21,6 +21,15 @@ class ConfigView:
         "retrieval.keyword_fallback_min_fts_candidates": (
             "retrieval_advanced.keyword_fallback_min_fts_candidates",
         ),
+        "retrieval.vector_precision": ("retrieval_advanced.vector_precision",),
+        "retrieval_advanced.vector_precision": (
+            "retrieval_advanced.vector_storage_precision",
+            "retrieval.vector_precision",
+        ),
+        "retrieval_advanced.vector_storage_precision": (
+            "retrieval_advanced.vector_precision",
+            "retrieval.vector_precision",
+        ),
         # conversation_memory → conversation_memory_advanced
         "conversation_memory.recent_events_for_followup": ("conversation_memory_advanced.recent_events_for_followup",),
         "conversation_memory.time_window_timeline_limit": ("conversation_memory_advanced.time_window_timeline_limit",),
@@ -56,6 +65,12 @@ class ConfigView:
         "conversation_memory.cross_window_private_to_group_enabled": (
             "conversation_memory_advanced.cross_window_private_to_group_enabled",
         ),
+        "conversation_memory.cross_window_group_to_group_enabled": (
+            "conversation_memory_advanced.cross_window_group_to_group_enabled",
+        ),
+        "conversation_memory.cross_window_excluded_groups": (
+            "conversation_memory_advanced.cross_window_excluded_groups",
+        ),
         # context_orchestration → context_orchestration_advanced
         "context_orchestration.intent_max_chars": ("context_orchestration_advanced.intent_max_chars",),
         "context_orchestration.self_timeline_limit": ("context_orchestration_advanced.self_timeline_limit",),
@@ -63,7 +78,6 @@ class ConfigView:
         "context_orchestration.current_window_limit": ("context_orchestration_advanced.current_window_limit",),
         "context_orchestration.conversation_summary_limit": ("context_orchestration_advanced.conversation_summary_limit",),
         "context_orchestration.stable_memory_limit": ("context_orchestration_advanced.stable_memory_limit",),
-        "maintenance.pending_review_max_age_days": ("maintenance.pending_candidate_retention_days",),
         # maintenance → maintenance_decay
         "maintenance.memory_decay_after_days": ("maintenance_decay.memory_decay_after_days",),
         "maintenance.memory_decay_idle_days": ("maintenance_decay.memory_decay_idle_days",),
@@ -78,10 +92,16 @@ class ConfigView:
         "maintenance.memory_decay_max_items_per_summary": ("maintenance_decay.memory_decay_max_items_per_summary",),
         "maintenance.memory_decay_summary_input_chars": ("maintenance_decay.memory_decay_summary_input_chars",),
         "maintenance.memory_decay_summary_chars": ("maintenance_decay.memory_decay_summary_chars",),
+        # 2.6.0 新增的渐进淡出四个键：service 仍按老前缀读，靠别名接到新 schema 域，
+        # 否则面板上的控件是假的（L2 同类问题）。
+        "maintenance.memory_decay_gradual_enabled": ("maintenance_decay.memory_decay_gradual_enabled",),
+        "maintenance.memory_decay_fade_floor_percent": ("maintenance_decay.memory_decay_fade_floor_percent",),
+        "maintenance.memory_decay_fade_ratio_percent": ("maintenance_decay.memory_decay_fade_ratio_percent",),
+        "maintenance.memory_decay_fade_interval_days": ("maintenance_decay.memory_decay_fade_interval_days",),
     }
 
     def __init__(self, raw: Any):
-        self.raw = raw or {}
+        self.raw = raw if isinstance(raw, dict) else raw or {}
 
     def get(self, dotted: str, default: Any = None) -> Any:
         marker = object()

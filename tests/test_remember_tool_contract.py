@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -143,12 +144,62 @@ class RememberToolContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<MemoryCompanion-Remember-Tool-Contract>", req.system_prompt)
         self.assertIn("只有该工具本轮返回的 JSON 明确包含 ok=true", req.system_prompt)
 
+    async def test_cancelled_hook_stage_emits_stage_timing(self) -> None:
+        service = self.make_service({
+            "memory_injection": {"debug_stage_timing_enabled": True},
+            "memory_capture": {"enabled": False},
+            "retrieval": {"embedding_enabled": False},
+        })
+        ctx = self.private_context()
+        service.identity = SimpleNamespace(resolve_event_context=AsyncMock(return_value=ctx))
+        service.capture = None
+        service._ensure_lifecycle_maintenance_dispatcher = Mock()
+        service._ensure_wal_checkpoint_loop = Mock()
+        service._ensure_acl_projection_reconcile_loop = Mock()
+        service._mark_memory_companion_injection_state = Mock()
+        service._sanitize_session_context_message_text = Mock()
+        service._apply_companion_relationship_projection = Mock()
+        service._apply_companion_expression_decision = Mock()
+        service._ensure_reconstruction_turn_token = Mock()
+        service._apply_private_companion_preferred_address = Mock()
+        service._private_companion_internal_generation_event = Mock(return_value=False)
+        service._apply_remember_tool_contract = Mock()
+        service._apply_core_memory_tool_contract = Mock()
+        service._scope_feature_enabled = Mock(return_value=False)
+        service._emit_hook_stage_timing = Mock()
+        stage_started = asyncio.Event()
+
+        async def blocked_reply_chain(_event):
+            stage_started.set()
+            await asyncio.Future()
+
+        service._reply_chain_for_event = blocked_reply_chain
+        req = SimpleNamespace(
+            system_prompt="原始系统提示",
+            prompt="",
+            contexts=[],
+            extra_user_content_parts=[],
+        )
+        task = asyncio.create_task(service.handle_llm_request(SimpleNamespace(), req))
+        await asyncio.wait_for(stage_started.wait(), timeout=2.0)
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        service._emit_hook_stage_timing.assert_called_once()
+        stage_timer = service._emit_hook_stage_timing.call_args.args[0]
+        self.assertEqual(
+            "cancelled:reply_chain",
+            service._emit_hook_stage_timing.call_args.kwargs["note"],
+        )
+        self.assertIn("reply_chain_cancelled", stage_timer.summary())
+
     def test_llm_tool_description_exposes_the_same_success_contract(self) -> None:
         main_source = (ROOT / "main.py").read_text(encoding="utf-8")
 
         self.assertIn("只有返回 JSON 中 ok=true 才能确认写入成功", main_source)
         self.assertIn("未调用、ok=false 或调用异常时", main_source)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timedelta, timezone
 
 try:
     from .package_bootstrap import bootstrap_package
@@ -16,7 +17,7 @@ from astrbot_plugin_memory_companion.core.bot_personal_contract import (
 )
 from astrbot_plugin_memory_companion.core.bot_personal_dto import build_bot_personal_archive
 from astrbot_plugin_memory_companion.core.injection import InjectionComposer
-from astrbot_plugin_memory_companion.core.memory_lifecycle import evaluate_memory_lifecycle
+from astrbot_plugin_memory_companion.core.memory_lifecycle import evaluate_memory_lifecycle, open_loop_expired
 from astrbot_plugin_memory_companion.core.models import MemoryRecord, SearchResult, SessionContext
 from astrbot_plugin_memory_companion.core.retrieval import RetrievalEngine
 from astrbot_plugin_memory_companion.core.service import MemoryCompanionService
@@ -97,6 +98,42 @@ class MemoryV2InjectionFeedbackTests(unittest.TestCase):
         foreign = MemoryRecord(id="foreign", content="other", metadata={"owner_bot_id": "bot-b"})
         self.assertFalse(evaluate_memory_lifecycle(expired, ctx).eligible)
         self.assertFalse(evaluate_memory_lifecycle(foreign, ctx).eligible)
+
+    def test_unfinished_open_loop_uses_a_default_expiry_without_expiring_its_summary(self) -> None:
+        now = datetime(2026, 10, 14, tzinfo=timezone.utc)
+        old = (now - timedelta(days=31)).isoformat()
+        ctx = SessionContext(scope="private", user_id="u1", bot_id="bot-1")
+        loop = MemoryRecord(id="old-loop", memory_type="open_loop", content="尚未完成的约定",
+                            created_at=old, occurred_at=old)
+        summary = MemoryRecord(id="old-summary", memory_type="conversation_summary", content="旧聊天摘要",
+                               created_at=old, occurred_at=old, metadata={"open_loop_weight": 0.9})
+        result = evaluate_memory_lifecycle(loop, ctx, now=now)
+        self.assertFalse(result.eligible)
+        self.assertEqual("validity=open_loop_expired", result.reason)
+        self.assertTrue(open_loop_expired(summary, now=now))
+        self.assertTrue(evaluate_memory_lifecycle(summary, ctx, now=now).eligible)
+
+
+class RecentlyInjectedOpenLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dedupe_uses_recent_logs_for_the_exact_session_only(self) -> None:
+        current = datetime(2026, 10, 14, tzinfo=timezone.utc)
+
+        class Store:
+            async def recent_injection_logs(self, **kwargs):
+                self.query = kwargs
+                return [
+                    {"created_at": (current - timedelta(days=1)).isoformat(), "selected_memory_ids": ["recent-loop"]},
+                    {"created_at": (current - timedelta(days=4)).isoformat(), "selected_memory_ids": ["old-loop"]},
+                    {"created_at": (current + timedelta(minutes=1)).isoformat(), "selected_memory_ids": ["future-loop"]},
+                ]
+
+        service = object.__new__(MemoryCompanionService)
+        service.store = Store()
+        selected = await service._recently_injected_memory_ids(
+            session_id="private:u1", scope="private", now=current,
+        )
+        self.assertEqual({"recent-loop"}, selected)
+        self.assertEqual({"limit": 48, "scope": "private", "session_id": "private:u1"}, service.store.query)
 
     def test_bot_personal_memory_requires_matching_persona_context(self) -> None:
         memory = MemoryRecord(

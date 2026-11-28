@@ -318,9 +318,11 @@ class V3RegressionContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(discarded["ok"])
         self.assertEqual(1, discarded["released_events"])
         self.assertEqual("completed", discarded["state"])
-        self.assertTrue(
-            (await store.get_timeline_by_ids([discard_event]))[discard_event]["summarized_at"],
-            "discard 必须把事件标记为已总结，避免悬空",
+        # 2.6.4 起 discard 是「连原文一起删」：事件行本身不再保留。
+        self.assertEqual(
+            {},
+            await store.get_timeline_by_ids([discard_event]),
+            "discard 必须把事件从 timeline 删除，避免悬空",
         )
         self.assertEqual(
             {"ok": False, "error": "unsupported_release_mode", "mode": "unknown"},

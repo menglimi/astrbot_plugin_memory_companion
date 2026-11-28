@@ -14,6 +14,7 @@ const TRANSPARENT_IMAGE = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAA
 const THEME_KEY = "memory_companion_theme";
 const NAV_KEY = "memory_companion_nav";
 const MODE_KEY = "memory_companion_mode";
+const PALETTE_KEY = "memory_companion_palette";
 
 /* ------------------------------------------------------------
    基础工具
@@ -51,6 +52,21 @@ function fmtInt(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return "-";
   return Math.round(parsed).toLocaleString("zh-CN");
+}
+
+function fmtBytes(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value < 0) return "-";
+  if (value === 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let idx = 0;
+  let current = value;
+  while (current >= 1024 && idx < units.length - 1) {
+    current /= 1024;
+    idx += 1;
+  }
+  const digits = idx === 0 ? 0 : current >= 100 ? 0 : current >= 10 ? 1 : 2;
+  return num(current, digits) + " " + units[idx];
 }
 
 function fmtTime(value) {
@@ -126,6 +142,7 @@ const ICON_PATHS = {
   clock: '<circle cx="8" cy="8" r="5.6"/><path d="M8 4.8V8l2.4 1.5"/>',
   tag: '<path d="M8.6 2.6H13v4.4l-6 6-4.4-4.4z"/><circle cx="10.4" cy="5.2" r="0.9"/>',
   db: '<ellipse cx="8" cy="4.2" rx="5" ry="2"/><path d="M3 4.2v7.6c0 1.1 2.2 2 5 2s5-.9 5-2V4.2"/><path d="M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>',
+  search: '<circle cx="7.2" cy="7.2" r="4.5"/><path d="M10.6 10.6L14 14"/>',
 };
 
 function icon(name, cls) {
@@ -175,6 +192,11 @@ async function apiPost(path, payload) {
 
 async function apiRequest(path, options) {
   const method = (options.method || "GET").toUpperCase();
+  // 2.6.0：危险动作的确认口令与写操作的 CSRF 令牌统一在这里补齐，调用点保持原样。
+  if (method !== "GET") {
+    options.body = await withCsrfToken(options.body);
+    options.body = await withConfirmation(path, options.body);
+  }
   const httpAvailable = canUseHttpFallback();
   const bridge = getBridge() || await waitForBridge();
   let data;
@@ -197,6 +219,111 @@ async function apiRequest(path, options) {
   }
   if (!data || data.success === false) throw new Error(data && data.error ? data.error : "请求失败");
   return guardPayload(data.data !== undefined ? data.data : data, path);
+}
+
+// 与后端 _wrap_route 的确认口径一一对应：
+// 删除类 DELETE:<id>、清空类 CLEAR:<scope>、擦人类 ERASE:<user_id>、
+// 其余危险路由 CONFIRM:<route>。只有危险路由才注入，普通写入不受影响。
+const CONFIRMATION_ROUTES = new Set([
+  "/memory/delete",
+  "/core-memory/delete",
+  "/person/erase",
+  "/person/weight",
+  "/portrait/govern",
+  "/maintenance/audit/apply",
+  "/maintenance/audit/rollback",
+  "/data/import/run",
+  "/conversation-import/rollback",
+  "/maintenance/clear_all",
+  "/maintenance/clear_scope",
+  "/import/livingmemory/run",
+  "/config/module/update",
+]);
+
+function canonicalConfirmation(route, payload) {
+  if (route === "/memory/delete" || route === "/core-memory/delete") {
+    return "DELETE:" + (payload.id || "");
+  }
+  if (route === "/person/erase") {
+    return "ERASE:" + (payload.user_id || "");
+  }
+  if (route === "/maintenance/clear_all") {
+    return "CLEAR:all";
+  }
+  if (route === "/maintenance/clear_scope") {
+    return "CLEAR:" + (payload.target_type || payload.type || payload.scope || "");
+  }
+  return "CONFIRM:" + route;
+}
+
+// P13：写操作要带 CSRF 令牌。令牌由 GET /ui/csrf 下发（15 分钟有效）；
+// 桥接通道无法自定义请求头，所以统一放进 body.csrf_token，服务端两种都收。
+let csrfTokenCache = { token: "", expiresAt: 0 };
+
+function payloadOf(data) {
+  return data && data.data !== undefined ? data.data : data;
+}
+
+// 不经过 apiRequest 的底层请求：取令牌/取 nonce 时不能再次触发注入逻辑。
+async function rawApiRequest(path, method, body) {
+  const bridge = getBridge() || await waitForBridge();
+  if (bridge && typeof bridge.apiGet === "function" && typeof bridge.apiPost === "function") {
+    return bridgeRequest(bridge, path, method, body);
+  }
+  if (canUseHttpFallback()) return httpRequest(path, method, body);
+  return null;
+}
+
+async function ensureCsrfToken(force) {
+  const now = Date.now();
+  if (!force && csrfTokenCache.token && csrfTokenCache.expiresAt > now + 5000) {
+    return csrfTokenCache.token;
+  }
+  let data = null;
+  try {
+    data = await rawApiRequest("/ui/csrf", "GET", null);
+  } catch (error) {
+    return "";
+  }
+  const body = payloadOf(data);
+  const token = body && typeof body.token === "string" ? body.token : "";
+  if (!token) return "";
+  const ttl = Number(body.expires_in) > 0 ? Number(body.expires_in) : 900;
+  csrfTokenCache = { token: token, expiresAt: now + ttl * 1000 };
+  return token;
+}
+
+async function withCsrfToken(body) {
+  const payload = Object.assign({}, body || {});
+  const token = await ensureCsrfToken(false);
+  if (token) payload.csrf_token = token;
+  return payload;
+}
+
+async function requestConfirmationNonce(route, payload) {
+  let data = null;
+  try {
+    const token = await ensureCsrfToken(false);
+    const requestBody = { route: route, payload: payload || {} };
+    if (token) requestBody.csrf_token = token;
+    data = await rawApiRequest("/ui/confirm-nonce", "POST", requestBody);
+  } catch (error) {
+    return "";
+  }
+  const body = payloadOf(data);
+  return body && typeof body.confirm === "string" ? body.confirm : "";
+}
+
+// P9：确认串改为一次性 nonce——先向服务端要 "<canonical>:<nonce>"，取不到时
+// 回退到固定串（非浏览器上下文仍然接受，便于本地脚本与排查）。
+async function withConfirmation(path, body) {
+  const route = String(path || "").split("?")[0];
+  if (!CONFIRMATION_ROUTES.has(route)) return body;
+  const payload = Object.assign({}, body || {});
+  const canonical = canonicalConfirmation(route, payload);
+  const nonce = await requestConfirmationNonce(route, payload);
+  payload.confirm = nonce || canonical;
+  return payload;
 }
 
 async function bridgeRequest(bridge, path, method, body) {
@@ -366,21 +493,33 @@ const state = {
   ready: false,
   stats: null,
   buckets: [],
-  filters: { scope: "", q: "", visibility: "", lifecycle: "", memoryType: "" },
+  filters: { scope: "", q: "", visibility: "", lifecycle: "", memoryType: "", ownerBot: "" },
   selected: null,
-  starmap: null,
   configSchema: null,
   configModule: "appearance",
   companion: null,
   acl: null,
   assemblyViewer: null,
+  lastHostIsDark: null,
+  explicitTheme: "",
+  manualThemeToggled: false,
 };
 
 /* ------------------------------------------------------------
    提示 / 忙碌 / 抽屉
    ------------------------------------------------------------ */
 let toastTimer = 0;
+let scrimTimer = 0;
+let drawerLastFocus = null;
 let assemblyViewerTicket = 0;
+
+function prefersReducedMotion() {
+  try {
+    return Boolean(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  } catch (error) {
+    return false;
+  }
+}
 
 function toast(message, tone) {
   const node = $("#toast");
@@ -402,32 +541,87 @@ function busy(on, text) {
   layer.classList.toggle("is-on", busyCount > 0);
 }
 
-async function withBusy(text, fn) {
+async function withBusy(text, fn, minMs) {
   busy(true, text);
+  const startedAt = Date.now();
   try {
     return await fn();
   } finally {
+    const remaining = (Number(minMs) || 0) - (Date.now() - startedAt);
+    if (remaining > 0) await new Promise((resolve) => window.setTimeout(resolve, remaining));
     busy(false);
   }
 }
 
+function setBusyText(text) {
+  const el = $("#busyText");
+  if (el && text) el.textContent = text;
+}
+
 function openDrawer(title, eyebrow, html) {
+  const drawer = $("#drawer");
+  const scrim = $("#scrim");
+  if (drawer && !drawer.classList.contains("is-open")) {
+    drawerLastFocus = document.activeElement;
+  }
   $("#drawerEyebrow").textContent = eyebrow || "记忆";
   $("#drawerTitle").textContent = title || "未选择";
   $("#drawerBody").innerHTML = html;
-  $("#drawer").classList.add("is-open");
-  $("#drawer").setAttribute("aria-hidden", "false");
-  $("#scrim").hidden = false;
+  window.clearTimeout(scrimTimer);
+  scrimTimer = 0;
+  if (scrim) {
+    scrim.hidden = false;
+    if (prefersReducedMotion()) {
+      scrim.classList.add("is-open");
+    } else {
+      void scrim.offsetWidth;
+      requestAnimationFrame(() => {
+        if (drawer && drawer.classList.contains("is-open")) scrim.classList.add("is-open");
+      });
+    }
+  }
+  if (drawer) {
+    drawer.inert = false;
+    drawer.classList.add("is-open");
+    drawer.setAttribute("aria-hidden", "false");
+  }
 }
 
 function closeDrawer() {
-  $("#drawer").classList.remove("is-open");
-  $("#drawer").setAttribute("aria-hidden", "true");
-  $("#scrim").hidden = true;
+  const drawer = $("#drawer");
+  const scrim = $("#scrim");
+  if (drawer) {
+    const active = document.activeElement;
+    if (active && typeof drawer.contains === "function" && drawer.contains(active) && typeof active.blur === "function") {
+      active.blur();
+    }
+    drawer.classList.remove("is-open");
+    drawer.setAttribute("aria-hidden", "true");
+    drawer.inert = true;
+  }
+  if (scrim) {
+    window.clearTimeout(scrimTimer);
+    scrimTimer = 0;
+    scrim.classList.remove("is-open");
+    if (prefersReducedMotion()) {
+      scrim.hidden = true;
+    } else {
+      scrimTimer = window.setTimeout(() => {
+        scrimTimer = 0;
+        if (!drawer || !drawer.classList.contains("is-open")) scrim.hidden = true;
+      }, 240);
+    }
+  }
+  const prev = drawerLastFocus;
+  drawerLastFocus = null;
+  if (prev && typeof prev.focus === "function" && document.contains(prev)) {
+    try { prev.focus({ preventScroll: true }); } catch (error) { /* 忽略 */ }
+  }
 }
 
 function showInlineConfirmation(title, message, confirmLabel) {
   return new Promise((resolve) => {
+    const prevFocus = document.activeElement;
     const overlay = document.createElement("div");
     overlay.className = "inline-confirm-overlay";
     overlay.innerHTML =
@@ -436,15 +630,42 @@ function showInlineConfirmation(title, message, confirmLabel) {
       '<p>' + esc(message || "确认继续此操作？") + "</p>" +
       '<div class="inline-confirm-actions"><button type="button" data-confirm-cancel>取消</button><button type="button" class="is-danger" data-confirm-ok>' +
       esc(confirmLabel || "继续") + "</button></div></section>";
+    let settled = false;
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        finish(false);
+      }
+    };
     const finish = (value) => {
-      overlay.remove();
+      if (settled) return;
+      settled = true;
+      document.removeEventListener("keydown", onKeyDown);
+      overlay.classList.remove("is-open");
+      if (prefersReducedMotion()) {
+        overlay.remove();
+      } else {
+        window.setTimeout(() => overlay.remove(), 180);
+      }
+      if (prevFocus && typeof prevFocus.focus === "function" && document.contains(prevFocus)) {
+        try { prevFocus.focus({ preventScroll: true }); } catch (error) { /* 忽略 */ }
+      }
       resolve(value);
     };
     overlay.addEventListener("click", (event) => {
       if (event.target === overlay || event.target.closest("[data-confirm-cancel]")) finish(false);
       if (event.target.closest("[data-confirm-ok]")) finish(true);
     });
+    document.addEventListener("keydown", onKeyDown);
     document.body.appendChild(overlay);
+    if (prefersReducedMotion()) {
+      overlay.classList.add("is-open");
+    } else {
+      void overlay.offsetWidth;
+      requestAnimationFrame(() => {
+        if (!settled) overlay.classList.add("is-open");
+      });
+    }
     const ok = $("[data-confirm-ok]", overlay);
     if (ok) ok.focus();
   });
@@ -465,29 +686,112 @@ function applyPalette(key) {
   const value = compact(key).toLowerCase();
   if (PALETTE_KEYS.has(value)) {
     document.documentElement.dataset.palette = value;
+    try { window.localStorage.setItem(PALETTE_KEY, value); } catch (error) { /* 忽略存储禁用 */ }
     return value;
   }
   delete document.documentElement.dataset.palette;
+  try { window.localStorage.removeItem(PALETTE_KEY); } catch (error) { /* 忽略存储禁用 */ }
   return "";
 }
 
 async function syncPalette() {
   const payload = await apiTry(() => apiGet("/ui-preferences"), null);
-  if (!payload) return;
-  applyPalette(payload.palette);
+  if (payload) {
+    applyPalette(payload.palette);
+    return;
+  }
+  // 后端暂时不可达时退回上次缓存，避免面板莫名变回默认紫色
+  try {
+    const cached = window.localStorage.getItem(PALETTE_KEY);
+    if (cached) applyPalette(cached);
+  } catch (error) { /* 忽略存储禁用 */ }
 }
 
-function applyTheme(theme) {
+function currentPageSearch() {
+  if (typeof location !== "undefined" && location && typeof location.search === "string") {
+    return location.search;
+  }
+  if (typeof window !== "undefined" && window && window.location && typeof window.location.search === "string") {
+    return window.location.search;
+  }
+  return "";
+}
+
+function peopleHref() {
+  const search = currentPageSearch();
+  if (!search) return "./people.html";
+  try {
+    if (typeof URLSearchParams === "function") {
+      const params = new URLSearchParams(search);
+      if (params.has("theme") && (state.theme === "light" || state.theme === "dark")) {
+        params.set("theme", state.theme);
+        const serialized = params.toString();
+        return "./people.html" + (serialized ? "?" + serialized : "");
+      }
+    }
+  } catch (error) { /* 忽略非法查询串 */ }
+  return "./people.html" + search;
+}
+
+function syncPeopleLinks() {
+  if (typeof document === "undefined" || !document || typeof document.querySelectorAll !== "function") return;
+  const href = peopleHref();
+  $$('a[data-people-link], a[href^="./people.html"]').forEach((link) => {
+    if (link && typeof link.setAttribute === "function") link.setAttribute("href", href);
+  });
+}
+
+function applyTheme(theme, options = {}) {
   state.theme = theme === "light" ? "light" : "dark";
   document.documentElement.dataset.theme = state.theme;
   const label = $("#themeToggleLabel");
   if (label) label.textContent = state.theme === "dark" ? "深色" : "浅色";
+  const meta = typeof document.querySelector === "function" ? $('meta[name="theme-color"]') : null;
+  if (meta && typeof meta.setAttribute === "function") {
+    meta.setAttribute("content", state.theme === "light" ? "#f6f7fa" : "#0b0d12");
+  }
+  syncPeopleLinks();
   try {
     window.localStorage.setItem(THEME_KEY, state.theme);
   } catch (error) {
     /* 忽略存储禁用 */
   }
   window.dispatchEvent(new CustomEvent("mc:theme", { detail: state.theme }));
+  // 2.6.6：localStorage 在部分 WebView 里会被清掉，主题再落一份到插件数据目录
+  if (options.persist !== false) {
+    state.manualThemeToggled = true;
+    state.explicitTheme = state.theme;
+    apiPost("/ui-preferences/save", { dark_mode: state.theme === "dark" }).catch(() => {});
+  }
+}
+
+function handleBridgeContext(ctx) {
+  if (!ctx || typeof ctx !== "object" || typeof ctx.isDark !== "boolean") return;
+  const hostTheme = ctx.isDark ? "dark" : "light";
+  const prevHostIsDark = state.lastHostIsDark;
+  state.lastHostIsDark = ctx.isDark;
+  if (prevHostIsDark !== null && prevHostIsDark !== ctx.isDark) {
+    state.explicitTheme = "";
+    applyTheme(hostTheme, { persist: false });
+    return;
+  }
+  if (state.manualThemeToggled || state.explicitTheme) {
+    applyTheme(state.explicitTheme || state.theme, { persist: false });
+    return;
+  }
+  if (hostTheme !== state.theme) {
+    applyTheme(hostTheme, { persist: false });
+  }
+}
+
+async function bindBridgeContext() {
+  const bridge = getBridge() || (await waitForBridge());
+  if (!bridge) return;
+  if (typeof bridge.onContext === "function") {
+    bridge.onContext(handleBridgeContext);
+  } else if (typeof bridge.getContext === "function") {
+    handleBridgeContext(bridge.getContext());
+  }
 }
 
 /* ------------------------------------------------------------
@@ -505,7 +809,7 @@ const NAV = [
     id: "insight",
     label: "洞察",
     icon: "spark",
-    views: ["starmap", "microscope", "synergy"],
+    views: ["microscope", "synergy"],
   },
   {
     id: "bridge",
@@ -517,13 +821,13 @@ const NAV = [
     id: "import",
     label: "导入",
     icon: "download",
-    views: ["chatimport", "migrate", "quarantine"],
+    views: ["chatimport", "migrate", "queue", "quarantine", "processed"],
   },
   {
     id: "settings",
     label: "设置",
     icon: "sliders",
-    views: ["config", "acl"],
+    views: ["config", "performance", "acl"],
   },
 ];
 
@@ -545,7 +849,15 @@ function findGroupOf(viewId) {
    ------------------------------------------------------------ */
 function renderRail() {
   const host = $("#railNav");
-  host.innerHTML = NAV.map((group) => {
+  if (!host) return;
+  const peopleEntry =
+    '<div class="nav-people-wrap">' +
+    '<a class="nav-item nav-people" id="railPeopleLink" data-people-link href="' + esc(peopleHref()) + '" title="返回「她记得的人」人物面板">' +
+    icon("heart") +
+    '<span class="nav-label">她记得的人</span>' +
+    '<span class="nav-ext" aria-hidden="true">↗</span>' +
+    "</a></div>";
+  host.innerHTML = peopleEntry + NAV.map((group) => {
     const isOpen = group.id === state.group;
     const groupIcon = icon(group.icon);
     const subs = group.views
@@ -596,6 +908,18 @@ async function go(viewId, options) {
   const view = VIEWS[viewId];
   if (!view || view.hidden) return;
   const opts = options || {};
+  const host = $("#content");
+  const isSameView = state.view === viewId;
+  const hasMountedChild = Boolean(host && (host.firstElementChild || (host.children && host.children.length > 0)));
+  const canInPlace = Boolean(opts.inPlace) && isSameView && hasMountedChild;
+  const prevScrollTop = canInPlace ? (host.scrollTop || 0) : 0;
+  const prevWinScrollY = canInPlace && typeof window !== "undefined" ? (window.scrollY || 0) : 0;
+  const activeEl = canInPlace && typeof document !== "undefined" ? document.activeElement : null;
+  const prevActiveId =
+    activeEl && activeEl.id && host && typeof host.contains === "function" && host.contains(activeEl)
+      ? activeEl.id
+      : "";
+
   state.view = viewId;
   state.group = findGroupOf(viewId);
   try {
@@ -613,19 +937,39 @@ async function go(viewId, options) {
 
   const token = renderToken + 1;
   renderToken = token;
-  const host = $("#content");
-  host.innerHTML = '<div class="skeleton" style="height:220px;border-radius:13px"></div>';
+  if (!canInPlace) {
+    host.innerHTML = '<div class="skeleton" style="height:220px;border-radius:13px"></div>';
+  }
 
   try {
     const payload = await view.load(opts);
     if (token !== renderToken) return;
     host.innerHTML = "";
     const node = document.createElement("div");
+    if (canInPlace && node.classList && typeof node.classList.add === "function") {
+      node.classList.add("is-inplace-refresh");
+    }
     node.innerHTML = view.render(payload, opts);
     host.appendChild(node);
     if (typeof view.mount === "function") view.mount(node, payload, opts);
+    if (canInPlace) {
+      host.scrollTop = prevScrollTop;
+      if (prevWinScrollY && typeof window !== "undefined" && typeof window.scrollTo === "function") {
+        window.scrollTo(0, prevWinScrollY);
+      }
+      if (prevActiveId) {
+        const nextActive = $("#" + prevActiveId.replace(/[^a-zA-Z0-9_-]/g, "\\$&"), node);
+        if (nextActive && !nextActive.disabled && typeof nextActive.focus === "function") {
+          try { nextActive.focus({ preventScroll: true }); } catch (err) { nextActive.focus(); }
+        }
+      }
+    }
   } catch (error) {
     if (token !== renderToken) return;
+    if (canInPlace) {
+      toast("刷新视图失败：" + (error.message || "未知错误"), "error");
+      return;
+    }
     host.innerHTML =
       '<div class="empty"><b>这个视图没能加载出来</b><span>' + esc(error.message || "未知错误") + "</span></div>";
   }
@@ -638,23 +982,27 @@ function refresh() {
 /* ------------------------------------------------------------
    组件片段
    ------------------------------------------------------------ */
-function kpi(label, value, foot, tone, goto) {
+function kpi(label, value, foot, tone, goto, iconName, filter) {
   const inner =
+    (iconName ? icon(iconName, "kpi-icon") : "") +
     '<span class="kpi-label">' + esc(label) + "</span>" +
     '<span class="kpi-value">' + esc(value) + "</span>" +
     (foot ? '<span class="kpi-foot">' + esc(foot) + "</span>" : "");
-  const toneAttr = tone ? ' data-tone="' + tone + '"' : "";
+  const toneAttr = tone ? ' data-tone="' + esc(tone) + '"' : "";
   if (goto) {
     return (
       '<button class="kpi is-link" type="button"' + toneAttr +
-      ' data-goto="' + esc(goto) + '">' + inner + "</button>"
+      ' data-goto="' + esc(goto) + '"' +
+      (filter ? ' data-filter="' + esc(filter) + '"' : "") + ">" +
+      inner +
+      '<span class="kpi-go" aria-hidden="true">›</span></button>'
     );
   }
   return '<article class="kpi"' + toneAttr + ">" + inner + "</article>";
 }
 
 function badge(text, tone) {
-  return '<span class="badge' + (tone ? '" data-tone="' + tone : "") + '">' + esc(text) + "</span>";
+  return '<span class="badge' + (tone ? '" data-tone="' + esc(tone) : "") + '">' + esc(text) + "</span>";
 }
 
 function emptyState(title, text) {
@@ -1079,6 +1427,59 @@ function applyMode(mode) {
 /* ============================================================
    视图：总览
    ============================================================ */
+function summaryWaitDuration(seconds) {
+  const value = Math.max(0, int(seconds));
+  if (value === 0) return "无";
+  if (value < 60) return "不足 1 分钟";
+  if (value >= 86400) return Math.floor(value / 86400) + " 天 " + Math.floor(value % 86400 / 3600) + " 小时";
+  if (value >= 3600) return Math.floor(value / 3600) + " 小时 " + Math.floor(value % 3600 / 60) + " 分钟";
+  return Math.floor(value / 60) + " 分钟";
+}
+
+function summaryWaitTone(key) {
+  if (key === "identity" || key === "retry" || key === "paused" || key === "disabled") return "warn";
+  if (key === "call_limit") return "danger";
+  if (key === "running") return "ok";
+  return "fact";
+}
+
+function summaryRecoveryCard(status) {
+  if (!status || typeof status !== "object") {
+    return card("记忆整理进度", "只读状态", emptyState("状态暂不可用", "请使用已登录的管理员面板刷新。"), "", "recovery-card");
+  }
+  const waits = status.waits || {};
+  const originals = status.unbatched || {};
+  const progress = status.progress || {};
+  const labels = status.wait_labels || {};
+  const rows = Object.keys(labels).filter((key) => int(waits[key]) > 0).map((key) =>
+    '<div class="row"><div class="row-main"><div class="row-title" title="' + esc(labels[key]) + '">' + esc(labels[key]) +
+    '</div></div><div class="row-meta">' + badge(fmtInt(waits[key]) + " 批", summaryWaitTone(key)) + "</div></div>"
+  ).join("");
+  const originalWaits = Object.keys(labels).filter((key) => int((originals.waits || {})[key]) > 0)
+    .map((key) => labels[key] + " " + fmtInt(originals.waits[key]) + " 个窗口").join(" · ");
+  const mode = !status.summary_enabled ? "自动总结已关闭"
+    : status.admission !== "normal" ? "已暂停常规整理"
+    : !status.recovery_enabled ? "后台恢复已关闭，聊天仍可触发整理"
+    : status.dispatcher_state === "degraded" ? "后台恢复已开启（调度器异常）"
+    : "后台恢复已开启";
+  return card("记忆整理进度", mode,
+    '<div class="pill-row">' +
+      badge("待处理 " + fmtInt(status.pending_batches) + " 批", "accent") +
+      badge("最老等待 " + summaryWaitDuration(status.oldest_wait_seconds), "fact") +
+      badge("每会话每小时 " + ((status.limits || {}).calls_per_session_hour === 0 ? "不限" : fmtInt((status.limits || {}).calls_per_session_hour) + " 次")) +
+      badge("全局并发 " + fmtInt((status.limits || {}).global_concurrency)) +
+    '</div><div class="row-list">' + (rows || emptyState("没有有效待处理批次", "空白历史行不计入积压。")) + '</div>' +
+    '<p class="section-note">未分批原文 ' + fmtInt(originals.events) + " 条；下一轮达到条件且身份有效 " +
+      fmtInt(originals.eligible_events) + " 条（" + fmtInt(originals.eligible_windows) + " 个窗口）。这些原文尚未计入批次。" +
+      (originalWaits ? " 当前：" + esc(originalWaits) + "。" : "") + '</p>' +
+    '<p class="section-note">正式会话记忆 ' + fmtInt(progress.adopted_memories) + " 条 · 待审候选 " +
+      fmtInt(progress.review_candidates) + " 条 · 已处理批次 " + fmtInt(progress.completed_batches) +
+      " 批 · 无新增记忆 " + fmtInt(progress.no_memory_batches) + " 批 · 隔离批次 " +
+      fmtInt(progress.quarantined_batches) + ' 批。</p>' +
+    '<p class="section-note">可以尝试整理表示队列条件已满足；模型是否可用会在实际整理时检查。查看状态不会发起模型调用或通过候选。</p>',
+    "", "recovery-card");
+}
+
 function renderCinemaOverview(data) {
   const stats = data.stats || {};
   const memories = Array.isArray(data.memories) ? data.memories : [];
@@ -1131,7 +1532,7 @@ function renderCinemaOverview(data) {
     '<div class="terminal-feed" id="terminalFeed">' + (recordButtons || emptyState("暂无记录", "连接后会在这里展开记忆流。")) + '</div>' +
     '<div class="terminal-controls"><div class="terminal-counter"><span>ARCHIVE / SELECT</span><strong><b id="terminalSelectedNumber">01</b><i>/</i><b>' + String(Math.max(records.length, 1)).padStart(2, "0") + '</b></strong></div><div class="terminal-arrows"><button type="button" data-terminal-prev aria-label="上一个记忆">↑</button><button type="button" data-terminal-next aria-label="下一个记忆">↓</button></div><div class="terminal-column"><button type="button" data-terminal-column-prev aria-label="上一记忆通道">←</button><span><small>MEMORY CHANNEL</small><b id="terminalChannel">ALL RECORDS</b></span><button type="button" data-terminal-column-next aria-label="下一记忆通道">→</button></div><span class="terminal-hint"><kbd>←</kbd><kbd>→</kbd> 通道 <span>/</span> <kbd>↑</kbd><kbd>↓</kbd> 档案 <span>/</span> <kbd>ENTER</kbd> 读取</span></div>' +
     '<div class="terminal-marquee"><span>ARCHIVE CHANNEL CONNECTED</span><i>●</i><span>PERSONAL CONTEXT READY</span><i>●</i><span>RECALL ENGINE STANDBY</span><i>●</i><span>ARCHIVE CHANNEL CONNECTED</span></div>' +
-    '</section>';
+    '</section>' + summaryRecoveryCard(data.recovery);
 }
 
 defineView("overview", {
@@ -1140,21 +1541,25 @@ defineView("overview", {
   eyebrow: "Overview",
   hint: "记忆库规模、范围分布与联动状态的整体快照",
   async load() {
-    const [statsPayload, buckets, core, caps, coord, memories, personal, injectionLogs] = await Promise.all([
+    const [statsPayload, buckets, core, caps, coord, memories, personal, injectionLogs, botsPayload, recoveryPayload] = await Promise.all([
       apiGet("/stats"),
       apiTry(() => apiGet("/buckets?limit=160"), { buckets: [] }),
       apiTry(() => apiGet("/core-memory"), { blocks: [] }),
       apiTry(() => apiGet("/capabilities/bot-personal"), {}),
       apiTry(() => apiGet("/coordination/status"), { status: {} }),
-      apiTry(() => apiGet("/memories?limit=80"), { memories: [] }),
+      // 列表接口必须带范围；总览用显式的 scope=all 表示“所有范围”。
+      apiTry(() => apiGet("/memories?scope=all&limit=80"), { memories: [] }),
       apiTry(() => apiGet("/companion/personal-memory?limit=1"), null),
       apiTry(() => apiGet("/logs?limit=12"), { items: [] }),
+      apiTry(() => apiGet("/bots"), { bots: [] }),
+      apiTry(() => apiGet("/maintenance/summary_status"), null),
     ]);
     const stats = (statsPayload && statsPayload.stats) || {};
     state.stats = stats;
     state.buckets = Array.isArray(buckets.buckets) ? buckets.buckets : [];
     return {
       stats,
+      recovery: recoveryPayload && recoveryPayload.status,
       buckets: state.buckets,
       core: core.blocks || [],
       caps,
@@ -1162,35 +1567,43 @@ defineView("overview", {
       coord: coord.status || {},
       memories: memories.memories || [],
       injectionLogs: Array.isArray(injectionLogs.items) ? injectionLogs.items : [],
+      bots: Array.isArray(botsPayload.bots) ? botsPayload.bots : [],
     };
   },
   render(data) {
     if (state.mode === "cinema") return renderCinemaOverview(data);
     const stats = data.stats || {};
     const byScope = stats.by_scope || {};
-    const progress = stats.summary_progress || {};
+    const recovery = data.recovery && typeof data.recovery === "object" ? data.recovery : null;
+    const recoveryProgress = recovery && recovery.progress && typeof recovery.progress === "object" ? recovery.progress : null;
     const storageMb = (int(stats.memory_storage_bytes) / 1048576).toFixed(1);
     const privateCount = int(byScope.private);
     const groupCount = int(byScope.group);
 
     const kpis = [
-      kpi("记忆总量", fmtInt(stats.total_memories), storageMb + " MB 存储", "accent"),
-      kpi("私聊记忆", fmtInt(privateCount), "一对一会话", "private"),
-      kpi("群聊记忆", fmtInt(groupCount), "群窗口沉淀", "group"),
-      kpi("用户档案", fmtInt(stats.identities), "已识别身份", "relation"),
-      kpi("核心记忆", fmtInt((data.core || []).length), "强制注入块", "gold"),
-      kpi("开放线程", fmtInt(stats.open_threads), "跨窗口续接", "fact"),
-      kpi("原文已记录", fmtInt(progress.raw_events), "原始会话事件", "group"),
-      kpi("会话记忆已生成", fmtInt(progress.conversation_memories), "不含待审核候选", "fact"),
-      kpi("待处理批次", fmtInt(progress.pending_batches), "排队或延迟重试", "accent"),
-      kpi("待修复批次", fmtInt(progress.quarantined_batches), "冻结原文 " + fmtInt(progress.frozen_events) + " 条 · 点击查看并释放", "gold", "quarantine"),
-      kpi("已处理，无新增记忆", fmtInt(progress.no_memory_batches), "原文保留，不重复总结", "private"),
+      kpi("记忆总量", fmtInt(stats.total_memories), storageMb + " MB 存储", "accent", "inspect", "db"),
+      kpi("私聊记忆", fmtInt(privateCount), "一对一会话", "private", "inspect", "user", "scope:private"),
+      kpi("群聊记忆", fmtInt(groupCount), "群窗口沉淀", "group", "inspect", "users", "scope:group"),
+      kpi("用户档案", fmtInt(stats.identities), "已识别身份", "relation", "inspect", "tag", "profile"),
+      kpi("核心记忆", fmtInt((data.core || []).length), "强制注入块", "gold", "core", "star"),
+      kpi("开放线程", fmtInt(stats.open_threads), "跨窗口续接", "fact", "navigate", "link"),
+      kpi("原文已记录", recoveryProgress ? fmtInt(recoveryProgress.raw_events) : "—", "不含空白历史行", "group", "inspect", "library"),
+      kpi("正式会话记忆", recoveryProgress ? fmtInt(recoveryProgress.adopted_memories) : "—", "待审候选另列", "fact", "inspect", "chat"),
+      kpi("待处理批次", recovery ? fmtInt(recovery.pending_batches) : "—", "等待原因见整理进度", "accent", "queue", "clock"),
+      kpi("待修复批次", recoveryProgress ? fmtInt(recoveryProgress.quarantined_batches) : "—", "总结失败被隔离", "gold", "quarantine", "shield"),
+      kpi("已处理，无新增记忆", recoveryProgress ? fmtInt(recoveryProgress.no_memory_batches) : "—", "原文保留，不重复总结", "private", "processed", "box"),
     ].join("");
 
-    const entries = [
+    const peopleEntry =
+      '<a class="row" data-people-link href="' + esc(peopleHref()) + '">' +
+      icon("heart", "scope-icon") +
+      '<div class="row-main"><div class="row-title">她记得的人</div>' +
+      '<div class="row-sub">按人查看分量、称呼与她记得的事</div></div>' +
+      '<div class="row-meta"><span class="badge">前往 ↗</span></div></a>';
+
+    const entries = peopleEntry + [
       ["navigate", "记忆导航", "按私聊 / 群聊 / 个人等范围进入", "scope"],
       ["inspect", "记忆检视", "逐条查看并修正记忆参数", "db"],
-      ["starmap", "知识星图", "以星系模型浏览关联记忆", "star"],
       ["microscope", "记忆显微镜", "模拟一次真实召回", "scope"],
       ["botlife", "Bot 日程与相册", "Bot 自身的生活记录", "camera"],
       ["config", "模块配置", "按模块调整检索与注入策略", "sliders"],
@@ -1261,19 +1674,54 @@ defineView("overview", {
       .map((item) => {
         const selected = Array.isArray(item.selected_memories) ? item.selected_memories : [];
         const blocked = Array.isArray(item.blocked_reasons) ? item.blocked_reasons : [];
+        const retrieval = item.retrieval_info && typeof item.retrieval_info === "object" ? item.retrieval_info : {};
+        const slotCounts = retrieval.slot_counts && typeof retrieval.slot_counts === "object" ? retrieval.slot_counts : {};
+        const slotLimits = retrieval.slot_limits && typeof retrieval.slot_limits === "object" ? retrieval.slot_limits : {};
+        const slotSummary = Object.keys(slotCounts)
+          .map((slot) => slot + " " + Number(slotCounts[slot] || 0) + "/" +
+            (slotLimits[slot] == null ? "-" : Number(slotLimits[slot] || 0)))
+          .join(" · ");
+        const capped = Array.isArray(retrieval.capped_slots) ? retrieval.capped_slots : [];
+        const cappedCandidates = blocked
+          .filter((entry) => String(entry.reason || "").startsWith("slot_capped:"))
+          .map((entry) => String(entry.id || "") + (entry.score == null ? "" : " (" + entry.score + ")"))
+          .filter(Boolean)
+          .slice(0, 3);
         const query = compact(item.query) || "无检索词";
+        const scopeTag = (memory) => {
+          const key = compact(memory.scope);
+          if (key === "group") return "群聊·";
+          if (key === "private") return "私聊·";
+          if (key === "profile") return "档案·";
+          if (key === "personal") return "Bot·";
+          return "";
+        };
         const selectedText = selected.length
-          ? selected.slice(0, 2).map((memory) => memoryTitle(memory)).join("；")
+          ? selected
+              .slice(0, 2)
+              .map((memory) => {
+                const logSession = compact(item.session_id);
+                const memorySession = compact(memory.session_id);
+                const cross = logSession && memorySession && logSession !== memorySession ? "↔跨窗口 " : "";
+                return cross + scopeTag(memory) + memoryTitle(memory);
+              })
+              .join("；")
           : blocked.length
             ? "未注入记忆 · 过滤 " + blocked.length + " 项"
             : "未注入记忆";
+        const detailText = [
+          selectedText,
+          slotSummary ? "槽位 " + slotSummary : "",
+          capped.length ? "受限 " + capped.join(", ") : "",
+          cappedCandidates.length ? "限流候选 " + cappedCandidates.join(", ") : "",
+        ].filter(Boolean).join(" · ");
         return (
           '<div class="row" style="cursor:default;align-items:flex-start">' +
             '<div class="row-main" style="min-width:0">' +
               '<div class="row-title" title="' + esc(query) + '">' + esc(clip(query, 72)) + "</div>" +
               '<div class="row-sub">' + esc(fmtTime(item.created_at)) + " · " +
                 esc(selected.length + " 条记忆 · " + int(item.injection_chars) + " 字") + "</div>" +
-              '<div class="section-note" style="margin-top:5px;white-space:normal">' + esc(clip(selectedText, 180)) + "</div>" +
+              '<div class="section-note" style="margin-top:5px;white-space:normal">' + esc(clip(detailText, 280)) + "</div>" +
             "</div>" +
             '<div class="row-meta">' +
               badge(selected.length ? "已注入" : "未注入", selected.length ? "ok" : "warn") +
@@ -1283,6 +1731,58 @@ defineView("overview", {
         );
       })
       .join("");
+    const fallbackOwners = (stats && stats.by_owner_bot) || {};
+    const botOwners = Array.isArray(data.bots) && data.bots.length
+      ? data.bots
+      : Object.keys(fallbackOwners).map((key) => ({
+          id: key === "<empty>" ? "" : key,
+          name: "",
+          count: int(fallbackOwners[key]),
+        }));
+    const personaName = compact(data.persona);
+    const botTotal = botOwners.reduce((sum, item) => sum + int(item.count), 0) || 1;
+    const botRows = botOwners
+      .map((item) => {
+        const count = int(item.count);
+        const botId = compact(item.id);
+        const ownerKey = botId || "__empty__";
+        const title = compact(item.name) || personaName || (botId ? "Bot " + botId : "未标记归属");
+        const sub = botId && compact(item.name) ? botId : "";
+        return (
+          '<button class="row is-clickable" type="button" data-goto="inspect" data-owner-bot="' + esc(ownerKey) + '">' +
+            '<div class="row-main" style="min-width:0">' +
+              '<div class="row-title">' + esc(title) + (sub ? ' <span class="bot-id">' + esc(sub) + "</span>" : "") + "</div>" +
+              '<div class="bot-bar"><span style="width:' + Math.max(3, Math.round((count / botTotal) * 100)) + '%"></span></div>' +
+            "</div>" +
+            '<div class="row-meta">' + badge(fmtInt(count) + " 条", "fact") + "</div>" +
+          "</button>"
+        );
+      })
+      .join("");
+    const botCard = botOwners.length
+      ? card("Bot 记忆分布", "共 " + botOwners.length + " 个归属 · 点名字看这个 Bot 的记忆", '<div class="row-list">' + botRows + "</div>", '<button class="btn is-sm is-ghost" type="button" data-goto="inspect" data-filter="all">全部记忆</button>')
+      : card("Bot 记忆分布", "还没有归属数据", emptyState("暂无归属", "记忆写入后会按 Bot 归属统计。"));
+
+    const drainInfo = (stats && stats.summary_drain) || {};
+    const drainLabel =
+      drainInfo.state === "running" ? "正在消化积压"
+      : drainInfo.state === "degraded" ? "上一轮出错"
+      : drainInfo.state === "scheduled" ? "等待下一轮"
+      : "未启动";
+    const drainCard = card(
+      "自动消化",
+      "后台定时扫未总结的原文",
+      '<div class="row-list">' +
+        '<div class="row"><div class="row-main"><div class="row-title">' + esc(drainLabel) + "</div>" +
+          '<div class="row-sub">' + esc(compact(drainInfo.last_result) || "还没有跑过") + "</div></div>" +
+          '<div class="row-meta">' + esc(compact(drainInfo.last_completed_at) || "—") + "</div></div>" +
+        (compact(drainInfo.last_error)
+          ? '<div class="row"><div class="row-main"><div class="row-title">最近错误</div><div class="row-sub">' + esc(drainInfo.last_error) + "</div></div></div>"
+          : "") +
+      "</div>",
+      '<button class="btn is-sm is-ghost" type="button" data-goto="queue">看排队中</button>'
+    );
+
     const injectionCard = card(
       "最近注入",
       injectionLogs.length ? "最近 12 轮主链注入记录" : "暂无可展示的注入记录",
@@ -1306,11 +1806,14 @@ defineView("overview", {
           ) +
         "</div>" +
       "</div>" +
+      botCard +
+      drainCard +
+      summaryRecoveryCard(recovery) +
       '<div class="grid g4">' +
-        kpi("稳定记忆", fmtInt(stats.stable_memories), "lifecycle=stable_memory", "fact") +
-        kpi("时间线事件", fmtInt(stats.timeline_events), "结构化事件流", "group") +
-        kpi("关系边", fmtInt(stats.relationships), "实体间关系", "relation") +
-        kpi("ACL 规则", fmtInt(stats.acl_rules), "跨窗口读写授权", "gold") +
+        kpi("稳定记忆", fmtInt(stats.stable_memories), "lifecycle=stable_memory", "fact", "inspect", "heart") +
+        kpi("时间线事件", fmtInt(stats.timeline_events), "结构化事件流", "group", "navigate", "clock") +
+        kpi("关系边", fmtInt(stats.relationships), "实体间关系", "relation", "navigate", "link") +
+        kpi("ACL 规则", fmtInt(stats.acl_rules), "跨窗口读写授权", "gold", "acl", "shield") +
       "</div>" +
       injectionCard +
       "</div>"
@@ -1398,7 +1901,7 @@ defineView("overview", {
    ============================================================ */
 async function loadPool() {
   if (state.pool) return state.pool;
-  const result = await apiGet("/memories?limit=800");
+  const result = await apiGet("/memories?scope=all&limit=200");
   state.pool = Array.isArray(result.memories) ? result.memories : [];
   return state.pool;
 }
@@ -1547,10 +2050,14 @@ defineView("inspect", {
     if (filters.lifecycle) params.push("lifecycle=" + encodeURIComponent(filters.lifecycle));
     if (filters.memoryType) params.push("memory_type=" + encodeURIComponent(filters.memoryType));
     if (filters.q) params.push("q=" + encodeURIComponent(filters.q));
+    if (filters.ownerBot) params.push("owner_bot=" + encodeURIComponent(filters.ownerBot));
     if (filters.target) {
       if (filters.scope === "group") params.push("group_id=" + encodeURIComponent(filters.target));
       else params.push("entity_id=" + encodeURIComponent(filters.target));
     }
+    // 没有指定范围时用显式 scope=all，而不是让后端默认放开全量。
+    if (!filters.scope && !filters.target) params.push("scope=all");
+    const botsPayload = await apiTry(() => apiGet("/bots"), { bots: [], persona: "" });
     const result = await apiGet("/memories?" + params.join("&"));
     let memories = Array.isArray(result.memories) ? result.memories : [];
     if (filters.scope === "profile") {
@@ -1560,7 +2067,7 @@ defineView("inspect", {
         "relationship", "relationship_claim", "relationship_phase_summary",
       ].includes(compact(m.memory_type)));
     }
-    return { memories, filters };
+    return { memories, filters, bots: Array.isArray(botsPayload.bots) ? botsPayload.bots : [], persona: botsPayload.persona || "" };
   },
   render(data) {
     const filters = data.filters || {};
@@ -1594,9 +2101,21 @@ defineView("inspect", {
       })
       .join("");
 
+    const botPills = (data.bots || []).length
+      ? '<div class="pill-row">' +
+        '<button class="pill' + (!filters.ownerBot ? " is-active" : "") + '" type="button" data-filter-key="ownerBot" data-filter-value="">全部 Bot</button>' +
+        (data.bots || []).map((bot) => {
+          const key = compact(bot.id) || "__empty__";
+          const name = compact(bot.name) || compact(data.persona) || (compact(bot.id) ? "Bot " + bot.id : "未标记归属");
+          return '<button class="pill' + (filters.ownerBot === key ? " is-active" : "") + '" type="button" data-filter-key="ownerBot" data-filter-value="' + esc(key) + '">' + esc(name) + " · " + fmtInt(bot.count) + "</button>";
+        }).join("") +
+        "</div>"
+      : "";
+
     const activeChips = [];
     if (filters.q) activeChips.push("关键词：" + filters.q);
     if (filters.target) activeChips.push("目标：" + filters.target);
+    if (filters.ownerBot) activeChips.push("Bot：" + (filters.ownerBot === "__empty__" ? "未标记归属" : filters.ownerBot));
 
     const rows = memories.length
       ? memories.map((memory, index) => memoryRow(memory, index)).join("")
@@ -1605,6 +2124,7 @@ defineView("inspect", {
     return (
       '<div class="grid" style="gap:14px">' +
       '<section class="card is-tight">' +
+        (botPills ? '<div style="display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin-bottom:10px">' + botPills + "</div>" : "") +
         '<div style="display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center">' +
           '<div class="pill-row">' + scopePills + "</div>" +
         "</div>" +
@@ -1712,6 +2232,7 @@ defineView("core", {
         '<label class="field is-inline" style="width:auto"><span>优先级</span><input name="priority" id="corePriority" type="number" min="0" max="100" step="1" value="50" style="width:88px" /></label>' +
         '<label class="switch"><input type="checkbox" id="coreEnabled" checked /><span class="switch-track"></span><span>启用注入</span></label>' +
         '<div class="pill-row" style="margin-left:auto">' +
+          '<button class="btn is-sm is-danger" type="button" id="coreDeleteBtn" disabled>删除此块</button>' +
           '<button class="btn is-sm is-ghost" type="button" id="coreResetBtn">重置</button>' +
           '<button class="btn is-sm is-primary" type="submit">保存核心块</button>' +
         "</div>" +
@@ -1720,7 +2241,15 @@ defineView("core", {
 
     return (
       '<div class="grid split-2">' +
-        card("核心记忆块", (data.blocks || []).length + " 个 · 按优先级排序", '<div class="row-list">' + rows + "</div>") +
+        card(
+          "核心记忆块",
+          (data.blocks || []).length + " 个 · 按优先级排序",
+          '<div class="row-actions" style="margin-bottom:10px">' +
+            '<button class="btn is-sm" type="button" id="coreExtractBtn">从记忆提炼核心块</button>' +
+            '<span class="cf-desc" style="margin-left:8px">按私聊 / 群聊 / 档案 / 全局汇总最稳定的事实</span>' +
+          "</div>" +
+          '<div class="row-list">' + rows + "</div>"
+        ) +
         card("编辑核心块", "留空 ID 表示新建", form) +
       "</div>"
     );
@@ -1743,6 +2272,8 @@ defineView("core", {
       $("#coreContent", node).value = block ? compact(block.content) : "";
       $("#corePriority", node).value = block ? int(block.priority) : 50;
       $("#coreEnabled", node).checked = block ? block.enabled !== false : true;
+      const deleteBtn = $("#coreDeleteBtn", node);
+      if (deleteBtn) deleteBtn.disabled = !block;
     };
 
     $$("[data-core]", node).forEach((row) => {
@@ -1750,6 +2281,26 @@ defineView("core", {
     });
 
     $("#coreResetBtn", node).addEventListener("click", () => fill(null));
+    $("#coreDeleteBtn", node).addEventListener("click", async () => {
+      const id = $("#coreId", node).value.trim();
+      if (!id) {
+        toast("先选中一个核心记忆块", "warn");
+        return;
+      }
+      const confirmed = await showInlineConfirmation("删除核心记忆块", "删除后该块不再参与注入，且不可恢复。确定删除？", "删除");
+      if (!confirmed) return;
+      await withBusy("正在删除…", async () => {
+        const result = await apiPost("/core-memory/delete", { id: id });
+        if (result && result.ok === false) {
+          toast("删除失败：" + (result.code || "未知原因"), "error");
+          return;
+        }
+        invalidatePool();
+        toast("核心记忆块已删除", "ok");
+        fill(null);
+        refresh();
+      }, 3000);
+    });
 
     $("#coreForm", node).addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -1782,6 +2333,82 @@ defineView("core", {
         refresh();
       });
     });
+
+    const extractBtn = $("#coreExtractBtn", node);
+    if (extractBtn) {
+      extractBtn.addEventListener("click", async () => {
+        extractBtn.disabled = true;
+        try {
+          const pool = await apiGet("/memories?scope=all&limit=200");
+          const list = Array.isArray(pool.memories) ? pool.memories : [];
+          if (!list.length) {
+            toast("还没有记忆可提炼，先聊几轮或导入历史", "warn");
+            return;
+          }
+          const buckets = { private: [], group: [], profile: [], global: [] };
+          list.forEach((memory) => {
+            const key = compact(memory.scope) || "global";
+            (buckets[key] || buckets.global).push(memory);
+          });
+          const labels = { private: "私聊稳定事实", group: "群聊稳定事实", profile: "用户档案要点", global: "全局规则与偏好" };
+          const candidates = Object.keys(labels)
+            .map((scope) => {
+              const items = buckets[scope] || [];
+              if (!items.length) return null;
+              const facts = [];
+              items
+                .slice()
+                .sort((a, b) => (Number(b.salience) || 0) - (Number(a.salience) || 0))
+                .forEach((memory) => {
+                  const keyFacts = Array.isArray(memory.key_facts) ? memory.key_facts : [];
+                  if (keyFacts.length) {
+                    keyFacts.forEach((fact) => {
+                      if (compact(fact)) facts.push(compact(fact));
+                    });
+                  } else if (compact(memory.content)) {
+                    facts.push(clip(compact(memory.content), 60));
+                  }
+                });
+              const unique = Array.from(new Set(facts.filter(Boolean))).slice(0, 8);
+              if (!unique.length) return null;
+              return {
+                label: labels[scope],
+                kind: "fact",
+                scope: scope === "profile" ? "global" : scope,
+                priority: 60,
+                content: unique.join("；"),
+                enabled: true,
+              };
+            })
+            .filter(Boolean);
+          if (!candidates.length) {
+            toast("没提炼出可用的事实", "warn");
+            return;
+          }
+          const previewText = candidates.map((item) => item.label + "：" + clip(item.content, 46)).join("；");
+          const confirmed = await showInlineConfirmation(
+            "从记忆提炼核心块",
+            "将生成 " + candidates.length + " 个核心块，可在列表里再改或删。" + previewText,
+            "写入 " + candidates.length + " 个"
+          );
+          if (!confirmed) return;
+          await withBusy("正在写入…", async () => {
+            let done = 0;
+            for (const candidate of candidates) {
+              const result = await apiPost("/core-memory/upsert", candidate);
+              if (result && result.ok !== false) done += 1;
+            }
+            invalidatePool();
+            toast("已写入 " + done + " 个核心块", done ? "ok" : "warn");
+            refresh();
+          }, 900);
+        } catch (error) {
+          toast("提炼失败：" + (error.message || error), "error");
+        } finally {
+          extractBtn.disabled = false;
+        }
+      });
+    }
   },
 });
 
@@ -1986,12 +2613,31 @@ async function hydratePersonalAlbumImages(root) {
   }));
 }
 
+function closeLightbox(box) {
+  if (!box || box.dataset.closing === "1") return;
+  box.dataset.closing = "1";
+  box.classList.remove("is-open");
+  if (prefersReducedMotion()) {
+    box.remove();
+  } else {
+    window.setTimeout(() => box.remove(), 180);
+  }
+}
+
 function openLightbox(src, caption) {
   const box = document.createElement("div");
   box.className = "lightbox";
   box.innerHTML = '<img src="' + esc(src) + '" alt="" /><div class="lightbox-cap">' + esc(caption || "") + "</div>";
-  box.addEventListener("click", () => box.remove());
+  box.addEventListener("click", () => closeLightbox(box));
   document.body.appendChild(box);
+  if (prefersReducedMotion()) {
+    box.classList.add("is-open");
+  } else {
+    void box.offsetWidth;
+    requestAnimationFrame(() => {
+      if (box.dataset.closing !== "1") box.classList.add("is-open");
+    });
+  }
 }
 
 /* ============================================================
@@ -2071,518 +2717,7 @@ function relationScore(center, other) {
   return clamp(score, 0, 1);
 }
 
-function buildGalaxy(memories, centerId) {
-  const pool = (memories || []).filter((m) => compact(m.id));
-  if (!pool.length) return null;
-  let center = centerId ? pool.find((m) => m.id === centerId) : null;
-  if (!center) {
-    center = pool.slice().sort((a, b) => {
-      const diff = Number(b.importance || 0) - Number(a.importance || 0);
-      if (Math.abs(diff) > 0.0001) return diff;
-      return memoryTimestamp(b) - memoryTimestamp(a);
-    })[0];
-  }
-  const scored = pool
-    .filter((m) => m.id !== center.id)
-    .map((memory) => ({ memory, score: relationScore(center, memory) }))
-    .filter((item) => item.score > 0.08)
-    .sort((a, b) => b.score - a.score || Number(b.memory.importance || 0) - Number(a.memory.importance || 0))
-    .slice(0, 12);
 
-  const nodes = scored.map((item, index) => {
-    const tier = item.score >= 0.62 ? 0 : item.score >= 0.36 ? 1 : 2;
-    const count = scored.filter((s, i) => (s.score >= 0.62 ? 0 : s.score >= 0.36 ? 1 : 2) === tier).length;
-    return {
-      id: item.memory.id,
-      memory: item.memory,
-      score: item.score,
-      tier,
-      color: satelliteColor(item.memory),
-      angle: (index / Math.max(1, scored.length)) * Math.PI * 2 + tier * 0.7,
-      size: 4.4 + Number(item.memory.importance || 0) * 5.2 + item.score * 2.4,
-      slotIndex: index,
-      tierCount: count,
-    };
-  });
-  return { center, nodes, pool };
-}
-
-function easeInOutCubic(t) {
-  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
-}
-
-class GalaxyView {
-  constructor(canvas) {
-    this.canvas = canvas;
-    this.ctx = canvas.getContext("2d");
-    this.dpr = Math.min(2, window.devicePixelRatio || 1);
-    this.w = 0;
-    this.h = 0;
-    this.galaxy = null;
-    this.pending = null;
-    this.transition = null;
-    this.hoverId = "";
-    this.paused = false;
-    this.destroyed = false;
-    this.starfield = [];
-    this.lastFrame = 0;
-    this.tip = null;
-    this.onSelect = null;
-    this.onHover = null;
-    this.resize();
-    this.bindEvents();
-    this.loop = this.loop.bind(this);
-    requestAnimationFrame(this.loop);
-  }
-
-  destroy() {
-    this.destroyed = true;
-    window.removeEventListener("resize", this.resizeHandler);
-    this.canvas.removeEventListener("mousemove", this.moveHandler);
-    this.canvas.removeEventListener("mouseleave", this.leaveHandler);
-    this.canvas.removeEventListener("click", this.clickHandler);
-  }
-
-  resize() {
-    const rect = this.canvas.getBoundingClientRect();
-    this.w = Math.max(320, Math.round(rect.width));
-    this.h = Math.max(320, Math.round(rect.height || 620));
-    this.canvas.width = Math.round(this.w * this.dpr);
-    this.canvas.height = Math.round(this.h * this.dpr);
-    this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    this.buildStarfield();
-  }
-
-  buildStarfield() {
-    const count = Math.round((this.w * this.h) / 5200);
-    const stars = [];
-    let seed = 20260829;
-    const rand = () => {
-      seed = (seed * 1664525 + 1013904223) % 4294967296;
-      return seed / 4294967296;
-    };
-    for (let i = 0; i < count; i += 1) {
-      stars.push({
-        x: rand() * this.w,
-        y: rand() * this.h,
-        r: 0.35 + rand() * 0.95,
-        a: 0.12 + rand() * 0.42,
-        tw: rand() * Math.PI * 2,
-      });
-    }
-    this.starfield = stars;
-  }
-
-  bindEvents() {
-    this.resizeHandler = () => this.resize();
-    window.addEventListener("resize", this.resizeHandler);
-
-    this.moveHandler = (event) => {
-      const rect = this.canvas.getBoundingClientRect();
-      const mx = event.clientX - rect.left;
-      const my = event.clientY - rect.top;
-      const found = this.hitTest(mx, my);
-      const id = found ? found.id : "";
-      if (id !== this.hoverId) {
-        this.hoverId = id;
-        this.canvas.style.cursor = id ? "pointer" : "default";
-        if (this.onHover) this.onHover(found ? found.node : null, mx, my);
-      } else if (id && this.onHover) {
-        this.onHover(found.node, mx, my);
-      }
-    };
-    this.leaveHandler = () => {
-      this.hoverId = "";
-      this.canvas.style.cursor = "default";
-      if (this.onHover) this.onHover(null, 0, 0);
-    };
-    this.clickHandler = (event) => {
-      const rect = this.canvas.getBoundingClientRect();
-      const found = this.hitTest(event.clientX - rect.left, event.clientY - rect.top);
-      if (found && this.onSelect) this.onSelect(found.node);
-    };
-    this.canvas.addEventListener("mousemove", this.moveHandler);
-    this.canvas.addEventListener("mouseleave", this.leaveHandler);
-    this.canvas.addEventListener("click", this.clickHandler);
-  }
-
-  setGalaxy(galaxy) {
-    if (!galaxy) return;
-    if (!this.galaxy || !this.galaxy.center || galaxy.center.id === this.galaxy.center.id) {
-      const keepAngles = {};
-      if (this.galaxy) this.galaxy.nodes.forEach((node) => (keepAngles[node.id] = node.angle));
-      galaxy.nodes.forEach((node) => {
-        if (keepAngles[node.id] !== undefined) node.angle = keepAngles[node.id];
-        node.born = 1;
-      });
-      this.galaxy = galaxy;
-      return;
-    }
-    const outgoing = this.galaxy;
-    const incoming = galaxy;
-    const clicked = outgoing.nodes.find((node) => node.id === galaxy.center.id);
-    incoming.nodes.forEach((node) => {
-      node.born = 0;
-    });
-    this.transition = {
-      t: 0,
-      outgoing,
-      incoming,
-      clicked: clicked || null,
-      startX: clicked ? this.nodeX(clicked) : this.w / 2,
-      startY: clicked ? this.nodeY(clicked) : this.h / 2,
-      startSize: clicked ? clicked.size : 6,
-      startColor: clicked ? clicked.color : "#a99bff",
-    };
-  }
-
-  cx() {
-    return this.w / 2;
-  }
-  cy() {
-    return this.h / 2 - 6;
-  }
-  orbitRadius(tier) {
-    const base = Math.min(this.w, this.h) * 0.5;
-    return base * ORBIT_TIERS[tier].ratio;
-  }
-  nodeX(node) {
-    const r = this.orbitRadius(node.tier);
-    return this.cx() + Math.cos(node.angle) * r;
-  }
-  nodeY(node) {
-    const r = this.orbitRadius(node.tier);
-    return this.cy() + Math.sin(node.angle) * r * 0.7;
-  }
-  depthOf(angle) {
-    return (Math.sin(angle) + 1) / 2;
-  }
-
-  hitTest(mx, my) {
-    if (!this.galaxy) return null;
-    const nodes = this.galaxy.nodes;
-    for (let i = nodes.length - 1; i >= 0; i -= 1) {
-      const node = nodes[i];
-      if (node.born < 0.4) continue;
-      const x = this.nodeX(node);
-      const y = this.nodeY(node);
-      const r = Math.max(11, node.size + 7);
-      if ((mx - x) ** 2 + (my - y) ** 2 <= r * r) return { id: node.id, node };
-    }
-    const cx = this.cx();
-    const cy = this.cy();
-    if ((mx - cx) ** 2 + (my - cy) ** 2 <= 26 * 26) return null;
-    return null;
-  }
-
-  loop(now) {
-    if (this.destroyed) return;
-    const dt = this.lastFrame ? Math.min(64, now - this.lastFrame) : 16;
-    this.lastFrame = now;
-    this.step(dt);
-    this.draw(now);
-    requestAnimationFrame(this.loop);
-  }
-
-  step(dt) {
-    if (this.transition) {
-      this.transition.t = Math.min(1, this.transition.t + dt / 1050);
-      const e = easeInOutCubic(this.transition.t);
-      this.transition.incoming.nodes.forEach((node, index) => {
-        const delay = clamp((index / Math.max(1, this.transition.incoming.nodes.length)) * 0.5, 0, 0.5);
-        node.born = clamp((e - delay) / (1 - delay), 0, 1);
-      });
-      if (this.transition.t >= 1) {
-        this.transition.incoming.nodes.forEach((node) => (node.born = 1));
-        this.galaxy = this.transition.incoming;
-        this.transition = null;
-        this.hoverId = "";
-      }
-      return;
-    }
-    if (this.paused || this.userPaused || !this.galaxy) return;
-    const seconds = dt / 1000;
-    this.galaxy.nodes.forEach((node) => {
-      const dir = node.tier % 2 === 0 ? 1 : -1;
-      node.angle += ((ORBIT_TIERS[node.tier].speed * Math.PI) / 180) * seconds * dir;
-      if (node.angle > Math.PI * 4) node.angle -= Math.PI * 4;
-      if (node.angle < -Math.PI * 4) node.angle += Math.PI * 4;
-    });
-  }
-
-  draw(now) {
-    const ctx = this.ctx;
-    const isDark = document.documentElement.dataset.theme !== "light";
-    ctx.clearRect(0, 0, this.w, this.h);
-
-    const bg = ctx.createLinearGradient(0, 0, 0, this.h);
-    if (isDark) {
-      bg.addColorStop(0, "#05070d");
-      bg.addColorStop(0.55, "#080b14");
-      bg.addColorStop(1, "#05070d");
-    } else {
-      bg.addColorStop(0, "#eef2f9");
-      bg.addColorStop(0.55, "#e6ecf7");
-      bg.addColorStop(1, "#eef2f9");
-    }
-    ctx.fillStyle = bg;
-    ctx.fillRect(0, 0, this.w, this.h);
-
-    this.drawStarfield(now, isDark);
-    this.drawDisk(isDark);
-    this.drawOrbits(isDark);
-    this.drawTransition(now, isDark);
-    if (!this.transition) this.drawSystem(this.galaxy, now, isDark);
-  }
-
-  drawStarfield(now, isDark) {
-    const ctx = this.ctx;
-    const time = now / 1000;
-    this.starfield.forEach((star) => {
-      const tw = 0.65 + 0.35 * Math.sin(time * 0.7 + star.tw);
-      ctx.globalAlpha = star.a * tw;
-      ctx.fillStyle = isDark ? "#dfe6f5" : "#7d8aa5";
-      ctx.beginPath();
-      ctx.arc(star.x, star.y, star.r, 0, Math.PI * 2);
-      ctx.fill();
-    });
-    ctx.globalAlpha = 1;
-  }
-
-  drawDisk(isDark) {
-    const ctx = this.ctx;
-    const r = this.orbitRadius(2) * 1.16;
-    const gradient = ctx.createRadialGradient(this.cx(), this.cy(), r * 0.06, this.cx(), this.cy(), r);
-    if (isDark) {
-      gradient.addColorStop(0, "rgba(124,108,240,0.16)");
-      gradient.addColorStop(0.42, "rgba(90,110,200,0.07)");
-      gradient.addColorStop(1, "rgba(10,14,26,0)");
-    } else {
-      gradient.addColorStop(0, "rgba(124,108,240,0.14)");
-      gradient.addColorStop(0.45, "rgba(120,140,210,0.07)");
-      gradient.addColorStop(1, "rgba(230,236,247,0)");
-    }
-    ctx.save();
-    ctx.translate(this.cx(), this.cy());
-    ctx.scale(1, 0.7);
-    ctx.beginPath();
-    ctx.arc(0, 0, r, 0, Math.PI * 2);
-    ctx.fillStyle = gradient;
-    ctx.fill();
-    ctx.restore();
-  }
-
-  drawOrbits(isDark) {
-    const ctx = this.ctx;
-    ORBIT_TIERS.forEach((tier, index) => {
-      const rx = this.orbitRadius(index);
-      const ry = rx * 0.7;
-      ctx.save();
-      ctx.translate(this.cx(), this.cy());
-      ctx.beginPath();
-      ctx.ellipse(0, 0, rx, ry, 0, 0, Math.PI * 2);
-      ctx.strokeStyle = isDark ? "rgba(255,255,255,0.055)" : "rgba(16,24,40,0.07)";
-      ctx.lineWidth = 1;
-      ctx.stroke();
-
-      ctx.beginPath();
-      ctx.ellipse(0, 0, rx, ry, 0, 0, Math.PI);
-      ctx.strokeStyle = isDark ? "rgba(255,255,255,0.13)" : "rgba(16,24,40,0.14)";
-      ctx.lineWidth = 1.1;
-      ctx.stroke();
-      ctx.restore();
-    });
-  }
-
-  drawSystem(galaxy, now, isDark) {
-    if (!galaxy) return;
-    this.drawCenter(galaxy.center, this.cx(), this.cy(), 1, 1, isDark, now);
-    const sorted = galaxy.nodes.slice().sort((a, b) => Math.sin(a.angle) - Math.sin(b.angle));
-    sorted.forEach((node) => {
-      const born = node.born === undefined ? 1 : node.born;
-      if (born <= 0.01) return;
-      this.drawSatellite(node, born, isDark, now);
-    });
-  }
-
-  drawTransition(now, isDark) {
-    const tr = this.transition;
-    if (!tr) return;
-    const e = easeInOutCubic(tr.t);
-
-    tr.outgoing.nodes.forEach((node) => {
-      if (tr.clicked && node.id === tr.clicked.id) return;
-      const fade = 1 - clamp(tr.t / 0.55, 0, 1);
-      const born = clamp(1 - fade * 0.92, 0.08, 1);
-      this.drawSatellite(node, born, isDark, now, 1 - fade * 0.9);
-    });
-
-    const oldCenterFade = 1 - clamp(tr.t / 0.5, 0, 1);
-    if (oldCenterFade > 0.01) {
-      this.drawCenter(tr.outgoing.center, this.cx(), this.cy(), 1 - e * 0.45, oldCenterFade, isDark, now);
-    }
-
-    if (tr.clicked) {
-      const x = tr.startX + (this.cx() - tr.startX) * e;
-      const y = tr.startY + (this.cy() - tr.startY) * e;
-      const scale = 1 + e * 1.5;
-      ctx_save(this.ctx);
-      this.drawMoving(x, y, tr.startSize * scale, tr.startColor, isDark);
-      ctx_restore(this.ctx);
-    }
-
-    if (e > 0.45) {
-      const appear = clamp((e - 0.45) / 0.55, 0, 1);
-      this.drawCenter(tr.incoming.center, this.cx(), this.cy(), 0.6 + appear * 0.4, appear, isDark, now);
-    }
-
-    tr.incoming.nodes.forEach((node) => {
-      if (node.born <= 0.01) return;
-      this.drawSatellite(node, node.born, isDark, now);
-    });
-  }
-
-  drawMoving(x, y, size, color, isDark) {
-    const ctx = this.ctx;
-    const glow = ctx.createRadialGradient(x, y, 0, x, y, size * 4.2);
-    glow.addColorStop(0, hexAlpha(color, 0.5));
-    glow.addColorStop(0.45, hexAlpha(color, 0.16));
-    glow.addColorStop(1, hexAlpha(color, 0));
-    ctx.fillStyle = glow;
-    ctx.beginPath();
-    ctx.arc(x, y, size * 4.2, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.fillStyle = color;
-    ctx.beginPath();
-    ctx.arc(x, y, size, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.fillStyle = isDark ? "rgba(255,255,255,0.9)" : "rgba(255,255,255,0.85)";
-    ctx.beginPath();
-    ctx.arc(x - size * 0.26, y - size * 0.3, size * 0.3, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  drawCenter(memory, x, y, scale, alpha, isDark, now) {
-    const ctx = this.ctx;
-    if (!memory) return;
-    const pulse = 1 + Math.sin(now / 1400) * 0.045;
-    const base = 13 * scale * pulse;
-    const color = satelliteColor(memory);
-
-    const halo = ctx.createRadialGradient(x, y, 0, x, y, base * 6);
-    halo.addColorStop(0, hexAlpha(color, 0.34 * alpha));
-    halo.addColorStop(0.3, hexAlpha(color, 0.13 * alpha));
-    halo.addColorStop(1, hexAlpha(color, 0));
-    ctx.fillStyle = halo;
-    ctx.beginPath();
-    ctx.arc(x, y, base * 6, 0, Math.PI * 2);
-    ctx.fill();
-
-    const core = ctx.createRadialGradient(x - base * 0.3, y - base * 0.34, base * 0.1, x, y, base);
-    core.addColorStop(0, hexAlpha("#ffffff", 0.98 * alpha));
-    core.addColorStop(0.42, hexAlpha(color, 0.95 * alpha));
-    core.addColorStop(1, hexAlpha(color, 0.6 * alpha));
-    ctx.fillStyle = core;
-    ctx.beginPath();
-    ctx.arc(x, y, base, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.strokeStyle = hexAlpha(color, 0.5 * alpha);
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.arc(x, y, base * 1.72, 0, Math.PI * 2);
-    ctx.stroke();
-
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    ctx.fillStyle = isDark ? "rgba(242,245,250,0.9)" : "rgba(16,19,25,0.86)";
-    ctx.font = '600 11px "Sarasa Gothic SC", "PingFang SC", system-ui, sans-serif';
-    ctx.textAlign = "center";
-    ctx.fillText(clip(memoryTitle(memory), 20), x, y + base * 1.72 + 16);
-    ctx.font = '400 10px "JetBrains Mono", monospace';
-    ctx.fillStyle = isDark ? "rgba(152,163,184,0.72)" : "rgba(85,96,122,0.78)";
-    ctx.fillText(
-      (TYPE_LABEL[compact(memory.memory_type)] || compact(memory.memory_type) || "记忆") +
-        " · 重要 " + num(memory.importance),
-      x,
-      y + base * 1.72 + 30
-    );
-    ctx.restore();
-  }
-
-  drawSatellite(node, born, isDark, now, alphaOverride) {
-    const ctx = this.ctx;
-    const rx = this.orbitRadius(node.tier);
-    const ry = rx * 0.7;
-    const x = this.cx() + Math.cos(node.angle) * rx * (0.35 + 0.65 * born);
-    const y = this.cy() + Math.sin(node.angle) * ry * (0.35 + 0.65 * born);
-    const depth = this.depthOf(node.angle);
-    const isHover = this.hoverId === node.id;
-    const sizeScale = (0.74 + depth * 0.4) * (0.5 + 0.5 * born) * (isHover ? 1.42 : 1);
-    const size = Math.max(2, node.size * sizeScale);
-    const alpha = clamp((alphaOverride === undefined ? 0.48 + depth * 0.52 : alphaOverride) * born, 0, 1);
-
-    const dir = node.tier % 2 === 0 ? 1 : -1;
-    const rEff = (rx + ry) / 2;
-    const step = (24 / Math.max(60, rEff)) * dir;
-    const trailScale = [0.5, 0.37, 0.26, 0.17];
-    const trailAlpha = [0.44, 0.3, 0.18, 0.09];
-    for (let i = 0; i < 4; i += 1) {
-      const ta = node.angle - step * (i + 1);
-      const tx = this.cx() + Math.cos(ta) * rx * (0.35 + 0.65 * born);
-      const ty = this.cy() + Math.sin(ta) * ry * (0.35 + 0.65 * born);
-      const tDepth = this.depthOf(ta);
-      ctx.globalAlpha = trailAlpha[i] * born * (0.55 + tDepth * 0.45);
-      ctx.fillStyle = node.color;
-      ctx.beginPath();
-      ctx.arc(tx, ty, Math.max(0.8, size * trailScale[i]), 0, Math.PI * 2);
-      ctx.fill();
-    }
-    ctx.globalAlpha = 1;
-
-    const glowR = size * (isHover ? 5.4 : 3.6);
-    const glow = ctx.createRadialGradient(x, y, 0, x, y, glowR);
-    glow.addColorStop(0, hexAlpha(node.color, (isHover ? 0.55 : 0.34) * alpha));
-    glow.addColorStop(1, hexAlpha(node.color, 0));
-    ctx.fillStyle = glow;
-    ctx.beginPath();
-    ctx.arc(x, y, glowR, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.globalAlpha = alpha;
-    ctx.fillStyle = node.color;
-    ctx.beginPath();
-    ctx.arc(x, y, size, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = hexAlpha("#ffffff", 0.55 * alpha);
-    ctx.beginPath();
-    ctx.arc(x - size * 0.28, y - size * 0.32, size * 0.32, 0, Math.PI * 2);
-    ctx.fill();
-
-    if (isHover || born > 0.85) {
-      ctx.globalAlpha = alpha * (isHover ? 1 : 0.62);
-      ctx.strokeStyle = hexAlpha(node.color, isHover ? 0.9 : 0.4);
-      ctx.lineWidth = isHover ? 1.4 : 1;
-      ctx.beginPath();
-      ctx.arc(x, y, size + (isHover ? 7 : 3.4), 0, Math.PI * 2);
-      ctx.stroke();
-    }
-
-    if (isHover || born > 0.9) {
-      ctx.globalAlpha = alpha;
-      ctx.fillStyle = isDark ? "rgba(242,245,250,0.94)" : "rgba(16,19,25,0.9)";
-      ctx.font = '500 10.5px "Sarasa Gothic SC", "PingFang SC", system-ui, sans-serif';
-      ctx.textAlign = "center";
-      ctx.fillText(clip(memoryTitle(node.memory), 16), x, y + size + 15);
-    }
-    ctx.globalAlpha = 1;
-  }
-}
-
-function ctx_save(ctx) { ctx.save(); }
-function ctx_restore(ctx) { ctx.restore(); }
 
 function hexAlpha(hex, alpha) {
   const value = compact(hex).replace("#", "");
@@ -2593,211 +2728,10 @@ function hexAlpha(hex, alpha) {
   return "rgba(" + r + "," + g + "," + b + "," + clamp(alpha, 0, 1).toFixed(3) + ")";
 }
 
-/* ------------------------------------------------------------
-   知识星图视图
-   ------------------------------------------------------------ */
-let galaxyInstance = null;
 
-defineView("starmap", {
-  title: "知识星图",
-  navLabel: "知识星图",
-  eyebrow: "Insight · Star Map",
-  hint: "选中的记忆是中央恒星，关联记忆按强度落在内 / 中 / 外三条星轨上；点击卫星即可升为新的恒星",
-  async load(options) {
-    const opts = options || {};
-    const pool = await loadPool();
-    const centerId = opts.center || (state.starmap && state.starmap.centerId) || "";
-    const galaxy = buildGalaxy(pool, centerId);
-    return { galaxy, poolSize: pool.length };
-  },
-  render(data) {
-    const galaxy = data.galaxy;
-    if (!galaxy) {
-      return emptyState("记忆库还是空的", "先产生一些记忆，星图才有可以围绕的恒星。");
-    }
-    const legend = ORBIT_TIERS.map(
-      (tier) =>
-        '<span class="legend-item" style="color:' + tier.color + '"><i></i><span style="color:var(--text-3)">' + esc(tier.label) + "</span></span>"
-    ).join("");
 
-    return (
-      '<div class="starmap-wrap">' +
-        '<div class="starmap-card" id="starmapCard">' +
-          '<div class="starmap-hud"><span class="hud-title">知识星图</span>' +
-            '<span class="hud-sub">' + fmtInt(data.poolSize) + " 条记忆参与关联计算 · 悬停暂停公转</span></div>" +
-          '<div class="starmap-tools">' +
-            '<button class="pill" type="button" id="starPauseBtn">暂停公转</button>' +
-            '<button class="pill" type="button" id="starReseedBtn">换一颗恒星</button>' +
-          "</div>" +
-          '<canvas class="starmap-canvas" id="starmapCanvas"></canvas>' +
-          '<div class="starmap-tip" id="starmapTip"></div>' +
-          '<div class="star-legend">' + legend + "</div>" +
-        "</div>" +
-        '<div class="star-panel" id="starPanel">' + starPanelHtml(galaxy) + "</div>" +
-      "</div>"
-    );
-  },
-  mount(node, data) {
-    const canvas = $("#starmapCanvas", node);
-    if (!canvas) return;
-    if (galaxyInstance) galaxyInstance.destroy();
-    galaxyInstance = new GalaxyView(canvas);
-    galaxyInstance.setGalaxy(data.galaxy);
-    state.starmap = { centerId: data.galaxy.center.id };
 
-    const tip = $("#starmapTip", node);
 
-    galaxyInstance.onHover = (hoverNode, mx, my) => {
-      galaxyInstance.paused = Boolean(hoverNode);
-      if (!hoverNode) {
-        tip.classList.remove("is-on");
-        return;
-      }
-      const memory = hoverNode.memory;
-      const weights = memory.persona_weights && typeof memory.persona_weights === "object" ? memory.persona_weights : {};
-      const weightKeys = Object.keys(weights).slice(0, 4);
-      tip.innerHTML =
-        '<div class="tip-head">' +
-          badge(typeLabel(memory), toneOfColor(hoverNode.color)) +
-          badge("关联 " + num(hoverNode.score), "accent") +
-        "</div>" +
-        '<div class="tip-body">' + esc(clip(memoryTitle(memory), 62)) + "</div>" +
-        (weightKeys.length
-          ? '<div class="tip-weights">' + weightKeys.map((key) => badge((WEIGHT_LABEL[key] || key) + " " + num(weights[key]), "accent")).join("") + "</div>"
-          : "") +
-        '<div class="tip-hint">悬停暂停公转 · 点击升为恒星</div>';
-      tip.style.left = clamp(mx, 130, galaxyInstance.w - 130) + "px";
-      tip.style.top = my + "px";
-      tip.classList.add("is-on");
-    };
-
-    galaxyInstance.onSelect = (selectedNode) => {
-      if (!selectedNode) return;
-      tip.classList.remove("is-on");
-      go("starmap", { center: selectedNode.id });
-    };
-
-    const pauseBtn = $("#starPauseBtn", node);
-    if (pauseBtn) {
-      pauseBtn.addEventListener("click", () => {
-        galaxyInstance.userPaused = !galaxyInstance.userPaused;
-        if (galaxyInstance.userPaused) galaxyInstance.paused = true;
-        pauseBtn.classList.toggle("is-active", galaxyInstance.userPaused);
-        pauseBtn.textContent = galaxyInstance.userPaused ? "继续公转" : "暂停公转";
-      });
-    }
-    const reseedBtn = $("#starReseedBtn", node);
-    if (reseedBtn) {
-      reseedBtn.addEventListener("click", () => {
-        const pool = state.pool || [];
-        if (!pool.length) return;
-        const current = state.starmap ? state.starmap.centerId : "";
-        const ranked = pool.slice().sort((a, b) => Number(b.importance || 0) - Number(a.importance || 0));
-        const next = ranked.find((m) => m.id !== current && m.id !== (data.galaxy.center && data.galaxy.center.id));
-        if (next) go("starmap", { center: next.id });
-      });
-    }
-
-    $$("[data-star-open]", node).forEach((button) => {
-      button.addEventListener("click", () => openMemory(button.dataset.starOpen));
-    });
-  },
-});
-
-function toneOfColor(color) {
-  const map = {
-    "#f472b6": "relation",
-    "#60a5fa": "fact",
-    "#2dd4bf": "group",
-    "#fb923c": "personal",
-    "#fcd34d": "gold",
-    "#7dd3fc": "external",
-    "#a99bff": "private",
-  };
-  return map[color] || "accent";
-}
-
-function starPanelHtml(galaxy) {
-  const center = galaxy.center;
-  const weights = center.persona_weights && typeof center.persona_weights === "object" ? center.persona_weights : {};
-  const weightKeys = Object.keys(weights).filter((key) => Number.isFinite(Number(weights[key])));
-  const tags = Array.isArray(center.tags) ? center.tags : [];
-
-  const paramRows = [
-    ["记忆 ID", shortId(center.id)],
-    ["类型", typeLabel(center) + "（" + compact(center.memory_type) + "）"],
-    ["范围", (SCOPE_META[compact(center.scope)] ? SCOPE_META[compact(center.scope)].label : compact(center.scope)) || "-"],
-    ["主体", compact(center.subject && center.subject.name) || "-"],
-    ["重要性", num(center.importance)],
-    ["置信度", num(center.confidence)],
-    ["显著性", num(center.salience)],
-    ["强化分", num(center.reinforcement_score)],
-    ["注入次数", String(int(center.injection_count))],
-    ["最近注入", compact(center.last_injected_at) ? fmtTime(center.last_injected_at) : "从未"],
-    ["可见性", VISIBILITY_LABEL[compact(center.visibility)] || compact(center.visibility) || "-"],
-    ["生命周期", LIFECYCLE_LABEL[compact(center.lifecycle)] || compact(center.lifecycle) || "-"],
-    ["时效", VALIDITY_LABEL[compact(center.validity_status)] || compact(center.validity_status) || "-"],
-    ["持久度", DURABILITY_LABEL[compact(center.durability)] || compact(center.durability) || "-"],
-    ["敏感度", SENSITIVITY_LABEL[compact(center.sensitivity)] || compact(center.sensitivity) || "-"],
-    ["现实层级", REALITY_LABEL[compact(center.reality_level)] || compact(center.reality_level) || "-"],
-    ["可提及分", center.mentionability_score === null || center.mentionability_score === undefined ? "-" : num(center.mentionability_score)],
-    ["关系阶段", compact(center.relationship_phase) || "-"],
-    ["来源插件", compact(center.source_plugin) || "本插件"],
-    ["导入批次", compact(center.import_batch_id) || "-"],
-    ["会话", compact(center.session_id) || "-"],
-    ["发生时间", compact(center.occurred_at_local) || fmtTime(center.occurred_at)],
-    ["更新时间", compact(center.updated_at_local) || fmtTime(center.updated_at)],
-  ]
-    .map((row) => '<div class="param-row"><span>' + esc(row[0]) + "</span><div>" + esc(row[1]) + "</div></div>")
-    .join("");
-
-  const orbitRows = ORBIT_TIERS.map((tier, index) => {
-    const nodes = galaxy.nodes.filter((node) => node.tier === index);
-    return (
-      '<div style="margin-bottom:4px"><div class="orbit-row" style="cursor:default;background:transparent;padding:4px 2px">' +
-      '<i style="background:' + tier.color + '"></i><b style="color:var(--text-2)">' + esc(tier.label) + "</b>" +
-      "<span>" + nodes.length + " 颗卫星</span></div>" +
-      (nodes.length
-        ? '<div style="display:grid;gap:3px;padding-left:14px">' +
-          nodes
-            .slice(0, 6)
-            .map(
-              (node) =>
-                '<button class="orbit-row" type="button" data-star-open="' + esc(node.id) + '">' +
-                '<i style="background:' + node.color + '"></i>' +
-                "<span>" + esc(clip(memoryTitle(node.memory), 22)) + "</span>" +
-                "<em>" + num(node.score) + "</em></button>"
-            )
-            .join("") +
-          "</div>"
-        : "") +
-      "</div>"
-    );
-  }).join("");
-
-  return (
-    '<section class="star-core">' +
-      '<span class="core-kicker">当前恒星 · 关联 ' + galaxy.nodes.length + " 条</span>" +
-      '<h3 class="core-title">' + esc(clip(memoryTitle(center), 46)) + "</h3>" +
-      '<p class="core-content">' + esc(clip(compact(center.content), 220)) + "</p>" +
-      '<div class="pill-row" style="margin-top:11px;position:relative">' +
-        badge(typeLabel(center), toneOfColor(satelliteColor(center))) +
-        badge("重要 " + num(center.importance), "accent") +
-        '<button class="btn is-sm is-ghost" type="button" data-star-open="' + esc(center.id) + '">完整参数</button>' +
-      "</div>" +
-    "</section>" +
-    card(
-      "选中记忆 · 参数明细",
-      weightKeys.length ? "含 " + weightKeys.length + " 项人格权重" : "基础属性",
-      '<div class="star-params">' + paramRows + "</div>" +
-        (weightKeys.length
-          ? '<div class="tag-row" style="margin-top:10px">' + weightKeys.map((key) => badge((WEIGHT_LABEL[key] || key) + " " + num(weights[key]), "accent")).join("") + "</div>"
-          : "") +
-        (tags.length ? '<div class="tag-row" style="margin-top:8px">' + tags.map((tag) => badge(tag, "fact")).join("") + "</div>" : "")
-    ) +
-    card("星轨构成", "点击任一行查看该记忆", orbitRows || emptyState("暂无关联记忆", "这条记忆与其他记忆没有足够的属性重合。"))
-  );
-}
 
 /* ============================================================
    视图：记忆显微镜
@@ -3271,6 +3205,7 @@ function speakerConfirmHtml(result) {
       '<label class="field"><span>目标 Bot ID</span><input id="impBotId" type="text" placeholder="多 Bot 时必填" value="' + esc(compact(botInfo.bot_id) || compact(botInfo.id)) + '" /></label>' +
       '<label class="field"><span>平台</span><input id="impPlatform" type="text" value="qq" /></label>' +
       '<label class="field"><span>会话 ID</span><input id="impSession" type="text" placeholder="留空自动推断" /></label>' +
+      '<label class="field"><span>关联人物 ID</span><input id="impPersonId" type="text" placeholder="person_...（可留空）" /></label>' +
     "</div>" +
     '<div class="pill-row" style="margin-top:12px">' +
       '<button class="btn is-primary" type="button" id="impStartBtn">开始生成记忆</button>' +
@@ -3419,11 +3354,22 @@ defineView("chatimport", {
           return;
         }
         await withBusy("正在读取历史…", async () => {
-          const result = await apiPost("/conversation-import/qq/preview", payload);
-          importState.preview = result.result || result;
-          toast("预览已生成", "ok");
-          go("chatimport");
-        });
+          try {
+            const result = await apiPost("/conversation-import/qq/preview", payload);
+            const preview = result.result || result;
+            const previewStats = preview && preview.stats && typeof preview.stats === "object" ? preview.stats : {};
+            const messageCount = int(previewStats.message_count ?? previewStats.messages ?? 0);
+            if (!preview || messageCount <= 0) {
+              toast("没读到这个 QQ 号的历史消息：确认号是否填对、时间范围覆盖到聊天、当前连接支持读取历史", "warn");
+              return;
+            }
+            importState.preview = preview;
+            toast("预览已生成：" + messageCount + " 条消息", "ok");
+            go("chatimport");
+          } catch (error) {
+            toast("读取失败：" + (error.message || error), "error");
+          }
+        }, 1200);
       });
     }
 
@@ -3497,6 +3443,7 @@ defineView("chatimport", {
           bot_name: "Bot",
           platform: $("#impPlatform", node).value.trim() || "qq",
           session_id: $("#impSession", node).value.trim(),
+          subject_person_id: $("#impPersonId", node).value.trim(),
         };
         if (!payload.user_id || !payload.bot_id) {
           toast("请填写目标用户 ID 与 Bot ID", "error");
@@ -3544,23 +3491,250 @@ defineView("chatimport", {
    ============================================================ */
 const PRESET_LABELS = { light: "轻量", standard: "标准", companion: "陪伴" };
 let migrateOutput = null;
+let migrateDbShrinkReport = null;
+
+function describeAutoVacuum(mode) {
+  const n = Number(mode);
+  if (n === 2) return "增量回收已开启";
+  if (n === 1) return "全量自动回收";
+  return "未开启增量回收";
+}
+
+function describeVacuumMode(mode) {
+  const text = compact(mode);
+  if (!text || text === "none") return "无须回收";
+  if (text === "incremental_vacuum") return "增量无损回收";
+  if (text === "full_vacuum_incremental_enabled") return "深度压缩（全量 VACUUM）并开启增量回收";
+  if (text.indexOf("disk_usage_unavailable") >= 0) return "无法读取磁盘余量已安全取消深度压缩";
+  if (text.indexOf("insufficient_disk_space") >= 0) return "磁盘剩余空间不足已取消深度压缩";
+  return text;
+}
+
+function renderDbHealthCard(dbHealthRes, shrinkReport) {
+  const actions =
+    '<button class="btn is-sm" type="button" id="dbHealthRefreshBtn">刷新体检</button>' +
+    '<button class="btn is-sm" type="button" id="dbGoPerfBtn">前往性能调优 →</button>';
+
+  if (!dbHealthRes || !dbHealthRes.ok) {
+    const errText = compact(dbHealthRes && dbHealthRes.error) || "无法读取数据库体检信息";
+    const isAdminErr = /admin_required|管理员/i.test(errText);
+    const body =
+      '<div class="db-health-notice">' +
+        '<b>' + esc(isAdminErr ? "需要面板管理员身份" : "暂未获取到体检快照") + "</b>" +
+        "<p>" + esc(isAdminErr ? "请以 AstrBot 面板管理员账号登录后查看数据库体积体检与执行一键瘦身。" : errText) + "</p>" +
+      "</div>";
+    return '<div id="dbHealthCard" class="db-health-wrap">' + card("数据库体检与一键瘦身", "查看主库 / WAL / 副库占用与向量精度分布，无损释放空闲空间", body, actions, "db-health-card") + "</div>";
+  }
+
+  const health = dbHealthRes.health || {};
+  const primary = health.primary || {};
+  const files = primary.files || {};
+  const scoped = health.scoped || {};
+  const emb = primary.embeddings || {};
+  const preflight = primary.disk_preflight || null;
+  const recs = Array.isArray(primary.recommendations) ? primary.recommendations : [];
+  const targetPrecision = compact(primary.vector_precision || health.configured_vector_precision, "float32");
+
+  const kpis =
+    '<div class="db-kpi-grid">' +
+      '<div class="db-kpi">' +
+        '<span class="db-kpi-label">主库总占用</span>' +
+        '<strong class="db-kpi-val">' + esc(fmtBytes(primary.total_bytes)) + "</strong>" +
+        '<span class="db-kpi-sub">主库 ' + esc(fmtBytes(files.db_bytes)) + " · WAL " + esc(fmtBytes(files.wal_bytes)) + "</span>" +
+      "</div>" +
+      '<div class="db-kpi">' +
+        '<span class="db-kpi-label">副库占用</span>' +
+        '<strong class="db-kpi-val">' + esc(fmtBytes(scoped.total_bytes || 0)) + "</strong>" +
+        '<span class="db-kpi-sub">范围状态与操作副库</span>' +
+      "</div>" +
+      '<div class="db-kpi">' +
+        '<span class="db-kpi-label">可回收空闲页</span>' +
+        '<strong class="db-kpi-val">' + esc(fmtBytes(primary.freelist_bytes || 0)) + "</strong>" +
+        '<span class="db-kpi-sub">' + esc(fmtInt(primary.freelist_count || 0)) + " 页 · " + esc(describeAutoVacuum(primary.auto_vacuum)) + "</span>" +
+      "</div>" +
+      '<div class="db-kpi">' +
+        '<span class="db-kpi-label">预计转码可省</span>' +
+        '<strong class="db-kpi-val' + (Number(emb.estimated_transcode_savings_bytes || 0) > 0 ? " is-highlight" : "") + '">' + esc(fmtBytes(emb.estimated_transcode_savings_bytes || 0)) + "</strong>" +
+        '<span class="db-kpi-sub">当前配置精度：' + esc(targetPrecision) + "</span>" +
+      "</div>" +
+    "</div>";
+
+  const totalRows = Math.max(0, int(emb.total_rows));
+  const f64 = Math.max(0, int(emb.float64_rows));
+  const f32 = Math.max(0, int(emb.float32_rows));
+  const f16 = Math.max(0, int(emb.float16_rows));
+  const jsonRows = Math.max(0, int(emb.json_rows));
+  const orphans = Math.max(0, int(emb.archived_orphan_rows));
+  const pct = (n) => (totalRows > 0 ? Math.max(n > 0 ? 2 : 0, Math.round((n / totalRows) * 1000) / 10) : 0);
+
+  const vecBar =
+    '<div class="db-vec-section">' +
+      '<div class="db-vec-head">' +
+        '<span class="db-vec-title">向量存储精度分布（共 ' + esc(fmtInt(totalRows)) + " 条 · 约 " + esc(fmtBytes(emb.vector_bytes || 0)) + "）</span>" +
+        (orphans > 0 ? '<span class="db-vec-orphan">含 ' + esc(fmtInt(orphans)) + " 条已归档/孤儿向量可清理</span>" : '<span class="db-vec-clean">无孤儿向量残留</span>') +
+      "</div>" +
+      '<div class="db-vec-bar" aria-label="向量存储精度占比">' +
+        (totalRows > 0
+          ? (f64 > 0 ? '<i class="seg-f64" style="width:' + pct(f64) + '%" title="float64: ' + f64 + '"></i>' : "") +
+            (f32 > 0 ? '<i class="seg-f32" style="width:' + pct(f32) + '%" title="float32: ' + f32 + '"></i>' : "") +
+            (f16 > 0 ? '<i class="seg-f16" style="width:' + pct(f16) + '%" title="float16: ' + f16 + '"></i>' : "") +
+            (jsonRows > 0 ? '<i class="seg-json" style="width:' + pct(jsonRows) + '%" title="JSON: ' + jsonRows + '"></i>' : "")
+          : '<i class="seg-empty" style="width:100%"></i>') +
+      "</div>" +
+      '<div class="db-vec-legend">' +
+        '<span><em class="dot-f64"></em>旧版 float64：' + esc(fmtInt(f64)) + "</span>" +
+        '<span><em class="dot-f32"></em>标准 float32：' + esc(fmtInt(f32)) + "</span>" +
+        '<span><em class="dot-f16"></em>半精度 float16：' + esc(fmtInt(f16)) + "</span>" +
+        '<span><em class="dot-json"></em>旧 JSON：' + esc(fmtInt(jsonRows)) + "</span>" +
+      "</div>" +
+    "</div>";
+
+  const recHtml = recs.length
+    ? '<ul class="db-rec-list">' + recs.map((item) => "<li>" + esc(item) + "</li>").join("") + "</ul>"
+    : '<div class="db-rec-ok">数据库体积与索引状态健康，当前无需强制整理。</div>';
+
+  const scopedPreflight = scoped.disk_preflight || null;
+  let preflightHtml = "";
+  if (preflight && preflight.ok === false) {
+    preflightHtml =
+      '<div class="db-preflight-warn">' +
+        "<b>深度压缩空间预检未通过</b>" +
+        "<span>" + esc(preflight.message || "磁盘剩余空间不足 2.2 倍主库大小 + 64 MiB 或无法读取余量，已安全阻断全量 VACUUM。") + "</span>" +
+      "</div>";
+  } else if (scopedPreflight && scopedPreflight.ok === false) {
+    preflightHtml =
+      '<div class="db-preflight-warn">' +
+        "<b>副库深度压缩空间预检未通过</b>" +
+        "<span>" + esc(scopedPreflight.message || "副库磁盘剩余空间不足 2.2 倍副库大小 + 64 MiB 或无法读取余量，已安全阻断副库全量 VACUUM。") + "</span>" +
+      "</div>";
+  } else if (preflight && preflight.available_free_bytes != null) {
+    preflightHtml =
+      '<div class="db-preflight-ok">' +
+        "磁盘当前剩余约 " + esc(fmtBytes(preflight.available_free_bytes)) +
+        "（满足深度压缩 2.2× 安全门槛 " + esc(fmtBytes(preflight.required_free_bytes)) + "）" +
+      "</div>";
+  }
+
+  let reportHtml = "";
+  if (shrinkReport && shrinkReport.ok) {
+    const pRes = shrinkReport.primary || {};
+    const tc = pRes.transcode || {};
+    reportHtml =
+      '<div class="db-shrink-report">' +
+        '<b>最近一次瘦身结果：' + esc(fmtBytes(pRes.before_bytes)) + " → " + esc(fmtBytes(pRes.after_bytes)) +
+        "（释放 " + esc(fmtBytes(pRes.bytes_reclaimed)) + "）</b>" +
+        "<span>转码向量 " + esc(fmtInt(tc.transcoded || 0)) + " 条 · 清理已归档/无主向量索引 " + esc(fmtInt(tc.purged_orphans || 0)) +
+        " 条 · 回收方式：" + esc(describeVacuumMode(pRes.vacuum_mode)) + "</span>" +
+        (shrinkReport.notice ? '<span class="db-shrink-notice">' + esc(shrinkReport.notice) + "</span>" : "") +
+      "</div>";
+  }
+
+  const actionBar =
+    '<div class="db-action-bar">' +
+      '<div class="db-action-btns">' +
+        '<button class="btn is-primary" type="button" id="dbShrinkRegularBtn">一键常规无损瘦身（推荐）</button>' +
+        '<button class="btn is-warn-outline" type="button" id="dbShrinkFullBtn">深度整理压缩（全量 VACUUM）</button>' +
+      "</div>" +
+      '<div class="db-action-hint">常规瘦身在线执行不卡聊天：仅整理向量存储、清理已归档/无主向量索引与超期内部回执，绝不删除任何记忆、聊天原文、人物关系或配置；深度压缩会重建主库文件彻底归还硬盘空间（同样绝不删除任何业务数据），期间写入短暂暂停数秒。</div>' +
+    "</div>";
+
+  return (
+    '<div id="dbHealthCard" class="db-health-wrap">' +
+    card(
+      "数据库体检与一键瘦身",
+      "实时查看主库、WAL、副库占用与向量精度分布，一键安全释放冗余体积",
+      kpis + vecBar + recHtml + preflightHtml + reportHtml + actionBar,
+      actions,
+      "db-health-card"
+    ) +
+    "</div>"
+  );
+}
+
+function fetchDbHealthSnapshot() {
+  return apiGet("/maintenance/db_health")
+    .then((res) => ({ ok: true, health: (res && res.health) || res || null }))
+    .catch((err) => ({ ok: false, error: (err && err.message) || "数据库体检读取失败" }));
+}
+
+function renderMigrateOutputContent(output) {
+  return output
+    ? '<pre style="margin:0;font-size:11.5px;line-height:1.6;color:var(--text-2);white-space:pre-wrap;word-break:break-all">' + esc(jsonPreview(output)) + "</pre>"
+    : emptyState("还没有输出", "执行任一操作后，结果会显示在这里。");
+}
+
+async function copyTextValue(text) {
+  const value = String(text || "").trim();
+  if (!value) return false;
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch (_) {
+      // Fallback to execCommand below for insecure contexts / embedded WebViews.
+    }
+  }
+  try {
+    const area = document.createElement("textarea");
+    area.value = value;
+    area.setAttribute("readonly", "readonly");
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    const ok = document.execCommand && document.execCommand("copy");
+    document.body.removeChild(area);
+    return !!ok;
+  } catch (_) {
+    return false;
+  }
+}
+
+function renderAllowedPathHint(label, dirPath) {
+  const cleanPath = compact(dirPath);
+  if (!cleanPath) return "";
+  return (
+    '<div class="allowed-path-hint">' +
+    '<span class="allowed-path-hint-text">' +
+    esc(label) +
+    '：<code class="allowed-path-hint-code">' +
+    esc(cleanPath) +
+    "</code></span>" +
+    '<button class="btn is-sm allowed-path-hint-btn" type="button" data-copy-path="' +
+    esc(cleanPath) +
+    '">复制路径</button>' +
+    "</div>"
+  );
+}
 
 defineView("migrate", {
   title: "维护与迁移",
   navLabel: "维护与迁移",
   eyebrow: "Import · Maintenance",
-  hint: "运行预设、运维诊断、可移植数据、LivingMemory 迁移与可回滚审计",
+  hint: "数据库体检瘦身、功能预设、运维诊断、可移植数据、LivingMemory 迁移与可回滚审计",
   async load() {
-    const preset = await apiTry(() => apiGet("/operations/preset"), { preset: {} });
-    return { preset: preset.preset || {}, output: migrateOutput };
+    const [preset, dbHealth] = await Promise.all([
+      apiTry(() => apiGet("/operations/preset"), { preset: {}, allowed_import_roots: {} }),
+      fetchDbHealthSnapshot(),
+    ]);
+    return {
+      preset: preset.preset || {},
+      dbHealth,
+      dbShrinkReport: migrateDbShrinkReport,
+      allowedRoots: preset.allowed_import_roots || {},
+      output: migrateOutput,
+    };
   },
   render(data) {
     const preset = data.preset || {};
+    const allowedRoots = data.allowedRoots || {};
     const current = compact(preset.preset) || compact(preset.current) || "-";
 
+    const dbHealthCard = renderDbHealthCard(data.dbHealth, data.dbShrinkReport);
+
     const presets =
-      '<div class="tool-block"><b>1. 运行预设</b>' +
-      "<p>轻量关闭外部检索调用；标准平衡功能与成本；陪伴提高关系与连续性记忆预算。已有 Provider 选择不会被覆盖。</p>" +
+      '<div class="tool-block"><b>1. 功能预设（轻量 / 标准 / 陪伴）</b>' +
+      "<p>控制「记多少、用哪些能力」：轻量关闭外部检索调用；标准平衡功能与成本；陪伴提高关系与连续性记忆预算。与「设置 → 性能调优」互不冲突，已有 Provider 选择不会被覆盖。</p>" +
       '<div class="tool-actions">' +
       Object.keys(PRESET_LABELS)
         .map((key) => '<button class="btn is-sm' + (current === key ? " is-primary" : "") + '" type="button" data-preset="' + key + '">' + PRESET_LABELS[key] + "</button>")
@@ -3578,8 +3752,12 @@ defineView("migrate", {
       {
         title: "3. 可移植数据",
         desc: "仅用于本插件导出的 UTF-8 JSONL，包含记忆、身份、关系、时间线与 ACL。",
+        pathHint: renderAllowedPathHint(
+          "当前允许存放目录",
+          allowedRoots.portable_export_dir || allowedRoots.memory_data_dir
+        ),
         input: "portablePath",
-        placeholder: "导入时填写 JSONL 路径；导出无需填写",
+        placeholder: "导入时填写允许目录内的 JSONL 路径；导出无需填写",
         actions: [
           ["portableExportBtn", "导出"],
           ["portablePreviewBtn", "预览"],
@@ -3588,9 +3766,13 @@ defineView("migrate", {
       },
       {
         title: "4. LivingMemory 导入",
-        desc: "先预览可导入数量和跳过原因，再执行导入。当前策略只导入完整摘要。",
+        desc: "先预览可导入数量和跳过原因，再执行导入。支持填 .db 文件或所在目录路径，留空自动扫描。",
+        pathHint: renderAllowedPathHint(
+          "当前允许存放目录（plugin_data）",
+          allowedRoots.plugin_data_dir || allowedRoots.memory_data_dir
+        ),
         input: "lmPath",
-        placeholder: "LivingMemory 数据库路径，可留空自动扫描",
+        placeholder: "LivingMemory 数据库文件或目录路径，可留空自动扫描",
         actions: [
           ["lmPreviewBtn", "预览导入"],
           ["lmRunBtn", "执行导入"],
@@ -3600,7 +3782,7 @@ defineView("migrate", {
         title: "5. 内容修复",
         desc: "修复早期导入后只剩旧库编号的记忆。",
         input: "lmRepairPath",
-        placeholder: "LivingMemory 数据库路径，可留空自动扫描",
+        placeholder: "LivingMemory 数据库文件或目录路径，可留空自动扫描",
         actions: [["lmRepairBtn", "修复内容"]],
       },
       {
@@ -3610,9 +3792,9 @@ defineView("migrate", {
       },
       {
         title: "7. 汇总批次释放",
-        desc: "被证据门禁隔离的批次会永远持有其时间线事件，那些原文不会再进入任何后续批次。填批次 ID 后由人工复核决定：重新排队（事件交还，可被新批次消费）或放弃（承认丢失，不再悬空）。",
+        desc: "被证据门禁隔离的批次会永远持有其时间线事件，那些原文不会再进入任何后续批次。填批次 ID 后由人工复核决定：重新排队（事件交还，可被新批次消费）或放弃（永久删除原文，无法通过重新排队恢复）。",
         input: "releaseBatchId",
-        placeholder: "summary_batch_... 批次 ID",
+        placeholder: "sb_... 批次 ID",
         actions: [
           ["releaseRetryBtn", "重新排队"],
           ["releaseDiscardBtn", "放弃并关闭"],
@@ -3648,7 +3830,7 @@ defineView("migrate", {
           : "";
         return (
           '<div class="tool-block"><b>' + esc(tool.title) + "</b><p>" + esc(tool.desc) + "</p>" +
-          input + audits +
+          (tool.pathHint || "") + input + audits +
           '<div class="tool-actions">' +
           (tool.actions || [])
             .map((row) => '<button class="btn is-sm' + (tool.danger ? " is-danger" : "") + '" type="button" id="' + row[0] + '">' + esc(row[1]) + "</button>")
@@ -3659,20 +3841,112 @@ defineView("migrate", {
       .join("");
 
     return (
+      '<div id="dbHealthSlot">' + dbHealthCard + "</div>" +
       '<div class="grid split-2">' +
       card("维护工具", "按顺序执行更稳妥", presets + tools) +
       card(
         "输出",
         "最近一次操作结果",
-        data.output
-          ? '<pre style="margin:0;font-size:11.5px;line-height:1.6;color:var(--text-2);white-space:pre-wrap;word-break:break-all">' + esc(jsonPreview(data.output)) + "</pre>"
-          : emptyState("还没有输出", "执行任一操作后，结果会显示在这里。")
+        '<div id="migrateOutputSlot">' + renderMigrateOutputContent(data.output) + "</div>"
       ) +
       "</div>"
     );
   },
   mount(node) {
-    const run = async (label, fn) => {
+    let dbHealthRefreshBusy = false;
+    const syncMigrateOutputSlot = () => {
+      const outputSlot = $("#migrateOutputSlot", node);
+      if (outputSlot) outputSlot.innerHTML = renderMigrateOutputContent(migrateOutput);
+    };
+
+    const runDbShrink = async (fullVacuum) => {
+      if (fullVacuum) {
+        const confirmed = await showInlineConfirmation(
+          "确认执行深度整理压缩（全量 VACUUM）",
+          "将重写记忆主库并开启增量回收，以彻底归还空闲磁盘空间。仅整理向量存储、清理已归档/无主向量索引与超期内部回执，绝不删除任何记忆、聊天原文、人物关系或配置。执行期间记忆写入会短暂暂停数秒（不影响日常聊天放行），且系统会对主库与副库分别预检磁盘剩余空间 ≥ 2.2 倍库大小 + 64 MiB（无法读取磁盘余量时将自动安全阻断）。确定继续？",
+          "开始深度压缩"
+        );
+        if (!confirmed) return;
+      }
+      const label = fullVacuum ? "深度整理压缩" : "一键常规无损瘦身";
+      await withBusy(label + "中…", async () => {
+        try {
+          const res = await apiPost("/maintenance/db_optimize", { run_full_vacuum: Boolean(fullVacuum) });
+          migrateDbShrinkReport = res;
+          migrateOutput = res;
+          const reclaimed = res && res.primary ? fmtBytes(res.primary.bytes_reclaimed || 0) : "0 B";
+          toast(label + "完成（释放 " + reclaimed + "）", "ok");
+          invalidatePool();
+        } catch (error) {
+          migrateOutput = { error: error.message };
+          toast(label + "失败：" + error.message, "error");
+        }
+        syncMigrateOutputSlot();
+        await refreshDbHealthInPlace({ showToast: false });
+      });
+    };
+
+    const bindDbHealthControls = () => {
+      const slot = $("#dbHealthSlot", node) || node;
+      const refreshHealthBtn = $("#dbHealthRefreshBtn", slot);
+      if (refreshHealthBtn) {
+        refreshHealthBtn.addEventListener("click", () => refreshDbHealthInPlace({ showToast: true }));
+      }
+      const goPerfBtn = $("#dbGoPerfBtn", slot);
+      if (goPerfBtn) {
+        goPerfBtn.addEventListener("click", () => go("performance"));
+      }
+      const shrinkRegularBtn = $("#dbShrinkRegularBtn", slot);
+      if (shrinkRegularBtn) shrinkRegularBtn.addEventListener("click", () => runDbShrink(false));
+      const shrinkFullBtn = $("#dbShrinkFullBtn", slot);
+      if (shrinkFullBtn) shrinkFullBtn.addEventListener("click", () => runDbShrink(true));
+    };
+
+    const refreshDbHealthInPlace = async (opts) => {
+      if (dbHealthRefreshBusy) return;
+      dbHealthRefreshBusy = true;
+      const slot = $("#dbHealthSlot", node);
+      const refreshBtn = $("#dbHealthRefreshBtn", slot || node);
+      const prevBtnText = refreshBtn ? refreshBtn.textContent : "";
+      const activeEl = typeof document !== "undefined" ? document.activeElement : null;
+      const focusedId =
+        activeEl && activeEl.id && slot && typeof slot.contains === "function" && slot.contains(activeEl)
+          ? activeEl.id
+          : "";
+      if (refreshBtn) {
+        refreshBtn.disabled = true;
+        refreshBtn.textContent = "体检刷新中…";
+      }
+      try {
+        const nextHealth = await fetchDbHealthSnapshot();
+        if (node.isConnected === false || state.view !== "migrate") return;
+        if (slot) {
+          slot.innerHTML = renderDbHealthCard(nextHealth, migrateDbShrinkReport);
+          bindDbHealthControls();
+          if (focusedId) {
+            const nextFocused = $("#" + focusedId.replace(/[^a-zA-Z0-9_-]/g, "\\$&"), slot);
+            if (nextFocused && !nextFocused.disabled && typeof nextFocused.focus === "function") {
+              try { nextFocused.focus({ preventScroll: true }); } catch (err) { nextFocused.focus(); }
+            }
+          }
+        }
+        if (opts && opts.showToast) {
+          toast(
+            nextHealth.ok ? "数据库体检已刷新" : ("体检刷新失败：" + (nextHealth.error || "未知错误")),
+            nextHealth.ok ? "ok" : "error"
+          );
+        }
+      } finally {
+        dbHealthRefreshBusy = false;
+        const currentBtn = $("#dbHealthRefreshBtn", slot || node);
+        if (currentBtn && currentBtn === refreshBtn) {
+          currentBtn.disabled = false;
+          currentBtn.textContent = prevBtnText || "刷新体检";
+        }
+      }
+    };
+
+    const run = async (label, fn, runOpts) => {
       await withBusy(label + "…", async () => {
         try {
           migrateOutput = await fn();
@@ -3681,12 +3955,51 @@ defineView("migrate", {
           migrateOutput = { error: error.message };
           toast(label + "失败：" + error.message, "error");
         }
-        go("migrate");
+        syncMigrateOutputSlot();
+        if (runOpts && runOpts.refreshPreset) {
+          const presetRes = await apiTry(() => apiGet("/operations/preset"), null);
+          const activePreset = compact(
+            (presetRes && presetRes.preset && (presetRes.preset.preset || presetRes.preset.current)) ||
+            (migrateOutput && !migrateOutput.error && runOpts.refreshPreset)
+          );
+          if (activePreset) {
+            $$("[data-preset]", node).forEach((btn) => {
+              btn.classList.toggle("is-primary", btn.dataset.preset === activePreset);
+            });
+            const badge = $(".tool-block .badge", node);
+            if (badge) badge.textContent = "当前：" + (PRESET_LABELS[activePreset] || activePreset);
+          }
+        }
+        if (/导入|迁移|修复|维护|清空/.test(label)) {
+          await refreshDbHealthInPlace({ showToast: false });
+        }
       });
     };
 
+    bindDbHealthControls();
+
+    if (state.pendingViewFocus && state.pendingViewFocus.viewId === "migrate") {
+      const targetId = state.pendingViewFocus.target;
+      state.pendingViewFocus = null;
+      const targetEl = targetId ? $("#" + targetId, node) : null;
+      if (targetEl) {
+        requestAnimationFrame(() => {
+          try { targetEl.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "start" }); } catch (err) { /* 忽略 */ }
+          targetEl.classList.add("is-search-hit");
+          window.setTimeout(() => targetEl.classList.remove("is-search-hit"), 2200);
+        });
+      }
+    }
+
     $$("[data-preset]", node).forEach((button) => {
-      button.addEventListener("click", () => run("应用预设", () => apiPost("/operations/preset", { preset: button.dataset.preset })));
+      button.addEventListener("click", () => run("应用预设", () => apiPost("/operations/preset", { preset: button.dataset.preset }), { refreshPreset: button.dataset.preset }));
+    });
+
+    $$("[data-copy-path]", node).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const copied = await copyTextValue(button.dataset.copyPath || "");
+        toast(copied ? "已复制允许目录路径" : "复制失败，请手动选中路径复制", copied ? "ok" : "error");
+      });
     });
 
     const bind = (id, fn, label) => {
@@ -3724,7 +4037,7 @@ defineView("migrate", {
       if (!batchId) throw new Error("请先填写批次 ID");
       const confirmed = await showInlineConfirmation(
         "放弃该批次的事件",
-        "这些原始消息将被标记为已总结，等于承认它们不会进入长期记忆。确定继续？",
+        "这些原始消息将被永久删除，不会进入长期记忆，且无法通过重新排队恢复。确定继续？",
         "放弃"
       );
       if (!confirmed) throw new Error("已取消");
@@ -3747,125 +4060,209 @@ defineView("migrate", {
    ============================================================ */
 const QUARANTINE_PAGE_SIZE = 50;
 let quarantineOffset = 0;
+let queueOffset = 0;
+let processedOffset = 0;
+let quarantineTab = "quarantined";
 
-defineView("quarantine", {
-  title: "待修复批次",
-  navLabel: "待修复批次",
-  eyebrow: "Quarantine · Review",
-  hint: "被隔离的总结批次：原文事件已冻结，需人工复核后重新排队或放弃",
-  async load() {
-    return apiTry(
-      () => apiGet("/maintenance/summary_batches?limit=" + QUARANTINE_PAGE_SIZE + "&offset=" + quarantineOffset),
-      { total: 0, legacy_failures: 0, batches: [] }
-    );
+const BATCH_TAB_META = {
+  quarantined: {
+    title: "待修复批次",
+    eyebrow: "Quarantine · Review",
+    hint: "被隔离的总结批次：原文事件已冻结，需人工复核后重新排队或放弃",
   },
-  render(data) {
-    const total = int(data.total);
-    const legacy = int(data.legacy_failures);
-    const batches = Array.isArray(data.batches) ? data.batches : [];
-    const pageTo = quarantineOffset + batches.length;
+  pending: {
+    title: "排队处理",
+    eyebrow: "Queue · Pending",
+    hint: "排队等待整理的批次，只读；具体等待原因见整理进度，总结失败的会进入「待修复」",
+  },
+  processed: {
+    title: "已处理批次",
+    eyebrow: "Processed · History",
+    hint: "已经总结完的批次：产出记忆或确认没有新增，只读",
+  },
+};
 
-    const summary =
-      '<div class="pill-row" style="gap:8px;margin-bottom:12px">' +
-      badge("待修复批次 " + fmtInt(total), "gold") +
-      badge("旧版失败记录 " + fmtInt(legacy), "fact") +
-      "</div>";
+const batchesView = (fixedTab, viewId, getOffset, setOffset) => {
+  const meta = BATCH_TAB_META[fixedTab];
+  const isRepair = fixedTab === "quarantined";
+  return {
+    title: meta.title,
+    navLabel: meta.title,
+    eyebrow: meta.eyebrow,
+    hint: meta.hint,
+    async load() {
+      const [batches, recovery] = await Promise.all([
+        apiTry(() => apiGet("/maintenance/summary_batches?state=" + fixedTab + "&limit=" + QUARANTINE_PAGE_SIZE + "&offset=" + getOffset()), { total: 0, legacy_failures: 0, batches: [] }),
+        fixedTab === "pending" ? apiTry(() => apiGet("/maintenance/summary_status"), null) : null,
+      ]);
+      return { ...batches, recovery: recovery && recovery.status };
+    },
+    render(data) {
+      const total = int(data.total);
+      const legacy = int(data.legacy_failures);
+      const batches = Array.isArray(data.batches) ? data.batches : [];
+      const offset = getOffset();
+      const pageTo = offset + batches.length;
 
-    const bulk =
-      '<div class="tool-actions" style="margin-bottom:12px">' +
-      '<button class="btn is-sm" type="button" id="qRetryAllBtn">全部重新排队</button>' +
-      '<button class="btn is-sm is-danger" type="button" id="qDiscardAllBtn">全部放弃</button>' +
-      '<button class="btn is-sm" type="button" id="qRefreshBtn">刷新</button>' +
-      "</div>";
+      const tone = isRepair ? "gold" : fixedTab === "pending" ? "accent" : "private";
+      const summary =
+        '<div class="pill-row" style="gap:8px;margin-bottom:12px">' +
+        badge(meta.title + " " + fmtInt(total), tone) +
+        (isRepair ? badge("旧版失败记录 " + fmtInt(legacy), "fact") : "") +
+        "</div>";
 
-    const pager =
-      '<div class="pill-row" style="justify-content:space-between;align-items:center;margin-top:12px">' +
-      '<button class="btn is-sm" type="button" id="qPrevBtn"' + (quarantineOffset <= 0 ? " disabled" : "") + ">上一页</button>" +
-      '<span class="kpi-foot">' + (batches.length ? quarantineOffset + 1 + "–" + pageTo + " / " + fmtInt(total) : "无记录") + "</span>" +
-      '<button class="btn is-sm" type="button" id="qNextBtn"' + (pageTo >= total ? " disabled" : "") + ">下一页</button>" +
-      "</div>";
+      const bulk = isRepair
+        ? '<div class="tool-actions" style="margin-bottom:12px">' +
+          '<button class="btn is-sm" type="button" id="qRetryAllBtn">全部重新排队</button>' +
+          '<button class="btn is-sm is-danger" type="button" id="qDiscardAllBtn">全部放弃</button>' +
+          '<button class="btn is-sm" type="button" id="qRefreshBtn">刷新</button>' +
+          '<button class="btn is-sm" type="button" data-goto="queue">看排队处理</button>' +
+          '<button class="btn is-sm" type="button" data-goto="processed">看已处理</button>' +
+          "</div>"
+        : '<div class="tool-actions" style="margin-bottom:12px">' +
+          '<span class="kpi-foot" style="align-self:center">' +
+          (fixedTab === "pending"
+            ? "请结合整理进度查看等待原因；身份缺失或冲突的批次不会自动调用模型。"
+            : "这些批次已经处理完，仅供查阅；失败的会进「待修复」。") +
+          "</span>" +
+          '<button class="btn is-sm" type="button" id="qRefreshBtn">刷新</button>' +
+          '<button class="btn is-sm" type="button" data-goto="quarantine">去待修复</button>' +
+          (fixedTab === "pending"
+            ? '<button class="btn is-sm" type="button" data-goto="processed">看已处理</button>'
+            : '<button class="btn is-sm" type="button" data-goto="queue">看排队处理</button>') +
+          "</div>";
 
-    const rows = batches.length
-      ? '<div class="row-list">' +
-        batches
-          .map((item) =>
-            '<div class="row">' +
-            '<div class="row-main">' +
-            '<div class="row-title">' + esc(compact(item.session_id)) + "</div>" +
-            '<div class="row-sub">' + esc(compact(item.last_error) || "（无错误摘要）") + "</div>" +
-            '<div class="row-sub" style="font-family:var(--font-mono)">' + esc(item.id) + "</div>" +
-            '<div class="row-meta">' +
-            badge("事件 " + fmtInt(item.event_count), "group") +
-            badge(compact(item.scope), "fact") +
-            badge(String(item.updated_at || "").slice(0, 16), "private") +
-            "</div></div>" +
-            '<div class="tool-actions" style="margin-top:0">' +
-            '<button class="btn is-sm" type="button" data-q-action="retry" data-q-batch="' + esc(item.id) + '">重新排队</button>' +
-            '<button class="btn is-sm is-danger" type="button" data-q-action="discard" data-q-batch="' + esc(item.id) + '">放弃</button>' +
-            "</div></div>"
-          )
-          .join("") +
+      const pager =
+        '<div class="pill-row" style="justify-content:space-between;align-items:center;margin-top:12px">' +
+        '<button class="btn is-sm" type="button" id="qPrevBtn"' + (offset <= 0 ? " disabled" : "") + ">上一页</button>" +
+        '<span class="kpi-foot">' + (batches.length ? offset + 1 + "–" + pageTo + " / " + fmtInt(total) : "无记录") + "</span>" +
+        '<button class="btn is-sm" type="button" id="qNextBtn"' + (pageTo >= total ? " disabled" : "") + ">下一页</button>" +
+        "</div>";
+
+      const rows = batches.length
+        ? '<div class="row-list">' +
+          batches
+            .map((item) =>
+              '<div class="row">' +
+              '<div class="row-main">' +
+              '<div class="row-title">' + esc(compact(item.session_id)) + "</div>" +
+              '<div class="row-sub">' + esc(compact(item.last_error) || "（无错误摘要）") + "</div>" +
+              '<div class="row-sub" style="font-family:var(--font-mono)">' + esc(item.id) + "</div>" +
+              '<div class="row-meta">' +
+              badge("事件 " + fmtInt(item.event_count), "group") +
+              badge(compact(item.scope), "fact") +
+              (fixedTab === "processed"
+                ? badge(item.state === "no_memory" ? "无新增记忆" : "已总结", item.state === "no_memory" ? "gold" : "accent")
+                : "") +
+              badge(String(item.updated_at || "").slice(0, 16), "private") +
+              "</div></div>" +
+              (isRepair
+                ? '<div class="tool-actions" style="margin-top:0">' +
+                  '<button class="btn is-sm" type="button" data-q-action="retry" data-q-batch="' + esc(item.id) + '">重新排队</button>' +
+                  '<button class="btn is-sm is-danger" type="button" data-q-action="discard" data-q-batch="' + esc(item.id) + '">放弃</button>' +
+                  "</div>"
+                : "") + "</div>"
+            )
+            .join("") +
+          "</div>"
+        : isRepair
+          ? emptyState("没有待修复批次", "被隔离的总结批次会出现在这里，可逐条或整批重新排队 / 放弃。")
+          : fixedTab === "pending"
+            ? emptyState("没有排队中的批次", "未分批原文另见整理进度，不能据此判断所有原文已处理。")
+            : emptyState("没有已处理批次", "总结完成的批次会出现在这里。");
+
+      return (
+        '<div class="grid">' +
+        (fixedTab === "pending" ? summaryRecoveryCard(data.recovery) : "") +
+        card(
+          meta.title,
+          isRepair
+            ? "隔离批次持有其原文事件，释放后事件才会重新进入总结流程"
+            : fixedTab === "pending"
+              ? "排队等待整理的批次，只读；具体等待原因见上方整理进度，总结失败的会进入「待修复」"
+              : "已完成的总结批次，仅供查阅",
+          summary + bulk + rows + pager
+        ) +
         "</div>"
-      : emptyState("没有待修复批次", "被隔离的总结批次会出现在这里，可逐条或整批重新排队 / 放弃。");
+      );
+    },
+    mount(node) {
+      const run = async (label, fn, minMs) => {
+        await withBusy(label + "…", async () => {
+          try {
+            const result = await fn();
+            const payload = result && typeof result === "object"
+              ? (result.data && typeof result.data === "object" ? result.data : result)
+              : {};
+            const released = payload.released;
+            toast(label + (released !== undefined ? "：" + released + " 条" : "完成"), "ok");
+          } catch (error) {
+            toast(label + "失败：" + error.message, "error");
+          }
+          go(viewId);
+        }, minMs === undefined ? 3000 : minMs);
+      };
+      const bulkRelease = async (mode, label) => {
+        const info = await apiTry(() => apiGet("/maintenance/summary_batches?state=quarantined&limit=1&offset=0"), { total: 0 });
+        const total = int(info.total);
+        let done = 0;
+        let guard = 0;
+        while (guard < 500) {
+          guard += 1;
+          setBusyText(label + " " + done + " / " + total);
+          const result = await apiPost("/maintenance/release_summary_batches", { all: true, mode, limit: 10 });
+          const payload = result && typeof result === "object"
+            ? (result.data && typeof result.data === "object" ? result.data : result)
+            : {};
+          const released = int(payload.released);
+          if (released <= 0) break;
+          done += released;
+        }
+        setBusyText(label + " " + done + " / " + total + " · 完成");
+        return { data: { released: done, total } };
+      };
+      const bind = (id, fn, label, minMs) => {
+        const button = $(id, node);
+        if (button) button.addEventListener("click", () => run(label, fn, minMs));
+      };
+      bind("#qRefreshBtn", () => Promise.resolve({}), "刷新");
+      if (isRepair) {
+        bind("#qRetryAllBtn", async () => {
+          const confirmed = await showInlineConfirmation("全部重新排队", "把全部待修复批次的事件交还，交给后续会话重新总结。确定继续？", "重新排队");
+          if (!confirmed) throw new Error("已取消");
+          return bulkRelease("retry", "已重新排队");
+        }, "全部重新排队", 800);
+        bind("#qDiscardAllBtn", async () => {
+          const confirmed = await showInlineConfirmation("全部放弃", "全部待修复批次的原始消息将被永久删除，不会进入长期记忆，且无法通过重新排队恢复。确定继续？", "全部放弃");
+          if (!confirmed) throw new Error("已取消");
+          return bulkRelease("discard", "已放弃");
+        }, "全部放弃", 800);
+      }
+      const prev = $("#qPrevBtn", node);
+      if (prev) prev.addEventListener("click", () => { setOffset(Math.max(0, getOffset() - QUARANTINE_PAGE_SIZE)); go(viewId); });
+      const next = $("#qNextBtn", node);
+      if (next) next.addEventListener("click", () => { setOffset(getOffset() + QUARANTINE_PAGE_SIZE); go(viewId); });
+      $$("[data-q-action]", node).forEach((button) => {
+        button.addEventListener("click", () => {
+          const batchId = button.dataset.qBatch;
+          if (button.dataset.qAction === "discard") {
+            run("放弃批次", async () => {
+              const confirmed = await showInlineConfirmation("放弃该批次", "该批次的原始消息将被永久删除，不会进入长期记忆，且无法通过重新排队恢复。确定继续？", "放弃");
+              if (!confirmed) throw new Error("已取消");
+              return apiPost("/maintenance/release_summary_batches", { batch_ids: [batchId], mode: "discard" });
+            });
+          } else {
+            run("重新排队", () => apiPost("/maintenance/release_summary_batches", { batch_ids: [batchId], mode: "retry" }));
+          }
+        });
+      });
+    },
+  };
+};
 
-    return (
-      '<div class="grid">' +
-      card(
-        "待修复批次",
-        "隔离批次持有其原文事件，释放后事件才会重新进入总结流程",
-        summary + bulk + rows + pager
-      ) +
-      "</div>"
-    );
-  },
-  mount(node) {
-    const run = async (label, fn) => {
-      await withBusy(label + "…", async () => {
-        try {
-          const result = await fn();
-          const payload = (result && result.data) || {};
-          toast(label + "完成" + (payload.released !== undefined ? "：" + payload.released + " 条" : ""), "ok");
-        } catch (error) {
-          toast(label + "失败：" + error.message, "error");
-        }
-        go("quarantine");
-      });
-    };
-    const bind = (id, fn, label) => {
-      const button = $(id, node);
-      if (button) button.addEventListener("click", () => run(label, fn));
-    };
-    bind("#qRefreshBtn", () => Promise.resolve({}), "刷新");
-    bind("#qRetryAllBtn", async () => {
-      const confirmed = await showInlineConfirmation("全部重新排队", "把全部待修复批次的事件交还，交给后续会话重新总结。确定继续？", "重新排队");
-      if (!confirmed) throw new Error("已取消");
-      return apiPost("/maintenance/release_summary_batches", { all: true, mode: "retry" });
-    }, "全部重新排队");
-    bind("#qDiscardAllBtn", async () => {
-      const confirmed = await showInlineConfirmation("全部放弃", "把全部待修复批次的原文标记为已总结，等于承认它们不再进入长期记忆。确定继续？", "全部放弃");
-      if (!confirmed) throw new Error("已取消");
-      return apiPost("/maintenance/release_summary_batches", { all: true, mode: "discard" });
-    }, "全部放弃");
-    const prev = $("#qPrevBtn", node);
-    if (prev) prev.addEventListener("click", () => { quarantineOffset = Math.max(0, quarantineOffset - QUARANTINE_PAGE_SIZE); go("quarantine"); });
-    const next = $("#qNextBtn", node);
-    if (next) next.addEventListener("click", () => { quarantineOffset += QUARANTINE_PAGE_SIZE; go("quarantine"); });
-    $$("[data-q-action]", node).forEach((button) => {
-      button.addEventListener("click", () => {
-        const batchId = button.dataset.qBatch;
-        if (button.dataset.qAction === "discard") {
-          run("放弃批次", async () => {
-            const confirmed = await showInlineConfirmation("放弃该批次", "该批次的原文将被标记为已总结，不再进入长期记忆。确定继续？", "放弃");
-            if (!confirmed) throw new Error("已取消");
-            return apiPost("/maintenance/release_summary_batches", { batch_ids: [batchId], mode: "discard" });
-          });
-        } else {
-          run("重新排队", () => apiPost("/maintenance/release_summary_batches", { batch_ids: [batchId], mode: "retry" }));
-        }
-      });
-    });
-  },
-});
+defineView("quarantine", batchesView("quarantined", "quarantine", () => quarantineOffset, (value) => { quarantineOffset = value; }));
+defineView("queue", batchesView("pending", "queue", () => queueOffset, (value) => { queueOffset = value; }));
+defineView("processed", batchesView("processed", "processed", () => processedOffset, (value) => { processedOffset = value; }));
 
 /* ============================================================
    视图：模块配置
@@ -3875,36 +4272,285 @@ const MODULE_LABELS = {
   memory_capture: "记忆捕获",
   scope_control: "范围控制",
   portrait: "统一画像",
+  memory_assertions: "记忆断言",
   memory_summary: "记忆摘要",
   historical_chat_import: "历史聊天导入",
   retrieval: "检索",
   retrieval_advanced: "检索进阶",
+  source_semantic: "原文语义",
   memory_injection: "记忆注入",
+  memory_humanization: "拟人化记忆",
   conversation_memory: "对话记忆",
   conversation_memory_advanced: "对话记忆进阶",
   core_memory: "核心记忆",
   context_orchestration: "上下文编排",
   context_orchestration_advanced: "上下文编排进阶",
+  persona_memory: "记得这个人",
   private_companion_bridge: "陪伴桥接",
   visibility: "可见性",
   memory_tools: "记忆工具",
   memory_reconstruction: "记忆重建",
   knowledge_graph: "知识图谱",
-  livingmemory_migration: "LivingMemory 迁移",
+  livingmemory_migration: "旧版记忆迁移",
   maintenance: "维护",
   maintenance_audit: "记忆审计",
   maintenance_decay: "记忆衰减",
-  memory_assertions: "记忆断言",
-  source_semantic: "原文语义",
   startup: "启动",
+  performance: "性能调优",
+  identity: "跨平台身份",
 };
+
+function moduleLabel(id, moduleSchema) {
+  if (MODULE_LABELS[id]) return MODULE_LABELS[id];
+  const desc = compact(moduleSchema && moduleSchema.description);
+  return desc || compact(id);
+}
+
+function moduleSubtitle(id, moduleSchema) {
+  const title = moduleLabel(id, moduleSchema);
+  const hint = compact(moduleSchema && moduleSchema.hint);
+  if (hint) return hint;
+  const desc = compact(moduleSchema && moduleSchema.description);
+  return desc && desc !== title ? desc : "";
+}
+
+// 2.6.2：面板里只把每个模块最常用的几项摆在明面上，其余收进「高级项」折叠，
+// 免得一个模块几十个输入框糊一屏、找不到该改哪一项。完整配置仍在 AstrBot 配置页。
+const CONFIG_COMMON_KEYS = {
+  appearance: ["theme", "ui_style"],
+  memory_capture: ["enabled", "capture_user_messages", "capture_bot_responses", "extract_stable_facts"],
+  scope_control: [
+    "private_capture_enabled",
+    "group_capture_enabled",
+    "private_recall_enabled",
+    "group_recall_enabled",
+    "private_topology_enabled",
+    "group_topology_enabled",
+  ],
+  portrait: ["daily_dispatch_enabled", "min_independent_evidence", "daily_success_limit_per_person"],
+  memory_assertions: ["enabled", "max_per_batch"],
+  memory_summary: [
+    "enabled",
+    "provider_id",
+    "private_provider_id",
+    "group_provider_id",
+    "trigger_event_count",
+    "trigger_interval_minutes",
+    "max_summary_chars",
+  ],
+  historical_chat_import: ["qq_max_range_days", "qq_max_messages", "max_retries"],
+  retrieval: ["embedding_enabled", "embedding_provider_id", "mode", "rerank_provider_id"],
+  retrieval_advanced: [
+    "vector_precision",
+    "vector_storage_precision",
+    "embedding_top_k",
+    "embedding_weight",
+    "embedding_score_threshold",
+    "mmr_redundancy_weight",
+  ],
+  source_semantic: ["enabled", "provider_id"],
+  memory_injection: ["enabled", "top_k", "max_chars", "enable_injection_logs"],
+  memory_humanization: ["enabled", "vivid_full_days", "no_recall_hint_enabled"],
+  conversation_memory: ["enabled", "capture_private_messages", "capture_group_messages", "idle_gap_minutes"],
+  conversation_memory_advanced: [
+    "cross_window_group_to_private_enabled",
+    "cross_window_private_to_group_enabled",
+    "cross_window_group_to_group_enabled",
+    "recent_fact_guard_enabled",
+    "topic_shift_guard_enabled",
+  ],
+  core_memory: ["enabled", "max_blocks", "max_chars"],
+  context_orchestration: ["enabled", "query_mode", "include_intent_context"],
+  context_orchestration_advanced: ["stable_memory_limit", "user_profile_limit", "current_window_limit"],
+  persona_memory: ["enabled", "max_chars", "max_items"],
+  private_companion_bridge: ["enabled", "prefer_memory_companion_memory", "accept_external_records"],
+  visibility: ["allow_group_public_in_private", "hide_pending_review", "enable_acl_rules"],
+  memory_tools: ["enable_recall_tool", "enable_remember_tool", "allow_group_remember", "enable_query_progress"],
+  memory_reconstruction: ["enabled", "max_steps", "per_step_limit"],
+  knowledge_graph: ["enabled", "retrieval_expansion_enabled"],
+  livingmemory_migration: ["import_limit", "livingmemory_db_path"],
+  maintenance: ["memory_decay_enabled", "auto_schedule_enabled", "retention_raw_event_days", "backup_before_import"],
+  maintenance_audit: ["enabled", "max_candidates"],
+  maintenance_decay: ["memory_decay_after_days", "memory_decay_idle_days", "memory_decay_gradual_enabled"],
+  startup: ["background_grace_seconds"],
+  performance: [
+    "profile",
+    "sqlite_cache_size_mb",
+    "sqlite_mmap_size_mb",
+    "sqlite_read_pool_size",
+    "sqlite_synchronous",
+  ],
+  identity: ["merge_platform_accounts"],
+};
+
+const CONFIG_OPTION_LABELS = {
+  "retrieval.mode": {
+    auto: "自动（有重排模型时自动启用）",
+    basic: "基础检索（语义 + 关键词）",
+    rerank: "强制重排",
+  },
+  "memory_capture.proposal_mode": {
+    hybrid: "混合模式（推荐）",
+    summary_first: "阶段总结优先",
+    explicit_only: "仅显式记住",
+  },
+  "context_orchestration.query_mode": {
+    current_message: "按当前消息检索",
+    guarded_companion: "带保护的陪伴协同",
+    companion_augmented: "陪伴上下文增强",
+  },
+  "livingmemory_migration.default_review_status": {
+    auto: "直接生效（auto）",
+    pending: "进入待复核（pending）",
+  },
+  "retrieval_advanced.vector_precision": {
+    float32: "标准精度（float32 · 推荐）",
+    float16: "半精度省流（float16 · 空间直降 75%）",
+  },
+  "retrieval_advanced.vector_storage_precision": {
+    float32: "标准精度（float32 · 推荐）",
+    float16: "半精度省流（float16 · 空间直降 75%）",
+  },
+  "performance.profile": {
+    auto: "智能自动（按机器与容器内存自动推荐）",
+    eco: "省资源（1–2G 低配云服 / Docker 容器）",
+    balanced: "均衡推荐（4–8G 日常主机）",
+    turbo: "高性能（16G+ 桌面机 / 大记忆库）",
+    compat: "慢盘 / 稳妥兼容（机械硬盘 / NAS / 弱网）",
+  },
+  "performance.sqlite_synchronous": {
+    auto: "跟随性能档位（auto）",
+    NORMAL: "NORMAL（速度与安全兼顾 · 推荐）",
+    FULL: "FULL（每次提交强刷磁盘 · 防断电）",
+  },
+};
+
+const PERFORMANCE_PROFILE_CHOICES = {
+  auto: {
+    title: "智能自动",
+    tag: "推荐",
+    code: "auto",
+    desc: "自动识别物理内存与 Docker 限额，按需分配资源",
+  },
+  eco: {
+    title: "省资源",
+    tag: "1–2G 低配",
+    code: "eco",
+    desc: "半精度向量 + 关 mmap，压低内存杜绝 OOM",
+  },
+  balanced: {
+    title: "均衡推荐",
+    tag: "4–8G 主机",
+    code: "balanced",
+    desc: "标准精度无损召回，速度与内存均衡平稳",
+  },
+  turbo: {
+    title: "高性能",
+    tag: "16G+ 大库",
+    code: "turbo",
+    desc: "大页缓存 + 最高 1GB mmap + 并发读池全开",
+  },
+  compat: {
+    title: "慢盘兼容",
+    tag: "机械盘 / 弱网",
+    code: "compat",
+    desc: "关 mmap + FULL 严格落盘 + 5 秒宽裕等待预算",
+  },
+};
+
+const VECTOR_PRECISION_CHOICES = {
+  float32: {
+    title: "标准精度",
+    tag: "推荐",
+    code: "float32",
+    desc: "精度无损，空间减半 · 日常首选",
+  },
+  float16: {
+    title: "半精度省流",
+    tag: "省 75% 空间",
+    code: "float16",
+    desc: "空间直降 75%，召回几乎无感 · 低配云服推荐",
+  },
+};
+
+const CONFIG_CHOICE_CARDS = {
+  "retrieval_advanced.vector_precision": VECTOR_PRECISION_CHOICES,
+  "retrieval_advanced.vector_storage_precision": VECTOR_PRECISION_CHOICES,
+  "performance.profile": PERFORMANCE_PROFILE_CHOICES,
+};
+
+function fieldOptions(item) {
+  if (item && Array.isArray(item.options) && item.options.length) return item.options;
+  if (item && Array.isArray(item.enum) && item.enum.length) return item.enum;
+  return null;
+}
+
+function renderChoiceCards(key, options, value, choiceMap, locked) {
+  const current = String(value === undefined || value === null || value === "" ? options[0] : value);
+  const cards = options
+    .map((opt) => {
+      const optStr = String(opt);
+      const info = choiceMap[optStr] || { title: optStr, tag: "", code: optStr, desc: "" };
+      const active = current === optStr;
+      return (
+        '<button type="button" class="cfg-choice-card' + (active ? " is-active" : "") + '"' +
+        ' role="radio" aria-checked="' + (active ? "true" : "false") + '"' +
+        ' data-choice-key="' + esc(key) + '" data-choice-val="' + esc(optStr) + '"' +
+        (locked ? " disabled" : "") + ">" +
+        '<span class="cfg-choice-head">' +
+          '<span class="cfg-choice-dot" aria-hidden="true"></span>' +
+          '<strong class="cfg-choice-title">' + esc(info.title) + "</strong>" +
+          (info.tag ? '<span class="cfg-choice-tag">' + esc(info.tag) + "</span>" : "") +
+          (info.code ? '<code class="cfg-choice-code">' + esc(info.code) + "</code>" : "") +
+        "</span>" +
+        (info.desc ? '<span class="cfg-choice-desc">' + esc(info.desc) + "</span>" : "") +
+        "</button>"
+      );
+    })
+    .join("");
+  return (
+    '<div class="cfg-choice-group" role="radiogroup" data-choice-group="' + esc(key) + '">' +
+    '<input type="hidden" id="cfg_' + esc(key) + '" value="' + esc(current) + '"' + (locked ? " disabled" : "") + " />" +
+    cards +
+    "</div>"
+  );
+}
+
+// P8：后端下发的受保护键（可见性 / 桥接闸门 / 凭据类）在面板里只读，
+// 保存时也不提交——面板不能成为修改安全键的通道。
+function protectedConfigSets(data) {
+  const keys = data && Array.isArray(data.protected_keys) ? data.protected_keys : [];
+  const modules = data && Array.isArray(data.protected_modules) ? data.protected_modules : [];
+  return { keys: new Set(keys), modules: new Set(modules) };
+}
+
+function isProtectedConfigKey(guard, moduleId, key) {
+  return guard.modules.has(moduleId) || guard.keys.has(moduleId + "." + key);
+}
+
+function orderedCommonKeys(moduleId, items) {
+  const preferred = CONFIG_COMMON_KEYS[moduleId] || [];
+  const out = [];
+  const seen = new Set();
+  for (let i = 0; i < preferred.length; i += 1) {
+    const key = preferred[i];
+    if (Object.prototype.hasOwnProperty.call(items, key) && !seen.has(key)) {
+      seen.add(key);
+      out.push(key);
+    }
+  }
+  return out;
+}
 
 defineView("config", {
   title: "模块配置",
   navLabel: "模块配置",
   eyebrow: "Settings · Config",
   hint: "按模块调整检索、注入、编排与维护策略，保存后立即写入插件配置",
-  async load() {
+  async load(opts) {
+    if (opts && opts.useCachedSchema && state.configSchema && state.configSchema.schema) {
+      return state.configSchema;
+    }
     const result = await apiGet("/config/schema");
     state.configSchema = result;
     return result;
@@ -3918,60 +4564,108 @@ defineView("config", {
     const moduleSchema = schema[moduleId] || { items: {} };
     const moduleValues = values[moduleId] || {};
     const items = moduleSchema.items || {};
+    const guard = protectedConfigSets(data);
+    const totalFields = modules.reduce((sum, key) => sum + Object.keys((schema[key] || {}).items || {}).length, 0);
 
-    const nav = modules
-      .map(
-        (key) =>
-          '<button type="button" class="' + (key === moduleId ? "is-active" : "") + '" data-module="' + esc(key) + '">' +
-          "<span>" + esc(MODULE_LABELS[key] || key) + "</span>" +
-          "<em>" + Object.keys((schema[key] || {}).items || {}).length + "</em></button>"
-      )
-      .join("");
+    const navSearch =
+      '<button type="button" class="config-nav-search" data-open-config-search aria-label="全局搜索所有配置项">' +
+      icon("search", "config-nav-search-icon") +
+      "<span>搜索全部 " + fmtInt(totalFields) + " 项…</span>" +
+      '<kbd class="cfg-kbd">' + esc(shortcutBadgeText()) + "</kbd>" +
+      "</button>";
 
-    const fields = Object.keys(items)
-      .map((key) => {
-        const item = items[key] || {};
-        const value = moduleValues[key] === undefined ? item.default : moduleValues[key];
-        const desc = compact(item.description) || key;
-        const hint = compact(item.hint);
-        let input;
-        if (Array.isArray(item.options) && item.options.length) {
-          input =
-            '<select id="cfg_' + esc(key) + '">' +
-            item.options
-              .map((opt) => '<option value="' + esc(opt) + '"' + (String(value) === String(opt) ? " selected" : "") + ">" + esc(opt) + "</option>")
-              .join("") +
-            "</select>";
-        } else if (item.type === "bool" || item.type === "boolean") {
-          input =
-            '<label class="switch"><input type="checkbox" id="cfg_' + esc(key) + '"' + (value ? " checked" : "") + ' /><span class="switch-track"></span><span>' + (value ? "已启用" : "已关闭") + "</span></label>";
-        } else if (item.type === "int" || item.type === "float" || item.type === "number") {
-          input = '<input type="number" id="cfg_' + esc(key) + '" value="' + esc(value === undefined || value === null ? "" : value) + '" step="' + (item.type === "float" ? "0.01" : "1") + '" />';
-        } else if (item.type === "list" || Array.isArray(value)) {
-          input = '<input type="text" id="cfg_' + esc(key) + '" value="' + esc(Array.isArray(value) ? value.join(",") : compact(value)) + '" />';
-        } else {
-          input = '<input type="text" id="cfg_' + esc(key) + '" value="' + esc(value === undefined || value === null ? "" : value) + '" />';
-        }
-        return (
-          '<div class="config-field"><div><div class="cf-label">' + esc(desc) + "</div>" +
-          (hint ? '<div class="cf-desc">' + esc(hint) + "</div>" : "") +
-          '<div class="cf-desc mono" style="opacity:.7;margin-top:4px">' + esc(key) + "</div></div>" +
-          '<div class="cf-input">' + input + "</div></div>"
-        );
-      })
-      .join("");
+    const nav =
+      navSearch +
+      modules
+        .map((key) => {
+          const active = key === moduleId;
+          return (
+            '<button type="button" class="' + (active ? "is-active" : "") + '"' +
+            (active ? ' aria-current="page"' : "") +
+            ' data-module="' + esc(key) + '">' +
+            "<span>" + esc(moduleLabel(key, schema[key])) + "</span>" +
+            "<em>" + Object.keys((schema[key] || {}).items || {}).length + "</em></button>"
+          );
+        })
+        .join("");
+
+    const commonKeys = orderedCommonKeys(moduleId, items);
+    const commonKeySet = new Set(commonKeys);
+    const advancedKeys = Object.keys(items).filter((key) => !commonKeySet.has(key));
+    const renderFields = (keys) =>
+      keys
+        .map((key) => {
+          const item = items[key] || {};
+          const value = moduleValues[key] === undefined ? item.default : moduleValues[key];
+          const desc = compact(item.description) || key;
+          const hint = compact(item.hint);
+          const locked = isProtectedConfigKey(guard, moduleId, key);
+          const choiceMap = CONFIG_CHOICE_CARDS[moduleId + "." + key] || null;
+          const optionList = fieldOptions(item);
+          const optionLabelMap = CONFIG_OPTION_LABELS[moduleId + "." + key] || null;
+          const isChoiceField = Boolean(choiceMap && optionList && optionList.length);
+          let input;
+          if (isChoiceField) {
+            input = renderChoiceCards(key, optionList, value, choiceMap, locked);
+          } else if (Array.isArray(item.options) && item.options.length) {
+            input =
+              '<select id="cfg_' + esc(key) + '">' +
+              item.options
+                .map((opt) => {
+                  const text = (optionLabelMap && optionLabelMap[String(opt)]) || String(opt);
+                  return '<option value="' + esc(opt) + '"' + (String(value) === String(opt) ? " selected" : "") + ">" + esc(text) + "</option>";
+                })
+                .join("") +
+              "</select>";
+          } else if (Array.isArray(item.enum) && item.enum.length) {
+            input =
+              '<select id="cfg_' + esc(key) + '">' +
+              item.enum
+                .map((opt) => {
+                  const text = (optionLabelMap && optionLabelMap[String(opt)]) || String(opt);
+                  return '<option value="' + esc(opt) + '"' + (String(value) === String(opt) ? " selected" : "") + ">" + esc(text) + "</option>";
+                })
+                .join("") +
+              "</select>";
+          } else if (item.type === "bool" || item.type === "boolean") {
+            input =
+              '<label class="switch"><input type="checkbox" id="cfg_' + esc(key) + '"' + (value ? " checked" : "") + ' /><span class="switch-track"></span><span>' + (value ? "已启用" : "已关闭") + "</span></label>";
+          } else if (item.type === "int" || item.type === "float" || item.type === "number") {
+            input = '<input type="number" id="cfg_' + esc(key) + '" value="' + esc(value === undefined || value === null ? "" : value) + '" step="' + (item.type === "float" ? "0.01" : "1") + '" />';
+          } else if (item.type === "list" || Array.isArray(value)) {
+            input = '<input type="text" id="cfg_' + esc(key) + '" value="' + esc(Array.isArray(value) ? value.join(",") : compact(value)) + '" />';
+          } else {
+            input = '<input type="text" id="cfg_' + esc(key) + '" value="' + esc(value === undefined || value === null ? "" : value) + '" />';
+          }
+          if (locked && !isChoiceField) input = input.replace(/<(input|select)/, "<$1 disabled");
+          return (
+            '<div class="config-field' + (isChoiceField ? " is-choice-field" : "") + '" data-config-field="' + esc(key) + '"><div><div class="cf-label">' + esc(desc) +
+            (locked ? ' <span class="cf-desc">（安全键 · 只读）</span>' : "") + "</div>" +
+            (hint ? '<div class="cf-desc">' + esc(hint) + "</div>" : "") +
+            '<div class="cf-desc mono" style="opacity:.66;margin-top:4px">' + esc(key) + "</div></div>" +
+            '<div class="cf-input">' + input + "</div></div>"
+          );
+        })
+        .join("");
+    const fields = renderFields(commonKeys);
+    const advancedFields = renderFields(advancedKeys);
 
     return (
       '<div class="config-layout">' +
-      '<nav class="config-nav">' + nav + "</nav>" +
-      '<div style="display:grid;gap:14px">' +
+      '<nav class="config-nav" aria-label="配置模块">' + nav + "</nav>" +
+      '<div class="config-main">' +
         card(
-          MODULE_LABELS[moduleId] || moduleId,
-          compact(moduleSchema.description) || moduleId,
-          '<form id="configForm" class="config-form">' + (fields || emptyState("该模块没有可配置项", "")) + "</form>",
-          '<button class="btn is-primary is-sm" type="button" id="configSaveBtn">保存本模块</button>'
+          moduleLabel(moduleId, moduleSchema),
+          moduleSubtitle(moduleId, moduleSchema),
+          '<form id="configForm" class="config-form">' +
+  (fields || (advancedFields ? "" : emptyState("该模块没有可配置项", ""))) +
+  (advancedFields
+    ? '<details class="config-advanced"><summary>高级项（' + advancedKeys.length + ' 个）· 一般不用改</summary><div class="config-advanced-body"><div class="config-advanced-inner">' + advancedFields + "</div></div></details>"
+    : "") +
+  "</form>",
+          '<button class="btn is-primary is-sm" type="button" id="configSaveBtn">保存本模块</button>',
+          "config-card"
         ) +
-        (moduleSchema.hint ? '<p class="section-note">' + esc(moduleSchema.hint) + "</p>" : "") +
       "</div>" +
       "</div>"
     );
@@ -3981,7 +4675,40 @@ defineView("config", {
     $$("[data-module]", node).forEach((button) => {
       button.addEventListener("click", () => {
         state.configModule = button.dataset.module;
-        go("config");
+        go("config", { useCachedSchema: true });
+      });
+    });
+
+    $$("[data-open-config-search]", node).forEach((button) => {
+      button.addEventListener("click", () => openConfigSearch());
+    });
+
+    $$(".cfg-choice-group", node).forEach((group) => {
+      const key = group.dataset.choiceGroup;
+      const hiddenInput = $("#cfg_" + key, group);
+      const cards = $$(".cfg-choice-card", group);
+      const pick = (cardEl, shouldFocus) => {
+        if (!cardEl || cardEl.disabled) return;
+        const val = cardEl.dataset.choiceVal;
+        if (hiddenInput) hiddenInput.value = val;
+        cards.forEach((btn) => {
+          const isSel = btn === cardEl;
+          btn.classList.toggle("is-active", isSel);
+          btn.setAttribute("aria-checked", isSel ? "true" : "false");
+        });
+        if (shouldFocus && typeof cardEl.focus === "function") cardEl.focus();
+      };
+      cards.forEach((btn, idx) => {
+        btn.addEventListener("click", () => pick(btn, false));
+        btn.addEventListener("keydown", (event) => {
+          if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+            event.preventDefault();
+            pick(cards[(idx + 1) % cards.length], true);
+          } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+            event.preventDefault();
+            pick(cards[(idx - 1 + cards.length) % cards.length], true);
+          }
+        });
       });
     });
 
@@ -3990,25 +4717,33 @@ defineView("config", {
       saveBtn.addEventListener("click", async () => {
         const moduleId = state.configModule;
         const items = (schema[moduleId] || {}).items || {};
+        const guard = protectedConfigSets(data);
         const values = {};
         Object.keys(items).forEach((key) => {
+          if (isProtectedConfigKey(guard, moduleId, key)) return;
           const item = items[key] || {};
           const el = $("#cfg_" + key, node);
           if (!el) return;
           if (el.type === "checkbox") values[key] = el.checked;
           else if (el.type === "number") values[key] = el.value === "" ? null : Number(el.value);
-          else if (Array.isArray(item.options)) values[key] = el.value;
+          else if (Array.isArray(item.options) || Array.isArray(item.enum)) values[key] = el.value;
           else if (item.type === "list" || Array.isArray(items[key].default)) {
             values[key] = el.value.trim() === "" ? [] : el.value.split(",").map((v) => v.trim());
           } else values[key] = el.value;
         });
         await withBusy("正在保存…", async () => {
-          await apiPost("/config/module/update", { module: moduleId, values });
-          toast("已保存 " + (MODULE_LABELS[moduleId] || moduleId), "ok");
+          const saved = await apiPost("/config/module/update", { module: moduleId, values });
+          if (state.configSchema && state.configSchema.values) {
+            state.configSchema.values[moduleId] =
+              saved && saved.values && typeof saved.values === "object"
+                ? saved.values
+                : Object.assign({}, state.configSchema.values[moduleId] || {}, values);
+          }
+          toast("已保存 " + moduleLabel(moduleId, schema[moduleId]), "ok");
           invalidatePool();
           // 配色改完当场生效，不用刷新页面——不然用户会以为这项又没生效
           if (moduleId === "appearance") syncPalette();
-          go("config");
+          await go("config");
         });
       });
     }
@@ -4019,8 +4754,941 @@ defineView("config", {
         if (label) label.textContent = input.checked ? "已启用" : "已关闭";
       });
     });
+
+    bindSmoothDetails(node);
+
+    const activeNav = $(".config-nav button.is-active", node);
+    if (activeNav && typeof activeNav.scrollIntoView === "function") {
+      try { activeNav.scrollIntoView({ block: "nearest" }); } catch (error) { /* 忽略 */ }
+    }
+    applyPendingConfigFocus(node);
   },
 });
+
+function bindSmoothDetails(rootNode) {
+  $$("details.config-advanced", rootNode).forEach((details) => {
+    const summary = details.querySelector(":scope > summary") || details.querySelector("summary");
+    const body = details.querySelector(":scope > .config-advanced-body") || details.querySelector(".config-advanced-body");
+    if (!summary || !body) return;
+    let animTimer = 0;
+    let animToken = 0;
+
+    const clearInline = () => {
+      body.style.height = "";
+      body.style.opacity = "";
+      body.style.overflow = "";
+      body.style.transition = "";
+      details.classList.remove("is-animating", "is-closing");
+    };
+
+    details.__cancelSmoothAnim = () => {
+      animToken += 1;
+      window.clearTimeout(animTimer);
+      animTimer = 0;
+      clearInline();
+    };
+
+    const renderedHeight = () => {
+      const rect = typeof body.getBoundingClientRect === "function" ? body.getBoundingClientRect() : null;
+      const h = rect && Number.isFinite(rect.height) ? rect.height : Number(body.offsetHeight);
+      return Number.isFinite(h) && h > 0 ? h : 0;
+    };
+
+    summary.addEventListener("click", (event) => {
+      if (prefersReducedMotion()) return;
+      event.preventDefault();
+      animToken += 1;
+      const token = animToken;
+      window.clearTimeout(animTimer);
+      animTimer = 0;
+
+      const shouldOpen = !details.open || details.classList.contains("is-closing");
+      if (shouldOpen) {
+        const wasOpen = Boolean(details.open);
+        const startHeight = wasOpen ? renderedHeight() : 0;
+        details.open = true;
+        details.classList.remove("is-closing");
+        details.classList.add("is-animating");
+        body.style.transition = "none";
+        body.style.overflow = "hidden";
+        body.style.height = startHeight + "px";
+        if (!wasOpen) body.style.opacity = "0";
+        void body.offsetHeight;
+        const targetHeight = body.scrollHeight;
+        body.style.transition = "height 0.24s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.2s cubic-bezier(0.22, 1, 0.36, 1)";
+        body.style.height = targetHeight + "px";
+        body.style.opacity = "1";
+        animTimer = window.setTimeout(() => {
+          if (token !== animToken) return;
+          animTimer = 0;
+          clearInline();
+        }, 260);
+      } else {
+        const startHeight = renderedHeight() || body.scrollHeight;
+        details.classList.add("is-animating", "is-closing");
+        body.style.transition = "none";
+        body.style.overflow = "hidden";
+        body.style.height = startHeight + "px";
+        body.style.opacity = "1";
+        void body.offsetHeight;
+        body.style.transition = "height 0.18s cubic-bezier(0.4, 0, 1, 1), opacity 0.15s cubic-bezier(0.4, 0, 1, 1)";
+        body.style.height = "0px";
+        body.style.opacity = "0";
+        animTimer = window.setTimeout(() => {
+          if (token !== animToken) return;
+          animTimer = 0;
+          details.open = false;
+          clearInline();
+        }, 190);
+      }
+    });
+  });
+}
+
+/* ============================================================
+   全局配置搜索（Ctrl+K / Cmd+K / / 快捷键 + 侧栏入口）
+   ============================================================ */
+const configSearchState = {
+  open: false,
+  query: "",
+  selectedIndex: 0,
+  loading: false,
+  error: "",
+  schemaRef: null,
+  moduleCount: 0,
+  fieldCount: 0,
+  catalog: [],
+  index: null,
+  hits: [],
+  pendingTarget: null,
+  hitTimer: 0,
+  closeTimer: 0,
+  lastFocus: null,
+  fetchPromise: null,
+  initialized: false,
+};
+
+const CONFIG_SEARCH_QUICK_CHIPS = [
+  "性能调优",
+  "一键瘦身",
+  "向量存储精度",
+  "跨群衔接",
+  "拟人化记忆",
+  "记得这个人",
+  "配色主题",
+  "总结模型",
+  "待复核",
+  "旧版记忆迁移",
+];
+
+const CONFIG_SEARCH_SHORTCUTS = [
+  {
+    key: "performance.tuning",
+    viewId: "performance",
+    focusTarget: "",
+    title: "性能调优（5 档一键配置）",
+    group: "快捷入口 · 设置",
+    desc: "自动识别本机/Docker 内存，在智能自动、省资源、均衡推荐、高性能、慢盘兼容间一键切换，也可展开微调 12 项底层参数。",
+    aliases: [
+      "性能调优",
+      "性能档位",
+      "省资源",
+      "均衡推荐",
+      "高性能",
+      "慢盘兼容",
+      "稳妥兼容",
+      "智能自动",
+      "低配机",
+      "机械硬盘",
+      "NAS",
+      "卡顿",
+      "OOM",
+      "防爆内存",
+      "performance",
+      "eco",
+      "balanced",
+      "turbo",
+      "compat",
+      "auto",
+    ],
+    priority: 24,
+  },
+  {
+    key: "performance.tier.auto",
+    viewId: "performance",
+    focusTarget: "tier:auto",
+    title: "性能档位 · 智能自动（默认推荐）",
+    group: "性能调优",
+    desc: "自动探测物理内存与容器 cgroup 内存上限，自动选择最稳妥档位并开启防爆限幅。",
+    aliases: ["智能自动", "自动档", "自动识别", "容器内存", "cgroup", "auto"],
+    priority: 10,
+  },
+  {
+    key: "performance.tier.eco",
+    viewId: "performance",
+    focusTarget: "tier:eco",
+    title: "性能档位 · 省资源（1–2G 低配云服 / 容器）",
+    group: "性能调优",
+    desc: "向量半精度省 75% 空间、关闭 mmap 与启动预热、缩小页缓存与并发读连接池，防止低配机器 OOM。",
+    aliases: ["省资源", "低配机", "低内存", "省内存", "1G", "2G", "容器", "Docker", "eco", "OOM"],
+    priority: 10,
+  },
+  {
+    key: "performance.tier.balanced",
+    viewId: "performance",
+    focusTarget: "tier:balanced",
+    title: "性能档位 · 均衡推荐（4–8G 日常主机）",
+    group: "性能调优",
+    desc: "标准精度无损召回，32MB 页缓存 + 256MB mmap + 3–6 路并发读池，速度与内存兼顾。",
+    aliases: ["均衡推荐", "均衡", "常规", "4G", "8G", "balanced"],
+    priority: 10,
+  },
+  {
+    key: "performance.tier.turbo",
+    viewId: "performance",
+    focusTarget: "tier:turbo",
+    title: "性能档位 · 高性能（16G+ 桌面机 / 大记忆库）",
+    group: "性能调优",
+    desc: "64MB 页缓存 + 最高 1GB 内存映射 + 6–12 路并行读连接池，海量记忆与多群高并发依然丝滑。",
+    aliases: ["高性能", "狂暴", "大内存", "16G", "32G", "大库", "多群", "turbo"],
+    priority: 10,
+  },
+  {
+    key: "performance.tier.compat",
+    viewId: "performance",
+    focusTarget: "tier:compat",
+    title: "性能档位 · 慢盘 / 稳妥兼容（机械硬盘 / NAS / 弱网）",
+    group: "性能调优",
+    desc: "关闭 mmap、开启 FULL 严格落盘保护，并将回复前记忆等待上限放宽至 5 秒减少偶发超时。",
+    aliases: ["慢盘", "慢盘兼容", "稳妥兼容", "机械硬盘", "HDD", "NAS", "弱网", "防断电", "卡顿", "compat"],
+    priority: 10,
+  },
+  {
+    key: "maintenance.db_optimize",
+    viewId: "migrate",
+    focusTarget: "dbHealthCard",
+    title: "数据库体检与一键瘦身",
+    group: "快捷入口 · 维护与迁移",
+    desc: "查看主库 / WAL / 副库体积、可回收空闲页与向量精度分布；支持一键常规无损瘦身与深度整理压缩（全量 VACUUM）。",
+    aliases: [
+      "数据库体检",
+      "一键瘦身",
+      "数据库瘦身",
+      "瘦身",
+      "体检",
+      "压缩",
+      "深度压缩",
+      "深度整理压缩",
+      "释放空间",
+      "空闲页",
+      "VACUUM",
+      "vacuum",
+      "freelist",
+      "db_health",
+      "db_optimize",
+      "省空间",
+      "转码",
+    ],
+    priority: 24,
+  },
+];
+
+function isMacPlatform() {
+  try {
+    const p = (navigator && (navigator.platform || navigator.userAgent)) || "";
+    return /mac|iphone|ipad|ipod/i.test(p);
+  } catch (error) {
+    return false;
+  }
+}
+
+function shortcutBadgeText() {
+  return isMacPlatform() ? "⌘ K" : "Ctrl K";
+}
+
+function isEditableElement(target) {
+  if (!target || typeof target !== "object") return false;
+  const tag = String(target.tagName || "").toUpperCase();
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+  if (target.isContentEditable) return true;
+  return false;
+}
+
+function buildConfigSearchCatalog(data) {
+  const schema = (data && data.schema) || {};
+  const guard = protectedConfigSets(data);
+  const catalog = [];
+  const moduleIds = Object.keys(schema);
+  let fieldCount = 0;
+
+  for (let m = 0; m < moduleIds.length; m += 1) {
+    const moduleId = moduleIds[m];
+    const modSchema = schema[moduleId] || {};
+    const modLabel = moduleLabel(moduleId, modSchema);
+    const modSub = moduleSubtitle(moduleId, modSchema);
+    const items = modSchema.items || {};
+    const fieldKeys = Object.keys(items);
+    const commonSet = new Set(orderedCommonKeys(moduleId, items));
+
+    const modAliases = [moduleId];
+    if (compact(modSchema.description) && compact(modSchema.description) !== modLabel) {
+      modAliases.push(compact(modSchema.description));
+    }
+
+    catalog.push({
+      kind: "module",
+      moduleId,
+      moduleLabel: modLabel,
+      fieldKey: "",
+      title: modLabel,
+      group: "模块配置",
+      desc: modSub || ("包含 " + fieldKeys.length + " 个配置项"),
+      key: moduleId,
+      aliases: modAliases,
+      fieldCount: fieldKeys.length,
+      isAdvanced: false,
+      locked: false,
+      priority: 22,
+    });
+
+    for (let f = 0; f < fieldKeys.length; f += 1) {
+      const fieldKey = fieldKeys[f];
+      const item = items[fieldKey] || {};
+      fieldCount += 1;
+      const title = compact(item.description) || fieldKey;
+      const hint = compact(item.hint);
+      const isAdvanced = !commonSet.has(fieldKey);
+      const locked = isProtectedConfigKey(guard, moduleId, fieldKey);
+      const opts = fieldOptions(item) || [];
+      const optLabelMap = CONFIG_OPTION_LABELS[moduleId + "." + fieldKey] || null;
+      const choiceMap = CONFIG_CHOICE_CARDS[moduleId + "." + fieldKey] || null;
+      const aliases = [moduleId, fieldKey, moduleId + "." + fieldKey];
+      for (let o = 0; o < opts.length; o += 1) {
+        const optStr = String(opts[o]);
+        aliases.push(optStr);
+        if (optLabelMap && optLabelMap[optStr]) aliases.push(optLabelMap[optStr]);
+        if (choiceMap && choiceMap[optStr]) {
+          if (choiceMap[optStr].title) aliases.push(choiceMap[optStr].title);
+          if (choiceMap[optStr].tag) aliases.push(choiceMap[optStr].tag);
+          if (choiceMap[optStr].desc) aliases.push(choiceMap[optStr].desc);
+        }
+      }
+
+      catalog.push({
+        kind: "field",
+        moduleId,
+        moduleLabel: modLabel,
+        fieldKey,
+        title,
+        group: modLabel,
+        desc: hint,
+        key: moduleId + "." + fieldKey,
+        aliases,
+        isAdvanced,
+        locked,
+        priority: isAdvanced ? 0 : 12,
+      });
+    }
+  }
+
+  // 附带高价值快捷操作入口（性能调优 5 档与数据库体检一键瘦身）
+  for (let s = 0; s < CONFIG_SEARCH_SHORTCUTS.length; s += 1) {
+    const sc = CONFIG_SEARCH_SHORTCUTS[s];
+    catalog.push({
+      kind: "action",
+      viewId: sc.viewId,
+      focusTarget: sc.focusTarget || "",
+      moduleId: "",
+      moduleLabel: sc.group,
+      fieldKey: "",
+      title: sc.title,
+      group: sc.group,
+      desc: sc.desc,
+      key: sc.key,
+      aliases: sc.aliases || [],
+      isAdvanced: false,
+      locked: false,
+      priority: sc.priority || 10,
+    });
+  }
+
+  // 附带控制台功能视图入口，便于一键切换页面
+  for (let g = 0; g < NAV.length; g += 1) {
+    const group = NAV[g];
+    for (let v = 0; v < group.views.length; v += 1) {
+      const viewId = group.views[v];
+      const view = VIEWS[viewId];
+      if (!view || view.hidden || viewId === "config") continue;
+      catalog.push({
+        kind: "view",
+        viewId,
+        moduleId: "",
+        moduleLabel: group.label,
+        fieldKey: "",
+        title: view.title || view.navLabel || viewId,
+        group: "面板视图 · " + group.label,
+        desc: compact(view.hint),
+        key: viewId,
+        aliases: [group.label, view.navLabel || "", view.eyebrow || ""].filter(Boolean),
+        isAdvanced: false,
+        locked: false,
+        priority: -4,
+      });
+    }
+  }
+
+  return { catalog, moduleCount: moduleIds.length, fieldCount };
+}
+
+function ensureConfigSearchIndex() {
+  const data = state.configSchema;
+  if (!data || !data.schema) return null;
+  if (configSearchState.schemaRef === data && configSearchState.index) {
+    return configSearchState.index;
+  }
+  const built = buildConfigSearchCatalog(data);
+  configSearchState.schemaRef = data;
+  configSearchState.catalog = built.catalog;
+  configSearchState.moduleCount = built.moduleCount;
+  configSearchState.fieldCount = built.fieldCount;
+  const engine = window.MemorySearchEngine;
+  if (engine && typeof engine.prepare === "function") {
+    configSearchState.index = engine.prepare(built.catalog, {
+      getTitle: (it) => it.title,
+      getDesc: (it) => it.desc,
+      getKey: (it) => it.key,
+      getGroup: (it) => it.group,
+      getAliases: (it) => it.aliases,
+      getPriority: (it) => it.priority,
+    });
+  } else {
+    configSearchState.index = { fallback: true, items: built.catalog };
+  }
+  return configSearchState.index;
+}
+
+function runConfigSearchQuery(rawQuery) {
+  const query = compact(rawQuery);
+  const index = ensureConfigSearchIndex();
+  if (!query || !index) return [];
+  const engine = window.MemorySearchEngine;
+  if (engine && typeof engine.search === "function" && !index.fallback) {
+    return engine.search(index, query, { limit: 36 });
+  }
+  const lower = query.toLowerCase();
+  return (index.items || [])
+    .filter((it) => {
+      const hay = [it.group, it.title, it.key, it.desc].concat(it.aliases || []).join(" ").toLowerCase();
+      return hay.includes(lower);
+    })
+    .slice(0, 36)
+    .map((item) => ({ item, score: 100, matchKind: "exact", reason: "", matchedAlias: "", matchedTerms: [query] }));
+}
+
+function highlightConfigText(text, matchedTerms) {
+  const engine = window.MemorySearchEngine;
+  if (engine && typeof engine.highlight === "function") {
+    return engine.highlight(text, matchedTerms, { markClass: "cfg-search-mark" });
+  }
+  return esc(text);
+}
+
+async function ensureConfigSchemaLoaded() {
+  if (state.configSchema && state.configSchema.schema) return state.configSchema;
+  if (!configSearchState.fetchPromise) {
+    configSearchState.loading = true;
+    configSearchState.error = "";
+    renderConfigSearchResults();
+    configSearchState.fetchPromise = apiGet("/config/schema")
+      .then((result) => {
+        state.configSchema = result;
+        configSearchState.error = "";
+        return result;
+      })
+      .catch((error) => {
+        configSearchState.error = (error && error.message) || "配置索引加载失败";
+        return null;
+      })
+      .finally(() => {
+        configSearchState.loading = false;
+        configSearchState.fetchPromise = null;
+        if (configSearchState.open) renderConfigSearchResults();
+      });
+  }
+  return configSearchState.fetchPromise;
+}
+
+function ensureConfigSearchModal() {
+  let modal = $("#configSearchModal");
+  if (modal) return modal;
+  modal = document.createElement("div");
+  modal.id = "configSearchModal";
+  modal.className = "cfg-search-overlay";
+  modal.hidden = true;
+  modal.innerHTML =
+    '<div class="cfg-search-dialog" role="dialog" aria-modal="true" aria-labelledby="cfgSearchTitle">' +
+      '<div class="cfg-search-head">' +
+        '<span class="cfg-search-icon" aria-hidden="true">' +
+          '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">' +
+            '<circle cx="7.2" cy="7.2" r="4.5"/><path d="M10.6 10.6L14 14"/>' +
+          "</svg>" +
+        "</span>" +
+        '<input id="configSearchInput" class="cfg-search-input" type="search" placeholder="搜索全部配置项：中文、简称、拼音、英文键或别名（如 向量精度 / xljd / float16 / 跨群）" autocomplete="off" spellcheck="false" aria-label="全局配置搜索" />' +
+        '<button type="button" class="cfg-search-clear" id="configSearchClear" aria-label="清空搜索" hidden>×</button>' +
+        '<span class="cfg-search-count" id="configSearchCount"></span>' +
+        '<button type="button" class="cfg-search-esc" id="configSearchClose" aria-label="关闭配置搜索">Esc</button>' +
+      "</div>" +
+      '<span id="cfgSearchTitle" class="sr-only">全局配置搜索</span>' +
+      '<div class="cfg-search-body" id="configSearchBody" role="listbox" aria-label="配置搜索结果"></div>' +
+      '<div class="cfg-search-foot">' +
+        '<span><kbd>↑</kbd><kbd>↓</kbd> 选择</span>' +
+        '<span><kbd>Enter</kbd> 直达并定位</span>' +
+        '<span><kbd>Esc</kbd> 关闭</span>' +
+        '<span class="cfg-search-foot-right">支持同义词 · 拼音首字母 · 错字容错</span>' +
+      "</div>" +
+    "</div>";
+
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal) {
+      closeConfigSearch();
+      return;
+    }
+    const chip = event.target.closest("[data-search-chip]");
+    if (chip) {
+      const input = $("#configSearchInput", modal);
+      if (input) {
+        input.value = chip.dataset.searchChip || "";
+        configSearchState.query = input.value;
+        configSearchState.selectedIndex = 0;
+        renderConfigSearchResults();
+        input.focus();
+      }
+      return;
+    }
+    const retry = event.target.closest("[data-search-retry]");
+    if (retry) {
+      ensureConfigSchemaLoaded();
+      return;
+    }
+    const row = event.target.closest("[data-search-hit]");
+    if (row) {
+      const idx = Number(row.dataset.searchHit);
+      if (Number.isFinite(idx) && configSearchState.hits[idx]) {
+        activateConfigSearchHit(configSearchState.hits[idx]);
+      }
+      return;
+    }
+    const modBtn = event.target.closest("[data-search-module]");
+    if (modBtn) {
+      activateConfigSearchHit({ item: { kind: "module", moduleId: modBtn.dataset.searchModule } });
+    }
+  });
+
+  modal.addEventListener("mousemove", (event) => {
+    const row = event.target.closest("[data-search-hit]");
+    if (!row) return;
+    const idx = Number(row.dataset.searchHit);
+    if (Number.isFinite(idx) && idx !== configSearchState.selectedIndex) {
+      configSearchState.selectedIndex = idx;
+      syncConfigSearchSelection(modal, false);
+    }
+  });
+
+  const input = $("#configSearchInput", modal);
+  const clearBtn = $("#configSearchClear", modal);
+  const closeBtn = $("#configSearchClose", modal);
+
+  input.addEventListener("input", () => {
+    configSearchState.query = input.value;
+    configSearchState.selectedIndex = 0;
+    renderConfigSearchResults();
+  });
+
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown") {
+      if (!configSearchState.hits.length) return;
+      event.preventDefault();
+      configSearchState.selectedIndex = (configSearchState.selectedIndex + 1) % configSearchState.hits.length;
+      syncConfigSearchSelection(modal, true);
+    } else if (event.key === "ArrowUp") {
+      if (!configSearchState.hits.length) return;
+      event.preventDefault();
+      configSearchState.selectedIndex =
+        (configSearchState.selectedIndex - 1 + configSearchState.hits.length) % configSearchState.hits.length;
+      syncConfigSearchSelection(modal, true);
+    } else if (event.key === "Home" && configSearchState.hits.length) {
+      event.preventDefault();
+      configSearchState.selectedIndex = 0;
+      syncConfigSearchSelection(modal, true);
+    } else if (event.key === "End" && configSearchState.hits.length) {
+      event.preventDefault();
+      configSearchState.selectedIndex = configSearchState.hits.length - 1;
+      syncConfigSearchSelection(modal, true);
+    } else if (event.key === "Enter") {
+      const hit = configSearchState.hits[configSearchState.selectedIndex];
+      if (hit) {
+        event.preventDefault();
+        activateConfigSearchHit(hit);
+      }
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeConfigSearch();
+    }
+  });
+
+  clearBtn.addEventListener("click", () => {
+    input.value = "";
+    configSearchState.query = "";
+    configSearchState.selectedIndex = 0;
+    renderConfigSearchResults();
+    input.focus();
+  });
+
+  closeBtn.addEventListener("click", () => closeConfigSearch());
+
+  document.body.appendChild(modal);
+  return modal;
+}
+
+function syncConfigSearchSelection(modal, shouldScroll) {
+  const rows = $$("[data-search-hit]", modal);
+  rows.forEach((row, idx) => {
+    const active = idx === configSearchState.selectedIndex;
+    row.classList.toggle("is-selected", active);
+    row.setAttribute("aria-selected", active ? "true" : "false");
+    if (active && shouldScroll && typeof row.scrollIntoView === "function") {
+      try { row.scrollIntoView({ block: "nearest" }); } catch (error) { /* 忽略 */ }
+    }
+  });
+}
+
+function renderConfigSearchResults() {
+  const modal = $("#configSearchModal");
+  if (!modal) return;
+  const body = $("#configSearchBody", modal);
+  const countEl = $("#configSearchCount", modal);
+  const clearBtn = $("#configSearchClear", modal);
+  const query = compact(configSearchState.query);
+  if (clearBtn) clearBtn.hidden = !configSearchState.query;
+
+  if (configSearchState.loading && !state.configSchema) {
+    configSearchState.hits = [];
+    if (countEl) countEl.textContent = "索引中…";
+    body.innerHTML = '<div class="cfg-search-empty"><b>正在载入全部配置项索引…</b><span>涵盖全部模块与折叠高级项</span></div>';
+    return;
+  }
+
+  if (configSearchState.error && !state.configSchema) {
+    configSearchState.hits = [];
+    if (countEl) countEl.textContent = "加载失败";
+    body.innerHTML =
+      '<div class="cfg-search-empty"><b>配置索引未能加载</b><span>' + esc(configSearchState.error) + "</span>" +
+      '<button type="button" class="btn is-sm" data-search-retry style="margin-top:10px">重试加载</button></div>';
+    return;
+  }
+
+  ensureConfigSearchIndex();
+
+  if (!query) {
+    configSearchState.hits = [];
+    if (countEl) {
+      countEl.textContent = configSearchState.moduleCount + " 模块 · " + configSearchState.fieldCount + " 项";
+    }
+    const chipsHtml = CONFIG_SEARCH_QUICK_CHIPS
+      .map((label) => '<button type="button" class="cfg-search-chip" data-search-chip="' + esc(label) + '">' + esc(label) + "</button>")
+      .join("");
+    const schema = (state.configSchema && state.configSchema.schema) || {};
+    const featuredIds = [
+      "retrieval_advanced",
+      "conversation_memory_advanced",
+      "memory_humanization",
+      "persona_memory",
+      "appearance",
+      "memory_summary",
+      "identity",
+      "livingmemory_migration",
+    ].filter((id) => Object.prototype.hasOwnProperty.call(schema, id));
+    const modGrid = featuredIds
+      .map((id) => {
+        const mod = schema[id] || {};
+        const count = Object.keys(mod.items || {}).length;
+        return (
+          '<button type="button" class="cfg-search-modcard" data-search-module="' + esc(id) + '">' +
+          '<b>' + esc(moduleLabel(id, mod)) + "</b>" +
+          '<em>' + count + " 项</em>" +
+          '<span>' + esc(clip(moduleSubtitle(id, mod) || "点击进入该模块配置", 36)) + "</span>" +
+          "</button>"
+        );
+      })
+      .join("");
+    body.innerHTML =
+      '<div class="cfg-search-welcome">' +
+        '<div class="cfg-search-sec-label">快捷直达</div>' +
+        '<div class="cfg-search-chips">' + chipsHtml + "</div>" +
+        (modGrid ? '<div class="cfg-search-sec-label" style="margin-top:14px">常用配置模块</div><div class="cfg-search-modgrid">' + modGrid + "</div>" : "") +
+      "</div>";
+    return;
+  }
+
+  const hits = runConfigSearchQuery(query);
+  configSearchState.hits = hits;
+  if (configSearchState.selectedIndex >= hits.length) configSearchState.selectedIndex = 0;
+  if (countEl) countEl.textContent = "命中 " + hits.length + " 项";
+
+  if (!hits.length) {
+    const chipsHtml = CONFIG_SEARCH_QUICK_CHIPS.slice(0, 5)
+      .map((label) => '<button type="button" class="cfg-search-chip" data-search-chip="' + esc(label) + '">' + esc(label) + "</button>")
+      .join("");
+    body.innerHTML =
+      '<div class="cfg-search-empty">' +
+        '<b>未找到与「' + esc(query) + '」匹配的配置</b>' +
+        "<span>可以尝试简称、同义词（如 省内存 / 小黑屋 / 跨群）、拼音首字母（如 xljd / nrh）或英文键名</span>" +
+        '<div class="cfg-search-chips" style="justify-content:center;margin-top:12px">' + chipsHtml + "</div>" +
+      "</div>";
+    return;
+  }
+
+  body.innerHTML = hits
+    .map((hit, idx) => {
+      const it = hit.item;
+      const selected = idx === configSearchState.selectedIndex;
+      const tags = [];
+      if (hit.matchKind === "alias" && hit.reason) {
+        tags.push('<span class="cfg-search-tag is-alias">' + esc(hit.reason) + "</span>");
+      } else if (hit.matchKind === "pinyin") {
+        tags.push('<span class="cfg-search-tag is-pinyin">拼音</span>');
+      } else if (hit.matchKind === "fuzzy") {
+        tags.push('<span class="cfg-search-tag is-fuzzy">容错</span>');
+      }
+      if (it.kind === "module") {
+        tags.push('<span class="cfg-search-tag is-mod">模块 · ' + esc(it.fieldCount) + " 项</span>");
+      } else if (it.kind === "action") {
+        tags.push('<span class="cfg-search-tag is-mod">直达</span>');
+      } else if (it.kind === "view") {
+        tags.push('<span class="cfg-search-tag is-mod">视图</span>');
+      } else {
+        if (it.isAdvanced) tags.push('<span class="cfg-search-tag is-adv">高级项</span>');
+        if (it.locked) tags.push('<span class="cfg-search-tag is-lock">只读</span>');
+      }
+
+      const crumb =
+        it.kind === "field"
+          ? '<span class="cfg-search-mod">' + highlightConfigText(it.moduleLabel, hit.matchedTerms) + "</span>" +
+            '<span class="cfg-search-sep" aria-hidden="true">›</span>' +
+            '<strong class="cfg-search-title">' + highlightConfigText(it.title, hit.matchedTerms) + "</strong>"
+          : '<span class="cfg-search-mod">' + esc(it.group) + "</span>" +
+            '<span class="cfg-search-sep" aria-hidden="true">›</span>' +
+            '<strong class="cfg-search-title">' + highlightConfigText(it.title, hit.matchedTerms) + "</strong>";
+
+      return (
+        '<button type="button" class="cfg-search-item' + (selected ? " is-selected" : "") + '"' +
+        ' role="option" aria-selected="' + (selected ? "true" : "false") + '"' +
+        ' data-search-hit="' + idx + '">' +
+        '<div class="cfg-search-row-top">' +
+          '<div class="cfg-search-crumb">' + crumb + "</div>" +
+          (tags.length ? '<div class="cfg-search-tags">' + tags.join("") + "</div>" : "") +
+        "</div>" +
+        (it.desc ? '<div class="cfg-search-desc">' + highlightConfigText(it.desc, hit.matchedTerms) + "</div>" : "") +
+        '<div class="cfg-search-key mono">' + highlightConfigText(it.key, hit.matchedTerms) + "</div>" +
+        "</button>"
+      );
+    })
+    .join("");
+}
+
+function openConfigSearch(initialQuery) {
+  const modal = ensureConfigSearchModal();
+  window.clearTimeout(configSearchState.closeTimer);
+  configSearchState.closeTimer = 0;
+  if (!configSearchState.open) {
+    configSearchState.lastFocus = document.activeElement;
+  }
+  configSearchState.open = true;
+  modal.hidden = false;
+  if (prefersReducedMotion()) {
+    modal.classList.add("is-open");
+  } else {
+    void modal.offsetWidth;
+    requestAnimationFrame(() => {
+      if (configSearchState.open) modal.classList.add("is-open");
+    });
+  }
+  const input = $("#configSearchInput", modal);
+  if (typeof initialQuery === "string") {
+    configSearchState.query = initialQuery;
+    if (input) input.value = initialQuery;
+  } else if (input) {
+    input.value = configSearchState.query;
+  }
+  configSearchState.selectedIndex = 0;
+  renderConfigSearchResults();
+  if (!state.configSchema || !state.configSchema.schema) {
+    ensureConfigSchemaLoaded();
+  }
+  if (input) {
+    input.focus();
+    if (input.value) input.select();
+  }
+}
+
+function closeConfigSearch(options) {
+  const modal = $("#configSearchModal");
+  if (!modal || !configSearchState.open) return;
+  configSearchState.open = false;
+  window.clearTimeout(configSearchState.closeTimer);
+  configSearchState.closeTimer = 0;
+  modal.classList.remove("is-open");
+  if (prefersReducedMotion() || (options && options.immediate)) {
+    modal.hidden = true;
+  } else {
+    configSearchState.closeTimer = window.setTimeout(() => {
+      configSearchState.closeTimer = 0;
+      if (!configSearchState.open) modal.hidden = true;
+    }, 180);
+  }
+  if (!options || options.restoreFocus !== false) {
+    const prev = configSearchState.lastFocus;
+    configSearchState.lastFocus = null;
+    if (prev && typeof prev.focus === "function" && document.contains(prev)) {
+      try { prev.focus({ preventScroll: true }); } catch (error) { /* 忽略 */ }
+    }
+  } else {
+    configSearchState.lastFocus = null;
+  }
+}
+
+async function activateConfigSearchHit(hit) {
+  const item = hit && hit.item;
+  if (!item) return;
+  closeConfigSearch({ restoreFocus: false });
+  if ((item.kind === "view" || item.kind === "action") && item.viewId) {
+    if (item.focusTarget) {
+      state.pendingViewFocus = { viewId: item.viewId, target: item.focusTarget };
+    }
+    await go(item.viewId);
+    return;
+  }
+  if (item.moduleId) {
+    state.configModule = item.moduleId;
+    if (item.kind === "field" && item.fieldKey) {
+      configSearchState.pendingTarget = {
+        moduleId: item.moduleId,
+        fieldKey: item.fieldKey,
+        isAdvanced: Boolean(item.isAdvanced),
+      };
+    } else {
+      configSearchState.pendingTarget = null;
+    }
+    await go("config", { useCachedSchema: Boolean(state.configSchema && state.configSchema.schema) });
+  }
+}
+
+function applyPendingConfigFocus(rootNode) {
+  const target = configSearchState.pendingTarget;
+  if (!target || target.moduleId !== state.configModule) return;
+  configSearchState.pendingTarget = null;
+
+  const scope = rootNode || $("#content");
+  if (!scope) return;
+  const safeKey = String(target.fieldKey || "").replace(/["\\]/g, "\\$&");
+  const fieldEl = scope.querySelector('[data-config-field="' + safeKey + '"]');
+  if (!fieldEl) return;
+
+  const details = fieldEl.closest("details.config-advanced");
+  if (details) {
+    if (typeof details.__cancelSmoothAnim === "function") details.__cancelSmoothAnim();
+    if (!details.open) details.open = true;
+  }
+
+  let reducedMotion = false;
+  try {
+    reducedMotion = Boolean(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  } catch (error) { /* 忽略 */ }
+
+  requestAnimationFrame(() => {
+    if (typeof fieldEl.scrollIntoView === "function") {
+      try {
+        fieldEl.scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "center" });
+      } catch (error) {
+        fieldEl.scrollIntoView();
+      }
+    }
+    $$(".config-field.is-search-hit", scope).forEach((el) => el.classList.remove("is-search-hit"));
+    void fieldEl.offsetWidth;
+    fieldEl.classList.add("is-search-hit");
+    window.clearTimeout(configSearchState.hitTimer);
+    configSearchState.hitTimer = window.setTimeout(() => {
+      fieldEl.classList.remove("is-search-hit");
+    }, 2200);
+
+    const focusable =
+      fieldEl.querySelector('.cfg-choice-card.is-active:not([disabled])') ||
+      fieldEl.querySelector('input:not([type="hidden"]):not([disabled]), select:not([disabled]), button:not([disabled])');
+    if (focusable && typeof focusable.focus === "function") {
+      try { focusable.focus({ preventScroll: true }); } catch (error) { /* 忽略 */ }
+    }
+  });
+}
+
+function mountConfigSearchTrigger() {
+  if ($("#configSearchBtn")) return;
+  const foot = $(".rail-foot");
+  if (!foot) return;
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.id = "configSearchBtn";
+  btn.className = "rail-search-btn";
+  btn.title = "搜索全部配置项 (" + shortcutBadgeText() + ")";
+  btn.setAttribute("aria-label", "搜索配置");
+  btn.innerHTML =
+    icon("search", "rail-search-icon") +
+    '<span class="rail-search-label">搜索配置</span>' +
+    '<kbd class="rail-search-kbd">' + esc(shortcutBadgeText()) + "</kbd>";
+  btn.addEventListener("click", () => openConfigSearch());
+  foot.insertBefore(btn, foot.firstChild);
+}
+
+function initConfigSearch() {
+  if (configSearchState.initialized) return;
+  configSearchState.initialized = true;
+  mountConfigSearchTrigger();
+
+  document.addEventListener("keydown", (event) => {
+    const key = String(event.key || "");
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && key.toLowerCase() === "k") {
+      event.preventDefault();
+      if (configSearchState.open) {
+        const input = $("#configSearchInput");
+        if (input) {
+          input.focus();
+          input.select();
+        }
+      } else {
+        openConfigSearch();
+      }
+      return;
+    }
+
+    if (key === "Escape" && configSearchState.open) {
+      event.preventDefault();
+      closeConfigSearch();
+      return;
+    }
+
+    if (
+      key === "/" &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      !configSearchState.open &&
+      !isEditableElement(event.target) &&
+      !(state.mode === "cinema" && state.view === "overview")
+    ) {
+      event.preventDefault();
+      openConfigSearch();
+    }
+  });
+}
 
 /* ============================================================
    视图：权限拓扑
@@ -4517,6 +6185,508 @@ defineView("acl", {
 });
 
 /* ============================================================
+   视图：性能调优
+   ============================================================ */
+const perfUiState = {
+  draftProfile: "",
+  preserveOnSwitch: false,
+  advancedOpen: false,
+  lastHotReload: null,
+};
+
+function fmtMemMb(mb) {
+  const n = Number(mb);
+  if (!Number.isFinite(n) || n <= 0) return "未知内存";
+  if (n < 1024) return Math.round(n) + " MiB";
+  return num(n / 1024, 1) + " GiB";
+}
+
+function fmtPerfValue(param, rawVal) {
+  if (param.value_type === "bool") return rawVal ? "已开启" : "已关闭";
+  if (param.value_type === "enum") return compact(rawVal, "-");
+  const scale = Number(param.display_scale) || 1;
+  const numeric = Number(rawVal);
+  if (!Number.isFinite(numeric)) return "-";
+  const shown = scale > 1 ? num(numeric / scale, 1) : num(numeric, param.value_type === "float" ? 1 : 0);
+  return param.unit ? shown + " " + param.unit : shown;
+}
+
+function toDisplayInputValue(param, rawVal) {
+  const scale = Number(param.display_scale) || 1;
+  if (param.value_type === "int" || param.value_type === "float") {
+    const numeric = Number(rawVal);
+    if (!Number.isFinite(numeric)) return "";
+    if (scale > 1) return String(Math.round(numeric / scale));
+    return String(numeric);
+  }
+  return String(rawVal ?? "");
+}
+
+function parseInputToRawValue(param, el) {
+  if (!el) return null;
+  if (param.value_type === "bool") return Boolean(el.checked);
+  if (param.value_type === "enum") return String(el.value || "");
+  const numeric = Number(el.value);
+  if (!Number.isFinite(numeric)) return null;
+  const scale = Number(param.display_scale) || 1;
+  if (param.value_type === "int") return Math.round(numeric * scale);
+  return Math.round(numeric * 100) / 100;
+}
+
+function perfValuesEqual(param, a, b) {
+  if (param.value_type === "bool") return Boolean(a) === Boolean(b);
+  if (param.value_type === "float") return Math.abs(Number(a) - Number(b)) < 1e-6;
+  if (param.value_type === "int") return Math.round(Number(a)) === Math.round(Number(b));
+  return String(a ?? "").trim().toLowerCase() === String(b ?? "").trim().toLowerCase();
+}
+
+defineView("performance", {
+  title: "性能调优",
+  navLabel: "性能调优",
+  eyebrow: "Settings · Performance",
+  hint: "按机器配置选择 5 档统一性能策略，也可展开微调数据库与检索底层参数",
+  async load() {
+    perfUiState.draftProfile = "";
+    perfUiState.preserveOnSwitch = false;
+    const res = await apiGet("/performance/tuning");
+    return (res && res.tuning) || res || {};
+  },
+  render(data) {
+    const hw = data.hardware || {};
+    const tiers = Array.isArray(data.tiers) ? data.tiers : [];
+    const groups = Array.isArray(data.groups) ? data.groups : [];
+    const params = Array.isArray(data.params) ? data.params : [];
+    const clamped = Array.isArray(data.clamped_fields) ? data.clamped_fields : [];
+    const dbSummary = data.db_summary || {};
+    const savedProfile = compact(data.profile, "auto");
+    const activeProfile = perfUiState.draftProfile || savedProfile;
+    const effectiveTierLabel = compact(data.effective_tier_label || data.effective_tier, "均衡推荐");
+    const profileLabel = compact(data.profile_label || savedProfile, "智能自动");
+    const overrideCount = Math.max(0, int(data.override_count));
+    const switchingWithOverrides = activeProfile !== savedProfile && overrideCount > 0;
+
+    const memSourceTag = {
+      cgroup_v2: "容器 cgroup v2 限额",
+      cgroup_v1: "容器 cgroup v1 限额",
+      windows: "主机物理内存",
+      proc_meminfo: "主机物理内存",
+      sysconf: "主机物理内存",
+    }[hw.memory_source] || "自动识别";
+
+    const statusBadgeText = overrideCount > 0
+      ? "基于「" + effectiveTierLabel + "」· 已微调 " + overrideCount + " 项"
+      : savedProfile === "auto"
+      ? "智能自动 · 当前生效：" + effectiveTierLabel
+      : "当前生效：" + profileLabel;
+
+    const hero =
+      '<section class="card perf-hero">' +
+        '<div class="perf-hero-top">' +
+          '<div class="perf-hero-copy">' +
+            '<div class="perf-hw-chips">' +
+              '<span class="perf-chip is-accent">可用内存：' + esc(fmtMemMb(hw.effective_memory_mb)) + "</span>" +
+              '<span class="perf-chip">CPU：' + esc(fmtInt(hw.cpu_count || 2)) + " 核</span>" +
+              '<span class="perf-chip">' + esc(memSourceTag) + "</span>" +
+              (hw.is_32bit ? '<span class="perf-chip is-warn">32 位环境 · 自动关 mmap</span>' : "") +
+            "</div>" +
+            '<p class="perf-hero-reason">' + esc(compact(hw.recommendation_reason, "已根据当前硬件自动评估推荐性能档位。")) + "</p>" +
+            '<p class="perf-orthogonal-note">' + esc(compact(data.orthogonal_notice, "功能预设管「记多少、用哪些能力」，性能档位管「跑多快、占多少内存硬盘」，两者互不冲突。")) + "</p>" +
+          "</div>" +
+          '<div class="perf-status-pill' + (overrideCount > 0 ? " is-overridden" : "") + '">' +
+            '<span class="perf-status-dot" aria-hidden="true"></span>' +
+            '<span>' + esc(statusBadgeText) + "</span>" +
+          "</div>" +
+        "</div>" +
+      "</section>";
+
+    const clampBanner = clamped.length
+      ? '<section class="perf-clamp-banner" role="status">' +
+          '<div class="perf-clamp-head"><b>已触发防爆内存安全限幅（' + clamped.length + ' 项）</b><span>为防止低配机器 OOM 崩溃，系统已按本机可用内存自动收紧下列参数：</span></div>' +
+          '<ul class="perf-clamp-list">' +
+            clamped.map((c) => "<li>" + esc(c.reason || (c.label + " 已自动限幅")) + "</li>").join("") +
+          "</ul>" +
+        "</section>"
+      : "";
+
+    const tierCards = tiers
+      .map((tier) => {
+        const isSel = tier.id === activeProfile;
+        const isRecommended = tier.id === hw.recommended_tier;
+        const extraTag = tier.id === "auto"
+          ? "自动匹配：" + (tiers.find((t) => t.id === hw.recommended_tier)?.label || effectiveTierLabel)
+          : isRecommended
+          ? "本机推荐"
+          : tier.badge;
+        return (
+          '<button type="button" class="perf-tier-card' + (isSel ? " is-active" : "") + '"' +
+          ' role="radio" aria-checked="' + (isSel ? "true" : "false") + '"' +
+          ' data-perf-tier="' + esc(tier.id) + '">' +
+            '<div class="perf-tier-head">' +
+              '<span class="cfg-choice-dot" aria-hidden="true"></span>' +
+              '<strong class="perf-tier-title">' + esc(tier.label) + "</strong>" +
+              (extraTag ? '<span class="perf-tier-badge' + (isRecommended || tier.id === "auto" ? " is-rec" : "") + '">' + esc(extraTag) + "</span>" : "") +
+            "</div>" +
+            '<div class="perf-tier-tagline">' + esc(tier.tagline) + "</div>" +
+            '<div class="perf-tier-scene">' + esc(tier.target_scene) + "</div>" +
+            '<div class="perf-tier-highlights">' +
+              (Array.isArray(tier.highlights) ? tier.highlights.map((h) => "<span>" + esc(h) + "</span>").join("") : "") +
+            "</div>" +
+          "</button>"
+        );
+      })
+      .join("");
+
+    const switchBar =
+      '<div class="perf-switch-bar" id="perfSwitchBar"' + (switchingWithOverrides ? "" : " hidden") + ">" +
+        '<span class="perf-switch-msg">检测到当前有 <b>' + overrideCount + "</b> 项手动微调，切换到新档位时：</span>" +
+        '<div class="perf-switch-choices" role="radiogroup" aria-label="切换档位时的微调处理">' +
+          '<button type="button" class="btn is-sm' + (!perfUiState.preserveOnSwitch ? " is-primary" : "") + '" data-perf-preserve="0">全部恢复新档位默认（推荐）</button>' +
+          '<button type="button" class="btn is-sm' + (perfUiState.preserveOnSwitch ? " is-primary" : "") + '" data-perf-preserve="1">保留我的微调项</button>' +
+        "</div>" +
+      "</div>";
+
+    const renderParamControl = (param) => {
+      const id = "perf_field_" + param.key.replace(/[^a-zA-Z0-9_]/g, "_");
+      const val = param.effective_value;
+      if (param.value_type === "bool") {
+        return (
+          '<label class="switch">' +
+            '<input type="checkbox" id="' + esc(id) + '" data-perf-input="' + esc(param.key) + '"' + (val ? " checked" : "") + " />" +
+            '<span class="switch-track"></span>' +
+            '<span class="perf-switch-text">' + (val ? "已开启" : "已关闭") + "</span>" +
+          "</label>"
+        );
+      }
+      if (param.value_type === "enum") {
+        const opts = Array.isArray(param.options) ? param.options : [];
+        return (
+          '<select id="' + esc(id) + '" data-perf-input="' + esc(param.key) + '">' +
+            opts
+              .map((opt) => '<option value="' + esc(opt.value) + '"' + (String(val) === String(opt.value) ? " selected" : "") + ">" + esc(opt.label) + "</option>")
+              .join("") +
+          "</select>"
+        );
+      }
+      const scale = Number(param.display_scale) || 1;
+      const minAttr = param.min != null ? ' min="' + esc(scale > 1 ? Math.round(param.min / scale) : param.min) + '"' : "";
+      const maxAttr = param.max != null ? ' max="' + esc(scale > 1 ? Math.round(param.max / scale) : param.max) + '"' : "";
+      const stepAttr = param.step != null ? ' step="' + esc(scale > 1 ? Math.max(1, Math.round(param.step / scale)) : param.step) + '"' : "";
+      return (
+        '<div class="perf-num-wrap">' +
+          '<input type="number" id="' + esc(id) + '" data-perf-input="' + esc(param.key) + '" value="' + esc(toDisplayInputValue(param, val)) + '"' + minAttr + maxAttr + stepAttr + " />" +
+          (param.unit ? '<span class="perf-unit">' + esc(param.unit) + "</span>" : "") +
+        "</div>"
+      );
+    };
+
+    const groupsHtml = groups
+      .map((grp) => {
+        const grpParams = params.filter((p) => p.group === grp.id);
+        if (!grpParams.length) return "";
+        const rows = grpParams
+          .map((p) => {
+            const overridden = Boolean(p.overridden);
+            const isClamped = Boolean(p.clamped);
+            return (
+              '<div class="perf-param' + (overridden ? " is-overridden" : "") + (isClamped ? " is-clamped" : "") + '" data-perf-param="' + esc(p.key) + '">' +
+                '<div class="perf-param-info">' +
+                  '<div class="perf-param-head">' +
+                    '<strong class="perf-param-label">' + esc(p.label) + "</strong>" +
+                    '<span class="perf-override-pill' + (overridden ? " is-on" : "") + '" data-perf-override-pill="' + esc(p.key) + '">' +
+                      (overridden ? "● 已微调" : "跟随档位") +
+                    "</span>" +
+                    '<span class="perf-scope-pill' + (p.hot_reload ? " is-hot" : "") + '">' + esc(p.effect_scope || (p.hot_reload ? "立即生效" : "下次重启生效")) + "</span>" +
+                    (isClamped ? '<span class="perf-clamp-pill">已安全限幅</span>' : "") +
+                  "</div>" +
+                  '<div class="perf-param-summary">' + esc(p.summary) + "</div>" +
+                  '<div class="perf-param-effects">' +
+                    '<span><b>▲</b> ' + esc(p.up_effect) + "</span>" +
+                    '<span><b>▼</b> ' + esc(p.down_effect) + "</span>" +
+                  "</div>" +
+                  '<div class="perf-param-meta">' +
+                    '<span>当前生效：<b>' + esc(fmtPerfValue(p, p.effective_value)) + "</b></span>" +
+                    '<span>档位默认：' + esc(fmtPerfValue(p, p.tier_default)) + "</span>" +
+                    '<code class="mono">' + esc(p.key) + "</code>" +
+                  "</div>" +
+                "</div>" +
+                '<div class="perf-param-ctrl">' +
+                  renderParamControl(p) +
+                  '<button type="button" class="btn is-sm perf-reset-one" data-perf-reset-key="' + esc(p.key) + '"' + (overridden ? "" : " disabled") + ">恢复跟随档位</button>" +
+                "</div>" +
+              "</div>"
+            );
+          })
+          .join("");
+        return (
+          '<section class="perf-group">' +
+            '<div class="perf-group-head"><h4>' + esc(grp.label) + "</h4><span>" + esc(grp.desc) + "</span></div>" +
+            '<div class="perf-group-list">' + rows + "</div>" +
+          "</section>"
+        );
+      })
+      .join("");
+
+    const advancedDetails =
+      '<details class="config-advanced perf-advanced" id="perfAdvancedDetails"' + (perfUiState.advancedOpen ? " open" : "") + ">" +
+        "<summary>" +
+          "<span>展开高级性能微调（" + params.length + " 项）</span>" +
+          (overrideCount > 0 ? '<span class="perf-summary-badge">已微调 ' + overrideCount + " 项</span>" : '<span class="perf-summary-hint">一般选上面 5 档即可，有特殊需求再微调</span>') +
+        "</summary>" +
+        '<div class="config-advanced-body"><div class="config-advanced-inner">' +
+          '<div class="perf-adv-toolbar">' +
+            '<span>绿色标签项保存后立即热刷新连接池与缓存；灰色标签项在下次重启 AstrBot 时生效。</span>' +
+            '<button type="button" class="btn is-sm" id="perfResetAllBtn"' + (overrideCount > 0 ? "" : " disabled") + ">全部恢复档位默认</button>" +
+          "</div>" +
+          groupsHtml +
+        "</div></div>" +
+      "</details>";
+
+    const saveBar =
+      '<div class="perf-save-bar">' +
+        '<div class="perf-save-hint">' +
+          (perfUiState.lastHotReload
+            ? "上次热刷新：读连接池代次 #" + esc(fmtInt(perfUiState.lastHotReload.read_pool_generation || 0)) +
+              "（" + esc(fmtInt(perfUiState.lastHotReload.read_pool_max || 0)) + " 路 · 页缓存 " +
+              esc(fmtInt(perfUiState.lastHotReload.cache_size_mb || 0)) + " MB · mmap " +
+              esc(fmtInt(perfUiState.lastHotReload.mmap_size_mb || 0)) + " MB）"
+            : "保存后立即写入插件配置并热刷新 SQLite 缓存、并发读连接池与检索预算。") +
+        "</div>" +
+        '<div class="perf-save-actions">' +
+          '<button type="button" class="btn is-sm" id="perfResetAllFooterBtn"' + (overrideCount > 0 ? "" : " disabled") + ">全部恢复档位默认</button>" +
+          '<button type="button" class="btn is-primary" id="perfSaveBtn">保存并立即生效</button>' +
+        "</div>" +
+      "</div>";
+
+    const dbStrip =
+      '<section class="card perf-db-strip">' +
+        '<div class="perf-db-strip-copy">' +
+          '<div class="perf-db-strip-title">' + icon("db", "perf-db-icon") + "<b>数据库体积速览</b>" +
+            '<span class="perf-db-total">' + esc(fmtBytes(dbSummary.grand_total_bytes || dbSummary.primary_total_bytes || 0)) + "</span>" +
+          "</div>" +
+          '<div class="perf-db-strip-meta">' +
+            "主库 " + esc(fmtBytes(dbSummary.primary_db_bytes || 0)) +
+            " · WAL " + esc(fmtBytes(dbSummary.wal_bytes || 0)) +
+            " · 副库 " + esc(fmtBytes(dbSummary.scoped_total_bytes || 0)) +
+            " — 切换半精度 float16 或感觉库偏大时，可前往一键无损瘦身。" +
+          "</div>" +
+        "</div>" +
+        '<button type="button" class="btn is-sm" id="perfGoDbHealthBtn">前往数据库体检与一键瘦身 →</button>' +
+      "</section>";
+
+    return (
+      '<div class="perf-view">' +
+        hero +
+        clampBanner +
+        card(
+          "选择性能档位",
+          "点选最贴合你机器配置的档位；不确定时直接选「智能自动」即可",
+          '<div class="perf-tier-grid" role="radiogroup" aria-label="性能档位选择">' + tierCards + "</div>" +
+            switchBar +
+            advancedDetails +
+            saveBar,
+          "",
+          "perf-main-card"
+        ) +
+        dbStrip +
+      "</div>"
+    );
+  },
+  mount(node, data) {
+    const params = Array.isArray(data.params) ? data.params : [];
+    const paramMap = {};
+    params.forEach((p) => { paramMap[p.key] = p; });
+    const savedProfile = compact(data.profile, "auto");
+    let selectedProfile = perfUiState.draftProfile || savedProfile;
+    const overrideCount = Math.max(0, int(data.override_count));
+
+    // Track per-field edits made inside this view before clicking Save.
+    const editedOverrides = Object.assign({}, data.overrides || {});
+    const dirtyOverrides = {};
+
+    const syncTierCards = (nextProfile, shouldFocus) => {
+      selectedProfile = nextProfile;
+      perfUiState.draftProfile = nextProfile;
+      const cards = $$(".perf-tier-card", node);
+      cards.forEach((btn) => {
+        const active = btn.dataset.perfTier === nextProfile;
+        btn.classList.toggle("is-active", active);
+        btn.setAttribute("aria-checked", active ? "true" : "false");
+        if (active && shouldFocus && typeof btn.focus === "function") btn.focus();
+      });
+      const shouldShowSwitchBar = nextProfile !== savedProfile && overrideCount > 0;
+      const existingBar = $("#perfSwitchBar", node);
+      if (existingBar) {
+        existingBar.hidden = !shouldShowSwitchBar;
+      }
+    };
+
+    const tierButtons = $$(".perf-tier-card", node);
+    tierButtons.forEach((btn, idx) => {
+      btn.addEventListener("click", () => syncTierCards(btn.dataset.perfTier, false));
+      btn.addEventListener("keydown", (event) => {
+        if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+          event.preventDefault();
+          const next = tierButtons[(idx + 1) % tierButtons.length];
+          syncTierCards(next.dataset.perfTier, true);
+        } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+          event.preventDefault();
+          const prev = tierButtons[(idx - 1 + tierButtons.length) % tierButtons.length];
+          syncTierCards(prev.dataset.perfTier, true);
+        }
+      });
+    });
+
+    $$("[data-perf-preserve]", node).forEach((btn) => {
+      btn.addEventListener("click", () => {
+        perfUiState.preserveOnSwitch = btn.dataset.perfPreserve === "1";
+        $$("[data-perf-preserve]", node).forEach((b) => {
+          b.classList.toggle("is-primary", (b.dataset.perfPreserve === "1") === perfUiState.preserveOnSwitch);
+        });
+      });
+    });
+
+    const syncParamRow = (key, rawVal) => {
+      const param = paramMap[key];
+      if (!param) return;
+      const isDiff = rawVal !== null && !perfValuesEqual(param, rawVal, param.tier_default);
+      if (isDiff) {
+        editedOverrides[key] = rawVal;
+        dirtyOverrides[key] = rawVal;
+      } else {
+        editedOverrides[key] = null;
+        dirtyOverrides[key] = null;
+      }
+      const row = $('[data-perf-param="' + key.replace(/["\\]/g, "\\$&") + '"]', node);
+      if (row) row.classList.toggle("is-overridden", isDiff);
+      const pill = $('[data-perf-override-pill="' + key.replace(/["\\]/g, "\\$&") + '"]', node);
+      if (pill) {
+        pill.classList.toggle("is-on", isDiff);
+        pill.textContent = isDiff ? "● 已微调" : "跟随档位";
+      }
+      const resetBtn = $('[data-perf-reset-key="' + key.replace(/["\\]/g, "\\$&") + '"]', node);
+      if (resetBtn) resetBtn.disabled = !isDiff;
+      const anyOverridden = Object.keys(editedOverrides).some((k) => editedOverrides[k] !== null && editedOverrides[k] !== undefined);
+      const r1 = $("#perfResetAllBtn", node);
+      const r2 = $("#perfResetAllFooterBtn", node);
+      if (r1) r1.disabled = !anyOverridden;
+      if (r2) r2.disabled = !anyOverridden;
+    };
+
+    $$("[data-perf-input]", node).forEach((input) => {
+      const key = input.dataset.perfInput;
+      const param = paramMap[key];
+      if (!param) return;
+      const onChange = () => {
+        if (param.value_type === "bool") {
+          const lbl = input.parentElement && input.parentElement.querySelector(".perf-switch-text");
+          if (lbl) lbl.textContent = input.checked ? "已开启" : "已关闭";
+        }
+        syncParamRow(key, parseInputToRawValue(param, input));
+      };
+      input.addEventListener("change", onChange);
+      if (input.type === "number") input.addEventListener("input", onChange);
+    });
+
+    $$("[data-perf-reset-key]", node).forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const key = btn.dataset.perfResetKey;
+        const param = paramMap[key];
+        if (!param) return;
+        const input = $('[data-perf-input="' + key.replace(/["\\]/g, "\\$&") + '"]', node);
+        if (input) {
+          if (param.value_type === "bool") {
+            input.checked = Boolean(param.tier_default);
+            const lbl = input.parentElement && input.parentElement.querySelector(".perf-switch-text");
+            if (lbl) lbl.textContent = input.checked ? "已开启" : "已关闭";
+          } else if (param.value_type === "enum") {
+            input.value = String(param.tier_default);
+          } else {
+            input.value = toDisplayInputValue(param, param.tier_default);
+          }
+        }
+        syncParamRow(key, null);
+      });
+    });
+
+    const advDetails = $("#perfAdvancedDetails", node);
+    if (advDetails) {
+      advDetails.addEventListener("toggle", () => {
+        perfUiState.advancedOpen = Boolean(advDetails.open);
+      });
+    }
+    bindSmoothDetails(node);
+
+    const applyTuning = async (resetAll) => {
+      const profileChanged = selectedProfile !== savedProfile;
+      const payload = {
+        profile: selectedProfile,
+        reset_overrides: Boolean(resetAll),
+        preserve_overrides: resetAll ? false : (profileChanged ? Boolean(perfUiState.preserveOnSwitch) : true),
+      };
+      if (!resetAll) {
+        const sourceMap = (!profileChanged || perfUiState.preserveOnSwitch) ? editedOverrides : dirtyOverrides;
+        const delta = {};
+        Object.keys(sourceMap).forEach((k) => {
+          delta[k] = sourceMap[k];
+        });
+        if (Object.keys(delta).length) payload.overrides = delta;
+      }
+      await withBusy(resetAll ? "正在恢复档位默认…" : "正在应用性能调优…", async () => {
+        try {
+          const res = await apiPost("/performance/tuning", payload);
+          const tuning = (res && res.tuning) || res || {};
+          perfUiState.draftProfile = "";
+          perfUiState.preserveOnSwitch = false;
+          perfUiState.lastHotReload = tuning.hot_reload || null;
+          state.configSchema = null;
+          invalidatePool();
+          const clampedCount = Array.isArray(tuning.clamped_fields) ? tuning.clamped_fields.length : 0;
+          if (clampedCount > 0) {
+            toast("性能调优已生效（" + clampedCount + " 项已触发防爆内存限幅）", "ok");
+          } else {
+            toast(resetAll ? "已恢复所选档位全部默认参数" : "性能调优已保存并热生效", "ok");
+          }
+          await go("performance", { inPlace: true });
+        } catch (error) {
+          toast("性能调优保存失败：" + error.message, "error");
+        }
+      });
+    };
+
+    const saveBtn = $("#perfSaveBtn", node);
+    if (saveBtn) saveBtn.addEventListener("click", () => applyTuning(false));
+    const resetAllBtn = $("#perfResetAllBtn", node);
+    if (resetAllBtn) resetAllBtn.addEventListener("click", () => applyTuning(true));
+    const resetAllFooterBtn = $("#perfResetAllFooterBtn", node);
+    if (resetAllFooterBtn) resetAllFooterBtn.addEventListener("click", () => applyTuning(true));
+
+    const goDbBtn = $("#perfGoDbHealthBtn", node);
+    if (goDbBtn) {
+      goDbBtn.addEventListener("click", () => {
+        state.pendingViewFocus = { viewId: "migrate", target: "dbHealthCard" };
+        go("migrate");
+      });
+    }
+
+    if (state.pendingViewFocus && state.pendingViewFocus.viewId === "performance") {
+      const target = compact(state.pendingViewFocus.target);
+      state.pendingViewFocus = null;
+      if (target.startsWith("tier:")) {
+        const tierId = target.slice(5);
+        const cardEl = $('[data-perf-tier="' + tierId.replace(/["\\]/g, "\\$&") + '"]', node);
+        if (cardEl) {
+          requestAnimationFrame(() => {
+            try { cardEl.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "center" }); } catch (err) { /* 忽略 */ }
+            cardEl.classList.add("is-search-hit");
+            window.setTimeout(() => cardEl.classList.remove("is-search-hit"), 2200);
+          });
+        }
+      }
+    }
+  },
+});
+
+/* ============================================================
    启动
    ============================================================ */
 function bindShell() {
@@ -4524,10 +6694,8 @@ function bindShell() {
     applyTheme(state.theme === "dark" ? "light" : "dark");
   });
 
-  window.addEventListener("mc:theme", () => {
-    if (galaxyInstance) galaxyInstance.buildStarfield();
-  });
-
+  const drawerNode = $("#drawer");
+  if (drawerNode && !drawerNode.classList.contains("is-open")) drawerNode.inert = true;
   $("#drawerClose").addEventListener("click", closeDrawer);
   $("#scrim").addEventListener("click", closeDrawer);
   $("#assemblyViewerClose")?.addEventListener("click", closeAssemblyViewer);
@@ -4543,6 +6711,8 @@ function bindShell() {
     invalidatePool();
     refresh();
   });
+
+  initConfigSearch();
 
   const modeToggle = $("#modeToggle");
   if (modeToggle) {
@@ -4569,6 +6739,14 @@ function bindShell() {
   });
 
   document.addEventListener("click", (event) => {
+    const peopleLink =
+      event && event.target && typeof event.target.closest === "function"
+        ? event.target.closest('a[data-people-link], a[href^="./people.html"]')
+        : null;
+    if (peopleLink && typeof peopleLink.setAttribute === "function") {
+      peopleLink.setAttribute("href", peopleHref());
+      return;
+    }
     const target = event.target.closest("[data-goto]");
     if (!target) return;
     const view = target.dataset.goto;
@@ -4576,13 +6754,21 @@ function bindShell() {
     const options = {};
     if (compact(target.dataset.scope)) options.scope = target.dataset.scope;
     if (compact(target.dataset.target)) options.target = target.dataset.target;
-    if (filter) {
+    const ownerBot = compact(target.dataset.ownerBot);
+    if (ownerBot) {
+      state.filters = { scope: "", q: "", visibility: "", lifecycle: "", memoryType: "", target: "", ownerBot: ownerBot };
+    } else if (filter === "all") {
+      state.filters = { scope: "", q: "", visibility: "", lifecycle: "", memoryType: "", target: "" };
+    } else if (filter) {
       if (filter.indexOf("scope:") === 0) {
         state.filters = { scope: filter.slice(6), q: "", visibility: "", lifecycle: "", memoryType: "", target: "" };
       } else if (filter === "profile") {
         state.filters = { scope: "profile", q: "", visibility: "", lifecycle: "", memoryType: "", target: "" };
       } else if (filter.indexOf("external:") === 0) {
         state.filters = { scope: "", q: "", visibility: "", lifecycle: "", memoryType: "", target: "" };
+      } else if (filter.indexOf("tab:") === 0) {
+        quarantineTab = filter.slice(4) === "pending" ? "pending" : "quarantined";
+        quarantineOffset = 0;
       }
     }
     go(view, options);
@@ -4635,24 +6821,39 @@ function bindShell() {
     if (event.key === "Escape") {
       closeDrawer();
       const box = $(".lightbox");
-      if (box) box.remove();
+      if (box) closeLightbox(box);
     }
   });
 }
 
 async function boot() {
   bindShell();
-  applyTheme(state.theme);
+  applyTheme(state.theme, { persist: false });
   applyMode(state.mode);
   renderRail();
+  bindBridgeContext();
   setRailStatus("loading", "正在连接…");
 
   const initial = document.documentElement.dataset.initialNav;
   const target = state.mode === "cinema" ? "overview" : (initial && VIEWS[initial] ? initial : "overview");
 
+  let prefsLoaded = false;
   try {
     await apiGet("/stats");
     setRailStatus("ok", "已连接");
+    // 2.6.6：浏览器存储被清过也能恢复上次的深色/浅色选择
+    const prefs = await apiGet("/ui-preferences").catch(() => null);
+    if (prefs) {
+      prefsLoaded = true;
+      if (typeof prefs.palette === "string") applyPalette(prefs.palette);
+      if (typeof prefs.dark_mode === "boolean" && prefs.dark_mode_saved !== false) {
+        const want = prefs.dark_mode ? "dark" : "light";
+        state.explicitTheme = want;
+        if (!state.manualThemeToggled && want !== state.theme) {
+          applyTheme(want, { persist: false });
+        }
+      }
+    }
   } catch (error) {
     setRailStatus("bad", "连接失败");
   }
@@ -4660,7 +6861,7 @@ async function boot() {
   state.ready = true;
   await go(target);
   // 配色放最后：不阻塞首屏，失败也不影响面板可用
-  syncPalette();
+  if (!prefsLoaded) syncPalette();
 }
 
 if (document.readyState === "loading") {

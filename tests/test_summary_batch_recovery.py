@@ -36,6 +36,8 @@ class SummaryBatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.config = {'startup': {'background_grace_seconds': 60}, 'memory_summary': {
             'min_events': 1, 'trigger_event_count': 1, 'max_events_per_summary': 1,
             'max_retries': 3, 'retry_backoff_seconds': 0, 'max_calls_per_session_hour': 6,
+            # 单次请求的 SDK 重试次数：2.6.0 起可配置（R14），这里钉住 1 保持旧回归语义。
+            'request_max_retries': 1,
         }}
         self.service = MemoryCompanionService(context=None, config=self.config, plugin_root=ROOT, data_dir=Path(self.temp.name))
         self.addCleanup(self.service.close)
@@ -61,6 +63,27 @@ class SummaryBatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     def batches(self):
         return [dict(r) for r in self.service.store._conn.execute('SELECT * FROM summary_batches ORDER BY created_at,id')]
+
+    async def persisted_batch(self, *, scope, session_id, batch_metadata, events):
+        event_ids = []
+        for index, event in enumerate(events):
+            event_ids.append(await self.service.store.add_timeline_event(
+                event_type='user_message',
+                session_id=session_id,
+                scope=scope,
+                subject_id=event.get('subject_id', ''),
+                object_id=event['object_id'],
+                content=f'恢复校验测试事件 {index}',
+                metadata=event.get('metadata', {}),
+            ))
+        timeline = await self.service.store.get_timeline_by_ids(event_ids)
+        batch_id = await self.service.store.create_summary_batch(
+            session_id,
+            scope,
+            [timeline[event_id] for event_id in event_ids],
+            metadata=batch_metadata,
+        )
+        return await self.service.store.get_summary_batch(batch_id)
 
     async def test_one_bad_batch_does_not_block_new_messages_or_get_retried(self):
         old = await self.event()
@@ -158,6 +181,9 @@ class SummaryBatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.use(p1, p2)
         for _ in range(5):
             await self.service.maybe_summarize_session(self.ctx)
+            batch = self.batches()[0]
+            self.assertEqual('', batch['lease_token'])
+            self.assertIsNone(batch['lease_expires_at'])
         self.assertEqual(3, len(p1.calls) + len(p2.calls))
         self.assertTrue(all(c['request_max_retries'] == 1 for c in p1.calls + p2.calls))
         store = self.service.store
@@ -169,6 +195,196 @@ class SummaryBatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.service.maybe_summarize_session(self.ctx)
         self.assertEqual(3, len(p1.calls) + len(p2.calls))
         self.assertEqual('quarantined', self.batches()[0]['state'])
+
+    async def test_request_failure_waits_for_backoff_and_recovers_without_repair(self):
+        self.config['memory_summary']['retry_backoff_seconds'] = 60
+        event_id = await self.event()
+        error = RuntimeError('400 Invalid request parameter')
+        error.response = SimpleNamespace(status_code=400)
+        provider = Provider([error, self.payload(event_id)])
+        self.use(provider)
+
+        self.assertEqual('', await self.service.maybe_summarize_session(self.ctx))
+
+        batch = self.batches()[0]
+        self.assertEqual(1, len(provider.calls))
+        self.assertEqual(1, batch['automatic_calls'])
+        self.assertEqual('retry_pending', batch['state'])
+        self.assertEqual(0, batch['repair_used'])
+        self.assertIn('400 Invalid request parameter', batch['last_error'])
+        self.assertFalse(batch['last_error'].startswith('repair:'))
+        self.assertGreater(datetime.fromisoformat(batch['next_retry_at']), datetime.now(timezone.utc))
+        self.assertFalse((await self.service.store.get_timeline_by_ids([event_id]))[event_id]['summarized_at'])
+        self.assertEqual('', await self.service.maybe_summarize_session(self.ctx))
+        self.assertEqual(1, len(provider.calls))
+
+        self.service.store._conn.execute(
+            "UPDATE summary_batches SET next_retry_at=? WHERE id=?",
+            ('2000-01-01T00:00:00+00:00', batch['id']),
+        )
+        self.service.store._conn.commit()
+        self.assertTrue(await self.service.maybe_summarize_session(self.ctx))
+        self.assertEqual(2, len(provider.calls))
+        self.assertNotIn('validation_errors', provider.calls[1]['prompt'])
+        self.assertEqual('completed', self.batches()[0]['state'])
+
+    async def test_request_failure_uses_fallback_without_repeating_the_failed_provider(self):
+        self.config['memory_summary']['retry_backoff_seconds'] = 60
+        event_id = await self.event()
+        primary = Provider([RuntimeError('400 Invalid request parameter')])
+        fallback = Provider([self.payload(event_id)])
+        self.use(primary, fallback)
+
+        self.assertTrue(await self.service.maybe_summarize_session(self.ctx))
+
+        self.assertEqual(1, len(primary.calls))
+        self.assertEqual(1, len(fallback.calls))
+        self.assertNotIn('validation_errors', fallback.calls[0]['prompt'])
+        self.assertEqual(2, self.batches()[0]['automatic_calls'])
+        self.assertEqual(0, self.batches()[0]['repair_used'])
+        self.assertEqual('completed', self.batches()[0]['state'])
+
+    async def test_request_failures_keep_the_batch_budget_across_rounds(self):
+        event_id = await self.event()
+        provider = Provider([RuntimeError('400 Invalid request parameter')] * 3)
+        self.use(provider)
+
+        for calls in range(1, 4):
+            self.assertEqual('', await self.service.maybe_summarize_session(self.ctx))
+            self.assertEqual(calls, len(provider.calls))
+            batch = self.batches()[0]
+            self.assertEqual(calls, batch['automatic_calls'])
+            self.assertEqual('quarantined' if calls == 3 else 'retry_pending', batch['state'])
+        self.assertEqual('', await self.service.maybe_summarize_session(self.ctx))
+        self.assertEqual(3, len(provider.calls))
+        self.assertFalse((await self.service.store.get_timeline_by_ids([event_id]))[event_id]['summarized_at'])
+        self.assertEqual([event_id], [row['id'] for row in await self.service.store.summary_batch_rows(batch['id'])])
+
+    async def test_fallback_keeps_validation_feedback_after_a_repair_request_fails(self):
+        event_id = await self.event()
+        invalid = self.payload(event_id)
+        invalid['summary_refs'] = ['missing-event']
+        primary = Provider([invalid, RuntimeError('400 Invalid request parameter')])
+        fallback = Provider([self.payload(event_id)])
+        self.use(primary, fallback)
+
+        self.assertTrue(await self.service.maybe_summarize_session(self.ctx))
+
+        self.assertEqual(2, len(primary.calls))
+        self.assertEqual(1, len(fallback.calls))
+        self.assertIn('summary_refs 含本批次不存在的 event_id', fallback.calls[0]['prompt'])
+        self.assertNotIn('Invalid request parameter', fallback.calls[0]['prompt'])
+        self.assertEqual('completed', self.batches()[0]['state'])
+
+    async def test_request_failure_after_a_repair_keeps_the_reviewable_body(self):
+        self.config['memory_summary']['max_retries'] = 2
+        event_id = await self.event()
+        invalid = self.payload(event_id)
+        invalid['summary_refs'] = ['missing-event']
+        provider = Provider([invalid, TimeoutError('503 Service Unavailable')])
+        self.use(provider)
+
+        memory_id = await self.service.maybe_summarize_session(self.ctx)
+
+        self.assertTrue(memory_id)
+        record = await self.service.store.get_memory(memory_id)
+        self.assertEqual('short_term_candidate', record.lifecycle)
+        self.assertEqual('pending', record.review_status)
+        self.assertEqual(2, len(provider.calls))
+        self.assertEqual('completed', self.batches()[0]['state'])
+
+    async def test_non_transient_failure_waits_for_backoff_then_resumes(self):
+        self.config["memory_summary"]["retry_backoff_seconds"] = 60
+        event_id = await self.event()
+        provider = Provider(["not json at all", self.payload(event_id)])
+        self.use(provider)
+        started = datetime.now(timezone.utc)
+
+        self.assertEqual("", await self.service.maybe_summarize_session(self.ctx))
+
+        batch = self.batches()[0]
+        self.assertEqual(1, len(provider.calls))
+        self.assertEqual(("retry_pending", 1, "", None),
+                         (batch["state"], batch["automatic_calls"], batch["lease_token"], batch["lease_expires_at"]))
+        self.assertTrue(batch["last_error"].startswith("repair:"))
+        self.assertGreaterEqual(datetime.fromisoformat(batch["next_retry_at"]), started + timedelta(seconds=59))
+        self.assertFalse((await self.service.store.get_timeline_by_ids([event_id]))[event_id]["summarized_at"])
+        self.assertEqual("", await self.service.maybe_summarize_session(self.ctx))
+        self.assertEqual(1, len(provider.calls))
+
+        with self.service.store._lock, self.service.store._transaction_sync():
+            self.service.store._conn.execute(
+                "UPDATE summary_batches SET next_retry_at=? WHERE id=?",
+                ((started - timedelta(seconds=1)).isoformat(timespec="seconds"), batch["id"]),
+            )
+        self.assertTrue(await self.service.maybe_summarize_session(self.ctx))
+        self.assertEqual(2, len(provider.calls))
+        self.assertIn("validation_errors", provider.calls[1]["prompt"])
+        self.assertEqual(("completed", 2), (self.batches()[0]["state"], self.batches()[0]["automatic_calls"]))
+
+    async def test_non_transient_backoff_grows_until_batch_budget_is_exhausted(self):
+        self.config["memory_summary"]["retry_backoff_seconds"] = 60
+        event_id = await self.event()
+        provider = Provider(["not json at all"] * 3)
+        self.use(provider)
+
+        for expected_calls in range(1, 4):
+            started = datetime.now(timezone.utc)
+            self.assertEqual("", await self.service.maybe_summarize_session(self.ctx))
+            batch = self.batches()[0]
+            self.assertEqual(expected_calls, len(provider.calls))
+            self.assertEqual(expected_calls, batch["automatic_calls"])
+            self.assertEqual(("", None), (batch["lease_token"], batch["lease_expires_at"]))
+            self.assertTrue(batch["last_error"].startswith("repair:"))
+            if expected_calls > 1:
+                self.assertIn("validation_errors", provider.calls[expected_calls - 1]["prompt"])
+            if expected_calls < 3:
+                self.assertEqual("retry_pending", batch["state"])
+                self.assertGreaterEqual(
+                    datetime.fromisoformat(batch["next_retry_at"]),
+                    started + timedelta(seconds=60 * 2 ** (expected_calls - 1) - 1),
+                )
+                with self.service.store._lock, self.service.store._transaction_sync():
+                    self.service.store._conn.execute(
+                        "UPDATE summary_batches SET next_retry_at=? WHERE id=?",
+                        ((started - timedelta(seconds=1)).isoformat(timespec="seconds"), batch["id"]),
+                    )
+
+        self.assertEqual("quarantined", self.batches()[0]["state"])
+        self.assertFalse((await self.service.store.get_timeline_by_ids([event_id]))[event_id]["summarized_at"])
+        self.assertEqual(0, self.service.store._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+
+    async def test_zero_backoff_keeps_immediate_provider_retry(self):
+        event_id = await self.event()
+        provider = Provider(["not json at all", self.payload(event_id)])
+        self.use(provider)
+
+        self.assertTrue(await self.service.maybe_summarize_session(self.ctx))
+
+        self.assertEqual(2, len(provider.calls))
+        self.assertIn("validation_errors", provider.calls[1]["prompt"])
+        self.assertEqual(2, self.batches()[0]["automatic_calls"])
+
+    async def test_manual_retry_is_bounded_without_automatic_backoff(self):
+        self.config["memory_summary"]["retry_backoff_seconds"] = 60
+        event_id = await self.event()
+        provider = Provider(["not json at all", self.payload(event_id)])
+        self.use(provider)
+
+        self.assertTrue(await self.service.maybe_summarize_session(self.ctx, force=True))
+
+        self.assertEqual(2, len(provider.calls))
+        self.assertIn("validation_errors", provider.calls[1]["prompt"])
+        self.assertEqual(0, self.batches()[0]["automatic_calls"])
+
+    async def test_request_max_retries_is_configurable(self):
+        """R14：单次请求重试次数不再是写死的 1，而是读 memory_summary.request_max_retries。"""
+        self.config['memory_summary']['request_max_retries'] = 4
+        service = MemoryCompanionService(
+            context=None, config=self.config, plugin_root=ROOT, data_dir=Path(self.temp.name) / 'retry',
+        )
+        self.addCleanup(service.close)
+        self.assertEqual(4, service.summarizer.request_max_retries)
 
     async def test_hourly_budget_spans_batches_but_not_sessions(self):
         self.config['memory_summary']['max_calls_per_session_hour'] = 1
@@ -327,3 +543,487 @@ class SummaryBatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
         p.responses.append(self.payload(second))
         self.assertTrue(await self.service.maybe_summarize_session(self.ctx))
         self.assertEqual([1, 1], [b['automatic_calls'] for b in self.batches()])
+
+    async def test_recovery_context_checks_every_private_event_target(self):
+        identity = {
+            'platform': 'qq',
+            'owner_bot_id': 'b1',
+            'persona_id': 'persona-1',
+            'participant_user_id': 'u1',
+        }
+        batch = await self.persisted_batch(
+            scope='private',
+            session_id='qq:FriendMessage:u1',
+            batch_metadata=identity,
+            events=[
+                {'subject_id': 'u1', 'object_id': 'other-user', 'metadata': identity},
+                {'subject_id': 'u1', 'object_id': 'u1', 'metadata': identity},
+            ],
+        )
+
+        context, reason = await self.service._summary_recovery_context(batch)
+
+        self.assertIsNone(context)
+        self.assertEqual('private_target_mismatch', reason)
+
+    async def test_recovery_context_checks_private_user_message_subject(self):
+        identity = {
+            'platform': 'qq',
+            'owner_bot_id': 'b1',
+            'persona_id': 'persona-1',
+            'participant_user_id': 'u1',
+        }
+        batch = await self.persisted_batch(
+            scope='private',
+            session_id='qq:FriendMessage:u1',
+            batch_metadata=identity,
+            events=[
+                {'subject_id': 'other-user', 'object_id': 'u1', 'metadata': identity},
+            ],
+        )
+
+        context, reason = await self.service._summary_recovery_context(batch)
+
+        self.assertIsNone(context)
+        self.assertEqual('private_subject_mismatch', reason)
+
+    async def test_recovery_defer_does_not_overwrite_newer_lease_or_completion(self):
+        identity = {
+            'platform': 'qq',
+            'owner_bot_id': 'b1',
+            'persona_id': 'persona-1',
+            'participant_user_id': 'u1',
+        }
+        batch = await self.persisted_batch(
+            scope='private',
+            session_id='qq:FriendMessage:u1',
+            batch_metadata=identity,
+            events=[{'subject_id': 'u1', 'object_id': 'u1', 'metadata': identity}],
+        )
+
+        self.assertTrue(await self.service.store.reserve_summary_call(
+            batch['id'], max_calls=3, hourly_limit=6, lease_seconds=3600,
+        ))
+        self.assertFalse(await self.service.store.defer_summary_batch(
+            batch['id'], 'stale recovery result', delay=0, only_if_due=True,
+        ))
+        leased = await self.service.store.get_summary_batch(batch['id'])
+        self.assertEqual('retry_pending', leased['state'])
+        self.assertEqual('', leased['last_error'])
+
+        completed_event = await self.event()
+        completed_rows = await self.service.store.get_timeline_by_ids([completed_event])
+        completed_batch_id = await self.service.store.create_summary_batch(
+            self.ctx.session_id,
+            self.ctx.scope,
+            [completed_rows[completed_event]],
+        )
+        await self.service.store.finish_summary_batch(
+            completed_batch_id, [completed_event], no_memory=True,
+        )
+        self.assertFalse(await self.service.store.defer_summary_batch(
+            completed_batch_id, 'stale recovery result', delay=0, only_if_due=True,
+        ))
+        completed = await self.service.store.get_summary_batch(completed_batch_id)
+        self.assertEqual('no_memory', completed['state'])
+
+    async def test_active_summary_lease_allows_owner_to_complete_batch(self):
+        event_id = await self.event()
+        rows = list((await self.service.store.get_timeline_by_ids([event_id])).values())
+        batch_id = await self.service.store.create_summary_batch(
+            self.ctx.session_id, self.ctx.scope, rows,
+        )
+        owner = 'summary-worker'
+        self.assertTrue(await self.service.store.reserve_summary_call(
+            batch_id, max_calls=3, hourly_limit=6, lease_token=owner,
+        ))
+
+        await self.service.store.finish_summary_batch(
+            batch_id, [event_id], no_memory=True, lease_token=owner,
+        )
+
+        batch = await self.service.store.get_summary_batch(batch_id)
+        self.assertEqual('no_memory', batch['state'])
+        self.assertEqual('', batch['lease_token'])
+        self.assertIsNone(batch['lease_expires_at'])
+
+    async def test_stale_summary_worker_cannot_defer_or_complete_after_lease_expiry(self):
+        identity = {
+            'platform': 'qq',
+            'owner_bot_id': 'b1',
+            'persona_id': 'persona-1',
+            'participant_user_id': 'u1',
+        }
+        batch = await self.persisted_batch(
+            scope='private',
+            session_id='qq:FriendMessage:u1',
+            batch_metadata=identity,
+            events=[{'subject_id': 'u1', 'object_id': 'u1', 'metadata': identity}],
+        )
+        owner = 'stale-worker'
+        self.assertTrue(await self.service.store.reserve_summary_call(
+            batch['id'], max_calls=3, hourly_limit=6,
+            lease_seconds=3600, lease_token=owner,
+        ))
+        with self.service.store._lock, self.service.store._transaction_sync():
+            self.service.store._conn.execute(
+                "UPDATE summary_batches SET lease_expires_at=? WHERE id=?",
+                ('2000-01-01T00:00:00+00:00', batch['id']),
+            )
+
+        self.assertFalse(await self.service.store.defer_summary_batch(
+            batch['id'], 'stale recovery result', delay=0, lease_token=owner,
+        ))
+        rows = await self.service.store.summary_batch_rows(batch['id'])
+        with self.assertRaisesRegex(RuntimeError, 'lease ownership changed'):
+            await self.service.store.finish_summary_batch(
+                batch['id'], [row['id'] for row in rows],
+                no_memory=True, lease_token=owner,
+            )
+        current = await self.service.store.get_summary_batch(batch['id'])
+        self.assertEqual('retry_pending', current['state'])
+        self.assertEqual(owner, current['lease_token'])
+
+    async def test_group_recovery_accepts_multiple_members_without_member_context(self):
+        batch_identity = {
+            'platform': 'qq',
+            'owner_bot_id': 'b1',
+            'persona_id': 'persona-1',
+            'source_group_id': 'g1',
+            'participant_user_id': 'member-a',
+        }
+        second_event = {
+            'platform': 'qq',
+            'owner_bot_id': 'b1',
+            'persona_id': 'persona-1',
+            'source_group_id': 'g1',
+            'user_id': 'member-c',
+            'participant_user_id': 'member-b',
+        }
+        batch = await self.persisted_batch(
+            scope='group',
+            session_id='qq:GroupMessage:g1',
+            batch_metadata=batch_identity,
+            events=[
+                {'subject_id': 'member-a', 'object_id': 'g1', 'metadata': batch_identity},
+                {'subject_id': 'member-b', 'object_id': 'g1', 'metadata': second_event},
+            ],
+        )
+
+        context, reason = await self.service._summary_recovery_context(batch)
+
+        self.assertEqual('', reason)
+        self.assertIsNotNone(context)
+        self.assertEqual('g1', context.group_id)
+        self.assertEqual('qq', context.platform)
+        self.assertEqual('b1', context.bot_id)
+        self.assertEqual('', context.user_id)
+        self.assertEqual('', context.user_name)
+
+    async def test_group_recovery_rejects_mismatched_event_group_target(self):
+        identity = {
+            'platform': 'qq',
+            'owner_bot_id': 'b1',
+            'persona_id': 'persona-1',
+            'source_group_id': 'g1',
+        }
+        batch = await self.persisted_batch(
+            scope='group',
+            session_id='qq:GroupMessage:g1',
+            batch_metadata=identity,
+            events=[
+                {'subject_id': 'member-a', 'object_id': 'g1', 'metadata': {**identity, 'participant_user_id': 'member-a'}},
+                {'subject_id': 'member-b', 'object_id': 'g2', 'metadata': {**identity, 'participant_user_id': 'member-b'}},
+            ],
+        )
+
+        context, reason = await self.service._summary_recovery_context(batch)
+
+        self.assertIsNone(context)
+        self.assertEqual('group_target_mismatch', reason)
+
+    async def test_database_initialization_starts_single_recovery_dispatcher_and_reports_shutdown(self):
+        self.config['memory_summary'].update({
+            'recovery_startup_delay_seconds': 3600,
+        })
+        self.service._background_grace_seconds = 0
+
+        self.assertTrue(await self.service.initialize_database())
+        dispatcher = self.service._summary_recovery_task
+        self.assertIsNotNone(dispatcher)
+        self.assertTrue(await self.service.initialize_database())
+
+        self.assertIs(self.service._summary_recovery_task, dispatcher)
+        self.assertEqual(1, sum(
+            task.get_name() == 'memory_companion:summary_recovery_dispatcher'
+            for task in self.service._background_tasks
+        ))
+
+        await self.service.aclose()
+        evidence = self.service.shutdown_evidence()
+        self.assertTrue(dispatcher.done())
+        self.assertEqual('stopped', evidence['summary_recovery_dispatcher']['state'])
+        self.assertFalse(evidence['summary_recovery_dispatcher']['running'])
+
+    async def test_capture_disabled_batch_is_deferred_while_other_session_is_scheduled(self):
+        self.config['memory_summary'].update({
+            'recovery_startup_delay_seconds': 0,
+            'recovery_sessions_per_round': 2,
+            'recovery_disabled_retry_seconds': 3600,
+        })
+        self.service._background_grace_seconds = 0
+        disabled_identity = {
+            'platform': 'qq', 'owner_bot_id': 'b1', 'persona_id': 'persona-1',
+            'participant_user_id': 'u-disabled',
+        }
+        enabled_identity = {
+            'platform': 'qq', 'owner_bot_id': 'b1', 'persona_id': 'persona-1',
+            'participant_user_id': 'u-enabled',
+        }
+        disabled_batch = await self.persisted_batch(
+            scope='private', session_id='qq:FriendMessage:u-disabled',
+            batch_metadata=disabled_identity,
+            events=[{'subject_id': 'u-disabled', 'object_id': 'u-disabled', 'metadata': disabled_identity}],
+        )
+        enabled_batch = await self.persisted_batch(
+            scope='private', session_id='qq:FriendMessage:u-enabled',
+            batch_metadata=enabled_identity,
+            events=[{'subject_id': 'u-enabled', 'object_id': 'u-enabled', 'metadata': enabled_identity}],
+        )
+        original_scope_enabled = self.service._scope_feature_enabled
+
+        def scope_enabled(scope_or_ctx, feature):
+            if getattr(scope_or_ctx, 'session_id', '') == 'qq:FriendMessage:u-disabled' and feature == 'capture':
+                return False
+            return original_scope_enabled(scope_or_ctx, feature)
+
+        scheduled = asyncio.Event()
+        scheduled_sessions = []
+
+        async def record_schedule(ctx, batch_id):
+            scheduled_sessions.append((ctx.session_id, batch_id))
+            scheduled.set()
+
+        self.service._scope_feature_enabled = scope_enabled
+        self.service._background_recover_summary_batch = record_schedule
+        self.service._ensure_summary_recovery_dispatcher()
+        await asyncio.wait_for(scheduled.wait(), timeout=2)
+
+        async def wait_until_disabled_batch_is_deferred():
+            deadline = asyncio.get_running_loop().time() + 2
+            while asyncio.get_running_loop().time() < deadline:
+                batch = await self.service.store.get_summary_batch(disabled_batch['id'])
+                if batch['last_error'] == 'recovery_capture_disabled':
+                    return batch
+                await asyncio.sleep(0.01)
+            self.fail('recovery dispatcher did not defer the capture-disabled batch')
+
+        deferred = await wait_until_disabled_batch_is_deferred()
+        self.assertEqual('recovery_capture_disabled', deferred['last_error'])
+        self.assertGreater(deferred['next_retry_at'], datetime.now(timezone.utc).isoformat(timespec='seconds'))
+        self.assertEqual([('qq:FriendMessage:u-enabled', enabled_batch['id'])], scheduled_sessions)
+
+    async def test_summary_lease_allows_same_worker_fallback_but_blocks_other_worker(self):
+        event_id = await self.event()
+        rows = list((await self.service.store.get_timeline_by_ids([event_id])).values())
+        batch_id = await self.service.store.create_summary_batch(
+            self.ctx.session_id, self.ctx.scope, rows
+        )
+
+        self.assertTrue(await self.service.store.reserve_summary_call(
+            batch_id, max_calls=3, hourly_limit=6, lease_token='worker-a',
+        ))
+        await self.service.store.defer_summary_batch(
+            batch_id, 'temporary provider failure', delay=3600,
+            lease_token='worker-a',
+        )
+
+        self.assertFalse(await self.service.store.reserve_summary_call(
+            batch_id, max_calls=3, hourly_limit=6, lease_token='worker-b',
+        ))
+        self.assertTrue(await self.service.store.reserve_summary_call(
+            batch_id, max_calls=3, hourly_limit=6, repair=True,
+            lease_token='worker-a',
+        ))
+        batch = await self.service.store.get_summary_batch(batch_id)
+        self.assertEqual(2, batch['automatic_calls'])
+
+    async def recovery_event(self, user_id='u-quiet'):
+        identity = {'platform': 'qq', 'owner_bot_id': 'b1', 'persona_id': 'persona-1',
+                    'participant_user_id': user_id}
+        event_id = await self.service.store.add_timeline_event(
+            event_type='user_message', session_id=f'qq:FriendMessage:{user_id}', scope='private',
+            subject_id=user_id, object_id=user_id,
+            content='小王和我聊了今天喝的无糖拿铁，觉得味道不错。', metadata=identity,
+        )
+        return event_id
+
+    async def test_quiet_unbatched_originals_recover_without_fresh_messages(self):
+        event_id = await self.recovery_event()
+        provider = Provider([self.payload(event_id)])
+        self.use(provider)
+        self.config['memory_summary']['recovery_startup_delay_seconds'] = 0
+        self.service._background_grace_seconds = 0
+        self.service._ensure_summary_recovery_dispatcher()
+        deadline = asyncio.get_running_loop().time() + 2
+        while asyncio.get_running_loop().time() < deadline:
+            batches = self.batches()
+            if batches and batches[0]['state'] == 'completed':
+                break
+            await asyncio.sleep(.01)
+        self.assertEqual(1, len(provider.calls))
+        self.assertEqual('completed', self.batches()[0]['state'])
+        self.assertEqual('qq:FriendMessage:u-quiet', self.batches()[0]['session_id'])
+        self.assertEqual('', self.batches()[0]['lease_token'])
+        await self.service.aclose()
+
+    async def test_recovery_session_ring_includes_unbatched_and_old_batches(self):
+        await self.recovery_event('u-a')
+        await self.recovery_event('u-b')
+        first = await self.service.store.summary_recovery_sessions(limit=1)
+        second = await self.service.store.summary_recovery_sessions(
+            limit=1, after_session_id=first[0]['session_id'])
+        third = await self.service.store.summary_recovery_sessions(
+            limit=1, after_session_id=second[0]['session_id'])
+        self.assertNotEqual(first[0]['session_id'], second[0]['session_id'])
+        self.assertEqual(first, third)
+        self.assertEqual([], await self.service.store.summary_recovery_sessions(
+            exclude_session_ids={first[0]['session_id'], second[0]['session_id']}))
+
+    async def test_sustained_new_messages_and_old_batches_both_progress(self):
+        old = await self.event()
+        rows = list((await self.service.store.get_timeline_by_ids([old])).values())
+        old_batch = await self.service.store.create_summary_batch(self.ctx.session_id, self.ctx.scope, rows)
+        fresh = await self.event()
+        provider = Provider([self.payload(fresh), self.payload(old)])
+        self.use(provider)
+        await self.service.maybe_summarize_session(self.ctx)
+        newer = await self.event()
+        await self.service.maybe_summarize_session(self.ctx)
+        self.assertIn(fresh, provider.calls[0]['prompt'])
+        self.assertIn(old, provider.calls[1]['prompt'])
+        self.assertNotIn(newer, provider.calls[1]['prompt'])
+        self.assertEqual('completed', (await self.service.store.get_summary_batch(old_batch))['state'])
+        provider.responses.append(self.payload(newer))
+        await self.service.maybe_summarize_session(self.ctx)
+        self.assertIn(newer, provider.calls[2]['prompt'])
+
+    async def test_budget_and_busy_slot_do_not_assign_new_originals(self):
+        first = await self.event()
+        self.config['memory_summary']['max_calls_per_session_hour'] = 1
+        provider = Provider([self.payload(first)])
+        self.use(provider)
+        await self.service.maybe_summarize_session(self.ctx)
+        second = await self.event()
+        await self.service.maybe_summarize_session(self.ctx)
+        self.assertEqual(1, len(self.batches()))
+        self.assertIsNone(self.service.store._conn.execute(
+            'SELECT 1 FROM summary_batch_events WHERE event_id=?', (second,)).fetchone())
+        self.config['memory_summary']['max_calls_per_session_hour'] = 6
+        await self.service._summary_call_semaphore.acquire()
+        try:
+            await self.service.maybe_summarize_session(self.ctx)
+            self.assertEqual(1, len(self.batches()))
+        finally:
+            self.service._summary_call_semaphore.release()
+
+    async def test_unlimited_budget_releases_old_budget_deferrals(self):
+        event_id = await self.event()
+        rows = list((await self.service.store.get_timeline_by_ids([event_id])).values())
+        batch_id = await self.service.store.create_summary_batch(self.ctx.session_id, self.ctx.scope, rows)
+        self.assertTrue(await self.service.store.reserve_summary_call(batch_id, max_calls=3, hourly_limit=1))
+        await self.service.store.defer_summary_batch(batch_id, 'temporary', delay=0)
+        self.assertFalse(await self.service.store.reserve_summary_call(batch_id, max_calls=3, hourly_limit=1))
+        self.assertIsNone(await self.service.store.next_summary_batch(self.ctx.session_id))
+        self.config['memory_summary']['max_calls_per_session_hour'] = 0
+        provider = Provider([self.payload(event_id)])
+        self.use(provider)
+        self.assertTrue(await self.service.maybe_summarize_session(self.ctx))
+        self.assertEqual(1, len(provider.calls))
+        self.assertEqual('completed', (await self.service.store.get_summary_batch(batch_id))['state'])
+
+    async def test_unlimited_preserves_error_cooldown_and_batch_limit(self):
+        event_id = await self.event()
+        rows = list((await self.service.store.get_timeline_by_ids([event_id])).values())
+        batch_id = await self.service.store.create_summary_batch(self.ctx.session_id, self.ctx.scope, rows)
+        self.assertTrue(await self.service.store.reserve_summary_call(batch_id, max_calls=1, hourly_limit=0))
+        await self.service.store.defer_summary_batch(batch_id, 'temporary', delay=600)
+        await self.service.store.release_summary_budget_deferrals()
+        self.assertIsNone(await self.service.store.next_summary_batch(self.ctx.session_id))
+        self.assertFalse(await self.service.store.reserve_summary_call(batch_id, max_calls=1, hourly_limit=0))
+
+    async def test_disabled_automatic_summary_leaves_quiet_originals_unassigned(self):
+        await self.recovery_event()
+        self.config['memory_summary'].update(enabled=False, recovery_startup_delay_seconds=0)
+        self.service._background_grace_seconds = 0
+        self.service._ensure_summary_recovery_dispatcher()
+        await asyncio.sleep(.03)
+        self.assertEqual('paused', self.service._summary_recovery_status['state'])
+        self.assertEqual([], self.batches())
+        await self.service.aclose()
+
+    async def test_blank_summary_provider_uses_restored_session_provider(self):
+        event_id = await self.recovery_event()
+        rows = list((await self.service.store.get_timeline_by_ids([event_id])).values())
+        ctx, reason = self.service._summary_context_from_sources(
+            'qq:FriendMessage:u-quiet', 'private', {}, rows)
+        self.assertEqual('', reason)
+        provider = Provider([])
+        requested_sessions = []
+        def current_provider(session_id):
+            requested_sessions.append(session_id)
+            return provider
+        self.service.context = SimpleNamespace(get_using_provider=current_provider)
+        attempts = await self.service._summary_provider_attempts(ctx)
+        self.assertEqual(['qq:FriendMessage:u-quiet'], requested_sessions)
+        self.assertEqual(1, len(attempts))
+        self.assertIs(provider, attempts[0]['provider'])
+        self.assertEqual('current_session', attempts[0]['source'])
+
+    async def test_lease_schema_upgrade_preserves_queue_and_is_repeatable(self):
+        event_id = await self.event()
+        rows = list((await self.service.store.get_timeline_by_ids([event_id])).values())
+        batch_id = await self.service.store.create_summary_batch(self.ctx.session_id, self.ctx.scope, rows)
+        store = self.service.store
+        with store._lock:
+            store._conn.execute('ALTER TABLE summary_batches DROP COLUMN lease_token')
+            store._conn.execute('ALTER TABLE summary_batches DROP COLUMN lease_expires_at')
+            store._conn.commit()
+            store._migrate_summary_batch_retry_state_sync()
+            store._migrate_summary_batch_retry_state_sync()
+            self.assertEqual('ok', store._conn.execute('PRAGMA integrity_check').fetchone()[0])
+            self.assertEqual([], store._conn.execute('PRAGMA foreign_key_check').fetchall())
+        batch = await store.get_summary_batch(batch_id)
+        self.assertEqual('pending', batch['state'])
+        self.assertEqual('', batch['lease_token'])
+        self.assertIsNone(batch['lease_expires_at'])
+        self.assertEqual([event_id], [row['id'] for row in await store.summary_batch_rows(batch_id)])
+
+    async def test_restart_recovers_old_batch_without_duplicate_event_ownership(self):
+        event_id = await self.recovery_event()
+        rows = list((await self.service.store.get_timeline_by_ids([event_id])).values())
+        batch_id = await self.service.store.create_summary_batch('qq:FriendMessage:u-quiet', 'private', rows)
+        await self.service.aclose()
+        self.config['memory_summary']['recovery_startup_delay_seconds'] = 0
+        self.service = MemoryCompanionService(
+            context=None, config=self.config, plugin_root=ROOT, data_dir=Path(self.temp.name))
+        self.addCleanup(self.service.close)
+        self.service._background_grace_seconds = 0
+        self.service._schedule_memory_embedding = lambda *args: None
+        provider = Provider([self.payload(event_id)])
+        self.use(provider)
+        await self.service.initialize_database()
+        deadline = asyncio.get_running_loop().time() + 2
+        while asyncio.get_running_loop().time() < deadline:
+            batch = await self.service.store.get_summary_batch(batch_id)
+            if batch['state'] == 'completed':
+                break
+            await asyncio.sleep(.01)
+        self.assertEqual('completed', batch['state'])
+        self.assertEqual(1, len(provider.calls))
+        self.assertEqual(1, len(self.batches()))
+        self.assertEqual(1, self.service.store._conn.execute(
+            'SELECT COUNT(*) FROM summary_batch_events WHERE event_id=?', (event_id,)).fetchone()[0])
+        self.assertEqual([], self.service.store._conn.execute('PRAGMA foreign_key_check').fetchall())
+        await self.service.aclose()
+        self.assertFalse(self.service.shutdown_evidence()['summary_recovery_dispatcher']['running'])

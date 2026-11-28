@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+from functools import lru_cache
 import inspect
 import math
 import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Iterable, Mapping
 
+from .astrbot_compat import logger
 from .identity import session_target_id
-from .memory_lifecycle import apply_lifecycle_score, evaluate_memory_lifecycle
+from .latency import (
+    MAX_MODEL_CALL_TIMEOUT_MS,
+    await_with_timeout,
+    bounded_model_call_timeout_ms,
+    exclude_model_call_wait,
+)
+from .memory_lifecycle import LifecycleScore, apply_lifecycle_score, evaluate_memory_lifecycle
 from .models import (
     MemoryRecord,
     SearchResult,
@@ -21,10 +30,136 @@ from .models import (
     memory_embedding_text_hash,
 )
 from .profile_quality import PROFILE_MEMORY_TYPES, profile_quality_decision
+from .source_surface import SURFACE_MIXED, SURFACE_UNKNOWN, row_source_surface, resolve_surface_weight
 
 from .store import MemoryStore
 from .time_intent import TimeIntent
-from .visibility import VisibilityPolicy, _platform_family
+from .visibility import VisibilityPolicy
+
+
+_MMR_WHITESPACE_RE = re.compile(r"\s+")
+_MMR_LATIN_TOKEN_RE = re.compile(r"[a-z0-9_]{2,}")
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+#: Undeclared-but-valid surfaces already reported, so the warning fires once per
+#: process instead of once per recall.
+_SOURCE_SURFACE_WARNED: set[str] = set()
+
+
+@lru_cache(maxsize=512)
+def _ascii_word_pattern(term: str) -> re.Pattern[str]:
+    return re.compile(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])")
+
+
+@dataclass(slots=True)
+class _BreakerState:
+    consecutive_failures: int = 0
+    open_until: float = 0.0
+    half_open_in_flight: bool = False
+
+
+class RerankCircuitBreaker:
+    """Thread-safe per-provider circuit breaker for failing/timing-out rerank providers.
+
+    Tracks consecutive transport/timeout/provider exceptions across per-turn
+    ``RetrievalEngine`` instances. Once ``failure_threshold`` consecutive failures
+    occur, subsequent requests skip the rerank call for ``cooldown_seconds`` with
+    reason ``rerank_circuit_open``, then allow a single half-open probe.
+    """
+
+    @staticmethod
+    def _normalize_threshold(value: Any) -> int:
+        if isinstance(value, bool):
+            return 0
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    @staticmethod
+    def _normalize_cooldown(value: Any) -> float:
+        if isinstance(value, bool):
+            return 0.0
+        try:
+            cooldown = float(value or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        if not math.isfinite(cooldown) or cooldown <= 0.0:
+            return 0.0
+        return cooldown
+
+    def __init__(
+        self,
+        *,
+        failure_threshold: int = 2,
+        cooldown_seconds: float = 60.0,
+    ) -> None:
+        self._lock = threading.Lock()
+        self.failure_threshold = self._normalize_threshold(failure_threshold)
+        self.cooldown_seconds = self._normalize_cooldown(cooldown_seconds)
+        self._states: dict[str, _BreakerState] = {}
+
+    def configure(self, *, failure_threshold: int, cooldown_seconds: float) -> None:
+        """Update breaker thresholds dynamically without dropping active state."""
+        with self._lock:
+            self.failure_threshold = self._normalize_threshold(failure_threshold)
+            self.cooldown_seconds = self._normalize_cooldown(cooldown_seconds)
+            if self.failure_threshold <= 0 or self.cooldown_seconds <= 0.0:
+                self._states.clear()
+
+    def allow_request(self, provider_id: str, *, now: float | None = None) -> tuple[bool, bool]:
+        """Return ``(allowed, is_half_open_probe)`` for ``provider_id``."""
+        key = clean_text(provider_id, 160) or "<auto>"
+        current = time.monotonic() if now is None else float(now)
+        with self._lock:
+            if self.failure_threshold <= 0 or self.cooldown_seconds <= 0.0:
+                return True, False
+            state = self._states.get(key)
+            if state is None or state.open_until <= 0.0:
+                return True, False
+            if current < state.open_until:
+                return False, False
+            if state.half_open_in_flight:
+                return False, False
+            state.half_open_in_flight = True
+            return True, True
+
+    def record_success(self, provider_id: str) -> None:
+        """Reset failure count and close the circuit after a successful response."""
+        key = clean_text(provider_id, 160) or "<auto>"
+        with self._lock:
+            self._states.pop(key, None)
+
+    def record_failure(
+        self,
+        provider_id: str,
+        *,
+        is_probe: bool = False,
+        now: float | None = None,
+    ) -> None:
+        """Record a transport/timeout/provider exception and trip cooldown when needed."""
+        key = clean_text(provider_id, 160) or "<auto>"
+        current = time.monotonic() if now is None else float(now)
+        with self._lock:
+            if self.failure_threshold <= 0 or self.cooldown_seconds <= 0.0:
+                self._states.pop(key, None)
+                return
+            state = self._states.get(key)
+            if state is None:
+                state = _BreakerState()
+                self._states[key] = state
+            state.half_open_in_flight = False
+            state.consecutive_failures += 1
+            if is_probe or state.consecutive_failures >= self.failure_threshold:
+                state.open_until = current + self.cooldown_seconds
+
+    def release_probe(self, provider_id: str) -> None:
+        """Release an aborted half-open probe without counting cancellation as a failure."""
+        key = clean_text(provider_id, 160) or "<auto>"
+        with self._lock:
+            state = self._states.get(key)
+            if state is not None:
+                state.half_open_in_flight = False
 
 
 class RetrievalEngine:
@@ -43,9 +178,11 @@ class RetrievalEngine:
         rerank_provider_id: str = "",
         rerank_candidate_multiplier: int = 5,
         rerank_candidate_limit: int = 32,
-        rerank_timeout_ms: int = 1200,
+        rerank_timeout_ms: int = MAX_MODEL_CALL_TIMEOUT_MS,
+        rerank_circuit_breaker: RerankCircuitBreaker | None = None,
         latency_budget_ms: int = 0,
         query_vector_cache_ttl_seconds: float = 0.0,
+        query_vector_cache: dict[Any, tuple[float, list[float]]] | None = None,
         embedding_provider: Any = None,
         embedding_provider_id: str = "",
         embedding_enabled: bool = False,
@@ -53,7 +190,7 @@ class RetrievalEngine:
         embedding_top_k: int = 32,
         embedding_score_threshold: float = 0.34,
         embedding_weight: float = 0.55,
-        embedding_timeout_ms: int = 5000,
+        embedding_timeout_ms: int = MAX_MODEL_CALL_TIMEOUT_MS,
         embedding_max_text_chars: int = 1200,
         current_window_candidate_limit: int = 600,
         keyword_fallback_min_fts_candidates: int = 80,
@@ -66,6 +203,15 @@ class RetrievalEngine:
         proactive_message_score_penalty: float = 1.0,
         dedupe_content_ratio: float = 0.0,
         non_conversation_budget: int = 2,
+        anchor_floor_enabled: bool = False,
+        scope_bonus_scale: float = 0.2,
+        mmr_redundancy_weight: float = 0.35,
+        source_surface_priority: str = "equal",
+        source_surface_weight: float = 1.0,
+        source_surface_weights: Mapping[str, float] | None = None,
+        source_surface_names: Iterable[str] | None = None,
+        bm25_k1: float = 1.2,
+        bm25_b: float = 0.75,
     ):
         self.store = store
         self.policy = policy
@@ -76,7 +222,8 @@ class RetrievalEngine:
         self.rerank_provider_id = clean_text(rerank_provider_id, 160)
         self.rerank_candidate_multiplier = max(1, int(rerank_candidate_multiplier or 5))
         self.rerank_candidate_limit = max(1, int(rerank_candidate_limit or 32))
-        self.rerank_timeout_ms = max(0, int(rerank_timeout_ms or 0))
+        self.rerank_timeout_ms = bounded_model_call_timeout_ms(rerank_timeout_ms)
+        self.rerank_circuit_breaker = rerank_circuit_breaker
         # A latency budget is spent on optional model calls, never on results.
         # Lowering top_k to go faster removes exactly the context this plugin
         # exists to supply, so the speed has to come from somewhere else.
@@ -85,7 +232,9 @@ class RetrievalEngine:
         self.query_vector_cache_ttl_seconds = max(
             0.0, float(query_vector_cache_ttl_seconds or 0.0)
         )
-        self._query_vector_cache: dict[str, tuple[float, list[float]]] = {}
+        self._query_vector_cache: dict[Any, tuple[float, list[float]]] = (
+            query_vector_cache if query_vector_cache is not None else {}
+        )
         self.embedding_provider = embedding_provider
         self.embedding_provider_id = clean_text(embedding_provider_id, 160)
         self.embedding_enabled = bool(embedding_enabled)
@@ -93,7 +242,7 @@ class RetrievalEngine:
         self.embedding_top_k = max(1, int(embedding_top_k or 32))
         self.embedding_score_threshold = max(0.0, min(1.0, float(embedding_score_threshold or 0.0)))
         self.embedding_weight = max(0.0, min(2.0, float(embedding_weight or 0.0)))
-        self.embedding_timeout_ms = max(0, int(embedding_timeout_ms or 0))
+        self.embedding_timeout_ms = bounded_model_call_timeout_ms(embedding_timeout_ms)
         self.embedding_max_text_chars = max(200, int(embedding_max_text_chars or 1200))
         self.current_window_candidate_limit = max(1, int(current_window_candidate_limit or 600))
         self.keyword_fallback_min_fts_candidates = max(
@@ -119,6 +268,53 @@ class RetrievalEngine:
         # out user/query evidence in ordinary questions. Explicit self-timeline
         # queries remove this cap via capped_slots.
         self.non_conversation_budget = max(0, min(12, int(non_conversation_budget or 0)))
+        # R5：人工词法锚定默认关闭。开启后 _apply_anchor_floor 才允许把被
+        # rerank 模型挤出窗口的强词法命中换回窗口；默认关闭表示完全信任
+        # rerank 排序，不再用启发式「人工锚定」改写模型结果。
+        self.anchor_floor_enabled = bool(anchor_floor_enabled)
+        # R6：scope 同源加分（同 session/同 user/同群/bot_self）整体缩放系数。
+        # 历史值分别是 +0.25/+0.15/+0.15/+0.08，硬偏置会把「同窗口但无关」
+        # 的记忆顶到「跨窗口但强相关」之前。默认 0.2 把最强项压到 +0.05，
+        # 让 scope 只做轻微平手裁决；设为 1.0 可恢复历史行为。
+        self.scope_bonus_scale = max(0.0, min(1.0, float(scope_bonus_scale if scope_bonus_scale is not None else 0.2)))
+        # R7：MMR 去冗余权重。0.16 太轻，高冗余的两条会一起进 top_k；
+        # 默认 0.35 让「重复内容」在价值上明显低于「新信息」。
+        self.mmr_redundancy_weight = max(0.0, min(1.0, float(mmr_redundancy_weight if mmr_redundancy_weight is not None else 0.35)))
+        # source_surface_*：按来源面（游戏内 / QQ / 第三方）区分主次。
+        # priority="equal"（默认）或 weight>=1.0 且没有显式权重表时完全不分主次，
+        # 评分与诊断串与旧版逐字节一致。names 是已注册来源名，未声明来源按 1.0
+        # 计权并记一条 warning，而不是被规则顺手降权。
+        self.source_surface_names = frozenset(
+            clean_text(name, 40).lower()
+            for name in (source_surface_names or ())
+            if clean_text(name, 40)
+        )
+        chosen = clean_text(source_surface_priority, 40).lower() or "equal"
+        if chosen != "equal" and chosen not in self.source_surface_names:
+            chosen = "equal"
+        self.source_surface_priority = chosen
+        try:
+            raw_surface_weight = float(source_surface_weight)
+        except (TypeError, ValueError):
+            raw_surface_weight = 1.0
+        if raw_surface_weight != raw_surface_weight:  # NaN
+            raw_surface_weight = 1.0
+        self.source_surface_weight = max(0.0, min(1.0, raw_surface_weight))
+        surface_weights: dict[str, float] = {}
+        for weight_name, weight_value in (source_surface_weights or {}).items():
+            key = clean_text(weight_name, 40).lower()
+            if not key:
+                continue
+            try:
+                surface_weights[key] = max(0.0, min(1.0, float(weight_value)))
+            except (TypeError, ValueError):
+                continue
+        self.source_surface_weights = surface_weights
+
+        # R1：BM25 参数（k1 饱和、b 长度归一化）。b=0 会退化成纯词频，
+        # 长文档会靠「什么词都有」占便宜，所以默认 b=0.75。
+        self.bm25_k1 = max(0.0, min(8.0, float(bm25_k1 if bm25_k1 is not None else 1.2)))
+        self.bm25_b = max(0.0, min(1.0, float(bm25_b if bm25_b is not None else 0.75)))
         self._rank_path_info: dict[str, Any] = {}
         # haystack 缓存：同一 (memory.id, updated_at) 在一次召回内会被
         # _term_document_stats/_score/MMR features 多次重建，按键复用可省去
@@ -229,13 +425,20 @@ class RetrievalEngine:
             if is_memory_placeholder(memory):
                 blocked.append({"id": memory_id, "reason": "placeholder_memory", "content": ""})
                 continue
-            memory_platform = _platform_family(getattr(memory, "platform", ""))
-            current_platform = _platform_family(getattr(ctx, "platform", ""))
-            if memory_platform and current_platform and memory_platform != current_platform:
+            explicit_person_link = self.policy.explicit_person_link_matches(memory, ctx)
+            # One question, one answer: cross-platform candidates survive only
+            # when the platform difference is backed by explicit identity
+            # evidence (see VisibilityPolicy.platform_identity_allows). The
+            # removed ``linked_private_user`` clause instead asked is_visible(),
+            # which returns True for every shareable row regardless of platform;
+            # the removed bare ``same_session`` test compared only a string the
+            # host adapter copies, so it could not distinguish a renamed adapter
+            # from a different one. Both let a foreign platform through.
+            if not self.policy.platform_identity_allows(memory, ctx):
                 blocked.append({"id": memory_id, "reason": "other_platform", "content": ""})
                 continue
             owner_visible, owner_reason = self.policy._bot_owner_visible(memory, ctx)
-            if not owner_visible:
+            if not owner_visible and not explicit_person_link:
                 blocked.append(
                     {
                         "id": memory_id,
@@ -307,7 +510,7 @@ class RetrievalEngine:
         total_limit: int = 6,
         time_intent: TimeIntent | None = None,
         capped_slots: set[str] | None = None,
-    ) -> tuple[list[SearchResult], list[dict[str, str]], dict[str, list[SearchResult]]]:
+    ) -> tuple[list[SearchResult], list[dict[str, Any]], dict[str, list[SearchResult]]]:
         self.start_latency_budget()
         ranked, blocked = await self._rank_candidates(query, ctx, time_intent=time_intent)
         total = max(1, int(total_limit or 1))
@@ -430,6 +633,31 @@ class RetrievalEngine:
         blocked.extend(mutable_blocked)
         selected, source_blocked, slot_map = self._collapse_redundant_source_slots(selected, slot_map)
         blocked.extend(source_blocked)
+        selected_ids = {item.memory.id for item in selected}
+        slot_capped: list[dict[str, Any]] = []
+        for slot in sorted(slot_limits):
+            limit = max(0, int(slot_limits.get(slot, 0) or 0))
+            if limit <= 0 or len(slot_map.get(slot, [])) < limit:
+                continue
+            omitted = 0
+            for candidate in ranked:
+                if candidate.memory.id in selected_ids:
+                    continue
+                if self._slot_for_memory(candidate.memory, ctx) != slot:
+                    continue
+                if not selectable_for_slot(candidate, slot):
+                    continue
+                slot_capped.append({
+                    "id": candidate.memory.id,
+                    "reason": f"slot_capped:{slot}",
+                    "slot": slot,
+                    "score": round(float(candidate.score), 4),
+                    "content": "",
+                })
+                omitted += 1
+                if omitted >= 3:
+                    break
+        blocked = slot_capped + blocked
         return selected, blocked, {slot: items for slot, items in slot_map.items() if items}
 
     def start_latency_budget(self) -> None:
@@ -537,10 +765,35 @@ class RetrievalEngine:
                 **self._rank_path_info,
             }
             return ranked
+        breaker = getattr(self, "rerank_circuit_breaker", None)
+        provider_key = self.rerank_provider_id or "<auto>"
+        is_probe = False
+        if breaker is not None:
+            allowed, is_probe = breaker.allow_request(provider_key)
+            if not allowed:
+                self.last_path_info = {
+                    "mode": self.retrieval_mode,
+                    "path": "fallback_basic",
+                    "provider_id": self.rerank_provider_id,
+                    "reason": "rerank_circuit_open",
+                    "candidate_count": len(ranked),
+                    "rerank_pool": len(rerank_pool),
+                    "rerank_filtered": filtered_count,
+                    **request_shape,
+                    **self._rank_path_info,
+                }
+                return ranked
+        probe_settled = False
         try:
             rerank_resp = await self._call_rerank_provider(query_text, documents)
             reranked = self._apply_rerank_response(rerank_resp, rerank_pool)
+            if breaker is not None:
+                breaker.record_success(provider_key)
+                probe_settled = True
         except Exception as error:
+            if breaker is not None:
+                breaker.record_failure(provider_key, is_probe=is_probe)
+                probe_settled = True
             self.last_path_info = {
                 "mode": self.retrieval_mode,
                 "path": "fallback_basic",
@@ -555,6 +808,9 @@ class RetrievalEngine:
                 **self._rank_path_info,
             }
             return ranked
+        finally:
+            if breaker is not None and is_probe and not probe_settled:
+                breaker.release_probe(provider_key)
 
         if not reranked:
             self.last_path_info = {
@@ -570,7 +826,13 @@ class RetrievalEngine:
             }
             return ranked
 
-        anchors = self._rerank_anchor_results(query_text, pool, final_limit)
+        # R5：锚定关闭时连锚点计算都省掉（_rerank_anchor_results 是 O(pool) 的
+        # 全量词法复核，不该为默认关闭的功能付成本）。
+        anchors = (
+            self._rerank_anchor_results(query_text, pool, final_limit)
+            if self.anchor_floor_enabled
+            else []
+        )
         merged: list[SearchResult] = []
         seen: set[str] = set()
         for item in [*reranked, *pool]:
@@ -616,6 +878,10 @@ class RetrievalEngine:
         weakest slot, evicting the least supported non-anchor row.
         """
 
+        # R5：人工锚定默认关闭，只有显式开启（anchor_floor_enabled=True）才
+        # 允许用词法锚点改写 rerank 模型的 top-k 窗口。
+        if not self.anchor_floor_enabled:
+            return 0
         if not anchors or len(merged) <= final_limit:
             return 0
         anchor_ids = {item.memory.id for item in anchors if item.memory.id}
@@ -711,30 +977,33 @@ class RetrievalEngine:
         scores = [float(item.score) for item in pool]
         minimum = min(scores)
         maximum = max(scores)
-
-        def relevance(item: SearchResult) -> float:
-            if maximum <= minimum:
-                return 1.0
-            return (float(item.score) - minimum) / (maximum - minimum)
+        if maximum <= minimum:
+            upper_bounds = {id(item): 0.84 for item in pool}
+        else:
+            span = maximum - minimum
+            upper_bounds = {
+                id(item): 0.84 * ((float(item.score) - minimum) / span)
+                for item in pool
+            }
 
         def features(item: SearchResult) -> set[str]:
             memory = item.memory
-            text = re.sub(r"\s+", "", self._haystack(memory))
-            cjk = frozenset(
-                text[index : index + 2]
-                for index in range(max(0, len(text) - 1))
-                if text[index : index + 2]
-            )
+            text = _MMR_WHITESPACE_RE.sub("", self._haystack(memory))
+            text_len = len(text)
+            cjk = {text[index : index + 2] for index in range(text_len - 1)} if text_len > 1 else set()
             # Avoid sorting the common case while preserving the historical
             # deterministic 180-feature cap for unusually long memories.
             if len(cjk) > 180:
-                cjk_features = set(sorted(cjk)[:180])
-            else:
-                cjk_features = set(cjk)
-            latin = set(re.findall(r"[a-z0-9_]{2,}", text))
-            tags = {f"tag:{clean_text(tag, 40).lower()}" for tag in (memory.tags or []) if clean_text(tag, 40)}
+                cjk = set(sorted(cjk)[:180])
+            cjk.update(_MMR_LATIN_TOKEN_RE.findall(text))
+            for tag in memory.tags or ():
+                cleaned_tag = clean_text(tag, 40)
+                if cleaned_tag:
+                    cjk.add(f"tag:{cleaned_tag.lower()}")
             source = clean_text(memory.source_plugin, 60).lower()
-            return cjk_features | latin | tags | ({f"source:{source}"} if source else set())
+            if source:
+                cjk.add(f"source:{source}")
+            return cjk
 
         feature_map: dict[int, set[str]] = {}
 
@@ -746,26 +1015,40 @@ class RetrievalEngine:
                 feature_map[item_id] = cached
             return cached
 
-        def similarity(left: SearchResult, right: SearchResult) -> float:
-            left_features = feature_for(left)
-            right_features = feature_for(right)
-            union = left_features | right_features
-            return (len(left_features & right_features) / len(union)) if union else 0.0
-
+        redundancy_weight = self.mmr_redundancy_weight
         selected: list[SearchResult] = [pool.pop(0)]
+        max_redundancy: dict[int, float] = {}
+        evaluated_count: dict[int, int] = {}
         target = min(len(ranked), max(1, int(selection_limit or 1)))
         while pool and len(selected) < target:
+            selected_len = len(selected)
             best_index = 0
             best_value = -math.inf
             for index, item in enumerate(pool):
+                item_id = id(item)
                 # Redundancy is non-negative, so this is an exact upper bound
                 # for the candidate's MMR value. Candidates that cannot beat
                 # the current winner need no expensive feature/intersection work.
-                upper_bound = 0.84 * relevance(item)
+                upper_bound = upper_bounds[item_id]
                 if upper_bound <= best_value:
                     continue
-                redundancy = max(similarity(item, chosen) for chosen in selected)
-                value = upper_bound - (0.16 * redundancy)
+                done_count = evaluated_count.get(item_id, 0)
+                redundancy = max_redundancy.get(item_id, 0.0)
+                if done_count < selected_len:
+                    item_features = feature_for(item)
+                    item_feature_len = len(item_features)
+                    for chosen in selected[done_count:]:
+                        chosen_features = feature_for(chosen)
+                        inter = len(item_features & chosen_features)
+                        union_len = item_feature_len + len(chosen_features) - inter
+                        sim = (inter / union_len) if union_len else 0.0
+                        if sim > redundancy:
+                            redundancy = sim
+                    max_redundancy[item_id] = redundancy
+                    evaluated_count[item_id] = selected_len
+                # R7：去冗余权重可配（默认 0.35，历史值 0.16 太轻，高冗余两条
+                # 会一起进 top_k）。upper_bound 仍是价值的严格上界，剪枝安全。
+                value = upper_bound - (redundancy_weight * redundancy)
                 if value > best_value:
                     best_value = value
                     best_index = index
@@ -805,10 +1088,12 @@ class RetrievalEngine:
                 if ratio >= ratio_threshold:
                     duplicate_of = other
                     break
-            if duplicate_of is None or (item.score or 0.0) > (duplicate_of.score or 0.0):
-                if duplicate_of is not None:
-                    kept.remove(duplicate_of)
+            if duplicate_of is None:
                 kept.append(item)
+            elif (item.score or 0.0) > (duplicate_of.score or 0.0):
+                # 原地替换，别把这条更好的挪到队尾（R4）：去重之后再按顺序截
+                # top_k 时，被挪到末尾的高分项会被直接截掉。
+                kept[kept.index(duplicate_of)] = item
             # else: drop this item (duplicate with lower/equal score)
         return kept
 
@@ -822,7 +1107,7 @@ class RetrievalEngine:
         exact_phrases = [str(item) for item in profile.get("exact_phrases", []) if str(item)]
         if any(phrase in compact_haystack for phrase in exact_phrases):
             return True
-        hits = sum(1 for term in terms if term and term in haystack)
+        hits = sum(1 for term in terms if term and self._term_frequency(haystack, term) > 0)
         contextual_recall = self._looks_like_contextual_recall_query(query)
         if contextual_recall and hits >= 1:
             return True
@@ -852,19 +1137,29 @@ class RetrievalEngine:
         resp: Any = None
         success = False
         error = ""
-        try:
-            result = method(**kwargs)
-            if inspect.isawaitable(result):
-                if self.rerank_timeout_ms > 0:
-                    resp = await asyncio.wait_for(result, timeout=self.rerank_timeout_ms / 1000.0)
-                else:
-                    resp = await result
+
+        async def invoke_provider() -> Any:
+            if inspect.iscoroutinefunction(method):
+                result = method(**kwargs)
             else:
-                resp = result
+                result = await asyncio.to_thread(method, **kwargs)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+
+        try:
+            async with exclude_model_call_wait():
+                if self.rerank_timeout_ms > 0:
+                    resp = await await_with_timeout(
+                        invoke_provider(),
+                        self.rerank_timeout_ms / 1000.0,
+                    )
+                else:
+                    resp = await invoke_provider()
             success = True
             return resp
         except Exception as exc:
-            error = str(exc)
+            error = clean_text(str(exc), 200) or type(exc).__name__
             raise
         finally:
             elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
@@ -1344,19 +1639,23 @@ class RetrievalEngine:
             return True
         metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
         candidate_ranges: list[tuple[datetime, datetime]] = []
-        start_at = self._parse_time(clean_text(metadata.get("start_at"), 80))
-        end_at = self._parse_time(clean_text(metadata.get("end_at"), 80))
-        if start_at is not None or end_at is not None:
-            start = start_at or end_at
-            end = end_at or start_at
-            if start is not None and end is not None:
-                if end <= start:
-                    end = start + timedelta(days=1)
-                candidate_ranges.append((start, end))
-        for value in (memory.occurred_at, memory.created_at, memory.updated_at):
-            dt = self._parse_time(value)
-            if dt is not None:
-                candidate_ranges.append((dt, dt + timedelta(seconds=1)))
+        for start_key, end_key in (("start_at", "end_at"), ("source_start_at", "source_end_at")):
+            start_at = self._parse_time(clean_text(metadata.get(start_key), 80))
+            end_at = self._parse_time(clean_text(metadata.get(end_key), 80))
+            if start_at is not None or end_at is not None:
+                start = start_at or end_at
+                end = end_at or start_at
+                if start is not None and end is not None:
+                    if end <= start:
+                        end = start + timedelta(days=1)
+                    candidate_ranges.append((start, end))
+        # Match actual event occurrence time (falling back to created_at only
+        # when occurred_at is absent). Never include updated_at: background
+        # decay/maintenance touches updated_at on old memories and must not
+        # pull last month's records into "today".
+        occurred_dt = self._parse_time(memory.occurred_at) or self._parse_time(memory.created_at)
+        if occurred_dt is not None:
+            candidate_ranges.append((occurred_dt, occurred_dt + timedelta(seconds=1)))
         if not candidate_ranges:
             return False
         return any(start < window_end and end > window_start for start, end in candidate_ranges)
@@ -1411,16 +1710,20 @@ class RetrievalEngine:
         time_window_spec: tuple[str, str, int] | None = None
         if time_intent is not None and time_intent.active:
             time_window_spec = (time_intent.start_at, time_intent.end_at, 1600)
-        bundle: dict[str, Any] | None = None
-        try:
-            bundle, vector_result = await asyncio.gather(
-                self.store.list_retrieval_candidate_bundle(
+        bundle_error_type = ""
+
+        async def load_candidate_bundle() -> dict[str, Any] | None:
+            nonlocal bundle_error_type
+            try:
+                return await self.store.list_retrieval_candidate_bundle(
                     materialize_limit=self.DEFAULT_MATERIALIZE_LIMIT,
                     current_window={
                         "scope": ctx.scope,
                         "session_id": ctx.session_id,
                         "user_id": ctx.user_id,
                         "group_id": ctx.group_id,
+                        "subject_person_id": ctx.subject_person_id,
+                        "identity_assurance": ctx.identity_assurance,
                         "limit": self.current_window_candidate_limit,
                     },
                     fts_terms=keyword_terms,
@@ -1430,22 +1733,37 @@ class RetrievalEngine:
                     keyword_fallback_min_fts=self.keyword_fallback_min_fts_candidates,
                     time_window=time_window_spec,
                     include_pending=include_pending,
-                ),
-                self._embedding_candidate_memories(
-                    query,
-                    ctx,
-                    include_pending=include_pending,
-                    time_intent=time_intent,
-                ),
-            )
-        except Exception:
-            bundle = None
-            vector_result = await self._embedding_candidate_memories(
+                )
+            except Exception as error:
+                bundle_error_type = type(error).__name__
+                return None
+
+        acl_revision_before: str | None = None
+        if self.policy.enable_acl_rules:
+            if self.embedding_enabled:
+                acl_rev_fn = getattr(self.store, "acl_revision", None)
+                mem_rev_fn = getattr(self.store, "memory_revision", None)
+                if callable(acl_rev_fn):
+                    acl_revision_before = await acl_rev_fn()
+                elif callable(mem_rev_fn):
+                    acl_revision_before = await mem_rev_fn()
+            acl_state = await self._acl_state()
+        else:
+            acl_state = self._empty_acl_state()
+
+        # A local read failure must not restart the concurrent model request.
+        # Keep its one bounded attempt and fall back only the failed source.
+        bundle, vector_result = await asyncio.gather(
+            load_candidate_bundle(),
+            self._embedding_candidate_memories(
                 query,
                 ctx,
                 include_pending=include_pending,
                 time_intent=time_intent,
-            )
+                acl_state=acl_state,
+                acl_revision=acl_revision_before,
+            ),
+        )
         if bundle is not None:
             bundle_timing = bundle.pop("_timing", None) or {}
             ranked_candidates = bundle["ranked_candidates"]
@@ -1481,6 +1799,8 @@ class RetrievalEngine:
                     group_id=ctx.group_id,
                     limit=self.current_window_candidate_limit,
                     include_pending=include_pending,
+                    subject_person_id=ctx.subject_person_id,
+                    identity_assurance=ctx.identity_assurance,
                 ),
                 self.store.list_fts_candidate_memories(
                     keyword_terms,
@@ -1503,6 +1823,8 @@ class RetrievalEngine:
         self._rank_path_info = embedding_info
         self._rank_path_info["candidate_load_ms"] = int((time.perf_counter() - load_started) * 1000)
         self._rank_path_info["candidate_bundle"] = bundle is not None
+        if bundle_error_type:
+            self._rank_path_info["candidate_bundle_error_type"] = bundle_error_type
         if bundle_timing:
             self._rank_path_info["bundle_lock_wait_ms"] = bundle_timing.get("lock_wait_ms", 0)
             self._rank_path_info["bundle_queries_ms"] = bundle_timing.get("queries_ms", 0)
@@ -1516,8 +1838,39 @@ class RetrievalEngine:
                 "keyword_candidates": len(keyword_candidates),
             }
         )
-        acl_state = await self._acl_state() if self.policy.enable_acl_rules else self._empty_acl_state()
         block_profile_retrieval = self._query_blocks_profile_retrieval(query)
+        # 召回不再只看「像不像」：谁在她心里重，谁的旧事就更容易被想起。
+        person_strengths: dict[str, float] = {}
+        try:
+            subject_ids: list[str] = []
+            seen_subjects: set[str] = set()
+            for group in (
+                ranked_candidates,
+                current_window_candidates,
+                fts_candidates,
+                keyword_candidates,
+                vector_candidates,
+                time_window_candidates,
+            ):
+                for memory in group:
+                    subject = getattr(memory, "subject", None)
+                    if clean_text(getattr(subject, "kind", ""), 20) != "user":
+                        continue
+                    subject_id = clean_text(getattr(subject, "id", ""), 120)
+                    if subject_id and subject_id not in seen_subjects:
+                        seen_subjects.add(subject_id)
+                        subject_ids.append(subject_id)
+            if subject_ids:
+                person_strengths = await self.store.person_weight_map(
+                    user_ids=subject_ids[:200],
+                    platform=clean_text(getattr(ctx, "platform", ""), 40),
+                    bot_id=clean_text(getattr(ctx, "bot_id", ""), 120),
+                )
+        except Exception:
+            person_strengths = {}
+        # H10：当前会话的情绪状态参与排序（倍率 + 未了债务跟进）。只读
+        # emotion_events，没有事件时是基线（倍率 1.0、加成为 0），行为不变。
+        emotion_mood = await self._emotion_retrieval_mood(ctx)
         ranking_started = time.perf_counter()
         results, blocked, ranking_info = await asyncio.to_thread(
             self._rank_candidates_sync,
@@ -1535,11 +1888,46 @@ class RetrievalEngine:
             acl_state,
             time_intent,
             block_profile_retrieval,
+            person_strengths,
+            emotion_mood,
         )
         self._rank_path_info.update(ranking_info)
         self._rank_path_info["ranking_cpu_ms"] = int((time.perf_counter() - ranking_started) * 1000)
         self._rank_path_info["ranking_offloaded"] = True
         return results, blocked
+
+    async def _emotion_retrieval_mood(self, ctx: SessionContext) -> dict[str, object] | None:
+        """H10：把当前会话的情绪状态压成检索用的两个数（倍率、债务跟进加成）。
+
+        只读 store.list_emotion_events，不建表、不写库；没有事件或读失败时返回
+        None，排序与历史版本完全一致。
+        """
+        try:
+            from .affect_modulation import modulate
+            from .emotion_state import state_for_session
+        except Exception:
+            return None
+        try:
+            state = await state_for_session(
+                self.store,
+                bot_id=clean_text(getattr(ctx, "bot_id", ""), 120),
+                session_id=clean_text(getattr(ctx, "session_id", ""), 120),
+            )
+            mood = modulate(state)
+        except Exception:
+            return None
+        retrieval = mood.get("retrieval") if isinstance(mood, dict) else None
+        if not isinstance(retrieval, dict):
+            return None
+        try:
+            multiplier = float(retrieval.get("emotional_weight_multiplier") or 1.0)
+            boost = float(retrieval.get("debt_followup_boost") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if abs(multiplier - 1.0) < 1e-6 and boost <= 0.0:
+            # 基线状态：不注入任何额外权重，走原路径。
+            return None
+        return {"emotional_weight_multiplier": multiplier, "debt_followup_boost": boost}
 
     def _rank_candidates_sync(
         self,
@@ -1557,8 +1945,11 @@ class RetrievalEngine:
         acl_state: dict[str, object],
         time_intent: TimeIntent | None,
         block_profile_retrieval: bool,
+        person_strengths: dict[str, float] | None = None,
+        emotion_mood: dict[str, object] | None = None,
     ) -> tuple[list[SearchResult], list[dict[str, str]], dict[str, int]]:
         """Score a private candidate snapshot without touching the event loop."""
+        person_strengths = person_strengths or {}
         route_lists = (
             ("fts", fts_candidates),
             ("current_window", current_window_candidates),
@@ -1576,16 +1967,17 @@ class RetrievalEngine:
             vector_candidates,
             time_window_candidates,
         )
-        searchable: list[tuple[MemoryRecord, str]] = []
+        searchable: list[tuple[MemoryRecord, str, LifecycleScore]] = []
         prefiltered: dict[str, int] = {}
         time_filtered = 0
+        now_utc = datetime.now(timezone.utc)
         for memory in candidates:
             memory_type = clean_text(getattr(memory, "memory_type", ""), 80).lower()
             visibility_reason, prefilter_reason = self._search_visibility_reason(
                 memory, ctx, acl_state
             )
             if visibility_reason:
-                lifecycle = evaluate_memory_lifecycle(memory, ctx)
+                lifecycle = evaluate_memory_lifecycle(memory, ctx, now=now_utc)
                 if not lifecycle.eligible:
                     key = clean_text(lifecycle.reason or "lifecycle_ineligible", 180)
                     prefiltered[key] = prefiltered.get(key, 0) + 1
@@ -1601,11 +1993,15 @@ class RetrievalEngine:
                 ):
                     time_filtered += 1
                     continue
-                searchable.append((memory, visibility_reason))
+                searchable.append((memory, visibility_reason, lifecycle))
             else:
                 key = clean_text(prefilter_reason or "not_visible", 180)
                 prefiltered[key] = prefiltered.get(key, 0) + 1
         profile = self._query_profile(query, expanded_terms)
+        if emotion_mood:
+            # 情绪只影响排序权重，不改变候选集与可见性判定。
+            profile = dict(profile)
+            profile["emotion_mood"] = emotion_mood
         # IDF must describe query-aware routes, not the unrelated priority scan.
         query_aware_ids = {
             memory_id
@@ -1614,12 +2010,12 @@ class RetrievalEngine:
         }
         term_pool = [
             memory
-            for memory, _reason in searchable
+            for memory, _reason, _lc in searchable
             if clean_text(memory.id, 120) in query_aware_ids
         ]
         if not term_pool:
-            term_pool = [memory for memory, _reason in searchable]
-        term_stats = self._term_document_stats(term_pool, expanded_terms)
+            term_pool = [memory for memory, _reason, _lc in searchable]
+        term_stats, average_doc_len = self._term_document_stats(term_pool, expanded_terms)
         route_families_by_id = {
             memory_id: self._route_families(sources)
             for memory_id, sources in candidate_sources.items()
@@ -1642,8 +2038,14 @@ class RetrievalEngine:
                     "content": "",
                 }
             )
-        for memory, visibility_reason in searchable:
+        for memory, visibility_reason, lifecycle in searchable:
             memory_id = clean_text(memory.id, 120)
+            subject = getattr(memory, "subject", None)
+            subject_strength = 0.0
+            if clean_text(getattr(subject, "kind", ""), 20) == "user":
+                subject_strength = float(
+                    person_strengths.get(clean_text(getattr(subject, "id", ""), 120), 0.0)
+                )
             score, reason = self._score(
                 memory,
                 expanded_terms,
@@ -1653,6 +2055,9 @@ class RetrievalEngine:
                 vector_score=vector_scores.get(memory_id, 0.0),
                 reciprocal_rank_score=reciprocal_rank_scores.get(memory_id, 0.0),
                 route_families=route_families_by_id.get(memory_id, frozenset()),
+                person_strength=subject_strength,
+                average_doc_len=average_doc_len,
+                lifecycle=lifecycle,
             )
             if score <= 0:
                 if len(blocked) < 40:
@@ -1688,6 +2093,8 @@ class RetrievalEngine:
         *,
         include_pending: bool,
         time_intent: TimeIntent | None = None,
+        acl_state: dict[str, object] | None = None,
+        acl_revision: str | None = None,
     ) -> tuple[list[MemoryRecord], dict[str, float], dict[str, Any]]:
         info: dict[str, Any] = {
             "embedding_enabled": bool(self.embedding_enabled),
@@ -1714,6 +2121,8 @@ class RetrievalEngine:
             query_vector = self._normalize_vector(query_vector)
         except Exception as error:
             info["embedding_reason"] = f"embedding_query_error:{clean_text(self._describe_exception(error), 120)}"
+            info["embedding_fallback"] = "local_fts_keyword"
+            info["embedding_timeout_ms"] = self.embedding_timeout_ms
             return [], {}, info
         if not query_vector:
             info["embedding_reason"] = "empty_query_vector"
@@ -1724,38 +2133,113 @@ class RetrievalEngine:
         block_profile = self._query_blocks_profile_retrieval(query)
         authorization_key = (
             ctx.scope, ctx.session_id, ctx.platform, ctx.user_id, ctx.group_id,
-            ctx.bot_id, ctx.persona_id, ctx.strict_session_only,
+            ctx.bot_id, ctx.persona_id, ctx.subject_person_id,
+            ctx.identity_assurance, ctx.strict_session_only,
             self.policy.allow_self_timeline_everywhere, self.policy.allow_group_public_in_private,
             self.policy.hide_pending_review, self.policy.include_raw_events,
             self.policy.enable_acl_rules, self.policy.admin_read_all,
-            self.private_topology_enabled, self.group_topology_enabled, block_profile,
-            (time_intent.start_at, time_intent.end_at) if time_intent and time_intent.active else None,
+            self.private_topology_enabled, self.group_topology_enabled,
         )
+        ref_filter = None
+        post_filter = None
+        if time_intent is not None and time_intent.active:
+            w_start_dt = self._parse_time(time_intent.start_at)
+            w_end_dt = self._parse_time(time_intent.end_at)
+            if w_start_dt is not None and w_end_dt is not None:
+                w_start_ts = (w_start_dt - _EPOCH).total_seconds()
+                w_end_ts = (w_end_dt - _EPOCH).total_seconds()
+
+                def ref_filter(ref: Any) -> bool:
+                    return any(
+                        start < w_end_ts and end > w_start_ts
+                        for start, end in ref.time_ranges
+                    )
+
+                def post_filter(memory: MemoryRecord) -> bool:
+                    return self._memory_overlaps_time_window(memory, time_intent)
+
         # A data/ACL race retries once with current authorization and the same
         # query vector. No second provider request, no importance-based fallback.
+        acl_rev_fn = getattr(self.store, "acl_revision", None)
         for attempt in range(2):
             try:
                 revision = await self.store.memory_revision()
-                acl_state = await self._acl_state() if self.policy.enable_acl_rules else self._empty_acl_state()
+                reuse_acl = False
+                if attempt == 0 and acl_state is not None:
+                    if not self.policy.enable_acl_rules:
+                        reuse_acl = True
+                    elif acl_revision is not None:
+                        current_acl_rev = (
+                            await acl_rev_fn() if callable(acl_rev_fn) else revision
+                        )
+                        reuse_acl = current_acl_rev == acl_revision
+                if reuse_acl:
+                    current_acl_state = acl_state
+                else:
+                    current_acl_state = (
+                        await self._acl_state()
+                        if self.policy.enable_acl_rules
+                        else self._empty_acl_state()
+                    )
+                    if acl_state is not None:
+                        acl_state.clear()
+                        acl_state.update(current_acl_state)
                 selection_time = datetime.now(timezone.utc)
 
                 def eligible(memory: MemoryRecord) -> bool:
-                    visible, blocked = self._search_visibility_reason(memory, ctx, acl_state)
+                    visible, blocked = self._search_visibility_reason(memory, ctx, current_acl_state)
                     return bool(
                         visible and not blocked
                         and evaluate_memory_lifecycle(memory, ctx, now=selection_time).eligible
-                        and not (block_profile and memory.memory_type in PROFILE_MEMORY_TYPES)
-                        and (not time_intent or not time_intent.active
-                             or self._memory_overlaps_time_window(memory, time_intent))
                     )
 
-                memories, scores, diagnostics = await self.store.search_memory_embeddings(
-                    provider_id=self.embedding_provider_id, query=query_vector,
-                    expected_revision=revision, authorization_key=authorization_key, eligible=eligible,
-                    include_pending=include_pending, top_k=self.embedding_top_k,
-                    threshold=self.embedding_score_threshold, batch_size=self.embedding_candidate_limit,
-                    max_text_chars=self.embedding_max_text_chars, selection_time=selection_time.timestamp(),
-                )
+                try:
+                    search_kwargs: dict[str, Any] = {
+                        "provider_id": self.embedding_provider_id,
+                        "query": query_vector,
+                        "expected_revision": revision,
+                        "authorization_key": authorization_key,
+                        "eligible": eligible,
+                        "include_pending": include_pending,
+                        "top_k": self.embedding_top_k,
+                        "threshold": self.embedding_score_threshold,
+                        "batch_size": self.embedding_candidate_limit,
+                        "max_text_chars": self.embedding_max_text_chars,
+                        "selection_time": selection_time.timestamp(),
+                        "excluded_memory_types": PROFILE_MEMORY_TYPES if block_profile else frozenset(),
+                    }
+                    if ref_filter is not None:
+                        search_kwargs["ref_filter"] = ref_filter
+                        search_kwargs["post_filter"] = post_filter
+                    memories, scores, diagnostics = await self.store.search_memory_embeddings(
+                        **search_kwargs
+                    )
+                except asyncio.CancelledError:
+                    if not getattr(self.store, "_closing", False) and not getattr(self.store, "_closed", False):
+                        warmup_key = (
+                            self.embedding_provider_id,
+                            len(query_vector),
+                            bool(include_pending),
+                            self.embedding_max_text_chars,
+                            authorization_key,
+                        )
+                        schedule_warmup = getattr(self.store, "schedule_vector_snapshot_warmup", None)
+                        if callable(schedule_warmup):
+                            schedule_warmup(
+                                warmup_key=warmup_key,
+                                provider_id=self.embedding_provider_id,
+                                query=query_vector,
+                                expected_revision=revision,
+                                authorization_key=authorization_key,
+                                eligible=eligible,
+                                include_pending=include_pending,
+                                top_k=self.embedding_top_k,
+                                threshold=self.embedding_score_threshold,
+                                batch_size=self.embedding_candidate_limit,
+                                max_text_chars=self.embedding_max_text_chars,
+                                selection_time=selection_time.timestamp(),
+                            )
+                    raise
                 info.update(diagnostics)
                 return memories, scores, info
             except VectorSnapshotChanged:
@@ -1778,22 +2262,42 @@ class RetrievalEngine:
         """A repeated question should not pay for a second embedding call."""
         if self.query_vector_cache_ttl_seconds <= 0 or not text:
             return []
-        entry = self._query_vector_cache.get(text)
-        if entry is None:
-            return []
-        stored_at, vector = entry
-        if time.monotonic() - stored_at > self.query_vector_cache_ttl_seconds:
-            self._query_vector_cache.pop(text, None)
-            return []
-        return list(vector)
+        cache_key = (self.embedding_provider_id, text)
+        entry = self._query_vector_cache.get(cache_key)
+        if entry is not None:
+            stored_at, vector = entry
+            if time.monotonic() - stored_at <= self.query_vector_cache_ttl_seconds:
+                return list(vector)
+            self._query_vector_cache.pop(cache_key, None)
+        from .vector_search import get_shared_query_embedding
+
+        shared = get_shared_query_embedding(
+            self.embedding_provider,
+            self.embedding_provider_id,
+            text,
+            self.query_vector_cache_ttl_seconds,
+        )
+        if shared:
+            self._query_vector_cache[cache_key] = (time.monotonic(), list(shared))
+            return shared
+        return []
 
     def _store_query_vector(self, text: str, vector: list[float]) -> None:
         if self.query_vector_cache_ttl_seconds <= 0 or not text or not vector:
             return
-        self._query_vector_cache[text] = (time.monotonic(), list(vector))
+        cache_key = (self.embedding_provider_id, text)
+        self._query_vector_cache[cache_key] = (time.monotonic(), list(vector))
         if len(self._query_vector_cache) > 64:
             oldest = min(self._query_vector_cache.items(), key=lambda item: item[1][0])[0]
             self._query_vector_cache.pop(oldest, None)
+        from .vector_search import put_shared_query_embedding
+
+        put_shared_query_embedding(
+            self.embedding_provider,
+            self.embedding_provider_id,
+            text,
+            vector,
+        )
 
     async def _call_embedding_provider(self, text: str) -> list[float]:
         provider = self.embedding_provider
@@ -1803,13 +2307,26 @@ class RetrievalEngine:
         cached = self._cached_query_vector(text)
         if cached:
             return cached
+        deadline = time.monotonic() + self.embedding_timeout_ms / 1000.0
 
-        async def maybe_wait(value: Any) -> Any:
-            if inspect.isawaitable(value):
-                if self.embedding_timeout_ms > 0:
-                    return await asyncio.wait_for(value, timeout=self.embedding_timeout_ms / 1000.0)
-                return await value
-            return value
+        async def maybe_wait(method: Any, *args: Any, **kwargs: Any) -> Any:
+            async def invoke() -> Any:
+                is_async = inspect.iscoroutinefunction(method) or inspect.iscoroutinefunction(
+                    getattr(method, "__call__", None)
+                )
+                if is_async:
+                    result = method(*args, **kwargs)
+                else:
+                    result = await asyncio.to_thread(method, *args, **kwargs)
+                if inspect.isawaitable(result):
+                    return await result
+                return result
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            async with exclude_model_call_wait():
+                return await await_with_timeout(invoke(), remaining)
 
         get_embedding = getattr(provider, "get_embedding", None)
         get_embeddings = getattr(provider, "get_embeddings", None)
@@ -1822,7 +2339,7 @@ class RetrievalEngine:
         try:
             if callable(get_embedding):
                 called_provider = True
-                payload = await maybe_wait(get_embedding(text))
+                payload = await maybe_wait(get_embedding, text)
                 success = True
                 vector = self._coerce_vector(payload)
                 self._store_query_vector(text, vector)
@@ -1830,7 +2347,7 @@ class RetrievalEngine:
 
             if callable(get_embeddings):
                 called_provider = True
-                payload = await maybe_wait(get_embeddings([text]))
+                payload = await maybe_wait(get_embeddings, [text])
                 success = True
                 vector = self._first_vector(payload)
                 self._store_query_vector(text, vector)
@@ -1840,12 +2357,18 @@ class RetrievalEngine:
                 called_provider = True
                 try:
                     payload = await maybe_wait(
-                        get_embeddings_batch([text], batch_size=1, tasks_limit=1, max_retries=1)
+                        get_embeddings_batch,
+                        [text],
+                        batch_size=1,
+                        tasks_limit=1,
+                        max_retries=1,
                     )
                 except TypeError:
-                    payload = await maybe_wait(get_embeddings_batch([text]))
+                    payload = await maybe_wait(get_embeddings_batch, [text])
                 success = True
-                return self._first_vector(payload)
+                vector = self._first_vector(payload)
+                self._store_query_vector(text, vector)
+                return vector
             return []
         except Exception as exc:
             error = self._describe_exception(exc)
@@ -3133,49 +3656,47 @@ class RetrievalEngine:
             "上次那个",
             "没说完",
             "还没说完",
+            "那件事",
+            "这件事",
+            "怎么样了",
+            "后来怎么样",
+            "有结果了吗",
+            "结果出来了",
+            "处理好了",
+            "已经解决",
+            "搞定了",
+            "办好了",
+            "还没弄",
+            "拿到了吗",
         )
-        return any(marker in compact for marker in markers) and len(compact) <= 18
+        return any(marker in compact for marker in markers) and len(compact) <= 32
 
     @staticmethod
     def _is_query_scaffold_term(term: str) -> bool:
+        # R3：这里只放「通用中文疑问/时间脚手架」。历史上这张表混进过评测
+        # 句子被切成两字后的碎片（得糖/端吗/骨吗/的胖/次颜，以及 想为/想一/
+        # 直提/提什/时你/是当/是异/近一/周的/这几 这类跨词切口），它们不是
+        # 任何正常问句里的功能词，只会让评测集里的碎片被当成停用词丢掉、又
+        # 让真实用户问句里的同样字面被误杀。删掉后这些字面重新按正常词参与
+        # 召回；通用疑问词与时间指示词保留。
         scaffold_terms = {
             "你再",
-            "再想",
             "想想",
-            "想为",
-            "想一",
             "一下",
             "你想",
             "你还",
             "就是",
-            "是当",
-            "时你",
-            "你一",
             "一直",
-            "直提",
-            "提什",
-            "我才",
-            "才说",
             "记得",
             "还记",
-            "得我",
-            "得你",
-            "得糖",
-            "我为",
-            "你为",
-            "为什",
             "什么",
-            "么说",
             "说你",
             "说我",
             "叫你",
             "叫我",
             "你是",
             "我是",
-            "是异",
             "的吗",
-            "端吗",
-            "骨吗",
             "原因",
             "之前",
             "以前",
@@ -3185,34 +3706,66 @@ class RetrievalEngine:
             "想起",
             "起来",
             "最近",
-            "近一",
             "一周",
-            "周的",
             "过去",
             "几天",
-            "这几",
             "本周",
             "这周",
-            "的胖",
-            "次颜",
         }
         return clean_text(term, 80).lower() in scaffold_terms
 
-    def _term_document_stats(self, memories: list[MemoryRecord], terms: list[str]) -> dict[str, float]:
+    # R1：英文/数字词要求词边界，避免 cat 命中 concatenate 这类子串误判。
+    _ASCII_WORD_RE = re.compile(r"[a-z0-9][a-z0-9_+.#-]*")
+
+    @classmethod
+    def _term_frequency(cls, haystack: str, term: str) -> int:
+        """词频统计（R1：带词边界，替代裸 str.count）。
+
+        纯 ASCII 词（英文/数字）按词边界匹配，中文等无空格语言仍按非重叠
+        子串计数（中文分词成本高，子串是行业常规），但统一走同一口径，避免
+        同一个 term 在 df 统计与 BM25 打分里用两种数法。
+        """
+
+        if not haystack or not term or term not in haystack:
+            return 0
+        if cls._ASCII_WORD_RE.fullmatch(term):
+            return len(_ascii_word_pattern(term).findall(haystack))
+        count = 0
+        start = 0
+        term_len = len(term)
+        while True:
+            index = haystack.find(term, start)
+            if index < 0:
+                return count
+            count += 1
+            start = index + term_len
+
+    def _term_document_stats(
+        self, memories: list[MemoryRecord], terms: list[str]
+    ) -> tuple[dict[str, float], float]:
+        """返回 (IDF 表, 平均文档长度)，供 BM25 做长度归一化（R1）。
+
+        平均长度用去掉空白后的字符数近似（中文按字、英文按字母），这正是
+        BM25 的 b 参数需要的那一维：长文档不该因为什么词都有而占便宜。
+        """
+
         if not terms:
-            return {}
+            return {}, 0.0
         document_count = max(1, len(memories))
         dfs = dict.fromkeys(terms, 0)
+        total_length = 0
         for memory in memories:
             haystack = self._haystack(memory)
+            total_length += len("".join(haystack.split()))
             for term in terms:
-                if term in haystack:
+                if self._term_frequency(haystack, term) > 0:
                     dfs[term] += 1
-        return {
+        idf = {
             term: math.log(1 + (document_count - df + 0.5) / (df + 0.5))
             for term, df in dfs.items()
             if df > 0
         }
+        return idf, (total_length / document_count if document_count else 0.0)
 
     def _cached_haystack(self, cache_key: tuple[str, str]) -> str | None:
         shared = self._shared_haystack_cache
@@ -3288,6 +3841,49 @@ class RetrievalEngine:
             return 0.0
         return min(0.12, 0.08 * (len(route_families) - 1))
 
+    def _source_surface_weight(self, memory: MemoryRecord) -> tuple[float, str]:
+        """Return (score_multiplier, surface) for this record's source surface.
+
+        The multiplier is 1.0 -- and the surface is "" -- whenever weighting is
+        off, so the caller stays byte-identical to the pre-weighting behaviour.
+        Rows without a usable surface, ``mixed`` rows and undeclared-but-valid
+        names are never discounted: the first two carry no single origin, and an
+        undeclared surface never opted into the priority rule. The latter is
+        reported once as a warning instead of being silently demoted.
+        """
+        if (
+            not self.source_surface_weights
+            and (self.source_surface_priority == "equal" or self.source_surface_weight >= 1.0)
+        ):
+            return 1.0, ""
+        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+        surface = row_source_surface({"metadata": metadata})
+        if not surface or surface in {SURFACE_MIXED, SURFACE_UNKNOWN}:
+            return 1.0, ""
+        if self.source_surface_names and surface not in self.source_surface_names:
+            self._warn_undeclared_surface(surface)
+            return 1.0, ""
+        weight = resolve_surface_weight(
+            surface,
+            priority=self.source_surface_priority,
+            weight=self.source_surface_weight,
+            weights=self.source_surface_weights,
+            registered=self.source_surface_names or None,
+        )
+        return weight, surface
+
+    def _warn_undeclared_surface(self, surface: str) -> None:
+        """Report an undeclared surface once per process (never per candidate)."""
+        if surface in _SOURCE_SURFACE_WARNED:
+            return
+        _SOURCE_SURFACE_WARNED.add(surface)
+        logger.warning(
+            "[MemoryCompanion] 来源面 %s 未在 source_surfaces 中声明：按 1.0 计权（不降权）。"
+            "已声明：%s",
+            surface,
+            ",".join(sorted(self.source_surface_names)) or "-",
+        )
+
     def _score(
         self,
         memory: MemoryRecord,
@@ -3299,10 +3895,17 @@ class RetrievalEngine:
         vector_score: float = 0.0,
         reciprocal_rank_score: float = 0.0,
         route_families: frozenset[str] = frozenset(),
+        person_strength: float = 0.0,
+        average_doc_len: float = 0.0,
+        lifecycle: LifecycleScore | None = None,
     ) -> tuple[float, str]:
         haystack = self._haystack(memory)
-        compact_haystack = re.sub(r"\s+", "", haystack)
-        term_hits = sum(1 for term in terms if term and term in haystack)
+        compact_haystack = "".join(haystack.split())
+        term_freqs = [
+            self._term_frequency(haystack, term) if term else 0
+            for term in terms
+        ]
+        term_hits = sum(1 for freq in term_freqs if freq > 0)
         exact_phrases = [str(item) for item in profile.get("exact_phrases", []) if str(item)]
         exact_hit = any(phrase in compact_haystack for phrase in exact_phrases)
         profile_hit = self._profile_query_matches_memory(
@@ -3311,6 +3914,15 @@ class RetrievalEngine:
         )
         min_hits = int(profile.get("min_hits", 1) or 1)
         vector_relevant = vector_score >= self.embedding_score_threshold if self.embedding_enabled else False
+        if (
+            not terms
+            and not vector_relevant
+            and not (route_families & self._QUERY_AWARE_ROUTE_SOURCES)
+        ):
+            # R2：没有查询词、也没有语义/多路召回证据时，不再用 importance 硬排
+            # 兜底。返回 0 分，让 _rank_candidates_sync 的 score <= 0 分支把它
+            # 归入 blocked，上层自然走「没有检索到相关记忆」的提示分支。
+            return 0.0, "no_query_terms"
         if (
             terms
             and not exact_hit
@@ -3324,29 +3936,39 @@ class RetrievalEngine:
             return 0.0, graph_guard_reason
         bm25 = 0.0
         if terms:
-            for term in terms:
-                if not term:
+            # R1：真 BM25 —— 词频饱和(k1) + 文档长度归一化(b)，不再用裸
+            # str.count 的线性词频。b=0.75 时同长度文档的取值与历史公式一致。
+            document_length = float(len(compact_haystack) or 1)
+            average_length = float(average_doc_len or 0.0) or document_length
+            length_norm = 1.0 - self.bm25_b + self.bm25_b * (
+                document_length / max(1.0, average_length)
+            )
+            for term, freq_int in zip(terms, term_freqs):
+                if freq_int <= 0:
                     continue
-                freq = haystack.count(term)
-                if freq <= 0:
-                    continue
+                freq = float(freq_int)
                 idf = term_stats.get(term, 0.0)
-                bm25 += idf * ((freq * 2.2) / (freq + 1.2))
+                bm25 += idf * ((freq * (self.bm25_k1 + 1.0)) / (freq + self.bm25_k1 * length_norm))
             lexical = (0.42 if exact_hit or profile_hit else 0.24) + min(
                 0.72, bm25 * 0.18
             )
         else:
             lexical = 0.0
 
+        # R6：scope 同源加分整体缩放（默认 0.2 → 最强项 +0.05）。历史值是
+        # +0.25/+0.15/+0.15/+0.08 的硬偏置，同窗口的无关记忆会压过跨窗口
+        # 的强相关记忆；缩放后 scope 只做轻微平手裁决。scope_bonus_scale=1.0
+        # 可恢复历史行为。
+        scope_scale = self.scope_bonus_scale
         scope_bonus = 0.0
         if memory.session_id and memory.session_id == ctx.session_id:
-            scope_bonus += 0.25
+            scope_bonus += 0.25 * scope_scale
         if ctx.user_id and ctx.user_id in {memory.subject.id, memory.object.id}:
-            scope_bonus += 0.15
+            scope_bonus += 0.15 * scope_scale
         if ctx.group_id and ctx.group_id == memory.group_id:
-            scope_bonus += 0.15
+            scope_bonus += 0.15 * scope_scale
         if memory.visibility == "bot_self":
-            scope_bonus += 0.08
+            scope_bonus += 0.08 * scope_scale
 
         age_bonus = self._recency_bonus(memory.occurred_at or memory.created_at)
         persona_bonus = self._persona_relevance_bonus(memory, profile)
@@ -3360,16 +3982,29 @@ class RetrievalEngine:
                 normalized_vector = vector_score
             vector_bonus = self.embedding_weight * max(0.0, min(1.0, normalized_vector))
         rrf_bonus = min(0.55, max(0.0, float(reciprocal_rank_score)) * 12.0)
+        # 人的分量进打分（H1）：同一个人的事，她记得更牢的人更容易被想起。
+        # 权重压到 0.32，避免「重要的人」把所有无关旧事都顶上来。
+        try:
+            strength_ratio = max(0.0, min(1.0, float(person_strength or 0.0) / 100.0))
+        except (TypeError, ValueError):
+            strength_ratio = 0.0
+        person_bonus = 0.32 * strength_ratio
         # Importance should not let unrelated high-priority rows crowd out
         # query-supported memories.  Strong lexical/profile evidence keeps
         # the historical weight; weak single-channel candidates are damped.
         strong_query_evidence = exact_hit or profile_hit or (vector_relevant and term_hits >= min_hits)
         importance_weight = 0.55 if strong_query_evidence else 0.28
-        score = lexical + scope_bonus + memory.importance * importance_weight + memory.confidence * 0.25 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus + route_bonus + rrf_bonus
-        if not terms:
-            score = scope_bonus + memory.importance * 0.8 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus + route_bonus + rrf_bonus
-        lifecycle = evaluate_memory_lifecycle(memory, ctx)
+        score = lexical + scope_bonus + memory.importance * importance_weight + memory.confidence * 0.25 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus + route_bonus + rrf_bonus + person_bonus
+        # R2：删掉 "if not terms: importance * 0.8" 的兜底分支。无词查询只剩
+        # 向量/多路召回证据才可能走到这里，importance 只按弱证据权重 0.28 计。
+        lifecycle = lifecycle if lifecycle is not None else evaluate_memory_lifecycle(memory, ctx)
         score = apply_lifecycle_score(score, lifecycle)
+        source_weight, source_surface = self._source_surface_weight(memory)
+        if source_weight < 1.0:
+            score = score * source_weight
+            source_reason = f";source={source_surface};w={source_weight:.2f}"
+        else:
+            source_reason = ""
         # relax：proactive_message（主动消息原文）类记忆评分降权（默认 1.0 不降权，行为与历史版本一致）。
         if self.proactive_message_score_penalty < 1.0 and clean_text(memory.memory_type, 120).lower() == "proactive_message":
             score = score * self.proactive_message_score_penalty
@@ -3380,7 +4015,9 @@ class RetrievalEngine:
             f"dynamics={dynamics_bonus:.2f};recency={age_bonus:.2f};"
             f"decay={lifecycle.decay_factor:.3f};salience={lifecycle.salience:.2f};"
             f"reinforcement={lifecycle.reinforcement:.2f};{lifecycle.reason}"
-            f"routes={'+'.join(sorted(route_families)) or '-'};route_bonus={route_bonus:.2f}"
+            f"routes={'+'.join(sorted(route_families)) or '-'};route_bonus={route_bonus:.2f};"
+            f"person={person_bonus:.2f}"
+            f"{source_reason}"
         )
 
     @staticmethod
@@ -3448,7 +4085,23 @@ class RetrievalEngine:
             bonus += min(0.11, max(open_loop, promise, emotional_debt, scar) * 0.11)
         if temporal:
             bonus += min(0.040, max(freshness, emotional) * 0.040)
-        return min(0.18, bonus)
+        mood = profile.get("emotion_mood") if isinstance(profile, dict) else None
+        if not isinstance(mood, dict):
+            return min(0.18, bonus)
+        # H10：情绪在排序里只做“同等相关度下的微调”——正/负情绪和欠了话没说完
+        # 的债务会把对应记忆轻微抬起，倍率夹在 [0.7, 1.6]，最终仍受 0.24 上限约束。
+        try:
+            multiplier = max(0.7, min(1.6, float(mood.get("emotional_weight_multiplier") or 1.0)))
+        except (TypeError, ValueError):
+            multiplier = 1.0
+        bonus *= multiplier
+        if open_loop_followup:
+            try:
+                boost = max(0.0, min(0.35, float(mood.get("debt_followup_boost") or 0.0)))
+            except (TypeError, ValueError):
+                boost = 0.0
+            bonus += boost * 0.30
+        return min(0.24, bonus)
 
     def _livingmemory_graph_relevance_guard(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -119,6 +120,15 @@ class _EmotionProducerCapability:
 
 
 @dataclass(frozen=True, slots=True)
+class _PrivateMemorySummaryCapability:
+    """Count-only summary capability issued to the registered V2 plugin."""
+
+    _bridge: Any
+    _producer: Any
+    _token: object
+
+
+@dataclass(frozen=True, slots=True)
 class _EmotionPageAdminCapability:
     """Non-serializable capability bound to this bridge's Page API instance."""
 
@@ -133,6 +143,19 @@ class _EmotionProducerContext:
 
     _bridge: Any
     _capability: _EmotionProducerCapability
+    bot_id: str
+    platform: str
+    scope: str
+    session_id: str
+    user_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PrivateMemorySummaryContext:
+    """Exact private target context for content-free memory summary reads."""
+
+    _bridge: Any
+    _capability: _PrivateMemorySummaryCapability
     bot_id: str
     platform: str
     scope: str
@@ -458,6 +481,7 @@ class MemoryCompanionBridge:
         self.__scoped_store_resolved = False
         self._capability_cache = CapabilityCache()
         self._emotion_producer_token = object()
+        self._private_memory_summary_token = object()
         self._emotion_page_admin_token = object()
         self._active = True
 
@@ -497,7 +521,40 @@ class MemoryCompanionBridge:
         """Revoke all issued capabilities before plugin service shutdown."""
         self._active = False
         self._emotion_producer_token = object()
+        self._private_memory_summary_token = object()
         self._emotion_page_admin_token = object()
+
+    def _write_capability_required(self) -> bool:
+        """Whether protected bridge writes must carry a live companion capability.
+
+        The switch mirrors the "private_companion_bridge.enable_p5_b1_bridge_gate"
+        option so deployments that never enrolled the companion side keep their
+        pre-capability writes working.  A capability that is supplied but not
+        valid for this bridge is always rejected, whatever the switch says.
+        """
+        try:
+            return bool(
+                self._plugin.config.bool(
+                    "private_companion_bridge.enable_p5_b1_bridge_gate", False
+                )
+            )
+        except Exception:
+            return False
+
+    def _authorize_write_capability(self, capability: Any) -> dict[str, Any] | None:
+        """Return a denial envelope when a protected bridge write is unauthorized.
+
+        None means the caller may proceed.  The returned envelope mirrors the
+        shape used by the namespace API (ok/state/error_code) so external
+        plugins get one consistent contract.
+        """
+        if capability is not None and not self._is_valid_private_companion_capability(capability):
+            return {"ok": False, "state": "forbidden", "error_code": "producer_capability_required"}
+        if capability is None and self._write_capability_required():
+            return {"ok": False, "state": "forbidden", "error_code": "producer_capability_required"}
+        if not self._active:
+            return {"ok": False, "state": "degraded", "error_code": "bridge_inactive"}
+        return None
 
     def register_emotion_producer(self, producer: Any) -> Any | None:
         """Issue a private Companion capability only to a live registered plugin."""
@@ -510,6 +567,38 @@ class MemoryCompanionBridge:
         """Issue the shared producer capability used by protected Companion APIs."""
 
         return self.register_emotion_producer(producer)
+
+    def register_private_companion_memory_summary_reader(self, producer: Any) -> Any | None:
+        """Issue only the redacted user-memory summary capability to the registered V2 plugin."""
+
+        if not self._active or not self._is_registered_v2_summary_reader(producer):
+            return None
+        return _PrivateMemorySummaryCapability(self, producer, self._private_memory_summary_token)
+
+    def create_private_companion_memory_summary_context(
+        self,
+        capability: Any,
+        *,
+        bot_id: str,
+        scope: str,
+        platform: str,
+        user_id: str,
+        session_id: str,
+    ) -> Any | None:
+        """Bind the summary-only capability to one explicit private user/window."""
+
+        if not self._is_valid_private_memory_summary_capability(capability):
+            return None
+        normalized = self._normalize_emotion_domain(
+            bot_id=bot_id,
+            scope=scope,
+            platform=platform,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        if normalized is None:
+            return None
+        return _PrivateMemorySummaryContext(self, capability, **normalized)
 
     def register_bot_personal_producer(self, producer: Any) -> Any | None:
         """Compatibility name for the same scoped Private Companion capability."""
@@ -653,6 +742,33 @@ class MemoryCompanionBridge:
                 return True
         return False
 
+    def _is_registered_v2_summary_reader(self, producer: Any) -> bool:
+        """Require the exact live V2 star; this identity receives no general producer capability."""
+
+        context = getattr(self._plugin, "context", None)
+        getter = getattr(context, "get_all_stars", None)
+        if not callable(getter):
+            return False
+        try:
+            stars = getter()
+        except Exception:
+            return False
+        if not isinstance(stars, (list, tuple)):
+            return False
+        for metadata in stars:
+            if getattr(metadata, "activated", True) is not True:
+                continue
+            if clean_text(getattr(metadata, "root_dir_name", ""), 120) != "astrbot_plugin_private_companion_v2":
+                continue
+            registered_instance = getattr(metadata, "star_cls", None)
+            registered_type = getattr(metadata, "star_cls_type", None)
+            if producer is registered_instance:
+                if registered_type is None or type(registered_instance) is registered_type:
+                    return True
+            if producer is registered_type and registered_instance is not None and type(registered_instance) is registered_type:
+                return True
+        return False
+
     def _is_valid_emotion_producer_capability(self, capability: Any) -> bool:
         return (
             self._active
@@ -660,6 +776,15 @@ class MemoryCompanionBridge:
             and capability._bridge is self
             and capability._token is self._emotion_producer_token
             and self._is_registered_private_companion(capability._producer)
+        )
+
+    def _is_valid_private_memory_summary_capability(self, capability: Any) -> bool:
+        return (
+            self._active
+            and type(capability) is _PrivateMemorySummaryCapability
+            and capability._bridge is self
+            and capability._token is self._private_memory_summary_token
+            and self._is_registered_v2_summary_reader(capability._producer)
         )
 
     def _producer_capability_from(self, value: Any) -> Any:
@@ -732,6 +857,23 @@ class MemoryCompanionBridge:
                 session_id=context.session_id,
             ) is not None
         )
+
+    def _is_valid_private_memory_summary_context(self, context: Any) -> bool:
+        return (
+            type(context) is _PrivateMemorySummaryContext
+            and context._bridge is self
+            and self._is_valid_private_memory_summary_capability(context._capability)
+            and self._normalize_emotion_domain(
+                bot_id=context.bot_id,
+                scope=context.scope,
+                platform=context.platform,
+                user_id=context.user_id,
+                session_id=context.session_id,
+            ) is not None
+        )
+
+    def _is_valid_user_memory_summary_context(self, context: Any) -> bool:
+        return self._is_valid_emotion_producer_context(context) or self._is_valid_private_memory_summary_context(context)
 
     def _is_valid_emotion_delivery_context(self, context: Any) -> bool:
         return (
@@ -961,6 +1103,7 @@ class MemoryCompanionBridge:
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         long_term: bool = True,
+        producer_capability: Any = None,
     ) -> dict[str, Any]:
         """Write one user-scoped long-term memory from an external source.
 
@@ -968,7 +1111,15 @@ class MemoryCompanionBridge:
         memory service fixes the record to that user's private scope, so an
         external plugin cannot accidentally write a group/public memory by
         passing arbitrary session fields.
+
+        producer_capability is the Private Companion capability issued by
+        register_private_companion().  When the bridge gate is enabled, a write
+        without a live capability is refused with producer_capability_required;
+        an invalid capability is always refused.
         """
+        denied = self._authorize_write_capability(producer_capability)
+        if denied is not None:
+            return {**denied, "memory_id": "", "deduplicated": False}
         writer = getattr(self._plugin, "record_external_memory", None)
         if not callable(writer):
             return {
@@ -1347,7 +1498,7 @@ class MemoryCompanionBridge:
         }
         if not identity:
             return {**base, "error_code": "missing_user_id"}
-        if not self._is_valid_emotion_producer_context(requester_context):
+        if not self._is_valid_user_memory_summary_context(requester_context):
             return {
                 **base,
                 "state": "forbidden",
@@ -1764,7 +1915,7 @@ class MemoryCompanionBridge:
                       direction=row['direction'],message=row['native_id'] if row['direction']=='incoming' else 'delivery:'+ticket)
         authorize = lambda: (self._is_valid_private_companion_capability(producer_capability)
                              and work.allowed(scope) and delivery.export(ticket) is not None)
-        return capture.submit(identity, dict(body=payload["body"], media=payload["media"],
+        return await capture.submit(identity, dict(body=payload["body"], media=payload["media"],
                               source_message_at=payload.get("source_message_at", ""), observed_at=payload["observed_at"],
                               evidence=row["evidence"], raw_body_digest=payload.get("raw_body_digest", "")), authorize=authorize)
 
@@ -1817,35 +1968,60 @@ class MemoryCompanionBridge:
             return {"state": "degraded", "error_code": "p5_status_exception"}
         return dict(result) if isinstance(result, dict) else {"state": "degraded", "error_code": "p5_status_invalid"}
 
-    def provenance_snapshot(self) -> dict[str, Any]:
+    def provenance_snapshot(self, *, producer_capability: Any = None) -> dict[str, Any]:
+        denied = self._authorize_write_capability(producer_capability)
+        if denied is not None:
+            return {"records": {}, "operation_count": 0, "state": "forbidden", "error_code": denied["error_code"]}
         getter = getattr(self._plugin, "provenance_snapshot", None)
         if not callable(getter):
             return {"records": {}, "operation_count": 0, "state": "degraded"}
         result = getter()
         return dict(result) if isinstance(result, dict) else {"records": {}, "operation_count": 0, "state": "degraded"}
 
-    def provenance_preview(self, candidates: list[dict[str, Any]], *, operation_ref_hash: str) -> dict[str, Any]:
+    def provenance_preview(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        operation_ref_hash: str,
+        producer_capability: Any = None,
+    ) -> dict[str, Any]:
+        denied = self._authorize_write_capability(producer_capability)
+        if denied is not None:
+            return {"mode": "preview", "readonly": True, "write_count": 0, "error_codes": [denied["error_code"]]}
         getter = getattr(self._plugin, "provenance_preview", None)
         if not callable(getter):
             return {"mode": "preview", "readonly": True, "write_count": 0, "error_codes": ["unavailable"]}
         result = getter(candidates, operation_ref_hash=operation_ref_hash)
         return dict(result) if isinstance(result, dict) else {"mode": "preview", "readonly": True, "write_count": 0, "error_codes": ["invalid_result"]}
 
-    async def provenance_apply(self, operation: dict[str, Any]) -> dict[str, Any]:
+    async def provenance_apply(
+        self, operation: dict[str, Any], *, producer_capability: Any = None
+    ) -> dict[str, Any]:
+        denied = self._authorize_write_capability(producer_capability)
+        if denied is not None:
+            return denied
         getter = getattr(self._plugin, "provenance_apply", None)
         if not callable(getter):
             return {"ok": False, "state": "degraded", "error_code": "unavailable"}
         result = await getter(operation)
         return dict(result) if isinstance(result, dict) else {"ok": False, "state": "degraded", "error_code": "invalid_result"}
 
-    async def provenance_backup(self) -> dict[str, Any]:
+    async def provenance_backup(self, *, producer_capability: Any = None) -> dict[str, Any]:
+        denied = self._authorize_write_capability(producer_capability)
+        if denied is not None:
+            return denied
         getter = getattr(self._plugin, "provenance_backup", None)
         if not callable(getter):
             return {"ok": False, "state": "degraded", "error_code": "unavailable"}
         result = await getter()
         return dict(result) if isinstance(result, dict) else {"ok": False, "state": "degraded", "error_code": "invalid_result"}
 
-    async def provenance_rollback(self, operation: dict[str, Any]) -> dict[str, Any]:
+    async def provenance_rollback(
+        self, operation: dict[str, Any], *, producer_capability: Any = None
+    ) -> dict[str, Any]:
+        denied = self._authorize_write_capability(producer_capability)
+        if denied is not None:
+            return denied
         getter = getattr(self._plugin, "provenance_rollback", None)
         if not callable(getter):
             return {"ok": False, "state": "degraded", "error_code": "unavailable"}
@@ -2236,6 +2412,152 @@ class MemoryCompanionBridge:
             return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
         return {"ok": True, "state": "ready", **result}
 
+    async def bind_namespace_migration_epoch_async(
+        self,
+        capability: Any,
+        *,
+        operation_id: str,
+        expected_previous_epoch: str,
+        migration_epoch: str,
+        policy_version: str,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.bind_namespace_migration_epoch,
+            capability,
+            operation_id=operation_id,
+            expected_previous_epoch=expected_previous_epoch,
+            migration_epoch=migration_epoch,
+            policy_version=policy_version,
+        )
+
+    async def upsert_scoped_record_async(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        record_kind: str,
+        record_id: str,
+        revision: int,
+        payload: dict[str, Any],
+        event_id: str,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.upsert_scoped_record,
+            capability,
+            namespace,
+            record_kind=record_kind,
+            record_id=record_id,
+            revision=revision,
+            payload=payload,
+            event_id=event_id,
+        )
+
+    async def read_scoped_record_async(
+        self, capability: Any, namespace: Any, *, record_kind: str, record_id: str
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.read_scoped_record,
+            capability,
+            namespace,
+            record_kind=record_kind,
+            record_id=record_id,
+        )
+
+    async def list_scoped_records_async(
+        self, capability: Any, namespace: Any, *, record_kind: str, limit: int = 100
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.list_scoped_records,
+            capability,
+            namespace,
+            record_kind=record_kind,
+            limit=limit,
+        )
+
+    async def tombstone_scoped_record_async(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        record_kind: str,
+        record_id: str,
+        revision: int,
+        event_id: str,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.tombstone_scoped_record,
+            capability,
+            namespace,
+            record_kind=record_kind,
+            record_id=record_id,
+            revision=revision,
+            event_id=event_id,
+        )
+
+    async def tombstone_scoped_namespace_async(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        operation_id: str,
+        reason_code: str,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.tombstone_scoped_namespace,
+            capability,
+            namespace,
+            operation_id=operation_id,
+            reason_code=reason_code,
+        )
+
+    async def tombstone_scoped_identity_scopes_async(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        operation_id: str,
+        reason_code: str,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.tombstone_scoped_identity_scopes,
+            capability,
+            namespace,
+            operation_id=operation_id,
+            reason_code=reason_code,
+        )
+
+    async def erase_scoped_group_scopes_async(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        operation_id: str,
+        reason_code: str = "group_reset",
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.erase_scoped_group_scopes,
+            capability,
+            namespace,
+            operation_id=operation_id,
+            reason_code=reason_code,
+        )
+
+    async def erase_scoped_persona_scopes_async(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        operation_id: str,
+        reason_code: str = "persona_reset",
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.erase_scoped_persona_scopes,
+            capability,
+            namespace,
+            operation_id=operation_id,
+            reason_code=reason_code,
+        )
+
     def capability_status(self) -> dict[str, Any]:
         """Return the bounded C4 cache state without probing storage."""
 
@@ -2426,7 +2748,11 @@ class MemoryCompanionBridge:
             metadata=metadata or {},
         )
 
-    async def mark_visibility(self, memory_id: str, visibility: str) -> bool:
+    async def mark_visibility(
+        self, memory_id: str, visibility: str, *, producer_capability: Any = None
+    ) -> bool:
+        if self._authorize_write_capability(producer_capability) is not None:
+            return False
         return await self._plugin.store.update_memory_visibility(memory_id, visibility)
 
     def get_emotional_events(self, *, session_id: str = "", limit: int = 5) -> list[dict[str, Any]]:

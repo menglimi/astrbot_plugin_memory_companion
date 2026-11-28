@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -85,6 +86,73 @@ class CoreMemoryStoreTests(unittest.IsolatedAsyncioTestCase):
         records = await store.list_core_memories()
         self.assertEqual(["core-high", "core-low"], [record.id for record in records])
         self.assertEqual("称呼用户为林林", records[1].content)
+
+    async def test_core_memory_read_does_not_wait_for_primary_write_lock(self) -> None:
+        store = self.make_store()
+        store._lock.acquire()
+        try:
+            records = await asyncio.wait_for(store.list_core_memories(), timeout=1.0)
+        finally:
+            store._lock.release()
+
+        self.assertEqual([], records)
+
+    async def test_recent_timeline_read_does_not_wait_for_primary_write_lock(self) -> None:
+        store = self.make_store()
+        store._lock.acquire()
+        try:
+            rows = await asyncio.wait_for(store.recent_timeline(limit=10), timeout=1.0)
+        finally:
+            store._lock.release()
+
+        self.assertEqual([], rows)
+        self.assertFalse(store.shutdown_state()["timeline_read_conn_closed"])
+        store.close()
+        self.assertTrue(store.shutdown_state()["timeline_read_conn_closed"])
+
+    async def test_recent_timeline_read_does_not_wait_for_candidate_read_lock(self) -> None:
+        store = self.make_store()
+        store._read_lock.acquire()
+        try:
+            rows = await asyncio.wait_for(store.recent_timeline(limit=10), timeout=1.0)
+        finally:
+            store._read_lock.release()
+
+        self.assertEqual([], rows)
+
+
+class StaticMemoryContextReadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_static_context_reads_start_concurrently(self) -> None:
+        service = MemoryCompanionService.__new__(MemoryCompanionService)
+        context = SessionContext(
+            session_id="qq:private:u1",
+            scope="private",
+            platform="qq",
+            user_id="u1",
+            bot_id="bot1",
+        )
+        started: set[str] = set()
+        all_started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def read(name: str, result: object) -> object:
+            started.add(name)
+            if len(started) == 3:
+                all_started.set()
+            await release.wait()
+            return result
+
+        service.core_memories_for_context = lambda _ctx: read("core_memories", [])
+        service._recent_fact_guard_context = lambda _ctx: read("recent_fact", "facts")
+        service._recent_cross_window_context = lambda _ctx: read("cross_window", "continuity")
+
+        task = asyncio.create_task(service._load_static_memory_context(context, None))
+        await asyncio.wait_for(all_started.wait(), timeout=1.0)
+        release.set()
+        result = await task
+
+        self.assertEqual({"core_memories", "recent_fact", "cross_window"}, started)
+        self.assertEqual(([], "facts", "continuity"), result)
 
 
 class CoreMemoryInjectionTests(unittest.TestCase):

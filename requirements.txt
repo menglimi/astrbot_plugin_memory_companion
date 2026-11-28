@@ -1,0 +1,2 @@
+# AstrBot 由宿主提供，兼容范围见 metadata.yaml 的 astrbot_version。
+# numpy 和 jsonschema 是可选依赖，缺失时插件会降级运行。

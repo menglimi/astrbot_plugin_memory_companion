@@ -15,6 +15,7 @@ import time
 
 from .models import utc_now
 from .sensitive_data import redact_sensitive_text
+from .source_surface import merge_source_surface
 from .message_sources import suppressed
 from .source_evidence import message_source_version
 
@@ -23,6 +24,7 @@ PROFILE = 'memory.source-capture.v1'
 MAX_BODY_BYTES = 256 * 1024
 MAX_PENDING_BYTES = 16 * 1024 * 1024
 CHUNK_CHARS = 4096
+DEFAULT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 IDENTITY_FIELDS = ('installation', 'platform', 'bot', 'persona', 'scope', 'session',
                    'speaker', 'audience', 'direction', 'message')
 
@@ -53,6 +55,7 @@ def initialize(db):
         CREATE TABLE IF NOT EXISTS capture_chunks (
             source_key TEXT NOT NULL, seq INTEGER NOT NULL, char_offset INTEGER NOT NULL,
             byte_offset INTEGER NOT NULL, body TEXT NOT NULL, digest TEXT NOT NULL,
+            created_at REAL NOT NULL DEFAULT 0, expires_at REAL NOT NULL DEFAULT 0,
             PRIMARY KEY(source_key,seq));
         CREATE TABLE IF NOT EXISTS capture_operations (
             operation TEXT PRIMARY KEY, source_key TEXT NOT NULL, payload_digest TEXT NOT NULL,
@@ -81,18 +84,64 @@ def initialize(db):
             UPDATE capture_sources SET state='changed',manifest='{}' WHERE timeline_id=NEW.id;
         END;
     ''')
+    # Idempotent upgrade for databases created before chunk retention existed.
+    columns = {row[1] for row in db.execute('PRAGMA table_info(capture_chunks)').fetchall()}
+    if 'created_at' not in columns:
+        db.execute('ALTER TABLE capture_chunks ADD COLUMN created_at REAL NOT NULL DEFAULT 0')
+    if 'expires_at' not in columns:
+        db.execute('ALTER TABLE capture_chunks ADD COLUMN expires_at REAL NOT NULL DEFAULT 0')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_capture_chunks_expires ON capture_chunks(expires_at) WHERE expires_at>0')
+    db.execute("CREATE INDEX IF NOT EXISTS idx_capture_operations_pending ON capture_operations(state) WHERE envelope!='{}'")
+    db.execute('CREATE INDEX IF NOT EXISTS idx_capture_operations_created ON capture_operations(state, created)')
     db.execute("INSERT OR IGNORE INTO capture_runtime VALUES ('installation',?)", (secrets.token_hex(24),))
     db.execute("INSERT OR IGNORE INTO capture_runtime VALUES ('digest_key',?)", (secrets.token_hex(32),))
     db.commit()
 
 
 class SourceCapture:
-    def __init__(self, store):
+    def __init__(self, store, *, default_enabled=True, retention_seconds=DEFAULT_RETENTION_SECONDS, surface_rules=None):
         self.store = store
         self.db = store._conn
+        self.default_enabled = bool(default_enabled)
+        self.retention_seconds = max(0, int(retention_seconds))
+        # Callable returning {known_prefixes, known_platforms}; None keeps the
+        # built-in set, which is the behaviour before registration existed.
+        self._surface_rules = surface_rules
         with store._lock:
             self.installation = self.db.execute("SELECT value FROM capture_runtime WHERE key='installation'").fetchone()[0]
             self._digest_key = bytes.fromhex(self.db.execute("SELECT value FROM capture_runtime WHERE key='digest_key'").fetchone()[0])
+            row = self.db.execute("SELECT value FROM capture_runtime WHERE key='source_capture_enabled'").fetchone()
+        self._source_capture_enabled = (
+            self.default_enabled
+            if row is None
+            else str(row[0]).strip().lower() in {'1', 'true', 'yes', 'on'}
+        )
+
+    def source_capture_enabled(self):
+        """Read the effective switch from the in-process cache."""
+        return self._source_capture_enabled
+
+    def set_source_capture_enabled(self, enabled, *, actor=''):
+        """Persist an explicit on/off override so the switch is writable at runtime."""
+        value = '1' if enabled else '0'
+        stamp = utc_now()
+        with self.store._lock, self.store._transaction_sync():
+            self.db.execute("INSERT OR REPLACE INTO capture_runtime VALUES ('source_capture_enabled',?)", (value,))
+            self.db.execute("INSERT OR REPLACE INTO capture_runtime VALUES ('source_capture_enabled_by',?)", (str(actor or '')[:120],))
+            self.db.execute("INSERT OR REPLACE INTO capture_runtime VALUES ('source_capture_enabled_at',?)", (stamp,))
+            self._source_capture_enabled = bool(enabled)
+        return {'enabled': bool(enabled), 'actor': str(actor or '')[:120], 'updated_at': stamp}
+
+    def source_capture_switch(self):
+        with self.store._lock:
+            rows = dict(self.db.execute("SELECT key,value FROM capture_runtime WHERE key IN ('source_capture_enabled','source_capture_enabled_by','source_capture_enabled_at')").fetchall())
+        self._source_capture_enabled = (
+            str(rows['source_capture_enabled']).strip().lower() in {'1', 'true', 'yes', 'on'}
+            if 'source_capture_enabled' in rows
+            else self.default_enabled
+        )
+        return {'enabled': self._source_capture_enabled, 'explicit': 'source_capture_enabled' in rows,
+                'actor': rows.get('source_capture_enabled_by', ''), 'updated_at': rows.get('source_capture_enabled_at', '')}
 
     def activate(self, generation):
         with self.store._lock, self.store._transaction_sync():
@@ -171,6 +220,67 @@ class SourceCapture:
             return {**receipt, 'operation': operation, 'status': row['state'], 'payload_digest': row['payload_digest'],
                     'source_state': 'revoked' if self._revoked(row['source_key']) else current_state}
 
+    def read_body(self, source_key, *, authorize=lambda: True):
+        """Read back the retained original body assembled from chunk rows."""
+        with self.store._lock:
+            if not authorize():
+                return {'ok': False, 'status': 'unavailable', 'source_key': source_key}
+            if self._revoked(source_key):
+                return {'ok': False, 'status': 'revoked', 'source_key': source_key}
+            source = self.db.execute('SELECT * FROM capture_sources WHERE source_key=?', (source_key,)).fetchone()
+            if not source:
+                return {'ok': False, 'status': 'missing', 'source_key': source_key}
+            rows = self.db.execute('SELECT seq,char_offset,byte_offset,body,digest,created_at,expires_at '
+                                   'FROM capture_chunks WHERE source_key=? ORDER BY seq', (source_key,)).fetchall()
+            if not rows:
+                return {'ok': False, 'status': 'expired' if source['state'] == 'current' else source['state'],
+                        'source_key': source_key, 'timeline_id': source['timeline_id'], 'revision': source['revision']}
+            body = ''.join(row['body'] for row in rows)
+            expires = [row['expires_at'] for row in rows if row['expires_at']]
+            return {'ok': True, 'status': 'available', 'source_key': source_key, 'timeline_id': source['timeline_id'],
+                    'revision': source['revision'], 'state': source['state'], 'body': body, 'chars': len(body),
+                    'bytes': sum(len(row['body'].encode('utf-8')) for row in rows), 'chunks': len(rows),
+                    'created_at': rows[0]['created_at'], 'expires_at': min(expires) if expires else 0.0}
+
+    def purge_expired(self, now=None):
+        """Delete retained bodies past their expiry; timeline projections stay untouched."""
+        deadline = time.time() if now is None else float(now)
+        read_ctx = getattr(self.store, '_read_conn_sync', None)
+        if callable(read_ctx):
+            with read_ctx() as conn:
+                has_expired = conn.execute(
+                    'SELECT 1 FROM capture_chunks WHERE expires_at>0 AND expires_at<=? LIMIT 1',
+                    (deadline,),
+                ).fetchone()
+            if has_expired is None:
+                return {'deleted_chunks': 0, 'sources': 0, 'at': deadline}
+        with self.store._lock, self.store._transaction_sync():
+            rows = self.db.execute('SELECT source_key,count(*) AS n FROM capture_chunks '
+                                   'WHERE expires_at>0 AND expires_at<=? GROUP BY source_key', (deadline,)).fetchall()
+            deleted = sum(int(row['n']) for row in rows)
+            if deleted:
+                self.db.execute('DELETE FROM capture_chunks WHERE expires_at>0 AND expires_at<=?', (deadline,))
+        return {'deleted_chunks': deleted, 'sources': len(rows), 'at': deadline}
+
+    def prune_completed_operations(self, *, older_than_seconds=7 * 86400, limit=2000, now=None):
+        """Remove aged terminal capture_operations receipts to prevent unbounded growth."""
+        cutoff = (time.time() if now is None else float(now)) - max(3600.0, float(older_than_seconds or (7 * 86400)))
+        safe_limit = max(1, int(limit or 2000))
+        with self.store._lock, self.store._transaction_sync():
+            cur = self.db.execute(
+                """DELETE FROM capture_operations
+                   WHERE operation IN (
+                       SELECT operation FROM capture_operations
+                       WHERE state IN ('committed', 'excluded', 'expired')
+                         AND envelope='{}'
+                         AND created < ?
+                       ORDER BY created ASC
+                       LIMIT ?
+                   )""",
+                (cutoff, safe_limit),
+            )
+            return max(0, int(cur.rowcount or 0))
+
     def stage(self, prepared, *, generation, authorize=lambda: True, expires=None):
         operation, key, ph = (prepared[k] for k in ('operation', 'source_key', 'payload_digest'))
         payload = prepared['payload']
@@ -196,69 +306,306 @@ class SourceCapture:
                 VALUES (?,?,?,?,'staged',?,?,?)''', (operation,key,ph,encoded(payload),now,now,deadline))
         return {**self.lookup(operation), 'durably_staged': True}
 
+    def _commit_payload_in_tx(
+        self,
+        *,
+        operation: str,
+        key: str,
+        payload_digest: str,
+        payload: dict,
+        generation: str,
+        authorize,
+        now: float,
+        deadline: float,
+        insert_operation: bool = False,
+    ) -> dict:
+        """Commit one prepared source payload inside an open ``store._transaction_sync``."""
+        identity = payload['identity']
+        existing = self.db.execute('SELECT * FROM capture_sources WHERE source_key=?', (key,)).fetchone()
+        if (existing['revision'] if existing else 0) != payload['expected_revision']:
+            if insert_operation:
+                self.db.execute(
+                    '''INSERT INTO capture_operations
+                    (operation,source_key,payload_digest,envelope,state,created,due,expires)
+                    VALUES (?,?,?,?,'held',?,?,?)''',
+                    (operation, key, payload_digest, encoded(payload), now, now, deadline),
+                )
+            else:
+                self.db.execute("UPDATE capture_operations SET state='held' WHERE operation=?", (operation,))
+            return {'status': 'conflict', 'operation': operation, 'reason': 'source_revision_changed'}
+        kind = 'user_message' if identity['direction'] == 'incoming' else 'bot_response'
+        adopted_row = None
+        if existing is None and identity['message'] and not identity['message'].startswith('observed:'):
+            adopted_row = self.db.execute(
+                '''SELECT id, metadata FROM timeline
+                   WHERE event_type=?
+                     AND session_id=?
+                     AND subject_id=?
+                     AND object_id=?
+                     AND message_id=?
+                     AND (bot_id='' OR bot_id=?)
+                     AND LOWER(COALESCE(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.platform') ELSE '' END, '')) IN ('', LOWER(?))
+                     AND COALESCE(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.persona_id') ELSE '' END, '') IN ('', 'legacy', ?)
+                     AND id NOT IN (SELECT timeline_id FROM capture_sources)
+                   ORDER BY created_at ASC, id ASC
+                   LIMIT 1''',
+                (
+                    kind,
+                    identity['session'],
+                    identity['speaker'],
+                    identity['audience'],
+                    identity['message'],
+                    identity['bot'],
+                    identity['platform'],
+                    identity['persona'],
+                ),
+            ).fetchone()
+        timeline_id = (
+            existing['timeline_id']
+            if existing
+            else (str(adopted_row['id']) if adopted_row is not None else 'tl_' + key)
+        )
+        preserved_observer_meta: dict = {}
+        if adopted_row is not None:
+            try:
+                raw_meta = json.loads(adopted_row['metadata'] or '{}')
+            except Exception:
+                raw_meta = {}
+            if isinstance(raw_meta, dict):
+                for keep_key in (
+                    'sender_name', 'participant_user_id', 'participant_user_name',
+                    'source', 'conversation_memory', 'reply_chain',
+                ):
+                    if keep_key in raw_meta and raw_meta[keep_key] not in ('', None):
+                        preserved_observer_meta[keep_key] = raw_meta[keep_key]
+        default_participant_id = (
+            identity['speaker']
+            if identity['scope'] == 'group' and identity['direction'] == 'incoming'
+            else (identity['audience'] if identity['scope'] == 'private' else '')
+        )
+        metadata = {
+            **preserved_observer_meta,
+            'platform': identity['platform'],
+            'owner_bot_id': identity['bot'],
+            'bot_id': identity['bot'],
+            'persona_id': identity['persona'],
+            'message_id': identity['message'],
+            'capture_profile': PROFILE,
+            'capture_truncated': False,
+            'source_key': key,
+            'capture_revision': payload['revision'],
+            'source_message_at': payload['source_message_at'],
+            'observed_at': payload['observed_at'],
+            'delivery_evidence': payload['evidence'],
+            'media': payload['media'],
+            'redaction': payload['redaction'],
+            'capture_processing': payload['processing'],
+        }
+        merge_source_surface(
+            metadata,
+            identity['message'],
+            identity['platform'],
+            **(self._surface_rules() if callable(self._surface_rules) else {}),
+        )
+        if default_participant_id and not metadata.get('participant_user_id'):
+            metadata['participant_user_id'] = default_participant_id
+        params = dict(
+            source_id=timeline_id, event_type=kind, scope=identity['scope'], session_id=identity['session'],
+            subject_id=identity['speaker'], object_id=identity['audience'], message_id=identity['message'], metadata=metadata,
+        )
+        if suppressed(self.db, **params):
+            if insert_operation:
+                self.db.execute(
+                    '''INSERT INTO capture_operations
+                    (operation,source_key,payload_digest,envelope,state,created,due,expires)
+                    VALUES (?,?,?,'{}','excluded',?,?,?)''',
+                    (operation, key, payload_digest, now, now, deadline),
+                )
+            self.withdraw(key, reason='legacy_source_deleted')
+            return self.lookup(operation)
+        when = payload['source_message_at'] or payload['observed_at']
+        if existing:
+            self.db.execute(
+                'UPDATE timeline SET content=?,metadata=?,occurred_at=?,summarized_at=?,bot_id=? WHERE id=?',
+                (payload['body'], encoded(metadata), when, '', identity['bot'], timeline_id),
+            )
+        elif adopted_row is not None:
+            # Consolidate the observer row in-place instead of inserting a duplicate
+            # timeline row for the same platform + session + message.
+            self.db.execute(
+                'UPDATE timeline SET content=?,metadata=?,dedupe_key=?,occurred_at=?,bot_id=? WHERE id=?',
+                (payload['body'], encoded(metadata), 'cap:' + key, when, identity['bot'], timeline_id),
+            )
+        else:
+            self.db.execute(
+                '''INSERT INTO timeline(id,event_type,session_id,scope,subject_id,object_id,content,
+                    metadata,message_id,dedupe_key,occurred_at,created_at,bot_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (timeline_id, kind, identity['session'], identity['scope'], identity['speaker'], identity['audience'],
+                 payload['body'], encoded(metadata), identity['message'], 'cap:' + key, when, utc_now(), identity['bot']),
+            )
+        actual = self.db.execute('SELECT * FROM timeline WHERE id=?', (timeline_id,)).fetchone()
+        if not actual:
+            raise ValueError('capture_timeline_not_committed')
+        self.db.execute('DELETE FROM capture_chunks WHERE source_key=?', (key,))
+        chunks = []
+        byte_offset = 0
+        chunk_created = time.time()
+        chunk_expires = (chunk_created + self.retention_seconds) if self.retention_seconds > 0 else 0.0
+        for seq, offset in enumerate(range(0, len(payload['body']), CHUNK_CHARS)):
+            chunk = payload['body'][offset:offset + CHUNK_CHARS]
+            blob = chunk.encode('utf-8')
+            sha = hashlib.sha256(blob).hexdigest()
+            self.db.execute(
+                'INSERT INTO capture_chunks (source_key,seq,char_offset,byte_offset,body,digest,created_at,expires_at) '
+                'VALUES (?,?,?,?,?,?,?,?)',
+                (key, seq, offset, byte_offset, chunk, sha, chunk_created, chunk_expires),
+            )
+            chunks.append(dict(
+                seq=seq, char_offset=offset, byte_offset=byte_offset, chars=len(chunk), bytes=len(blob),
+                digest=sha, created_at=chunk_created, expires_at=chunk_expires,
+            ))
+            byte_offset += len(blob)
+        manifest = dict(
+            chunks=chunks, chars=len(payload['body']), bytes=byte_offset,
+            body_digest=hashlib.sha256(payload['body'].encode('utf-8')).hexdigest(), processing=payload['processing'],
+        )
+        self.db.execute(
+            'INSERT OR REPLACE INTO capture_sources VALUES (?,?,?,?,?,?)',
+            (key, encoded(identity), timeline_id, payload['revision'], encoded(manifest), 'current'),
+        )
+        receipt = dict(
+            profile=PROFILE, operation=operation, source_key=key, source_ref='timeline:' + timeline_id,
+            source_version=message_source_version(dict(actual)), payload_digest=payload_digest,
+            committed_at=utc_now(), revision=payload['revision'],
+            completeness=dict(
+                stored_body='full', source_observation='submitted_observation',
+                redaction=payload['redaction'], legacy_projection='full', media='references_only',
+            ),
+            index_state='ready' if getattr(self.store, '_source_fts_enabled', False) else 'scan_only',
+            delivery_evidence=payload['evidence'], user_seen='unknown',
+        )
+        if insert_operation:
+            self.db.execute(
+                '''INSERT INTO capture_operations
+                (operation,source_key,payload_digest,envelope,state,receipt,created,due,generation,expires)
+                VALUES (?,?,?,'{}','committed',?,?,?,?,?)''',
+                (operation, key, payload_digest, encoded(receipt), now, now, generation, deadline),
+            )
+        else:
+            self.db.execute(
+                "UPDATE capture_operations SET state='committed',receipt=?,envelope='{}',generation=? WHERE operation=?",
+                (encoded(receipt), generation, operation),
+            )
+        self.db.execute(
+            "INSERT INTO capture_changes(source_key,revision,kind) VALUES (?,?,'committed')",
+            (key, payload['revision']),
+        )
+        self.fence(generation, authorize)
+        return {
+            **receipt,
+            'operation': operation,
+            'status': 'committed',
+            'payload_digest': payload_digest,
+            'source_state': 'current',
+        }
+
+    def stage_and_commit_incoming(
+        self,
+        identity,
+        *,
+        body: str,
+        source_message_at: str = '',
+        observed_at: str = '',
+        generation: str,
+        authorize=lambda: True,
+        expires=None,
+        media=None,
+    ):
+        """Prepare, stage, and commit an incoming source in one SQLite transaction."""
+        prepared = self.prepare(
+            identity,
+            body=body,
+            source_message_at=source_message_at,
+            observed_at=observed_at,
+            media=media,
+        )
+        operation, key, ph = (prepared[k] for k in ('operation', 'source_key', 'payload_digest'))
+        payload = prepared['payload']
+        now = time.time()
+        with self.store._lock, self.store._transaction_sync():
+            self.fence(generation, authorize)
+            old = self.db.execute('SELECT * FROM capture_operations WHERE operation=?', (operation,)).fetchone()
+            if old is not None:
+                if ph != old['payload_digest']:
+                    return {'status': 'conflict', 'operation': operation}
+                if old['state'] in {'staged', 'uncertain', 'retry_due'}:
+                    if old['expires'] <= now or self._revoked(key):
+                        self.db.execute(
+                            "UPDATE capture_operations SET state=?,envelope='{}' WHERE operation=?",
+                            ('excluded' if self._revoked(key) else 'expired', operation),
+                        )
+                        return self.lookup(operation)
+                    old_payload = json.loads(old['envelope']) if old['envelope'] != '{}' else payload
+                    return self._commit_payload_in_tx(
+                        operation=operation,
+                        key=key,
+                        payload_digest=ph,
+                        payload=old_payload,
+                        generation=generation,
+                        authorize=authorize,
+                        now=now,
+                        deadline=old['expires'],
+                        insert_operation=False,
+                    )
+                return self.lookup(operation)
+            if self._revoked(key):
+                return {'status': 'excluded', 'source_state': 'revoked', 'operation': operation}
+            size = len(encoded(payload).encode('utf-8'))
+            pending = self.db.execute(
+                "SELECT COALESCE(sum(length(CAST(envelope AS BLOB))),0) FROM capture_operations WHERE envelope!='{}'"
+            ).fetchone()[0]
+            if pending + size > MAX_PENDING_BYTES:
+                return {'status': 'held', 'reason': 'capture_capacity', 'durably_staged': False}
+            deadline = min(expires if expires is not None else now + 86400, now + 86400)
+            if deadline <= now:
+                return {'status': 'expired', 'durably_staged': False}
+            return self._commit_payload_in_tx(
+                operation=operation,
+                key=key,
+                payload_digest=ph,
+                payload=payload,
+                generation=generation,
+                authorize=authorize,
+                now=now,
+                deadline=deadline,
+                insert_operation=True,
+            )
+
     def commit(self, operation, *, generation, authorize=lambda: True):
         with self.store._lock, self.store._transaction_sync():
             self.fence(generation, authorize)
             row = self.db.execute('SELECT * FROM capture_operations WHERE operation=?', (operation,)).fetchone()
             if not row or row['state'] in {'committed', 'excluded', 'expired', 'held'}:
                 return self.lookup(operation)
-            if row['expires'] <= time.time() or self._revoked(row['source_key']):
+            now = time.time()
+            if row['expires'] <= now or self._revoked(row['source_key']):
                 self.db.execute("UPDATE capture_operations SET state=?,envelope='{}' WHERE operation=?",
                                 ('excluded' if self._revoked(row['source_key']) else 'expired', operation))
                 return self.lookup(operation)
             payload = json.loads(row['envelope'])
-            identity = payload['identity']; key = row['source_key']
-            existing = self.db.execute('SELECT * FROM capture_sources WHERE source_key=?', (key,)).fetchone()
-            if (existing['revision'] if existing else 0) != payload['expected_revision']:
-                self.db.execute("UPDATE capture_operations SET state='held' WHERE operation=?", (operation,))
-                return {'status': 'conflict', 'operation': operation, 'reason': 'source_revision_changed'}
-            timeline_id = existing['timeline_id'] if existing else 'tl_' + key
-            metadata = dict(platform=identity['platform'],owner_bot_id=identity['bot'],bot_id=identity['bot'],
-                            persona_id=identity['persona'],message_id=identity['message'],capture_profile=PROFILE,
-                            capture_truncated=False, source_key=key, capture_revision=payload['revision'],
-                            source_message_at=payload['source_message_at'], observed_at=payload['observed_at'],
-                            delivery_evidence=payload['evidence'], media=payload['media'],
-                            redaction=payload['redaction'], capture_processing=payload['processing'])
-            kind = 'user_message' if identity['direction']=='incoming' else 'bot_response'
-            params = dict(source_id=timeline_id,event_type=kind,scope=identity['scope'],session_id=identity['session'],
-                          subject_id=identity['speaker'],object_id=identity['audience'],message_id=identity['message'],metadata=metadata)
-            if suppressed(self.db, **params):
-                self.withdraw(key, reason='legacy_source_deleted')
-                return self.lookup(operation)
-            when = payload['source_message_at'] or payload['observed_at']
-            if existing:
-                self.db.execute('UPDATE timeline SET content=?,metadata=?,occurred_at=?,summarized_at=? WHERE id=?',
-                                (payload['body'],encoded(metadata),when,'',timeline_id))
-            else:
-                self.db.execute('''INSERT INTO timeline(id,event_type,session_id,scope,subject_id,object_id,content,
-                    metadata,message_id,dedupe_key,occurred_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
-                    (timeline_id,kind,identity['session'],identity['scope'],identity['speaker'],identity['audience'],
-                     payload['body'],encoded(metadata),identity['message'],'cap:'+key,when,utc_now()))
-            actual = self.db.execute('SELECT * FROM timeline WHERE id=?', (timeline_id,)).fetchone()
-            if not actual:
-                raise ValueError('capture_timeline_not_committed')
-            self.db.execute('DELETE FROM capture_chunks WHERE source_key=?', (key,))
-            chunks=[]; byte_offset=0
-            for seq, offset in enumerate(range(0,len(payload['body']),CHUNK_CHARS)):
-                chunk=payload['body'][offset:offset+CHUNK_CHARS]; blob=chunk.encode('utf-8')
-                sha=hashlib.sha256(blob).hexdigest()
-                self.db.execute('INSERT INTO capture_chunks VALUES (?,?,?,?,?,?)', (key,seq,offset,byte_offset,chunk,sha))
-                chunks.append(dict(seq=seq,char_offset=offset,byte_offset=byte_offset,chars=len(chunk),bytes=len(blob),digest=sha))
-                byte_offset+=len(blob)
-            manifest=dict(chunks=chunks,chars=len(payload['body']),bytes=byte_offset,
-                          body_digest=hashlib.sha256(payload['body'].encode('utf-8')).hexdigest(),processing=payload['processing'])
-            self.db.execute('INSERT OR REPLACE INTO capture_sources VALUES (?,?,?,?,?,?)',
-                            (key,encoded(identity),timeline_id,payload['revision'],encoded(manifest),'current'))
-            receipt=dict(profile=PROFILE,operation=operation,source_key=key,source_ref='timeline:'+timeline_id,
-                         source_version=message_source_version(dict(actual)),payload_digest=row['payload_digest'],
-                         committed_at=utc_now(),revision=payload['revision'],
-                         completeness=dict(stored_body='full',source_observation='submitted_observation',
-                                           redaction=payload['redaction'],legacy_projection='full',media='references_only'),
-                         index_state='ready' if getattr(self.store,'_source_fts_enabled',False) else 'scan_only', delivery_evidence=payload['evidence'],user_seen='unknown')
-            self.db.execute("UPDATE capture_operations SET state='committed',receipt=?,envelope='{}',generation=? WHERE operation=?",
-                            (encoded(receipt),generation,operation))
-            self.db.execute("INSERT INTO capture_changes(source_key,revision,kind) VALUES (?,?,'committed')", (key,payload['revision']))
-            self.fence(generation, authorize)
+            result = self._commit_payload_in_tx(
+                operation=operation,
+                key=row['source_key'],
+                payload_digest=row['payload_digest'],
+                payload=payload,
+                generation=generation,
+                authorize=authorize,
+                now=now,
+                deadline=row['expires'],
+                insert_operation=False,
+            )
+            if result.get('status') == 'conflict':
+                return result
         return self.lookup(operation)
 
     def withdraw(self, key, *, reason='withdrawn'):
@@ -276,6 +623,10 @@ class SourceCapture:
             self.db.execute("UPDATE capture_operations SET state='excluded',envelope='{}' WHERE operation=? AND state!='committed'",(operation,))
 
     def due(self, limit=8):
+        read_ctx = getattr(self.store, '_read_conn_sync', None)
+        if callable(read_ctx):
+            with read_ctx() as conn:
+                return [dict(r) for r in conn.execute("SELECT * FROM capture_operations WHERE state IN ('staged','uncertain','retry_due') AND due<=? ORDER BY due,operation LIMIT ?", (time.time(), min(limit, 32)))]
         with self.store._lock:
             return [dict(r) for r in self.db.execute("SELECT * FROM capture_operations WHERE state IN ('staged','uncertain','retry_due') AND due<=? ORDER BY due,operation LIMIT ?", (time.time(), min(limit,32)))]
 
@@ -290,8 +641,11 @@ class SourceCapture:
 
     def status(self):
         with self.store._lock:
+            chunk_rows = self.db.execute('SELECT count(*) AS n,min(expires_at) AS expires FROM capture_chunks WHERE expires_at>0').fetchone()
             return dict(profile=PROFILE,operations=dict(self.db.execute('SELECT state,count(*) FROM capture_operations GROUP BY state').fetchall()),
                         journal_mode=self.db.execute('PRAGMA journal_mode').fetchone()[0],
                         synchronous=self.db.execute('PRAGMA synchronous').fetchone()[0],
                         body_byte_limit=MAX_BODY_BYTES, pending_byte_limit=MAX_PENDING_BYTES,
+                        retention_seconds=self.retention_seconds, retained_chunks=chunk_rows['n'],
+                        next_expiry=chunk_rows['expires'] or 0.0, source_capture=self.source_capture_switch(),
                         inventory_coverage='observed_hooks_only')

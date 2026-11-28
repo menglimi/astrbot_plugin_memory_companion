@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .source_query import SourceQueryError, _instant, source_partition
 from .query_session import query_context
+from .tool_schema import project_tool_schema
 
 
 PROFILE = "memory.local-event-query.v1"
@@ -441,5 +442,5 @@ def bind_event_tool_schema(manager: Any, module_path: str) -> bool:
     if tool is None or tool.handler_module_path != module_path:
         return False
     schema = json.loads((CONTRACT_ROOT / "schemas/request.schema.json").read_text(encoding="utf-8"))
-    tool.parameters = {key: value for key, value in schema.items() if key not in {"$schema", "$id", "title"}}
+    tool.parameters = project_tool_schema(schema)
     return True

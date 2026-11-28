@@ -16,6 +16,7 @@ from .sensitive_data import redact_sensitive_value
 PORTABLE_FORMAT = "astrbot-memory-jsonl"
 PORTABLE_VERSION = 1
 MAX_PORTABLE_BYTES = 64 * 1024 * 1024
+MAX_PORTABLE_RECORDS = 200_000
 PORTABLE_EXPORT_PAGE_SIZE = 500
 PORTABLE_IMPORT_BATCH_SIZE = 200
 
@@ -29,7 +30,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "knowledge_graph.retrieval_expansion_enabled": False,
         "memory_injection.top_k": 4,
         "memory_injection.max_chars": 1400,
-        "memory_injection.max_item_chars": 320,
+        "memory_injection.max_item_chars": 240,
         "context_orchestration.query_mode": "current_message",
         "memory_summary.min_events": 12,
         "memory_summary.trigger_event_count": 24,
@@ -42,7 +43,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "knowledge_graph.retrieval_expansion_enabled": True,
         "memory_injection.top_k": 4,
         "memory_injection.max_chars": 1800,
-        "memory_injection.max_item_chars": 320,
+        "memory_injection.max_item_chars": 240,
         "context_orchestration.query_mode": "current_message",
         "memory_summary.min_events": 8,
         "memory_summary.trigger_event_count": 12,
@@ -56,12 +57,12 @@ PRESETS: dict[str, dict[str, Any]] = {
         "knowledge_graph.retrieval_expansion_enabled": True,
         "memory_injection.top_k": 8,
         "memory_injection.max_chars": 2400,
-        "memory_injection.max_item_chars": 320,
+        "memory_injection.max_item_chars": 240,
         "context_orchestration.query_mode": "current_message",
-        "context_orchestration_advanced.self_timeline_limit": 2,
+        "context_orchestration_advanced.self_timeline_limit": 4,
         "context_orchestration_advanced.user_profile_limit": 2,
         "context_orchestration_advanced.current_window_limit": 3,
-        "context_orchestration_advanced.conversation_summary_limit": 2,
+        "context_orchestration_advanced.conversation_summary_limit": 3,
         "context_orchestration_advanced.stable_memory_limit": 4,
         "memory_summary.min_events": 8,
         "memory_summary.trigger_event_count": 12,
@@ -205,23 +206,20 @@ def detect_preset(config: ConfigView) -> str:
     return "custom"
 
 
-def persist_runtime_config(raw: dict[str, Any], data_dir: Path) -> Path:
-    data_dir = Path(data_dir)
-    root = data_dir.parent.parent if data_dir.parent.name == "plugin_data" else data_dir.parent
-    path = root / "config" / "astrbot_plugin_memory_companion_config.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(suffix=".tmp", prefix=path.stem, dir=str(path.parent))
+def persist_runtime_config(raw: dict[str, Any], updates: dict[str, Any]) -> str:
+    save_config = getattr(raw, "save_config", None)
+    if not callable(save_config):
+        raise RuntimeError("AstrBot plugin configuration saving is unavailable")
+
+    previous = dict(raw)
+    raw.update(updates)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(raw, handle, ensure_ascii=False, indent=2)
-        os.replace(temp_name, path)
+        save_config()
     except Exception:
-        try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
+        raw.clear()
+        raw.update(previous)
         raise
-    return path
+    return str(getattr(raw, "config_path", ""))
 
 
 def scan_plugin_conflicts(plugin_root: Path) -> list[dict[str, Any]]:
@@ -274,6 +272,15 @@ async def build_operational_report(service: Any) -> dict[str, Any]:
         warnings.append("Embedding 已启用但未指定 Provider，将依赖自动发现。")
     if calls <= 0:
         warnings.append("还没有模型调用统计，Token 与耗时结论暂无样本。")
+    recovery_failure = (stats.get("wal") or {}).get("last_recovery_failure") or {}
+    if isinstance(recovery_failure, dict) and recovery_failure:
+        diagnostics = recovery_failure.get("diagnostics") or {}
+        hint = clean_text(diagnostics.get("hint"), 400)
+        reason = clean_text(recovery_failure.get("reason"), 80) or "database_unavailable"
+        warnings.append(
+            "记忆库最近一次写入被拒绝（原因码：%s）。%s"
+            % (reason, hint or "请在面板重试，或检查数据目录权限与占用情况。")
+        )
     return {
         "preset": detect_preset(service.config),
         "preset_label": PRESET_LABELS[detect_preset(service.config)],
@@ -308,10 +315,89 @@ async def build_operational_report(service: Any) -> dict[str, Any]:
 
 
 class PortableMemoryArchive:
-    def __init__(self, store: Any, data_dir: Path):
+    """Export/import portable JSONL archives.
+
+    P5: import/export entry points accept a caller supplied path.  Until now
+    only the config writer constrained paths, so a page API caller could point
+    the importer at any file on disk.  allowed_roots keeps archives inside the
+    plugin data directory (and its parent, so a backup exported to a sibling
+    directory stays importable) while still allowing callers to widen the set
+    explicitly.
+    """
+
+    def __init__(
+        self,
+        store: Any,
+        data_dir: Path,
+        allowed_roots: tuple[Path, ...] | None = None,
+    ):
         self.store = store
         self.data_dir = Path(data_dir)
         self.export_dir = self.data_dir / "exports"
+        if allowed_roots is None:
+            allowed_roots = (self.data_dir, self.data_dir.parent)
+        self.allowed_roots = tuple(Path(root).expanduser() for root in allowed_roots)
+
+    def _resolved_root(self, root: Path) -> Path | None:
+        try:
+            return Path(root).expanduser().resolve(strict=False)
+        except OSError:
+            return None
+
+    def _is_inside_allowed_roots(self, resolved: Path) -> bool:
+        for root in self.allowed_roots:
+            base = self._resolved_root(root)
+            if base is None:
+                continue
+            if resolved == base or base in resolved.parents:
+                return True
+        return False
+
+    @staticmethod
+    def _clean_path_input(path: str) -> str:
+        raw = clean_text(path, 1024)
+        while len(raw) >= 2 and (
+            (raw[0] == raw[-1] and raw[0] in {'"', "'"})
+            or (raw[0] == "“" and raw[-1] == "”")
+            or (raw[0] == "‘" and raw[-1] == "’")
+        ):
+            raw = raw[1:-1].strip()
+        return raw
+
+    def _allowed_roots_hint(self) -> str:
+        roots: list[str] = []
+        for root in self.allowed_roots:
+            resolved = self._resolved_root(root)
+            if resolved is None:
+                continue
+            label = str(resolved)
+            if label not in roots:
+                roots.append(label)
+        return "；".join(roots[:2]) or str(self.data_dir)
+
+    def _resolve_source_path(self, path: str) -> Path:
+        """Resolve an archive path and refuse anything outside allowed roots."""
+        raw = self._clean_path_input(path)
+        if not raw:
+            raise ValueError("请填写可移植档案路径（portable archive path is required）")
+        if ".." in Path(raw.replace(chr(92), "/")).parts:
+            raise ValueError("路径不能包含上级目录跳转（.. / two dots）")
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            # Relative archive paths are resolved against the plugin data dir,
+            # never against whatever cwd the bot process happens to run in.
+            candidate = self.data_dir / candidate
+        try:
+            resolved = candidate.resolve(strict=False)
+        except OSError as exc:
+            raise ValueError(
+                f"路径无法解析（portable archive path cannot be resolved）: {clean_text(exc, 120)}"
+            ) from exc
+        if not self._is_inside_allowed_roots(resolved):
+            raise ValueError(
+                f"路径超出允许的插件数据目录范围（outside the plugin data directory），请将档案放到以下目录后重试：{self._allowed_roots_hint()}"
+            )
+        return resolved
 
     async def export(self) -> dict[str, Any]:
         stats = await self.store.stats()
@@ -374,10 +460,11 @@ class PortableMemoryArchive:
         return {"path": str(path), "counts": counts, "format": PORTABLE_FORMAT, "version": PORTABLE_VERSION}
 
     def preview(self, path: str) -> dict[str, Any]:
-        header, records = self._read(path)
+        resolved = self._resolve_source_path(path)
+        header, records = self._read(str(resolved))
         counts = Counter(str(item.get("record_type") or "unknown") for item in records)
         return {
-            "path": str(Path(path).expanduser().resolve()),
+            "path": str(resolved),
             "format": header.get("format"),
             "version": header.get("version"),
             "exported_at": header.get("exported_at"),
@@ -387,12 +474,13 @@ class PortableMemoryArchive:
         }
 
     async def import_data(self, path: str) -> dict[str, Any]:
-        header, records = self._read(path)
+        resolved = self._resolve_source_path(path)
+        header, records = self._read(str(resolved))
         preview_counts = Counter(str(item.get("record_type") or "unknown") for item in records)
         backup = await self.store.backup_async(".before_portable_import")
         batch_id = await self.store.add_import_batch(
             source_plugin=clean_text(header.get("plugin"), 120) or "portable_jsonl",
-            source_path=str(Path(path).expanduser().resolve()),
+            source_path=str(resolved),
             mode=f"portable_v{PORTABLE_VERSION}",
             stats={"preview_counts": dict(preview_counts)},
         )
@@ -434,7 +522,7 @@ class PortableMemoryArchive:
                     detail = f": {message}" if message else ""
                     errors.append(f"line {op.get('line')}: {code}{detail}")
         return {
-            "path": str(Path(path).expanduser().resolve()),
+            "path": str(resolved),
             "backup": str(backup),
             "batch_id": batch_id,
             "imported": dict(imported),
@@ -696,6 +784,10 @@ class PortableMemoryArchive:
                         raise ValueError("unsupported portable archive version")
                     continue
                 records.append(item)
+                if len(records) > MAX_PORTABLE_RECORDS:
+                    raise ValueError(
+                        f"portable archive has more than {MAX_PORTABLE_RECORDS} records"
+                    )
         if not header:
             raise ValueError("portable archive header is missing")
         declared_counts = header.get("counts")

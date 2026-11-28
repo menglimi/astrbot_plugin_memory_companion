@@ -15,11 +15,13 @@ from typing import Any
 
 from .models import json_dumps
 from . import query_notes
+from .tool_schema import project_tool_schema
 
 
 PROFILE = "memory.local-query-session.v1"
 PROFILE_V3 = "memory.local-query-session.v3"
 TOOL_NAME = "memory_companion_query"
+DISCOVER_TOOL_NAME = "memory_companion_discover_sources"
 OPERATIONS = ("recall", "sources", "navigate", "events")
 OPERATIONS_V3 = (*OPERATIONS, "discover")
 SOURCE_DISCOVERY_PROFILE = "memory.local-source-discovery.v1"
@@ -361,6 +363,9 @@ async def execute(service: Any, event: Any, operation: str = "status", parameter
         note_ids, params = params.get("note_ids"), {}
     if _notes and query_note is not None and operation != "sources":
         return {**result, "error": "query_note_requires_sources"}
+    if operation == "sources" and isinstance(params, dict):
+        from .source_query import normalize_source_query_parameters
+        params = normalize_source_query_parameters(params)
     payload = {"operation": operation, "parameters": params}
     if not request_validator().is_valid(payload):
         return {**result, "error": "invalid_query_arguments"}
@@ -452,6 +457,9 @@ async def execute_v3(service: Any, event: Any, operation: str = "status", parame
         note_ids, params = params.get("note_ids"), {}
     if _notes and query_note is not None and normalized_operation != "sources":
         return {**result, "error": "query_note_requires_sources"}
+    if normalized_operation == "sources" and isinstance(params, dict):
+        from .source_query import normalize_source_query_parameters
+        params = normalize_source_query_parameters(params)
     payload = {"operation": operation, "parameters": params}
     if not request_validator_v3().is_valid(payload):
         return {**result, "error": "invalid_query_arguments"}
@@ -544,9 +552,10 @@ def bind_query_tool_schema(manager: Any, module_path: str) -> bool:
     tool = manager.get_func(TOOL_NAME)
     if tool is None or tool.handler_module_path != module_path:
         return False
-    tool.parameters = {k: deepcopy(v) for k, v in request_schema().items() if k not in {"$schema", "$id", "title"}}
+    tool.parameters = project_tool_schema(request_schema())
     source = manager.get_func("memory_companion_sources")
     if source is not None and source.handler_module_path == module_path:
+        source.parameters = project_tool_schema(source.parameters)
         source.parameters.get("properties", {}).pop("query_note", None)
         if "required" in source.parameters:
             source.parameters["required"] = [k for k in source.parameters["required"] if k != "query_note"]
@@ -577,7 +586,7 @@ def bind_source_query_v2_schema(manager: Any, module_path: str) -> bool:
         schema = _legacy_source_schema()
     except (OSError, ValueError, KeyError, ImportError):
         return False
-    source.parameters = deepcopy(schema)
+    source.parameters = project_tool_schema(schema)
     function = inspect.unwrap(source.handler)
     setattr(function, "_memory_source_query_profile", SOURCE_QUERY_PROFILE_V2)
     setattr(function, "_memory_source_query_module", module_path)
@@ -588,7 +597,7 @@ def bind_source_query_v2_schema(manager: Any, module_path: str) -> bool:
 def _legacy_source_schema() -> dict[str, Any]:
     root = Path(__file__).resolve().parents[1] / "docs/contracts/source-query/v1"
     schema = json.loads((root / "schemas/request.schema.json").read_text(encoding="utf-8"))
-    return {k: v for k, v in schema.items() if k not in {"$schema", "$id", "title"}}
+    return project_tool_schema(schema)
 
 
 def _marked_source_v2_handler(tool: Any) -> bool:
@@ -637,9 +646,7 @@ def bind_query_tool_v3_schema(manager: Any, module_path: str) -> bool:
         request_validator_v3()
     except (OSError, ValueError, KeyError, ImportError):
         return False
-    wrapper.parameters = {
-        k: deepcopy(v) for k, v in schema.items() if k not in {"$schema", "$id", "title"}
-    }
+    wrapper.parameters = project_tool_schema(schema)
     # Mark the unwrapped callables so request-local projection can prove that
     # the tool was registered by this plugin, rather than trusting a same-name
     # tool supplied by another extension.
@@ -720,19 +727,23 @@ def offer_query_tool(service: Any, req: Any, ctx: Any, event: Any) -> None:
         if item.name == "memory_companion_sources" and _marked_source_v2_handler(item):
             from .source_query_v2 import request_schema as batch_schema
             item = copy(item)
-            item.parameters = deepcopy(_legacy_source_schema())
+            item.parameters = project_tool_schema(_legacy_source_schema())
             if (event is not None and service.config.bool("memory_tools.enable_source_query_v2", False)
                     and service._memory_reconstruction_enabled(ctx)):
                 legacy = deepcopy(item.parameters)
                 batch = {k: deepcopy(v) for k, v in batch_schema().items() if k not in {"$schema", "$id", "title"}}
-                item.parameters = {"type": "object", "additionalProperties": False,
-                                   "properties": deepcopy(legacy["properties"]), "anyOf": [legacy, batch]}
+                item.parameters = project_tool_schema({
+                    "type": "object", "additionalProperties": False,
+                    "properties": deepcopy(legacy["properties"]), "anyOf": [legacy, batch],
+                })
                 item.parameters["properties"]["action"]["enum"].append("range_batch")
-                item.description += (
+                range_batch_desc = (
                     " range_batch 按消息观察时间正序连续读取 [start_at,end_at)，使用服务配置的字节/消息/片段预算。"
                     "next_batch_cursor 只传 cursor 续读，长正文保留偏移。已找到的部分不等于整个范围；"
                     "coverage 分别说明遍历、实际展示和未证明的事件覆盖，按问题需要补查即可。"
                 )
+                if range_batch_desc not in item.description:
+                    item.description += range_batch_desc
                 event._memory_source_query_v2 = True
                 event._memory_source_query_v2_key = service._reconstruction_budget_key(event, ctx)
         if item.name == "memory_companion_sources" and "query_note" in item.parameters.get("properties", {}):
@@ -749,12 +760,18 @@ def offer_query_tool(service: Any, req: Any, ctx: Any, event: Any) -> None:
         req.func_tool = clone
     wrapper = next((t for t in tools if t.name == TOOL_NAME and getattr(t, "active", True)), None)
     if wrapper is None:
+        if any(getattr(t, "name", "") == DISCOVER_TOOL_NAME for t in tools):
+            clone = copy(toolset)
+            clone.tools = [t for t in tools if getattr(t, "name", "") != DISCOVER_TOOL_NAME]
+            req.func_tool = clone
         return
     bound = wrapper.parameters.get("properties", {}).get("operation", {}).get("enum", [])
     source_tools = tools
     if not enabled(service) or not service._memory_reconstruction_enabled(ctx) or "status" not in bound:
         clone = copy(toolset)
-        clone.tools = [t for t in source_tools if t.name != TOOL_NAME]
+        clone.tools = [
+            t for t in source_tools if getattr(t, "name", "") not in {TOOL_NAME, DISCOVER_TOOL_NAME}
+        ]
         req.func_tool = clone
         return
     allowed = [op for op in OPERATIONS if any(t.name == "memory_companion_" + op and getattr(t, "active", True)
@@ -766,15 +783,17 @@ def offer_query_tool(service: Any, req: Any, ctx: Any, event: Any) -> None:
         allowed.append("discover")
     if not allowed or event is None:
         clone = copy(toolset)
-        clone.tools = [t for t in source_tools if t.name != TOOL_NAME]
+        clone.tools = [
+            t for t in source_tools if getattr(t, "name", "") not in {TOOL_NAME, DISCOVER_TOOL_NAME}
+        ]
         req.func_tool = clone
         return
     projected = copy(wrapper)
     projected.description = "各记忆查询返回 result（本次资料）和 progress（短进度）。已有原文够用时可直接回答，进度不用写进回复。status 仅按需回看较早操作和有效续页，不检索、不总结。"
-    projected.parameters = {"type": "object", "additionalProperties": False, "properties": {
+    projected.parameters = project_tool_schema({"type": "object", "additionalProperties": False, "properties": {
         "operation": {"type": "string", "enum": ["status", "discover"] if discover_available else ["status"], "default": "status"},
         "parameters": {"type": "object", "additionalProperties": False, "properties": {}},
-    }}
+    }})
     if discover_available:
         projected.description += (
             " discover 用语义索引找历史来源候选；结果可能不完整，不代表已证明查全。"
@@ -793,16 +812,22 @@ def offer_query_tool(service: Any, req: Any, ctx: Any, event: Any) -> None:
                 note_schema = None
             if note_schema is not None:
                 note_source = copy(source)
-                note_source.parameters = deepcopy(source.parameters)
+                note_source.parameters = project_tool_schema(source.parameters)
                 note_source.parameters.setdefault("properties", {})["query_note"] = note_schema
                 for branch in note_source.parameters.get("anyOf", []):
                     branch.setdefault("properties", {})["query_note"] = deepcopy(note_schema)
+                note_source.parameters = project_tool_schema(note_source.parameters)
                 tools = [note_source if t is source else t for t in tools]
                 projected.parameters["properties"]["parameters"] = query_notes.status_parameters()
                 projected.description += " sources 可随查询附 query_note，保留此前已读材料的简短理解和引用；足够回答无需记事。status 可用 note_ids 回看，便笺是模型理解，日期和补充细节仍以原文为据。"
                 event._memory_query_notes = service._reconstruction_budget_key(event, ctx)
+    projected.parameters = project_tool_schema(projected.parameters)
     clone = copy(toolset)
-    clone.tools = [projected if t is wrapper else t for t in tools]
+    clone.tools = [
+        projected if t is wrapper else t
+        for t in tools
+        if discover_available or getattr(t, "name", "") != DISCOVER_TOOL_NAME
+    ]
     req.func_tool = clone
     turn_key = service._reconstruction_budget_key(event, ctx)
     event._memory_query_operations = (turn_key, {"status", *allowed})

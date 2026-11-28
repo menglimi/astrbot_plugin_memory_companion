@@ -20,7 +20,7 @@ except ImportError:
 ROOT = bootstrap_package()
 
 from astrbot_plugin_memory_companion.core.models import EntityRef, MemoryRecord
-from astrbot_plugin_memory_companion.core.store import MemoryStore
+from astrbot_plugin_memory_companion.core.store import MemoryStore, MemoryStoreUnavailableError
 
 
 class StoreConsistencyTests(unittest.IsolatedAsyncioTestCase):
@@ -859,10 +859,12 @@ class StoreConsistencyTests(unittest.IsolatedAsyncioTestCase):
         store._closed = False
 
         try:
-            with self.assertRaisesRegex(sqlite3.OperationalError, "database file is missing"):
+            with self.assertRaises(MemoryStoreUnavailableError) as raised:
                 store._recover_connection_sync()
         finally:
             store._closed = True
+        self.assertEqual("database_file_missing", raised.exception.reason)
+        self.assertEqual(str(store.db_path), raised.exception.diagnostics["db_path"])
         self.assertFalse(store.db_path.exists())
 
     async def test_memory_ordering_uses_absolute_time_for_mixed_offsets(self) -> None:

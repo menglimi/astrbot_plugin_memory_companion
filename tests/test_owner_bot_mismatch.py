@@ -94,6 +94,58 @@ class OwnerBotLifecycleTests(unittest.TestCase):
         )
         self.assertTrue(lifecycle.eligible)
 
+    def test_platform_name_is_not_a_specific_bot_owner(self) -> None:
+        memory = self.summary(owner_bot_id="QQ")
+        memory.platform = "qq"
+        lifecycle = evaluate_memory_lifecycle(memory, self.ctx(bot_id="another-self-id"))
+        self.assertTrue(lifecycle.eligible)
+
+    def test_platform_name_owner_does_not_block_group_visibility(self) -> None:
+        policy = VisibilityPolicy()
+        context = SessionContext(
+            session_id="qq:GroupMessage:g1",
+            scope="group",
+            platform="qq",
+            group_id="g1",
+            bot_id="bot-1",
+        )
+        memory = MemoryRecord(
+            id="group-memory",
+            scope="group",
+            group_id="g1",
+            platform="QQ",
+            visibility="group_public",
+            metadata={"owner_bot_id": "qq"},
+        )
+
+        self.assertEqual(policy.is_visible(memory, context), (True, "same_group"))
+        memory.metadata["owner_bot_id"] = "bot-2"
+        self.assertEqual(policy.is_visible(memory, context), (False, "other_bot_owner"))
+
+    def test_platform_name_keeps_legacy_summary_ambiguity_guard(self) -> None:
+        policy = VisibilityPolicy()
+        context = SessionContext(
+            session_id="qq:GroupMessage:g1",
+            scope="group",
+            platform="qq",
+            group_id="g1",
+            bot_id="bot-1",
+        )
+        memory = MemoryRecord(
+            id="legacy-group-summary",
+            memory_type="conversation_summary",
+            scope="group",
+            group_id="g1",
+            platform="qq",
+            visibility="group_public",
+            metadata={
+                "owner_bot_id": "qq",
+                "summarizer": "companion_memory_schema_v1",
+            },
+        )
+
+        self.assertEqual(policy.is_visible(memory, context), (False, "ambiguous_bot_owner"))
+
 
 class SummarySlotRoutingTests(unittest.TestCase):
     def ctx(self) -> SessionContext:

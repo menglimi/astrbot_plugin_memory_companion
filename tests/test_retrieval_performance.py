@@ -127,7 +127,9 @@ def _legacy_mmr(engine: RetrievalEngine, ranked: list[SearchResult], selection_l
         best_value = -math.inf
         for index, item in enumerate(pool):
             redundancy = max(similarity(item, chosen) for chosen in selected)
-            value = (0.84 * relevance(item)) - (0.16 * redundancy)
+            # R7：去冗余权重已可配，参考实现必须跟着引擎的取值走，否则这条
+            # 「优化不改变算法」的对照测试会锁死旧常数 0.16。
+            value = (0.84 * relevance(item)) - (engine.mmr_redundancy_weight * redundancy)
             if value > best_value:
                 best_value = value
                 best_index = index

@@ -36,10 +36,59 @@ class LivingMemoryMigrator:
         self.data_dir = Path(data_dir)
         self.importance = ImportanceEvaluator()
 
+    @staticmethod
+    def _clean_configured_path(raw: str) -> str:
+        text = str(raw or "").strip()
+        while len(text) >= 2 and (
+            (text[0] == text[-1] and text[0] in {'"', "'"})
+            or (text[0] == "“" and text[-1] == "”")
+            or (text[0] == "‘" and text[-1] == "’")
+        ):
+            text = text[1:-1].strip()
+        return text
+
+    @staticmethod
+    def _scan_directory_dbs(directory: Path) -> list[Path]:
+        """Scan a directory for LivingMemory SQLite files with common names prioritized."""
+        priority = [
+            directory / "livingmemory.db",
+            directory / "data" / "livingmemory.db",
+            directory / "astrbot_plugin_livingmemory" / "livingmemory.db",
+            directory / "astrbot_plugin_livingmemory" / "data" / "livingmemory.db",
+            directory / "memory.db",
+            directory / "data" / "memory.db",
+        ]
+        found: list[Path] = [path for path in priority if path.is_file()]
+        discovered: list[tuple[int, str, Path]] = []
+        try:
+            for path in directory.rglob("*.db"):
+                if not path.is_file():
+                    continue
+                lower_name = path.name.lower()
+                if lower_name == "memory_companion.db" or ".before_" in lower_name:
+                    continue
+                try:
+                    rel_depth = len(path.relative_to(directory).parts)
+                except ValueError:
+                    rel_depth = 99
+                discovered.append((rel_depth, lower_name, path))
+                if len(discovered) >= 64:
+                    break
+        except OSError:
+            pass
+        discovered.sort(key=lambda item: (item[0], item[1]))
+        found.extend(item[2] for item in discovered)
+        return found
+
     def candidate_paths(self, configured_path: str = "") -> list[Path]:
         candidates: list[Path] = []
-        if configured_path:
-            candidates.append(Path(configured_path).expanduser())
+        cleaned = self._clean_configured_path(configured_path)
+        if cleaned:
+            configured = Path(cleaned).expanduser()
+            if configured.is_dir():
+                candidates.extend(self._scan_directory_dbs(configured))
+            else:
+                candidates.append(configured)
 
         plugins_dir = self.plugin_root.parent
         data_parent = self.data_dir.parent

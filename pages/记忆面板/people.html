@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0f1218" />
+  <title>我会牢牢记住你 · 她记得的人</title>
+  <script>
+    (() => {
+      const root = document.documentElement;
+      let theme = "";
+      try {
+        const param = new URLSearchParams(location.search).get("theme");
+        if (param === "light" || param === "dark") theme = param;
+      } catch (_) {}
+      if (!theme) {
+        const preset = root.dataset.theme;
+        if (preset === "light" || preset === "dark") theme = preset;
+      }
+      if (!theme) {
+        try {
+          if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
+            theme = "light";
+          }
+        } catch (_) {}
+      }
+      if (theme !== "light" && theme !== "dark") theme = "dark";
+      root.dataset.theme = theme;
+      const meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) meta.setAttribute("content", theme === "light" ? "#f6f7fa" : "#0f1218");
+    })();
+  </script>
+  <style>
+    html { background: #0f1218; color: #e8edf5; }
+    html[data-theme="light"] { background: #f6f7fa; color: #1b2430; }
+  </style>
+  <link rel="stylesheet" href="./people.css?v=2.6.9" />
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <span class="heart" aria-hidden="true"></span>
+      <div>
+        <h1>她记得的人</h1>
+        <p id="subtitle">正在想…</p>
+      </div>
+    </div>
+    <div class="tools">
+      <input id="search" type="search" placeholder="找一个人：名字、称呼、备注" autocomplete="off" />
+      <select id="botFilter" title="按 bot 筛选" hidden></select>
+      <select id="sort" title="排序">
+        <option value="weight">按分量</option>
+        <option value="recent">按最近</option>
+        <option value="memory">按记得多少</option>
+        <option value="name">按名字</option>
+      </select>
+      <button id="refresh" type="button">刷新</button>
+      <button id="themeToggle" class="theme-btn" type="button" aria-label="切换深浅主题" aria-pressed="true" title="切换浅色/深色主题">
+        <span class="theme-icon" aria-hidden="true">
+          <svg class="icon-sun" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.8"/><path d="M8 1.6v1.6M8 12.8v1.6M1.6 8h1.6M12.8 8h1.6M3.5 3.5l1.1 1.1M11.4 11.4l1.1 1.1M12.5 3.5l-1.1 1.1M4.6 11.4l-1.1 1.1"/></svg>
+          <svg class="icon-moon" viewBox="0 0 16 16"><path d="M12.9 10.2A5.2 5.2 0 015.8 3.1a5.4 5.4 0 107.1 7.1z"/></svg>
+        </span>
+        <span id="themeToggleLabel">深色</span>
+      </button>
+      <a id="consoleLink" class="ghost" data-console-link href="./legacy.html">完整控制台</a>
+    </div>
+  </header>
+
+  <main>
+    <section id="summary" class="summary" hidden></section>
+    <details id="recovery" class="recovery" hidden></details>
+    <section id="grid" class="grid"></section>
+    <section id="loading" class="loading">正在把她记得的人翻出来…</section>
+    <section id="empty" class="empty" hidden>
+      <h2>她还没记住谁</h2>
+      <p>等有人跟她多聊几次，人就会自己长出来。这里不用配置，她本来就在记。</p>
+      <p class="dim">想看她把每句话记成了什么？去 <a data-console-link href="./legacy.html">完整控制台</a> 翻记忆库。</p>
+    </section>
+  </main>
+
+  <div id="scrim" class="scrim" hidden></div>
+  <aside id="drawer" class="drawer" hidden aria-label="一个人的档案">
+    <button id="close" class="close" type="button" aria-label="关闭">×</button>
+    <div id="drawerBody"></div>
+  </aside>
+  <dialog id="personConfirm" class="person-confirm" aria-labelledby="personConfirmTitle" aria-describedby="personConfirmMessage">
+    <form method="dialog">
+      <h2 id="personConfirmTitle"></h2>
+      <p id="personConfirmMessage"></p>
+      <div class="actions">
+        <button id="personConfirmCancel" type="submit" value="cancel">取消</button>
+        <button id="personConfirmAction" type="submit" value="confirm"></button>
+      </div>
+    </form>
+  </dialog>
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="/api/plugin/page/bridge-sdk.js"></script>
+  <script src="./people.js?v=2.6.9"></script>
+</body>
+</html>

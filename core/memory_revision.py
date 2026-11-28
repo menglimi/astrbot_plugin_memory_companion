@@ -28,7 +28,7 @@ def memory_ref(record: MemoryRecord) -> dict[str, str]:
     data = asdict(record)
     semantic = {key: data[key] for key in fields}
     metadata = record.metadata or {}
-    semantic["metadata"] = {
+    semantic_metadata = {
         key: value for key, value in metadata.items()
         if key.startswith(("profile_", "core_")) or key in {
             "persona_id", "owner_bot_id", "canonical_summary", "key_facts", "key_facts_with_refs",
@@ -38,6 +38,12 @@ def memory_ref(record: MemoryRecord) -> dict[str, str]:
             "expires_at", "core_enabled", "core_scope", "target_id", "source_ref",
         }
     }
+    if metadata.get("_scene_gated"):
+        if metadata.get("_persisted_mention_policy_missing"):
+            semantic_metadata.pop("mention_policy", None)
+        elif "_persisted_mention_policy" in metadata:
+            semantic_metadata["mention_policy"] = metadata["_persisted_mention_policy"]
+    semantic["metadata"] = semantic_metadata
     return {"id": record.id, "version": digest(semantic)}
 
 

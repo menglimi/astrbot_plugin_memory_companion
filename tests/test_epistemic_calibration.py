@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -537,6 +538,58 @@ class EpistemicCalibrationTests(unittest.TestCase):
         injected = composer.compose(ctx, [result], max_chars=4000, slot_sections=[("open_loop", [result])])
         self.assertIn("<other_memory>", injected)
         self.assertNotIn("<open_loops>", injected)
+
+    def test_open_loop_is_only_mentioned_for_the_current_topic_and_not_repeated(self) -> None:
+        service = self.make_service()
+        now = datetime.now(timezone.utc)
+        memory = MemoryRecord(
+            id="pending-trip", memory_type="open_loop", content="周末旅行还要确认车票和天气。",
+            confidence=0.9, importance=0.8, created_at=now.isoformat(),
+            metadata={"open_loop_weight": 0.9},
+        )
+        unrelated = SessionContext(scope="private", user_id="u1", bot_id="bot-1", message_text="今天吃什么？")
+        unrelated_decision = service._memory_route_decision(
+            unrelated, analyze_turn_signal(unrelated.message_text), parse_time_intent(unrelated.message_text),
+        )
+        expression, reason = service._memory_expression_decision(
+            unrelated, memory, SearchResult(memory=memory, score=1.0), "open_loop",
+            unrelated_decision, parse_time_intent(unrelated.message_text), query_text=unrelated.message_text,
+        )
+        self.assertEqual(("tone", "open_loop_not_current_topic"), (expression, reason))
+
+        followup = SessionContext(scope="private", user_id="u1", bot_id="bot-1", message_text="周末旅行的车票后来怎么样了？")
+        followup_decision = service._memory_route_decision(
+            followup, analyze_turn_signal(followup.message_text), parse_time_intent(followup.message_text),
+        )
+        expression, _ = service._memory_expression_decision(
+            followup, memory, SearchResult(memory=memory, score=1.0), "open_loop",
+            followup_decision, parse_time_intent(followup.message_text), query_text=followup.message_text,
+            open_loop_related=True, open_loop_followup=True,
+        )
+        self.assertEqual("mention", expression)
+        repeated, reason = service._memory_expression_decision(
+            followup, memory, SearchResult(memory=memory, score=1.0), "open_loop",
+            followup_decision, parse_time_intent(followup.message_text), query_text=followup.message_text,
+            open_loop_related=True, recently_injected=True,
+        )
+        self.assertEqual(("tone", "open_loop_recently_surfaced"), (repeated, reason))
+
+    def test_resolved_and_expired_open_loops_are_not_explicitly_reintroduced(self) -> None:
+        service = self.make_service()
+        now = datetime.now(timezone.utc)
+        ctx = SessionContext(scope="private", user_id="u1", bot_id="bot-1", message_text="你今天怎么样？")
+        decision = service._memory_route_decision(ctx, analyze_turn_signal(ctx.message_text), parse_time_intent(ctx.message_text))
+        for metadata, created_at in (
+            ({"resolved_at": now.isoformat()}, now.isoformat()),
+            ({}, (now - timedelta(days=31)).isoformat()),
+        ):
+            memory = MemoryRecord(id="old-loop", memory_type="open_loop", content="继续聊旅行。",
+                confidence=0.9, created_at=created_at, metadata=metadata)
+            expression, reason = service._memory_expression_decision(
+                ctx, memory, SearchResult(memory=memory, score=1.0), "open_loop", decision,
+                parse_time_intent(ctx.message_text), query_text=ctx.message_text,
+            )
+            self.assertEqual(("tone", "open_loop_closed_or_expired"), (expression, reason))
 
     def test_sensitive_values_are_redacted_from_memory_items(self) -> None:
         composer = InjectionComposer()

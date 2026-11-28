@@ -35,6 +35,10 @@ class ScopedStoreTests(unittest.TestCase):
         self.group_b = _context("group_member", group="group-b")
 
     def tearDown(self) -> None:
+        # Windows 上被打开的 sqlite 文件无法删除：先关连接再清临时目录。
+        close = getattr(self.store, "close", None)
+        if callable(close):
+            close()
         self.tmp.cleanup()
 
     def test_private_group_a_and_group_b_are_physically_isolated(self) -> None:

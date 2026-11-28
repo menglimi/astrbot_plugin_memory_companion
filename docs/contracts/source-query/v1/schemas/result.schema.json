@@ -72,6 +72,10 @@
     },
     "usage": {
       "type": "object"
+    },
+    "hint": {
+      "type": "string",
+      "maxLength": 200
     }
   },
   "allOf": [

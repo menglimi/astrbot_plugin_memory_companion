@@ -8,7 +8,7 @@ rows and legacy rows whose governance values still live in metadata.
 
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .models import MemoryRecord, SessionContext, clean_text, clamp_float
@@ -25,6 +25,9 @@ HALF_LIFE_DAYS = {
     "durable": 730.0,
     "pinned": math.inf,
 }
+OPEN_LOOP_DEFAULT_TTL = timedelta(days=30)
+OPEN_LOOP_MEMORY_TYPES = frozenset({"open_loop", "promise", "todo_memory", "emotional_debt"})
+OPEN_LOOP_TAGS = frozenset({"open_loop", "promise", "todo", "unfinished", "emotional_debt"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +37,7 @@ class LifecycleScore:
     decay_factor: float
     salience: float
     reinforcement: float
+    salience_is_copy: bool = False
 
 
 def _metadata(memory: MemoryRecord) -> dict[str, Any]:
@@ -46,6 +50,51 @@ def _field(memory: MemoryRecord, name: str, default: Any = "") -> Any:
     if value not in (None, ""):
         return value
     return _metadata(memory).get(name, default)
+
+
+def is_open_loop_candidate(memory: MemoryRecord) -> bool:
+    if clean_text(getattr(memory, "memory_type", ""), 80).lower() in OPEN_LOOP_MEMORY_TYPES:
+        return True
+    metadata = _metadata(memory)
+    tags = {clean_text(tag, 64).lower() for tag in (getattr(memory, "tags", None) or [])}
+    if tags & OPEN_LOOP_TAGS:
+        return True
+    for key in ("open_loop_weight", "promise_weight", "emotional_debt_weight"):
+        try:
+            if float(metadata.get(key) or 0.0) >= 0.30:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def open_loop_expired(memory: MemoryRecord, *, now: datetime | None = None) -> bool:
+    if not is_open_loop_candidate(memory):
+        return False
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    metadata = _metadata(memory)
+    explicit_ends = [
+        clean_text(_field(memory, "valid_to", ""), 96),
+        clean_text(metadata.get("expires_at"), 96),
+    ]
+    explicit_ends = [value for value in explicit_ends if value]
+    if explicit_ends:
+        parsed = [_moment(value) for value in explicit_ends]
+        if any(value is None for value in parsed):
+            return True
+        return current >= min(value for value in parsed if value is not None)
+    created = _moment(getattr(memory, "created_at", ""))
+    occurred = _moment(getattr(memory, "occurred_at", ""))
+    updated = _moment(getattr(memory, "updated_at", ""))
+    base = created or occurred or updated
+    return base is not None and current >= base + OPEN_LOOP_DEFAULT_TTL
+
+
+def _is_dedicated_open_loop(memory: MemoryRecord) -> bool:
+    if clean_text(getattr(memory, "memory_type", ""), 80).lower() in OPEN_LOOP_MEMORY_TYPES:
+        return True
+    tags = {clean_text(tag, 64).lower() for tag in (getattr(memory, "tags", None) or [])}
+    return bool(tags & OPEN_LOOP_TAGS)
 
 
 def _moment(value: Any) -> datetime | None:
@@ -99,16 +148,19 @@ def evaluate_memory_lifecycle(
         return LifecycleScore(False, "validity=not_started", 0.0, 0.0, 0.0)
     if valid_to is not None and current >= valid_to:
         return LifecycleScore(False, "validity=expired", 0.0, 0.0, 0.0)
+    if _is_dedicated_open_loop(memory) and open_loop_expired(memory, now=current):
+        return LifecycleScore(False, "validity=open_loop_expired", 0.0, 0.0, 0.0)
 
     sensitivity = clean_text(_field(memory, "sensitivity", "internal"), 32).lower() or "internal"
     if sensitivity == "restricted":
         return LifecycleScore(False, "sensitivity=restricted", 0.0, 0.0, 0.0)
 
     owner_bot_id = clean_text(_field(memory, "owner_bot_id", ""), 160)
+    platform_id = clean_text(_field(memory, "platform", ""), 160)
+    if owner_bot_id and platform_id and owner_bot_id.casefold() == platform_id.casefold():
+        owner_bot_id = ""
     context_bot_id = clean_text(getattr(ctx, "bot_id", ""), 160)
-    # Empty or ``self`` owner means no specific bot owner. Keep that memory
-    # visible while still diagnosing a missing runtime bot context for all
-    # other explicit owners.
+    # Empty, ``self``, or a platform label does not identify a specific bot.
     if owner_bot_id and owner_bot_id != "self" and not context_bot_id:
         return LifecycleScore(False, "owner_bot_context_missing", 0.0, 0.0, 0.0)
     if owner_bot_id and owner_bot_id != "self" and owner_bot_id != context_bot_id:
@@ -129,7 +181,18 @@ def evaluate_memory_lifecycle(
     # Soft decay may lower rank but never silently delete an otherwise active
     # fact.  Archive/expiration decisions live in the maintenance pipeline.
     decay_factor = max(0.05, min(1.0, decay_factor))
-    salience = clamp_float(_field(memory, "salience", memory.importance), default=memory.importance)
+    importance = clamp_float(getattr(memory, "importance", 0.0), default=0.0)
+    raw_salience = _field(memory, "salience", None)
+    if raw_salience in (None, ""):
+        # 没有单独记过 salience（旧行）就沿用 importance，但调用方要能看出
+        # 「这条 salience 只是 importance 的副本」，避免同一个信号被加两次。
+        salience = importance
+        salience_is_copy = True
+    else:
+        salience = clamp_float(raw_salience, default=importance)
+        # 只有「本来就没人记过 salience、于是拿 importance 顶上」才算副本。
+        # 数值恰好相等不算：MemoryRecord 的默认 salience 可能正好等于 importance。
+        salience_is_copy = False
     reinforcement = clamp_float(_field(memory, "reinforcement_score", 0.0), default=0.0)
     return LifecycleScore(
         True,
@@ -137,14 +200,21 @@ def evaluate_memory_lifecycle(
         decay_factor,
         salience,
         reinforcement,
+        salience_is_copy,
     )
 
 
 def apply_lifecycle_score(base_score: float, lifecycle: LifecycleScore) -> float:
     if not lifecycle.eligible:
         return 0.0
-    freshness_multiplier = 0.65 + (0.35 * lifecycle.decay_factor)
-    salience_bonus = lifecycle.salience * 0.12
+    # 时间真的会磨掉一些：刚发生的事排前面，很久以前又没再被想起的事，
+    # 分数会一路掉下去，而不是只打八折。半衰期到了约打七折，两三个半衰期后
+    # 只剩三成左右，自然排不进上下文。
+    freshness_multiplier = 0.22 + (0.78 * lifecycle.decay_factor)
+    # salience 和 importance 是同一个数时只算一次，不重复加分。
+    salience_bonus = 0.0 if lifecycle.salience_is_copy else lifecycle.salience * 0.12 * (
+        0.35 + 0.65 * lifecycle.decay_factor
+    )
     reinforcement_bonus = min(0.12, lifecycle.reinforcement * 0.12)
     return max(0.0, (float(base_score) * freshness_multiplier) + salience_bonus + reinforcement_bonus)
 
@@ -154,6 +224,9 @@ __all__ = [
     "HALF_LIFE_DAYS",
     "LifecycleScore",
     "NON_RETRIEVABLE_STATUSES",
+    "OPEN_LOOP_DEFAULT_TTL",
     "apply_lifecycle_score",
     "evaluate_memory_lifecycle",
+    "is_open_loop_candidate",
+    "open_loop_expired",
 ]

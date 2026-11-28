@@ -91,7 +91,7 @@ async def test_hidden_matches_do_not_starve_authorized_candidate(service, ctx):
 
 @pytest.mark.parametrize("changes", [
     {"metadata": {"owner_bot_id": "another-bot"}}, {"metadata": {"platform": "other"}},
-    {"metadata": {"persona_id": ""}}, {"metadata": {"persona_id": "other-persona"}},
+    {"metadata": {"persona_id": "other-persona"}},
     {"metadata": {"participant_user_id": "other"}}, {"object_id": "other"},
     {"subject_id": "other"}, {"scope": "group"}, {"session_id": "qq:FriendMessage:other"},
     {"event_type": "summary"},
@@ -101,6 +101,14 @@ async def test_search_excludes_wrong_source_ownership(service, ctx, changes):
     result = await sources(service, terms=["无糖拿铁"])
     assert result["ok"] and not result["sources"]
     assert hidden not in str(result)
+
+
+async def test_search_keeps_legacy_rows_without_a_persona(service, ctx):
+    target = await add_row(service, ctx, metadata={"persona_id": ""})
+
+    result = await sources(service, terms=["无糖拿铁"])
+
+    assert refs(result) == [target]
 
 
 async def test_range_pages_use_absolute_time_and_stable_ties_without_duplicates(service, ctx):

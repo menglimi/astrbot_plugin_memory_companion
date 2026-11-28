@@ -6,10 +6,12 @@ import copy
 import json
 import hashlib
 import inspect
-import logging
 import mimetypes
 import re
+import sqlite3
+import secrets
 import sys
+import time
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -23,13 +25,18 @@ try:
 except Exception:  # pragma: no cover - optional in isolated page tests.
     astrbot_web_request = None
 
+from .core.astrbot_compat import logger
 from .core.bridge import serialize_memory
 from .core.capability_probe import CAPABILITY_SNAPSHOT_FIELDS
 from .core.coordination_status import build_coordination_status, project_p6_status
 from .core.identity import normalize_session_context_fields, parse_scope_from_session
 from .core.local_time import local_tz
 from .core.memory_atom import DURABILITY_LEVELS, SENSITIVITY_LEVELS, VALIDITY_STATUSES
+from .core.absorb import ADDRESS_MAX_CHARS, NOTE_MAX_CHARS, RELATION_MAX_CHARS
 from .core.models import SessionContext, clean_text
+from .core.operations import persist_runtime_config
+from .core.person_weight import clamp_weight
+from .core.store import MemoryStoreUnavailableError
 from .companion_page_bridge import (
     COMPANION_PLUGIN_ID,
     CompanionPageBridge,
@@ -41,7 +48,26 @@ from .companion_page_bridge import (
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
 PAGE_API_PREFIXES = (f"/{PLUGIN_NAME}/page",)
 
-logger = logging.getLogger("MemoryCompanion.PageAPI")
+# Windows 绝对路径（盘符或 UNC）：非 Windows 平台上必须显式拒绝，
+# 否则 Path() 会把它当成普通相对路径拼到当前目录下。
+_WINDOWS_ABSOLUTE_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+
+
+def _split_capture_keywords(raw: Any) -> list[str]:
+    """把 schema 里的字符串关键词（逗号/分号/空格分隔）拆成列表，兼容历史 list 值。"""
+
+    if isinstance(raw, str):
+        items: list[Any] = re.split(r"[,，;；\s]+", raw)
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        return []
+    keywords: list[str] = []
+    for item in items:
+        text = clean_text(item, 40)
+        if text and text not in keywords:
+            keywords.append(text)
+    return keywords
 
 # 响应字段归属契约：端点 → 页面允许读取、且后端保证提供的业务字段。
 # 沿用 core/capability_probe.py 的白名单范式：契约之外的字段不构成页面接口，
@@ -135,7 +161,10 @@ UI_VIEW_ENDPOINTS = {
         "/retrieval/config/update",
         "/operations/diagnostics",
         "/operations/preset",
+        "/performance/tuning",
         "/maintenance",
+        "/maintenance/db_health",
+        "/maintenance/db_optimize",
         "/maintenance/audit/preview",
         "/maintenance/audit/status",
         "/maintenance/audit/apply",
@@ -195,6 +224,10 @@ MEMORY_VISIBILITY_FILTERS = {
     "restricted": ("restricted", "internal"),
 }
 UI_ENDPOINT_EXPOSURE = {
+    "/maintenance/summary_admission": {"exposure": "advanced", "reason": "管理员通过受保护的维护入口暂停、限量试跑或恢复记忆整理"},
+    "/maintenance/db_health": {"exposure": "visible", "reason": "管理员在维护与迁移面板查看数据库体积、向量精度分布与索引体检状态"},
+    "/maintenance/db_optimize": {"exposure": "visible", "reason": "管理员在维护与迁移面板执行一键数据库瘦身、旧向量精度转码与回收"},
+    "/performance/tuning": {"exposure": "visible", "reason": "在性能调优面板选择性能档位并微调数据库与检索性能参数"},
     "/ui/capabilities": {"exposure": "internal", "reason": "前端启动时用于自校验，不作为业务按钮"},
     "/memory/visibility": {"exposure": "compat", "reason": "由统一 memory/update 表单覆盖"},
     "/memory/lifecycle": {"exposure": "compat", "reason": "由统一 memory/update 表单覆盖"},
@@ -228,6 +261,16 @@ UI_ENDPOINT_EXPOSURE = {
     "/portrait/profiles": {"exposure": "compat", "reason": "统一画像档案列表，面板改用 /memories 的画像分类筛选，保留兼容读取"},
     "/portrait/profile": {"exposure": "compat", "reason": "统一画像单档详情，面板改用 /memories 的画像分类筛选，保留兼容读取"},
     "/portrait/govern": {"exposure": "advanced", "reason": "统一画像治理是危险操作，面板不提供按钮，保留管理员直连"},
+    # 2.5.0 以人为主的新面板（people.html）专用端点：由人物面板首屏调用，
+    # 不进入旧控制台视图，因此在这里登记用途，避免“后端有路由但没有消费方”。
+    "/people": {"exposure": "internal", "reason": "人物面板首屏「她记得的人」目录，由 people.html 调用"},
+    "/person": {"exposure": "internal", "reason": "人物面板单人详情，由 people.html 点开卡片时调用"},
+    "/person/weight": {"exposure": "internal", "reason": "人物面板里改称呼/关系/分量，由 people.html 的编辑表单调用"},
+    "/person/erase": {"exposure": "internal", "reason": "人物面板「擦掉这个人的一切」，由 people.html 二次确认后调用"},
+    # 2.6.0 页面安全基线：两个端点由 app.js/people.js 在每次写操作前自动调用，
+    # 不对应任何按钮，因此登记为 internal。
+    "/ui/csrf": {"exposure": "internal", "reason": "写操作前由前端取 CSRF 令牌，用户不可见"},
+    "/ui/confirm-nonce": {"exposure": "internal", "reason": "危险操作前由前端换取一次性确认 nonce，用户不可见"},
 }
 UI_DANGEROUS_ENDPOINTS = frozenset(
     {
@@ -241,8 +284,163 @@ UI_DANGEROUS_ENDPOINTS = frozenset(
         "/maintenance/clear_all",
         "/maintenance/clear_scope",
         "/import/livingmemory/run",
+        # 2.6.0 安全整改：改分量与擦除一个人都不可撤销，统一走确认与审计。
+        "/person/weight",
+        "/person/erase",
+        # P8：配置写入可以改 visibility / bridge 闸门这类安全键，必须走确认与审计。
+        "/config/module/update",
     }
 )
+
+# 危险端点为什么危险——审计日志与 /ui/capabilities 都要给人话解释。
+UI_DANGEROUS_REASONS = {
+    "/memory/delete": "删除单条记忆，不可撤销",
+    "/core-memory/delete": "删除核心记忆块，不可撤销",
+    "/portrait/govern": "改写统一画像，影响她对这个人的长期判断",
+    "/maintenance/audit/apply": "应用审计批次，会批量改写记忆",
+    "/maintenance/audit/rollback": "回滚审计批次，会批量改写记忆",
+    "/data/import/run": "导入便携数据，会写入记忆库",
+    "/conversation-import/rollback": "回滚历史对话导入，会删除已生成的记忆",
+    "/maintenance/clear_all": "清空全部记忆数据，不可撤销",
+    "/maintenance/clear_scope": "按范围清空记忆数据，不可撤销",
+    "/import/livingmemory/run": "执行 LivingMemory 迁移，会写入记忆库",
+    "/person/weight": "改一个人在她心里的分量与称呼，属于人工判断写入",
+    "/person/erase": "擦掉一个人的全部分量、档案与相关记忆，不可撤销",
+    "/config/module/update": "写插件配置，可改可见性与桥接闸门等安全键",
+}
+
+# 只读端点：不修改任何持久数据（方法可以是 GET，也可以是 POST 查询）。
+UI_READ_ENDPOINTS = frozenset(
+    {
+        "/ui/capabilities",
+        "/ui/csrf",
+        "/ui-preferences",
+        "/stats",
+        "/bots",
+        "/people",
+        "/person",
+        "/buckets",
+        "/memories",
+        "/memory",
+        "/core-memory",
+        "/acl",
+        "/acl/matrix",
+        "/search",
+        "/timeline",
+        "/relations",
+        "/graph",
+        "/threads",
+        "/logs",
+        "/context/config",
+        "/config/schema",
+        "/operations/diagnostics",
+        "/emotion/trace",
+        "/emotion/traces",
+        "/coordination/status",
+        "/data/export",
+        "/data/import/preview",
+        "/conversation-import/qq/capabilities",
+        "/conversation-import/qq/preview",
+        "/conversation-import/status",
+        "/conversation-import/targets",
+        "/profiles",
+        "/user-memory-summary",
+        "/portrait/profiles",
+        "/portrait/profile",
+        "/capabilities/bot-personal",
+        "/companion/personal-memory",
+        "/companion/personal-photo",
+        "/companion/personal-photo-data",
+        "/maintenance/audit/preview",
+        "/maintenance/audit/status",
+        "/maintenance/summary_batches",
+        "/maintenance/summary_status",
+        "/maintenance/db_health",
+        "/import/livingmemory/preview",
+        "/persona-state",
+        # 双方法路由：GET 只读状态，POST 才落盘，按请求方法分档。
+        "/operations/preset",
+        "/performance/tuning",
+        "/maintenance/sleep",
+    }
+)
+
+# 会改数据的端点（危险端点之外）。GET 一律不允许出现在这些路由上。
+UI_WRITE_ENDPOINTS = frozenset(
+    {
+        "/ui/confirm-nonce",
+        "/memory/update",
+        "/memory/rebind-owner",
+        "/memory/visibility",
+        "/memory/lifecycle",
+        "/core-memory/upsert",
+        "/acl/upsert",
+        "/acl/policy",
+        "/acl/delete",
+        "/thread/status",
+        "/config/module/update",
+        "/retrieval/config/update",
+        "/conversation-import/upload",
+        "/conversation-import/start",
+        "/conversation-import/pause",
+        "/conversation-import/resume",
+        "/conversation-import/rebind",
+        "/portrait/migration",
+        "/maintenance",
+        "/maintenance/repair_livingmemory_content",
+        "/maintenance/release_summary_batch",
+        "/maintenance/release_summary_batches",
+        "/maintenance/summary_admission",
+        "/maintenance/db_optimize",
+        "/ui-preferences/save",
+        # 双方法路由的写分支（GET 分支只读，见 UI_READ_ENDPOINTS）。
+        "/operations/preset",
+        "/performance/tuning",
+        "/maintenance/sleep",
+    }
+)
+
+# 危险端点的 confirm 约定：删除类 "DELETE:<target_id>"、清空类 "CLEAR:<scope>"、
+# 擦人类 "ERASE:<user_id>"，其余 "CONFIRM:<route>"。
+UI_CONFIRMATION_RULES = {
+    "/memory/delete": ("DELETE", ("id",)),
+    "/core-memory/delete": ("DELETE", ("id",)),
+    "/person/erase": ("ERASE", ("user_id",)),
+    "/maintenance/clear_all": ("CLEAR_ALL", ()),
+    "/maintenance/clear_scope": ("CLEAR", ("target_type", "type", "scope")),
+}
+UI_CONFIRM_PREFIX = "CONFIRM"
+
+PAGE_ACCESS_LOG_NAME = "page_access.log"
+PAGE_ACCESS_LOG_ROTATE_BYTES = 1024 * 1024
+AUDIT_CONFIRM_TEXT = "确认"
+
+# P13：写操作要求 CSRF 令牌。会话建立时由 GET /ui/csrf 下发，服务端内存校验，短 TTL。
+UI_CSRF_HEADER = "X-CSRF-Token"
+UI_CSRF_TTL_SECONDS = 900
+# P9：危险操作的确认串改为一次性 nonce（服务端签发、短 TTL、用后作废）。
+UI_CONFIRM_NONCE_TTL_SECONDS = 120
+UI_CONFIRM_NONCE_HEX_CHARS = 24
+
+# P8：安全键白名单。这些键决定谁能看到什么、外部插件能不能写进来，
+# 面板的 /config/module/update 一律不允许修改——要改只能手工编辑插件配置，
+# 由部署者自己承担；面板只保留非安全键的日常调整能力。
+UI_PROTECTED_CONFIG_KEYS = frozenset(
+    {
+        "visibility.allow_self_timeline_everywhere",
+        "visibility.allow_group_public_in_private",
+        "visibility.enable_acl_rules",
+        "visibility.hide_pending_review",
+        "private_companion_bridge.accept_external_records",
+        "private_companion_bridge.enable_p5_b1_recall_gate",
+        "private_companion_bridge.enable_p5_b1_bridge_gate",
+        "maintenance.backup_before_import",
+    }
+)
+# 整个模块按安全模块处理：只允许改与鉴权无关的键。
+UI_PROTECTED_CONFIG_MODULES = frozenset({"visibility"})
+# 键名里出现这些词一律视为凭据类配置，面板不得写入。
+UI_PROTECTED_CONFIG_TOKENS = ("secret", "password", "passwd", "token", "api_key", "apikey", "credential")
 
 
 class PluginPageApi:
@@ -257,12 +455,29 @@ class PluginPageApi:
                 self._emotion_page_admin_capability = binder(self)
             except Exception:
                 self._emotion_page_admin_capability = None
+        # P13/P9：CSRF 令牌与一次性确认 nonce 只活在内存里，进程重启即全部失效。
+        self._csrf_tokens: dict[str, float] = {}
+        self._confirm_nonces: dict[str, tuple[str, str, float]] = {}
+        # A6：记下真正挂到宿主上的路由，卸载时尽力摘除（宿主不支持时靠入口快速失败兜底）。
+        self._registered_routes: list[str] = []
+        self._unregistered = False
+        self._terminate_hook_installed = False
 
     def _route_specs(self) -> list[tuple[str, Any, list[str], str]]:
         return [
             ("/ui/capabilities", self.ui_capabilities, ["GET"], "MemoryCompanion UI capability contract"),
             ("/ui-preferences", self.ui_preferences, ["GET"], "MemoryCompanion UI preferences"),
+            (
+                "/ui-preferences/save",
+                self.ui_preferences_save,
+                ["POST"],
+                "MemoryCompanion UI preferences write",
+            ),
             ("/stats", self.stats, ["GET"], "MemoryCompanion Page stats"),
+            ("/people", self.people, ["GET"], "MemoryCompanion people panel cards"),
+            ("/person", self.person, ["GET"], "MemoryCompanion people panel person detail"),
+            ("/person/weight", self.person_weight_update, ["POST"], "MemoryCompanion people panel person weight update"),
+            ("/person/erase", self.person_erase, ["POST"], "MemoryCompanion people panel erase one person"),
             ("/buckets", self.buckets, ["GET"], "MemoryCompanion Page buckets"),
             ("/memories", self.memories, ["GET"], "MemoryCompanion Page memories"),
             ("/memory", self.memory_detail, ["GET"], "MemoryCompanion Page memory detail"),
@@ -294,6 +509,7 @@ class PluginPageApi:
             ("/emotion/traces", self.emotion_traces, ["GET"], "MemoryCompanion redacted emotion trace list"),
             ("/coordination/status", self.coordination_status, ["GET"], "MemoryCompanion safe coordination status"),
             ("/operations/preset", self.operations_preset, ["GET", "POST"], "MemoryCompanion operations preset"),
+            ("/performance/tuning", self.performance_tuning, ["GET", "POST"], "MemoryCompanion performance tuning profiles"),
             ("/data/export", self.data_export, ["POST"], "MemoryCompanion portable data export"),
             ("/data/import/preview", self.data_import_preview, ["GET"], "MemoryCompanion portable data preview"),
             ("/data/import/run", self.data_import_run, ["POST"], "MemoryCompanion portable data import"),
@@ -307,6 +523,7 @@ class PluginPageApi:
             ("/conversation-import/resume", self.conversation_import_resume, ["POST"], "MemoryCompanion historical chat resume"),
             ("/conversation-import/rebind", self.conversation_import_rebind, ["POST"], "MemoryCompanion historical chat rebind"),
             ("/conversation-import/rollback", self.conversation_import_rollback, ["POST"], "MemoryCompanion historical chat rollback"),
+            ("/bots", self.bots, ["GET"], "MemoryCompanion bot memory owners"),
             ("/profiles", self.profiles, ["GET"], "MemoryCompanion Bot Profiles"),
             ("/user-memory-summary", self.user_memory_summary, ["GET"], "MemoryCompanion User Memory workspace summary"),
             ("/portrait/profiles", self.portrait_profiles, ["GET"], "MemoryCompanion unified portrait profiles"),
@@ -328,18 +545,534 @@ class PluginPageApi:
             ("/maintenance/clear_scope", self.clear_scope, ["POST"], "MemoryCompanion Page clear scoped memory data"),
             ("/maintenance/release_summary_batch", self.release_summary_batch, ["POST"], "MemoryCompanion Page release quarantined summary batch"),
             ("/maintenance/summary_batches", self.summary_batches, ["GET"], "MemoryCompanion Page list quarantined summary batches"),
+            ("/maintenance/summary_status", self.summary_status, ["GET"], "MemoryCompanion Page read-only recovery waits"),
+            ("/maintenance/summary_admission", self.summary_admission, ["POST"], "MemoryCompanion Page control summary admission"),
+            ("/maintenance/db_health", self.db_health, ["GET"], "MemoryCompanion Page database health snapshot"),
+            ("/maintenance/db_optimize", self.db_optimize, ["POST"], "MemoryCompanion Page database shrink and optimize"),
             ("/maintenance/release_summary_batches", self.release_summary_batches, ["POST"], "MemoryCompanion Page bulk release quarantined summary batches"),
             ("/import/livingmemory/preview", self.import_preview, ["GET"], "MemoryCompanion Page import preview"),
             ("/import/livingmemory/run", self.import_run, ["POST"], "MemoryCompanion Page import run"),
             ("/persona-state", self.persona_state, ["GET"], "MemoryCompanion Page persona state"),
             ("/acl/matrix", self.acl_matrix, ["GET"], "MemoryCompanion Page ACL matrix"),
+            ("/ui/csrf", self.ui_csrf, ["GET"], "MemoryCompanion UI CSRF token"),
+            ("/ui/confirm-nonce", self.ui_confirm_nonce, ["POST"], "MemoryCompanion one-time confirmation nonce"),
         ]
 
     def register_routes(self) -> None:
         register = self.plugin.context.register_web_api
+        self._registered_routes = []
         for prefix in PAGE_API_PREFIXES:
             for route, handler, methods, desc in self._route_specs():
-                register(f"{prefix}{route}", handler, methods, desc)
+                # 2.6.0：统一在挂载处包一层授权/确认/审计。保持 _route_specs 的
+                # 字面量元组结构不变，既有的 AST 契约测试与直调 handler 的测试
+                # 都不受影响；只有真正经 Web API 进来的请求会经过这一层。
+                path = f"{prefix}{route}"
+                register(
+                    path,
+                    self._wrap_route(route, handler),
+                    methods,
+                    desc,
+                )
+                self._registered_routes.append(path)
+        self._install_terminate_hook()
+
+    def _install_terminate_hook(self) -> None:
+        """A6：把页面 API 的清理挂到插件 terminate 上（宿主不会替我们清）。
+
+        AstrBot 的 PluginManager._unbind_plugin 只解除事件/指令绑定，不回收
+        register_web_api 注册的路由（宿主 context.py:126 与 :723-727），所以
+        插件侧只能尽力而为：terminate 时先摘路由、清令牌，再走原 terminate。
+        宿主没有反注册接口时，_wrap_route 里的 terminated 快速失败仍然是兜底。
+        """
+        if getattr(self, "_terminate_hook_installed", False):
+            return
+        original = getattr(self.plugin, "terminate", None)
+        if not callable(original):
+            return
+        api = self
+
+        async def terminate_with_page_cleanup(*args: Any, **kwargs: Any):
+            try:
+                api.unregister_routes()
+            except Exception as exc:  # pragma: no cover - 清理失败不能挡住卸载
+                logger.warning("页面路由清理失败: %s", exc)
+            return await original(*args, **kwargs)
+
+        try:
+            setattr(self.plugin, "terminate", terminate_with_page_cleanup)
+        except Exception:  # pragma: no cover - 实例不允许赋值时放弃
+            return
+        self._terminate_hook_installed = True
+
+    def unregister_routes(self) -> None:
+        """Best-effort 反注册：摘掉本插件的 /page 路由并丢弃内存中的令牌。
+
+        幂等：重复调用只做一次。宿主没有提供反注册 API 时返回已摘除数量 0，
+        由 _wrap_route 的 terminated 分支继续兜底（见 _install_terminate_hook）。
+        """
+        if getattr(self, "_unregistered", False):
+            return
+        self._unregistered = True
+        self._csrf_tokens.clear()
+        self._confirm_nonces.clear()
+        context = getattr(self.plugin, "context", None)
+        removed = 0
+        for path in list(getattr(self, "_registered_routes", [])):
+            for attribute in ("unregister_web_api", "remove_web_api", "unregister_route"):
+                remover = getattr(context, attribute, None)
+                if not callable(remover):
+                    continue
+                try:
+                    remover(path)
+                    removed += 1
+                except Exception as exc:  # pragma: no cover - 宿主实现差异
+                    logger.warning("反注册页面路由 %s 失败: %s", path, exc)
+                break
+        self._registered_routes = []
+        if removed:
+            logger.info("已从宿主摘除 %s 条页面路由", removed)
+        else:
+            logger.warning("宿主未提供页面路由反注册接口，只能依赖 terminated 快速失败")
+
+
+    # ---- 2.6.0 面板授权、确认与访问审计 ---------------------------------
+    def _endpoint_policy(self, route: str, method: str = "") -> dict[str, str]:
+        """给路由分档：read 只读 / write 会改数据 / dangerous 需确认。
+
+        未登记的路由按 dangerous 处理（fail closed）：新增路由忘了分类时，
+        宁可要求确认并打日志，也不能默认放行写入。
+        """
+        verb = (method or "").upper()
+        if route in UI_DANGEROUS_ENDPOINTS:
+            return {
+                "policy": "dangerous",
+                "reason": UI_DANGEROUS_REASONS.get(route, "危险操作，需要确认"),
+            }
+        if verb and verb != "GET" and route in UI_WRITE_ENDPOINTS:
+            return {"policy": "write", "reason": "会修改持久数据"}
+        if route in UI_READ_ENDPOINTS:
+            return {"policy": "read", "reason": "只读查询"}
+        if route in UI_WRITE_ENDPOINTS:
+            return {"policy": "write", "reason": "会修改持久数据"}
+        logger.warning("页面路由 %s 未登记权限档位，按 dangerous 处理", route)
+        return {
+            "policy": "dangerous",
+            "reason": "未登记的路由默认按危险操作处理",
+        }
+
+    def _expected_confirmation(
+        self, route: str, payload: dict[str, Any]
+    ) -> tuple[str, str]:
+        """返回 (期望的 confirm 文本, 供审计的目标标识)。"""
+        rule = UI_CONFIRMATION_RULES.get(route)
+        if rule is None:
+            return f"{UI_CONFIRM_PREFIX}:{route}", ""
+        kind, keys = rule
+        if kind == "CLEAR_ALL":
+            return "CLEAR:all", "all"
+        value = ""
+        for key in keys:
+            value = clean_text(payload.get(key), 160)
+            if value:
+                break
+        if not value:
+            return "", ""
+        if kind == "DELETE":
+            return f"DELETE:{value}", value
+        if kind == "ERASE":
+            return f"ERASE:{value}", value
+        return f"CLEAR:{value}", value
+
+    def _confirmation_required_response(self, route: str):
+        body = {
+            "success": False,
+            "status": "error",
+            "error": "confirm_required",
+            "message": "这个操作需要确认：请在面板里重新操作一次（confirm 缺失或不匹配）。",
+            "route": route,
+        }
+        response = jsonify(body)
+        response.status_code = 400
+        return response
+
+    @staticmethod
+    def _csrf_required_response():
+        response = jsonify(
+            {
+                "success": False,
+                "status": "error",
+                "error": "csrf_required",
+                "message": "写操作需要 CSRF 令牌：请先 GET /ui/csrf 获取，再放进 X-CSRF-Token 头。",
+            }
+        )
+        response.status_code = 403
+        return response
+
+    @staticmethod
+    def _admin_required_response():
+        response = jsonify(
+            {
+                "success": False,
+                "status": "error",
+                "error": "admin_required",
+                "message": "这个操作只允许 AstrBot 面板的管理员账号执行。",
+            }
+        )
+        response.status_code = 403
+        return response
+
+    def _prune_csrf_tokens(self) -> None:
+        now = time.monotonic()
+        for token, expires_at in list(self._csrf_tokens.items()):
+            if expires_at < now:
+                self._csrf_tokens.pop(token, None)
+
+    def _issue_csrf_token(self) -> tuple[str, int]:
+        self._prune_csrf_tokens()
+        token = secrets.token_urlsafe(24)
+        self._csrf_tokens[token] = time.monotonic() + UI_CSRF_TTL_SECONDS
+        return token, UI_CSRF_TTL_SECONDS
+
+    @staticmethod
+    def _request_header(name: str) -> str:
+        headers = getattr(request, "headers", None)
+        if headers is None:
+            return ""
+        try:
+            value = headers.get(name)
+            if not value:
+                value = headers.get(name.lower())
+        except Exception:
+            return ""
+        return clean_text(value, 300)
+
+    def _request_csrf_token(self, payload: dict[str, Any]) -> str:
+        """令牌优先取请求头；桥接通道无法加头时退化为 body 字段。"""
+        token = self._request_header(UI_CSRF_HEADER)
+        if token:
+            return token
+        return clean_text(payload.get("csrf_token"), 200)
+
+    def _is_browser_context(self) -> bool:
+        """浏览器发起的请求一定带 Origin 或 Referer；命令行/桥接调用通常没有。
+
+        测试与本地脚本的请求桩没有 headers 属性，按非浏览器上下文处理——
+        CSRF 保护的是被浏览器自动带上凭据的请求，非浏览器客户端不属于这个面。
+        """
+        headers = getattr(request, "headers", None)
+        if headers is None:
+            return False
+        for name in ("Origin", "Referer"):
+            if self._request_header(name):
+                return True
+        return False
+
+    def _require_csrf(self, payload: dict[str, Any]):
+        """写档的统一 CSRF 关口：返回响应表示拒绝，返回 None 表示放行。"""
+        token = self._request_csrf_token(payload)
+        if token:
+            self._prune_csrf_tokens()
+            expires_at = self._csrf_tokens.get(token)
+            if expires_at is not None and expires_at >= time.monotonic():
+                return None
+            return self._csrf_required_response()
+        if self._is_browser_context():
+            return self._csrf_required_response()
+        return None
+
+    def _dashboard_admin_state(self) -> str:
+        """返回 allowed / denied / unavailable。
+
+        allowed：宿主注入的面板用户就是配置里的 dashboard.username。
+        denied：宿主注入了一个用户但不是管理员。
+        unavailable：宿主没有注入用户（命令行/测试）或没配置管理员账号——
+        这时不能把所有人挡在门外，保持原有可用性并打 warning。
+        """
+        bound_request = astrbot_web_request
+        if bound_request is None:
+            return "unavailable"
+        try:
+            username = clean_text(bound_request.username, 160)
+        except Exception:
+            return "unavailable"
+        context = getattr(self.plugin, "context", None)
+        config_getter = getattr(context, "get_config", None)
+        if not callable(config_getter):
+            return "unavailable"
+        try:
+            config = config_getter()
+        except Exception:
+            return "unavailable"
+        dashboard = config.get("dashboard") if isinstance(config, dict) else None
+        expected_username = clean_text(
+            dashboard.get("username") if isinstance(dashboard, dict) else "",
+            160,
+        )
+        if not expected_username:
+            return "unavailable"
+        if username and username == expected_username:
+            return "allowed"
+        return "denied"
+
+    def _require_dashboard_admin(self, route: str, method: str):
+        """写档的统一管理员关口（P7/P9/P10/P13）。"""
+        state = self._dashboard_admin_state()
+        if state == "allowed":
+            return None
+        if state == "denied":
+            return self._admin_required_response()
+        logger.warning(
+            "页面写路由 %s %s 无法校验面板管理员身份，按未启用面板鉴权放行",
+            method,
+            route,
+        )
+        return None
+
+    def _prune_confirm_nonces(self) -> None:
+        now = time.monotonic()
+        for nonce, record in list(self._confirm_nonces.items()):
+            if record[2] < now:
+                self._confirm_nonces.pop(nonce, None)
+
+    def _issue_confirmation_nonce(
+        self, route: str, payload: dict[str, Any]
+    ) -> tuple[str, int] | None:
+        """为一次危险操作签发一次性确认串：<canonical>:<nonce>。"""
+        expected, _target = self._expected_confirmation(route, payload)
+        if not expected:
+            return None
+        self._prune_confirm_nonces()
+        nonce = secrets.token_hex(UI_CONFIRM_NONCE_HEX_CHARS // 2)
+        self._confirm_nonces[nonce] = (
+            route,
+            expected,
+            time.monotonic() + UI_CONFIRM_NONCE_TTL_SECONDS,
+        )
+        return f"{expected}:{nonce}", UI_CONFIRM_NONCE_TTL_SECONDS
+
+    def _consume_confirmation_nonce(self, route: str, expected: str, provided: str) -> bool:
+        """校验并作废一次性 nonce；路由或确认串不匹配一律拒绝。"""
+        prefix = f"{expected}:"
+        if not provided.startswith(prefix):
+            return False
+        nonce = provided[len(prefix):].strip()
+        if len(nonce) != UI_CONFIRM_NONCE_HEX_CHARS:
+            return False
+        if any(character not in "0123456789abcdef" for character in nonce):
+            return False
+        record = self._confirm_nonces.pop(nonce, None)
+        if record is None:
+            return False
+        recorded_route, recorded_expected, expires_at = record
+        if recorded_route != route or recorded_expected != expected:
+            return False
+        return expires_at >= time.monotonic()
+
+    def _confirmation_text(self, payload: dict[str, Any]) -> str:
+        """剥掉一次性 nonce 后缀，供 handler 内部做直调防护比对。"""
+        text = clean_text(payload.get("confirm"), 200)
+        if ":" not in text:
+            return text
+        head, _separator, tail = text.rpartition(":")
+        if len(tail) == UI_CONFIRM_NONCE_HEX_CHARS and all(
+            character in "0123456789abcdef" for character in tail
+        ):
+            return head
+        return text
+
+    @staticmethod
+    def _is_protected_config_key(module: str, key: str) -> bool:
+        """P8：面板不能改的安全键。"""
+        module_name = clean_text(module, 80)
+        key_name = clean_text(key, 120)
+        if not key_name:
+            return True
+        dotted = f"{module_name}.{key_name}".strip(".")
+        if dotted in UI_PROTECTED_CONFIG_KEYS:
+            return True
+        lowered = key_name.lower()
+        if any(token in lowered for token in UI_PROTECTED_CONFIG_TOKENS):
+            return True
+        if module_name in UI_PROTECTED_CONFIG_MODULES:
+            # visibility 整块都在回答"谁能看到什么"，面板一律只读。
+            return True
+        return False
+    def _require_confirmation(self, route: str, payload: dict[str, Any]):
+        """危险端点的统一关口。返回响应表示拒绝，返回 None 表示放行。
+
+        P9：浏览器上下文必须带一次性 nonce（"<canonical>:<nonce>"），固定确认串
+        只在非浏览器上下文（测试、命令行、本地桥接）继续接受，避免把"公开可推
+        的固定串"当成唯一防线。
+        """
+        expected, _target = self._expected_confirmation(route, payload)
+        if not expected:
+            return self._confirmation_required_response(route)
+        provided = clean_text(payload.get("confirm"), 200)
+        if not provided:
+            return self._confirmation_required_response(route)
+        if provided == expected:
+            if not self._is_browser_context():
+                return None
+            return self._confirmation_required_response(route)
+        if self._consume_confirmation_nonce(route, expected, provided):
+            return None
+        return self._confirmation_required_response(route)
+
+    @staticmethod
+    def _audit_target(payload: dict[str, Any], fallback: str = "") -> str:
+        for key in ("id", "memory_id", "user_id", "batch_id", "group_id",
+                    "entity_id", "session_id", "target_id", "path"):
+            value = clean_text(payload.get(key), 160)
+            if value:
+                return value
+        return clean_text(fallback, 160)
+
+    def _page_data_dir(self) -> Path | None:
+        data_dir = getattr(getattr(self.plugin, "service", None), "data_dir", "")
+        text = str(data_dir or "").strip()
+        if not text:
+            return None
+        return Path(text)
+
+    def _audit_page_access(
+        self,
+        route: str,
+        method: str,
+        policy: str,
+        outcome: str,
+        target: str = "",
+    ) -> None:
+        """每次 /page 请求追加一行 JSON 访问日志；写失败只 warning，不影响业务。"""
+        data_dir = self._page_data_dir()
+        if data_dir is None:
+            return
+        line = json.dumps(
+            {
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "route": route,
+                "method": method,
+                "policy": policy,
+                "outcome": outcome,
+                "target": target,
+            },
+            ensure_ascii=False,
+        )
+        try:
+            data_dir.mkdir(parents=True, exist_ok=True)
+            log_path = data_dir / PAGE_ACCESS_LOG_NAME
+            try:
+                if (
+                    log_path.exists()
+                    and log_path.stat().st_size > PAGE_ACCESS_LOG_ROTATE_BYTES
+                ):
+                    log_path.replace(log_path.with_name(log_path.name + ".1"))
+            except OSError as exc:
+                logger.warning("page_access.log 轮转失败: %s", exc)
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError as exc:
+            logger.warning("page_access.log 写入失败: %s", exc)
+        except Exception as exc:  # pragma: no cover - 审计不能影响业务
+            logger.warning("page_access.log 写入异常: %s", exc)
+
+    def _wrap_route(self, route: str, handler: Any):
+        """所有页面请求的唯一入口：分档 -> 危险确认 -> 执行 -> 审计。"""
+
+        async def guarded(*args: Any, **kwargs: Any):
+            # A6：宿主不能反注册已经挂上的 web api，插件 terminate 之后这些路由仍存在。
+            # 所以入口必须自己快速失败，不能再去碰已经关掉的服务和数据库。
+            if getattr(self.plugin, "terminated", False) or getattr(
+                self, "_unregistered", False
+            ):
+                response = jsonify(
+                    {
+                        "success": False,
+                        "error": "plugin_terminated",
+                        "message": "插件已卸载，页面接口不再提供服务。",
+                    }
+                )
+                response.status_code = 503
+                return response
+            method = str(getattr(request, "method", "GET") or "GET").upper()
+            policy = self._endpoint_policy(route, method)
+            payload: dict[str, Any] = {}
+            target = ""
+            mutating = method != "GET" and policy["policy"] in {"write", "dangerous"}
+            if mutating or policy["policy"] == "dangerous":
+                try:
+                    payload = await self._json()
+                except Exception:
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                target = self._audit_target(payload)
+            if mutating:
+                # P13：写档先过 CSRF；P7/P9/P10：再过管理员身份。
+                rejected = self._require_csrf(payload)
+                if rejected is not None:
+                    self._audit_page_access(
+                        route, method, policy["policy"], "csrf_required", target
+                    )
+                    return rejected
+                rejected = self._require_dashboard_admin(route, method)
+                if rejected is not None:
+                    self._audit_page_access(
+                        route, method, policy["policy"], "admin_required", target
+                    )
+                    return rejected
+            if policy["policy"] == "dangerous":
+                rejected = self._require_confirmation(route, payload)
+                if rejected is not None:
+                    self._audit_page_access(
+                        route, method, policy["policy"], "confirm_required", target
+                    )
+                    return rejected
+            try:
+                response = await handler(*args, **kwargs)
+            except Exception:
+                self._audit_page_access(
+                    route, method, policy["policy"], "exception", target
+                )
+                raise
+            status_code = getattr(response, "status_code", 200) or 200
+            try:
+                outcome = "ok" if int(status_code) < 400 else "error"
+            except (TypeError, ValueError):
+                outcome = "ok"
+            self._audit_page_access(route, method, policy["policy"], outcome, target)
+            return response
+
+        guarded.__name__ = getattr(handler, "__name__", "page_api_handler")
+        guarded.__doc__ = getattr(handler, "__doc__", None)
+        return guarded
+
+    async def ui_csrf(self):
+        """P13：下发短 TTL 的 CSRF 令牌，写操作要带 X-CSRF-Token（或 body.csrf_token）。"""
+        token, expires_in = self._issue_csrf_token()
+        return self._ok(
+            {"token": token, "expires_in": expires_in, "header": UI_CSRF_HEADER}
+        )
+
+    async def ui_confirm_nonce(self):
+        """P9：为一次危险操作签发一次性确认串 <canonical>:<nonce>。
+
+        前端先取 nonce，再把它放进 confirm 字段；服务端校验通过后立刻作废，
+        所以同一个确认串不能重放，也无法从路由名推出来。
+        """
+        payload = await self._json()
+        route = clean_text(payload.get("route"), 200)
+        if not route:
+            return self._err("route is required", 400)
+        if route not in UI_DANGEROUS_ENDPOINTS:
+            return self._err("route does not need a confirmation nonce", 400)
+        inner = payload.get("payload")
+        if not isinstance(inner, dict):
+            inner = {}
+        issued = self._issue_confirmation_nonce(route, inner)
+        if issued is None:
+            return self._err("route cannot be confirmed", 400)
+        confirm, expires_in = issued
+        return self._ok({"confirm": confirm, "expires_in": expires_in})
 
     async def ui_capabilities(self):
         routes = self._route_specs()
@@ -364,6 +1097,7 @@ class PluginPageApi:
                         "reason": UI_ENDPOINT_EXPOSURE.get(path, {}).get("reason", "面板直接功能"),
                         "views": endpoint_views.get(path, []),
                         "dangerous": path in UI_DANGEROUS_ENDPOINTS,
+                        "policy": self._endpoint_policy(path)["policy"],
                     }
                     for path, _handler, methods, description in routes
                 ],
@@ -376,25 +1110,265 @@ class PluginPageApi:
         ``palette`` 必须在这里返回，而不是让面板自己再去读配置：``index.html`` 是在
         跳转**之前**调这个端点的，拿到就能先把 ``data-palette`` 打到 ``<html>`` 上，
         于是配色在第一帧就是对的，不会有「先紫后青」那种闪。
+
+        GET 只读；POST 落盘深色/浅色偏好。浏览器 localStorage 在某些 WebView 里
+        会被清掉，主题偏好因此改存插件数据目录，下次打开仍能恢复。
         """
         config = self.plugin.service.config
-        style = clean_text(config.get("appearance.ui_style", "旧版"), 20).lower()
-        modern = style in {"modern", "new", "新版"}
+        style = clean_text(config.get("appearance.ui_style", "人物"), 20).lower()
+        if style in {"modern", "new", "新版", "cinema", "三维终端", "三维"}:
+            ui_style = "modern"
+        elif style in {"legacy", "console", "classic", "旧版", "控制台"}:
+            ui_style = "legacy"
+        else:
+            ui_style = "people"
         theme_name = str(config.get("appearance.theme", DEFAULT_THEME_NAME))
+        saved = self._read_ui_preferences()
+        dark_mode_saved = isinstance(saved.get("dark_mode"), bool)
+        dark_mode = saved["dark_mode"] if dark_mode_saved else True
         return self._ok(
             {
-                "ui_style": "modern" if modern else "legacy",
+                "ui_style": ui_style,
                 "palette": self._theme_key(theme_name),
                 "theme": theme_name,
+                "dark_mode": bool(dark_mode),
+                "dark_mode_saved": dark_mode_saved,
                 "available_palettes": list(THEME_NAME_TO_KEY.keys()),
             }
         )
+
+    async def ui_preferences_save(self):
+        """落盘深色/浅色偏好。
+
+        单独一个 POST 路由而不是给 ``/ui-preferences`` 加方法：AstrBot 的
+        ``register_web_api`` 只在「路由 + 方法列表完全相同」时替换旧条目，改了方法
+        列表会在重载后留下旧 GET 条目，请求先命中旧 handler 直接 503。
+        """
+        payload = await self._json()
+        dark_mode = payload.get("dark_mode")
+        if not isinstance(dark_mode, bool):
+            return self._err("dark_mode must be a boolean", 400)
+        prefs = self._read_ui_preferences()
+        prefs["dark_mode"] = dark_mode
+        self._write_ui_preferences(prefs)
+        return self._ok({"dark_mode": dark_mode})
+
+    def _ui_preferences_path(self) -> Path | None:
+        data_dir = getattr(self.plugin.service, "data_dir", None)
+        if not data_dir:
+            return None
+        return Path(data_dir) / "ui_preferences.json"
+
+    def _read_ui_preferences(self) -> dict[str, Any]:
+        path = self._ui_preferences_path()
+        if path is None:
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write_ui_preferences(self, prefs: dict[str, Any]) -> None:
+        path = self._ui_preferences_path()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(prefs, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("[MemoryCompanion] 保存面板偏好失败: %s", exc)
+
+    async def people(self):
+        """人物面板：她记得的人。一个人一张卡，带分量和最近记得的事。"""
+        bot_id = clean_text(request.args.get("bot_id", ""), 120)
+        query = clean_text(request.args.get("q", ""), 120)
+        sort = clean_text(request.args.get("sort", "weight"), 20)
+        try:
+            limit = max(1, min(120, int(request.args.get("limit", "24"))))
+        except (TypeError, ValueError):
+            limit = 24
+        try:
+            offset = max(0, int(request.args.get("offset", "0")))
+        except (TypeError, ValueError):
+            offset = 0
+        data = await self.plugin.service.store.list_person_cards(
+            bot_id=bot_id,
+            query=query,
+            limit=limit,
+            offset=offset,
+            sort=sort,
+        )
+        return self._ok(data)
+
+    async def person(self):
+        """人物面板：点开一个人，看档案、分量和她记得的事。"""
+        user_id = clean_text(request.args.get("user_id", ""), 120)
+        if not user_id:
+            return self._err("missing user_id", 400)
+        platform = clean_text(request.args.get("platform", ""), 40)
+        bot_id = clean_text(request.args.get("bot_id", ""), 120)
+        try:
+            limit = max(1, min(400, int(request.args.get("limit", "80"))))
+        except (TypeError, ValueError):
+            limit = 80
+        detail = await self.plugin.service.store.person_panel_detail(
+            user_id=user_id,
+            platform=platform,
+            bot_id=bot_id,
+            limit=limit,
+        )
+        return self._ok(detail)
+
+    async def person_weight_update(self):
+        """人物面板：改称呼、关系，或者干脆纠正她心里的分量。"""
+        payload = await self._json()
+        user_id = clean_text(payload.get("user_id"), 120)
+        if not user_id:
+            return self._err("missing user_id", 400)
+        platform = clean_text(payload.get("platform"), 40)
+        bot_id = clean_text(payload.get("bot_id"), 120)
+        store = self.plugin.service.store
+        raw_weight = payload.get("weight")
+        weight: int | None = None
+        if raw_weight not in (None, ""):
+            weight = self._strict_weight(raw_weight)
+            if weight is None:
+                return self._err("weight 必须是 0-100 的整数", 400)
+        relation_fields: dict[str, str] = {}
+        for key, limit, title in (
+            ("label", RELATION_MAX_CHARS, "关系"),
+            ("address", ADDRESS_MAX_CHARS, "称呼"),
+            ("note", NOTE_MAX_CHARS, "备注"),
+        ):
+            if payload.get(key) is None:
+                continue
+            value, error = self._bounded_payload_text(payload, key, limit, title)
+            if error:
+                return self._err(error, 400)
+            relation_fields[f"relation_{key}"] = value
+        if weight is not None:
+            await store.set_person_weight(
+                user_id=user_id,
+                weight=weight,
+                platform=platform,
+                bot_id=bot_id,
+            )
+        profile_updated = False
+        if relation_fields:
+            profile_updated = await store.set_person_panel_relation(
+                user_id=user_id, platform=platform, fields=relation_fields
+            )
+        detail = await store.person_panel_detail(
+            user_id=user_id,
+            platform=platform,
+            bot_id=bot_id,
+            limit=20,
+        )
+        return self._ok(
+            {
+                "profile_updated": profile_updated,
+                "weight": detail.get("weight"),
+                "person": {
+                    "user_id": user_id,
+                    "display_name": detail.get("display_name"),
+                    "profile": detail.get("profile"),
+                },
+            }
+        )
+
+    async def person_erase(self):
+        """人物面板：擦掉一个人的一切（分量、身份档案、关系与相关记忆）。
+
+        不可撤销，所以只接受 confirm=="ERASE:<user_id>"；真正的删除逻辑在
+        store.erase_person_data，页面层只负责确认与审计。
+        """
+        payload = await self._json()
+        user_id = clean_text(payload.get("user_id"), 120)
+        if not user_id:
+            return self._err("missing user_id", 400)
+        platform = clean_text(payload.get("platform"), 40)
+        bot_id = clean_text(payload.get("bot_id"), 120)
+        store = getattr(getattr(self.plugin, "service", None), "store", None)
+        eraser = getattr(store, "erase_person_data", None)
+        if not callable(eraser):
+            return self._err("store 不支持擦除人物数据", 501)
+        result = await eraser(user_id=user_id, platform=platform, bot_id=bot_id)
+        if not isinstance(result, dict):
+            result = {"ok": bool(result)}
+        if not result.get("ok"):
+            reason = clean_text(result.get("code") or result.get("error") or "unknown", 160)
+            return self._err(f"擦除失败: {reason}", 400)
+        return self._ok({"data": result})
 
     async def stats(self):
         stats = await self.plugin.service.store.stats()
         stats.pop("pending_review", None)
         stats["summary_progress"] = await self.plugin.service.store.summary_progress()
+        drain = getattr(self.plugin.service, "_summary_drain_status", None)
+        if isinstance(drain, dict):
+            stats["summary_drain"] = dict(drain)
         return self._ok({"stats": stats})
+
+
+    async def bots(self):
+        """按 Bot 归属列出记忆条数，并尽量带上人格设定里的名字。"""
+        store = self.plugin.service.store
+        owner_counts_fn = getattr(store, "owner_bot_counts", None)
+        if callable(owner_counts_fn):
+            owners = await owner_counts_fn()
+        else:
+            stats = await store.stats()
+            owners = stats.get("by_owner_bot") or {}
+        persona_name = self._current_persona_name()
+        bots: list[dict[str, Any]] = []
+        for key, count in owners.items():
+            raw_id = "" if key == "<empty>" else clean_text(key, 120)
+            name = ""
+            if raw_id in {"", "self"} and persona_name:
+                name = persona_name
+            bots.append({"id": raw_id, "name": name, "count": int(count or 0)})
+        bots.sort(key=lambda item: item["count"], reverse=True)
+        return self._ok({"bots": bots, "persona": persona_name})
+
+    def _current_persona_name(self) -> str:
+        """读当前默认人格的显示名；拿不到就返回空串，由前端兜底。"""
+        try:
+            manager = getattr(getattr(self.plugin, "context", None), "persona_manager", None)
+        except Exception:
+            manager = None
+        if manager is None:
+            return ""
+        try:
+            default_v3 = getattr(manager, "selected_default_persona_v3", None)
+            if isinstance(default_v3, dict):
+                name = clean_text(default_v3.get("name"), 80)
+                if name:
+                    return name
+        except Exception:
+            pass
+        default_id = ""
+        try:
+            default_id = clean_text(getattr(manager, "default_persona", ""), 80)
+        except Exception:
+            default_id = ""
+        try:
+            for item in getattr(manager, "personas_v3", None) or []:
+                if not isinstance(item, dict):
+                    continue
+                name = clean_text(item.get("name"), 80)
+                if name and (not default_id or name == default_id):
+                    return name
+        except Exception:
+            pass
+        try:
+            for persona in getattr(manager, "personas", None) or []:
+                persona_id = clean_text(getattr(persona, "persona_id", ""), 80)
+                if persona_id and persona_id == default_id and persona_id not in {"default", "系统默认"}:
+                    return persona_id
+        except Exception:
+            pass
+        return ""
 
     async def profiles(self):
         profile = clean_text(request.args.get("profile", ""), 80)
@@ -677,7 +1651,10 @@ class PluginPageApi:
 
     async def operations_preset(self):
         if request.method == "GET":
-            return self._ok({"preset": self.plugin.service.operation_preset_status()})
+            return self._ok({
+                "preset": self.plugin.service.operation_preset_status(),
+                "allowed_import_roots": self._allowed_import_roots_payload(),
+            })
         payload = await self._json()
         try:
             result = self.plugin.service.apply_operation_preset(clean_text(payload.get("preset"), 40))
@@ -687,6 +1664,37 @@ class PluginPageApi:
         except Exception as exc:
             return self._err(f"应用预设失败: {exc}", 500)
 
+    async def performance_tuning(self):
+        """Read or update unified 5-tier performance profile and sparse overrides."""
+        if request.method == "GET":
+            try:
+                snapshot = await self.plugin.service.get_performance_tuning_snapshot()
+                return self._ok({"tuning": snapshot})
+            except Exception as exc:
+                return self._err(f"读取性能调优状态失败: {exc}", 500)
+        if self._dashboard_admin_state() == "denied":
+            return self._admin_required_response()
+        payload = await self._json()
+        raw_profile = payload.get("profile")
+        profile = clean_text(raw_profile, 32) if raw_profile is not None else None
+        raw_overrides = payload.get("overrides")
+        if raw_overrides is not None and not isinstance(raw_overrides, dict):
+            return self._err("overrides 必须是对象", 400)
+        preserve_overrides = bool(payload.get("preserve_overrides", True))
+        reset_overrides = bool(payload.get("reset_overrides", False))
+        try:
+            result = await self.plugin.service.apply_performance_tuning(
+                profile=profile,
+                overrides=raw_overrides,
+                preserve_overrides=preserve_overrides,
+                reset_overrides=reset_overrides,
+            )
+            return self._ok({"tuning": result})
+        except ValueError as exc:
+            return self._err(str(exc), 400)
+        except Exception as exc:
+            return self._err(f"应用性能调优失败: {exc}", 500)
+
     async def data_export(self):
         try:
             return self._ok({"data": await self.plugin.service.export_portable_data()})
@@ -694,9 +1702,9 @@ class PluginPageApi:
             return self._err(f"导出失败: {exc}", 500)
 
     async def data_import_preview(self):
-        path = clean_text(request.args.get("path", ""), 2000)
+        path = self._strip_path_input(request.args.get("path", ""))
         if not path:
-            return self._err("path is required", 400)
+            return self._err("请填写可移植档案路径（path is required）", 400)
         try:
             return self._ok({"data": self.plugin.service.preview_portable_data(path)})
         except (OSError, ValueError) as exc:
@@ -704,9 +1712,9 @@ class PluginPageApi:
 
     async def data_import_run(self):
         payload = await self._json()
-        path = clean_text(payload.get("path"), 2000)
+        path = self._strip_path_input(payload.get("path"))
         if not path:
-            return self._err("path is required", 400)
+            return self._err("请填写可移植档案路径（path is required）", 400)
         try:
             return self._ok({"data": await self.plugin.service.import_portable_data(path)})
         except (OSError, ValueError) as exc:
@@ -1023,9 +2031,27 @@ class PluginPageApi:
         return self._ok({"buckets": buckets})
 
     async def memories(self):
-        limit = self._query_int("limit", 50)
-        query = clean_text(request.args.get("q", ""), 200)
+        # 2.6.0：不做无范围的全量导出。scope 或 entity_id 至少要有一个，
+        # "scope=all" 是面板总览显式声明的通配，不代表缺省放开。
         scope = clean_text(request.args.get("scope", ""), 40)
+        entity_id = clean_text(request.args.get("entity_id", ""), 120)
+        if not scope and not entity_id:
+            return self._err(
+                "missing scope or entity_id：列表查询必须限定范围（scope 或 entity_id），不接受无范围的全量导出。",
+                400,
+            )
+        try:
+            limit = max(1, min(200, int(request.args.get("limit", "50") or "50")))
+        except (TypeError, ValueError):
+            limit = 50
+        try:
+            offset = max(0, int(request.args.get("offset", "0") or "0"))
+        except (TypeError, ValueError):
+            offset = 0
+        query = clean_text(request.args.get("q", ""), 200)
+        raw_owner_bot = clean_text(request.args.get("owner_bot", ""), 120)
+        owner_bot = "" if raw_owner_bot == "__empty__" else raw_owner_bot
+        owner_bot_strict = bool(raw_owner_bot)
         visibility = clean_text(request.args.get("visibility", ""), 40)
         lifecycle = clean_text(request.args.get("lifecycle", ""), 40)
         lifecycle_values = MEMORY_LIFECYCLE_FILTERS.get(lifecycle)
@@ -1034,8 +2060,12 @@ class PluginPageApi:
         memory_types = MEMORY_TYPE_FILTERS.get(requested_type)
         if scope == "profile" and not memory_types:
             memory_types = MEMORY_TYPE_FILTERS["profile"] + MEMORY_TYPE_FILTERS["preference"] + MEMORY_TYPE_FILTERS["relationship"]
+        # "all" 是面板总览显式声明的通配：在传给 store 前归一为空串（不按 scope 过滤），
+        # 与 "profile"/"external" 一样由后续过滤决定实际可见范围。
+        if scope == "all":
+            scope = ""
         records = await self.plugin.service.store.list_memories(
-            limit=max(limit * 2, 50),
+            limit=max(limit * 2, 50) if scope == "external" else limit,
             include_pending=False,
             query=query,
             memory_type="" if memory_types else requested_type,
@@ -1049,7 +2079,10 @@ class PluginPageApi:
             lifecycle_values=lifecycle_values,
             session_id=clean_text(request.args.get("session_id", ""), 200),
             group_id=clean_text(request.args.get("group_id", ""), 120),
-            entity_id=clean_text(request.args.get("entity_id", ""), 120),
+            entity_id=entity_id,
+            offset=offset,
+            owner_bot_id=owner_bot,
+            owner_bot_strict=owner_bot_strict,
         )
         if scope == "external":
             records = [record for record in records if clean_text(getattr(record, "source_plugin", ""), 120) != PLUGIN_NAME]
@@ -1068,7 +2101,9 @@ class PluginPageApi:
         if not record:
             return self._err("memory not found", 404)
         payload = serialize_memory(record)
-        payload["evidence"] = record.evidence
+        # 2.6.0：evidence 原文默认不下发，只有显式 include_evidence=1/true 才带。
+        if self._bool(request.args.get("include_evidence"), False):
+            payload["evidence"] = record.evidence
         payload["metadata"] = record.metadata
         payload["merged_count"] = record.merged_count
         payload["content_fingerprint"] = record.content_fingerprint
@@ -1137,10 +2172,51 @@ class PluginPageApi:
             logger.exception("记忆 Bot 归属修正失败")
             return self._err(f"记忆 Bot 归属修正失败: {exc}", 500)
 
+    @staticmethod
+    def _database_unavailable_message(exc: BaseException) -> str:
+        message = clean_text(exc, 900) or "记忆库暂时无法写入"
+        reason = clean_text(getattr(exc, "reason", ""), 80)
+        if reason and reason not in message:
+            return f"{message}（{reason}）"
+        return message
+
     async def memory_delete(self):
         payload = await self._json()
-        ok = await self.plugin.service.store.delete_memory(clean_text(payload.get("id"), 120))
-        return self._ok({"deleted": ok})
+        memory_id = clean_text(payload.get("id"), 120)
+        if not memory_id:
+            return self._err("missing id", 400)
+        try:
+            ok = await self.plugin.service.store.delete_memory(memory_id)
+        except MemoryStoreUnavailableError as exc:
+            # A bare 500 with no body is what made this look like a random
+            # plugin bug: the memory stayed in place and the panel only said
+            # "Internal server error".  Report what actually blocked the write
+            # and keep the original diagnostic for the operations page.
+            logger.warning(
+                "[MemoryCompanion] 删除记忆时记忆库不可写 id=%s reason=%s 诊断=%s",
+                memory_id,
+                exc.reason or "unknown",
+                json.dumps(exc.diagnostics, ensure_ascii=False),
+            )
+            return self._err(
+                f"删除失败：{self._database_unavailable_message(exc)}",
+                503,
+                extra={
+                    "code": "database_unavailable",
+                    "reason": exc.reason or "database_unavailable",
+                    "detail": exc.diagnostics,
+                },
+            )
+        except sqlite3.Error as exc:
+            logger.exception("[MemoryCompanion] 删除记忆时 SQLite 写入异常 id=%s", memory_id)
+            return self._err(
+                f"删除失败：记忆库写入异常（{clean_text(exc, 300)}），原记忆未被删除",
+                503,
+                extra={"code": "database_error"},
+            )
+        if not ok:
+            return self._err("memory not found", 404)
+        return self._ok({"deleted": bool(ok)})
 
     async def memory_visibility(self):
         payload = await self._json()
@@ -1213,7 +2289,30 @@ class PluginPageApi:
         memory_id = clean_text(payload.get("id"), 120)
         if not memory_id:
             return self._err("missing id", 400)
-        result = await self.plugin.service.delete_core_memory_block(memory_id)
+        try:
+            result = await self.plugin.service.delete_core_memory_block(memory_id)
+        except MemoryStoreUnavailableError as exc:
+            logger.warning(
+                "[MemoryCompanion] 删除核心记忆时记忆库不可写 id=%s reason=%s",
+                memory_id,
+                exc.reason or "unknown",
+            )
+            return self._err(
+                f"删除失败：{self._database_unavailable_message(exc)}",
+                503,
+                extra={
+                    "code": "database_unavailable",
+                    "reason": exc.reason or "database_unavailable",
+                    "detail": exc.diagnostics,
+                },
+            )
+        except sqlite3.Error as exc:
+            logger.exception("[MemoryCompanion] 删除核心记忆时 SQLite 写入异常 id=%s", memory_id)
+            return self._err(
+                f"删除失败：记忆库写入异常（{clean_text(exc, 300)}）",
+                503,
+                extra={"code": "database_error"},
+            )
         if result.get("ok"):
             return self._ok({"deleted": True})
         code = clean_text(result.get("code"), 80) or "core_memory_delete_failed"
@@ -1552,7 +2651,14 @@ class PluginPageApi:
                 },
                 "conversation_memory": {
                     "enabled": config.bool("conversation_memory.enabled", True),
-                    "capture_group_messages": config.bool("conversation_memory.capture_group_messages", True),
+                    "capture_group_messages": config.bool("conversation_memory.capture_group_messages", False),
+                    "capture_private_messages": config.bool("conversation_memory.capture_private_messages", True),
+                    "group_capture_engagement_only": config.bool(
+                        "conversation_memory.group_capture_engagement_only", True
+                    ),
+                    "group_capture_keywords": _split_capture_keywords(
+                        config.get("conversation_memory.group_capture_keywords", "")
+                    ),
                     "idle_gap_minutes": config.int("conversation_memory.idle_gap_minutes", 20),
                     "recent_events_for_followup": config.int("conversation_memory.recent_events_for_followup", 12),
                     "time_window_timeline_limit": config.int("conversation_memory.time_window_timeline_limit", 12),
@@ -1598,14 +2704,14 @@ class PluginPageApi:
                     "rerank_provider_id": str(config.get("retrieval.rerank_provider_id", "") or ""),
                     "rerank_candidate_multiplier": config.int("retrieval.rerank_candidate_multiplier", 5),
                     "rerank_candidate_limit": config.int("retrieval.rerank_candidate_limit", 32),
-                    "rerank_timeout_ms": config.int("retrieval.rerank_timeout_ms", 1200),
+                    "rerank_timeout_ms": config.int("retrieval.rerank_timeout_ms", 2000),
                     "embedding_enabled": config.bool("retrieval.embedding_enabled", False),
                     "embedding_provider_id": str(config.get("retrieval.embedding_provider_id", "") or ""),
                     "embedding_candidate_limit": config.int("retrieval.embedding_candidate_limit", 1200),
                     "embedding_top_k": config.int("retrieval.embedding_top_k", 32),
                     "embedding_score_threshold": config.float("retrieval.embedding_score_threshold", 0.34),
                     "embedding_weight": config.float("retrieval.embedding_weight", 0.55),
-                    "embedding_timeout_ms": config.int("retrieval.embedding_timeout_ms", 5000),
+                    "embedding_timeout_ms": config.int("retrieval.embedding_timeout_ms", 2000),
                     "embedding_max_text_chars": config.int("retrieval.embedding_max_text_chars", 1200),
                     "embedding_backfill_enabled": config.bool("retrieval.embedding_backfill_enabled", True),
                     "embedding_backfill_batch_size": config.int("retrieval.embedding_backfill_batch_size", 50),
@@ -1699,7 +2805,7 @@ class PluginPageApi:
                         "private_companion_bridge.prefer_memory_companion_memory",
                         True,
                     ),
-                    "clean_proactive_history": config.bool("private_companion_bridge.clean_proactive_history", True),
+                    "clean_proactive_history": config.bool("private_companion_bridge.clean_proactive_history", False),
                     "suppress_self_timeline_when_companion_seen": config.bool(
                         "private_companion_bridge.suppress_self_timeline_when_companion_seen",
                         True,
@@ -1768,25 +2874,25 @@ class PluginPageApi:
             "embedding_provider_id": clean_text(payload.get("embedding_provider_id"), 160),
         }
         advanced_values = {
-            "rerank_timeout_ms": max(0, self._int(payload.get("rerank_timeout_ms"), 1200)),
+            "rerank_timeout_ms": max(0, self._int(payload.get("rerank_timeout_ms"), 2000)),
             "embedding_candidate_limit": max(1, self._int(payload.get("embedding_candidate_limit"), 1200)),
             "embedding_top_k": max(1, self._int(payload.get("embedding_top_k"), 32)),
             "embedding_score_threshold": max(0.0, min(1.0, self._float(payload.get("embedding_score_threshold"), 0.34))),
             "embedding_weight": max(0.0, min(2.0, self._float(payload.get("embedding_weight"), 0.55))),
-            "embedding_timeout_ms": max(0, self._int(payload.get("embedding_timeout_ms"), 5000)),
+            "embedding_timeout_ms": max(0, self._int(payload.get("embedding_timeout_ms"), 2000)),
             "embedding_max_text_chars": max(200, self._int(payload.get("embedding_max_text_chars"), 1200)),
             "embedding_backfill_enabled": bool(payload.get("embedding_backfill_enabled", True)),
             "embedding_backfill_batch_size": max(1, self._int(payload.get("embedding_backfill_batch_size"), 50)),
         }
-        raw.setdefault("retrieval", {})
-        if not isinstance(raw["retrieval"], dict):
-            raw["retrieval"] = {}
-        raw["retrieval"].update(core_values)
-        raw.setdefault("retrieval_advanced", {})
-        if not isinstance(raw["retrieval_advanced"], dict):
-            raw["retrieval_advanced"] = {}
-        raw["retrieval_advanced"].update(advanced_values)
-        self._write_plugin_config(raw)
+        retrieval = raw.get("retrieval")
+        retrieval_advanced = raw.get("retrieval_advanced")
+        self._write_plugin_config(
+            {
+                "retrieval": (retrieval if isinstance(retrieval, dict) else {}) | core_values,
+                "retrieval_advanced": (retrieval_advanced if isinstance(retrieval_advanced, dict) else {})
+                | advanced_values,
+            }
+        )
         return self._ok(
             {
                 "retrieval": {
@@ -1860,6 +2966,9 @@ class PluginPageApi:
                 {
                     "schema": schema,
                     "values": self._schema_config_values(schema),
+                    # P8：前端据此把安全键渲染成只读，不再随保存提交。
+                    "protected_keys": sorted(UI_PROTECTED_CONFIG_KEYS),
+                    "protected_modules": sorted(UI_PROTECTED_CONFIG_MODULES),
                     "provider_options": self._provider_options(),
                     "rerank_provider_options": await self._rerank_provider_options(),
                     "embedding_provider_options": await self._embedding_provider_options(),
@@ -1885,15 +2994,61 @@ class PluginPageApi:
         if not isinstance(items, dict):
             return self._err("invalid config module", 400)
 
-        target = raw.setdefault(module, {})
-        if not isinstance(target, dict):
-            target = {}
-            raw[module] = target
+        # P8：安全键（可见性/桥接闸门/凭据类）不允许经面板写入，
+        # 其余键照常保存，避免一次越权请求把整份配置写坏。
+        blocked = sorted(
+            key
+            for key in values
+            if self._is_protected_config_key(module, str(key))
+        )
+        if blocked:
+            return self._err(
+                "protected_config_key: " + ", ".join(blocked[:5]) + " 只能在插件配置文件里手工修改",
+                403,
+            )
+
+        current = raw.get(module)
+        target = dict(current) if isinstance(current, dict) else {}
         for key, item_schema in items.items():
             if key not in values or not isinstance(item_schema, dict):
                 continue
             target[key] = self._coerce_config_value(values.get(key), item_schema)
-        self._write_plugin_config(raw)
+        if module == "performance":
+            from .core.performance_tuning import (
+                SQLITE_SENTINELS,
+                build_performance_config_updates,
+            )
+
+            next_profile = clean_text(target.get("profile"), 32).lower() or None
+            sqlite_overrides: dict[str, Any] = {}
+            for full_key in SQLITE_SENTINELS:
+                field_name = full_key.split(".", 1)[1]
+                if field_name in values:
+                    sqlite_overrides[full_key] = target.get(field_name)
+            try:
+                updated_full, _plan = build_performance_config_updates(
+                    raw,
+                    profile=next_profile,
+                    overrides=sqlite_overrides if sqlite_overrides else None,
+                    preserve_overrides=True,
+                )
+            except ValueError as exc:
+                return self._err(str(exc), 400)
+            changed_sections = {
+                sec: updated_full[sec]
+                for sec in ("performance", "retrieval_advanced", "memory_injection", "maintenance", "startup")
+                if sec in updated_full
+            }
+            self._write_plugin_config(changed_sections)
+        else:
+            self._write_plugin_config({module: target})
+        if module in {"performance", "retrieval_advanced", "memory_injection", "maintenance", "startup"}:
+            refresher = getattr(self.plugin.service, "refresh_performance_tuning", None)
+            if callable(refresher):
+                try:
+                    refresher()
+                except Exception:
+                    pass
         return self._ok(
             {
                 "module": module,
@@ -3115,6 +4270,72 @@ class PluginPageApi:
                 rows.append(f"{window} {cleaned}".strip() if window else cleaned)
         return rows
 
+    async def summary_status(self):
+        if not self._is_bound_dashboard_admin():
+            return self._admin_required_response()
+        return self._ok({"status": await self.plugin.service.summary_recovery_status()})
+
+    async def summary_admission(self):
+        """Operate on the live service through the existing admin/CSRF guard."""
+        if self._dashboard_admin_state() != "allowed":
+            return self._admin_required_response()
+        payload = await self._json()
+        action = payload.get("action")
+        service = self.plugin.service
+        if action == "pause":
+            state = await service.pause_summary_admission()
+        elif action == "trial":
+            # This transport deliberately exposes only the reviewed five-ID
+            # operation, never caller-provided IDs, force or budget overrides.
+            state = await service.run_summary_recovery_trial(limit=5)
+        elif action == "resume":
+            await service.resume_summary_admission()
+            state = service._summary_admission.state
+        else:
+            return self._err("action 必须为 pause（暂停）、trial（最多五批试跑）或 resume（恢复）", 400)
+        return self._ok({"data": {
+            "mode": state["mode"],
+            "selected_batches": len(state.get("batches", [])),
+            "attempted_batches": len(state.get("results", [])),
+            "stop_reason": state.get("stop_reason", ""),
+        }})
+
+    async def db_health(self):
+        """Return read-only database size, vector precision, FTS, and vacuum health."""
+        if not self._is_bound_dashboard_admin():
+            return self._admin_required_response()
+        health = await self.plugin.service.database_health_snapshot()
+        return self._ok({"health": health})
+
+    async def db_optimize(self):
+        """Run one-click database slimming: precision transcode, orphan cleanup, vacuum, optimize."""
+        if self._dashboard_admin_state() != "allowed":
+            return self._admin_required_response()
+        payload = await self._json()
+        raw_precision = clean_text(payload.get("target_precision") or payload.get("vector_precision"), 32).lower()
+        if raw_precision and raw_precision not in {"float32", "float16"}:
+            return self._err("target_precision 必须为 float32 或 float16", 400)
+        transcode_limit = max(0, min(100000, self._int(payload.get("transcode_limit"), 20000)))
+        run_full_vacuum = bool(payload.get("run_full_vacuum", False))
+        result = await self.plugin.service.optimize_and_shrink_database(
+            target_precision=raw_precision,
+            transcode_limit=transcode_limit,
+            run_full_vacuum=run_full_vacuum,
+        )
+        if isinstance(result, dict) and result.get("ok") is False:
+            error_code = str(result.get("error_code") or "db_optimize_failed")
+            status = 409 if error_code == "db_optimize_in_progress" else 400
+            return self._err(
+                str(result.get("error") or "数据库瘦身未能完成"),
+                status,
+                extra={
+                    "error_code": error_code,
+                    "disk_preflight": result.get("disk_preflight"),
+                    "data": result,
+                },
+            )
+        return self._ok({"data": result})
+
     async def maintenance(self):
         result = await self.plugin.service.sleep_maintenance(reason="page_maintenance")
         return self._ok({"data": result})
@@ -3148,9 +4369,10 @@ class PluginPageApi:
     async def audit_apply(self):
         payload = await self._json()
         try:
+            # 面板的 confirm 由 _wrap_route 统一校验；service 只认自己的确认词。
             result = await self.plugin.service.apply_memory_audit(
                 clean_text(payload.get("batch_id"), 80),
-                clean_text(payload.get("confirm"), 20),
+                AUDIT_CONFIRM_TEXT,
             )
         except ValueError as exc:
             return self._err(clean_text(exc, 300), 400)
@@ -3161,7 +4383,7 @@ class PluginPageApi:
         try:
             result = await self.plugin.service.rollback_memory_audit(
                 clean_text(payload.get("batch_id"), 80),
-                clean_text(payload.get("confirm"), 20),
+                AUDIT_CONFIRM_TEXT,
             )
         except ValueError as exc:
             return self._err(clean_text(exc, 300), 400)
@@ -3169,14 +4391,19 @@ class PluginPageApi:
 
     async def repair_livingmemory_content(self):
         payload = await self._json()
+        resolved, error = self._resolve_page_path(payload.get("path"))
+        if error:
+            return self._err(error, 400)
         result = await self.plugin.service.migrator.repair_imported_content(
-            configured_path=clean_text(payload.get("path"), 1000)
+            configured_path=str(resolved) if resolved else ""
         )
         return self._ok({"data": result})
 
     async def clear_all(self):
         payload = await self._json()
-        if clean_text(payload.get("confirm"), 20) != "清空":
+        # 统一确认口径：CLEAR:all（_wrap_route 已校验一次，这里防止直调绕过）。
+        # _confirmation_text 会剥掉一次性 nonce 后缀，直调时传 canonical 串也成立。
+        if self._confirmation_text(payload) != "CLEAR:all":
             return self._err("confirmation mismatch", 400)
         result = await self.plugin.service.clear_all_memory_data()
         return self._ok({"data": result})
@@ -3195,7 +4422,8 @@ class PluginPageApi:
                     user_id=user_id,
                 )
             else:
-                if clean_text(payload.get("confirm"), 20) != "清空":
+                # 统一确认口径：CLEAR:<scope>（_wrap_route 已校验，这里防直调绕过）。
+                if self._confirmation_text(payload) != f"CLEAR:{target_type}":
                     return self._err("confirmation mismatch", 400)
                 result = await self.plugin.service.clear_scoped_memory(
                     target_type=target_type,
@@ -3221,6 +4449,13 @@ class PluginPageApi:
         result = await self.plugin.service.store.release_summary_batch(batch_id, mode=mode)
         if not result.get("ok"):
             return self._err(clean_text(result.get("error"), 120) or "release failed", 400)
+        logger.info(
+            "[MemoryCompanion] 阶段总结批次已释放: batch=%s mode=%s released_events=%s state=%s",
+            batch_id,
+            clean_text(result.get("mode"), 20) or mode,
+            int(result.get("released_events") or 0),
+            clean_text(result.get("state"), 40),
+        )
         return self._ok({"data": result})
 
     async def summary_batches(self):
@@ -3230,12 +4465,16 @@ class PluginPageApi:
         id, so without this read side the freeze was effectively unactionable.
         """
         state = clean_text(request.args.get("state", "quarantined"), 40) or "quarantined"
-        if state != "quarantined":
+        limit = max(1, min(500, self._int(request.args.get("limit"), 50)))
+        offset = max(0, self._int(request.args.get("offset"), 0))
+        if state == "quarantined":
+            result = await self.plugin.service.store.list_quarantined_batches(limit=limit, offset=offset)
+        elif state == "pending":
+            result = await self.plugin.service.store.list_pending_batches(limit=limit, offset=offset)
+        elif state == "processed":
+            result = await self.plugin.service.store.list_processed_batches(limit=limit, offset=offset)
+        else:
             return self._err("unsupported_state", 400)
-        result = await self.plugin.service.store.list_quarantined_batches(
-            limit=max(1, min(500, self._int(request.args.get("limit"), 50))),
-            offset=max(0, self._int(request.args.get("offset"), 0)),
-        )
         return self._ok({"data": result})
 
     async def release_summary_batches(self):
@@ -3262,15 +4501,113 @@ class PluginPageApi:
             return self._err(clean_text(result.get("error"), 120) or "release failed", 400)
         return self._ok({"data": result})
 
+    def _page_allowed_roots(self) -> tuple[Path, ...]:
+        """P4：页面接口允许读取的根目录。
+
+        只允许插件数据目录及其父目录（plugin_data，LivingMemory 的库就在这一层
+        的兄弟插件目录里）。插件自身目录也放进来，便于导入随包样例；其余位置一律
+        拒绝，避免 ?path= 变成任意文件读取/写入。
+        """
+        roots: list[Path] = []
+        data_dir = self._page_data_dir()
+        if data_dir is not None:
+            roots.append(data_dir)
+            roots.append(data_dir.parent)
+        roots.append(Path(__file__).resolve().parent)
+        return tuple(roots)
+
+    @staticmethod
+    def _strip_path_input(raw: Any) -> str:
+        text = clean_text(raw, 1000)
+        while len(text) >= 2 and (
+            (text[0] == text[-1] and text[0] in {'"', "'"})
+            or (text[0] == "“" and text[-1] == "”")
+            or (text[0] == "‘" and text[-1] == "’")
+        ):
+            text = text[1:-1].strip()
+        if text.lower().startswith("file:///"):
+            rest = text[8:]
+            text = rest if _WINDOWS_ABSOLUTE_PATH.match(rest) else ("/" + rest.lstrip("/"))
+        elif text.lower().startswith("file://"):
+            text = text[7:]
+        return text.strip()
+
+    def _allowed_root_display_paths(self) -> list[str]:
+        display: list[str] = []
+        for root in self._page_allowed_roots():
+            try:
+                label = str(root.expanduser().resolve(strict=False))
+            except OSError:
+                continue
+            if label not in display:
+                display.append(label)
+        return display
+
+    def _allowed_import_roots_payload(self) -> dict[str, Any]:
+        data_dir = self._page_data_dir()
+        resolved_data: Path | None = None
+        if data_dir is not None:
+            try:
+                resolved_data = data_dir.expanduser().resolve(strict=False)
+            except OSError:
+                resolved_data = data_dir
+        return {
+            "memory_data_dir": str(resolved_data) if resolved_data is not None else "",
+            "portable_export_dir": str(resolved_data / "exports") if resolved_data is not None else "",
+            "plugin_data_dir": str(resolved_data.parent) if resolved_data is not None else "",
+            "roots": self._allowed_root_display_paths(),
+        }
+
+    def _resolve_page_path(self, raw: Any) -> tuple[Path | None, str]:
+        """把调用方给的路径解析成允许根内的绝对路径。
+
+        返回 (路径, 错误说明)：空输入返回 (None, "")，表示"用插件自己的默认配置"，
+        其余任何越界、含 ".."、解析失败的情况都返回包含允许目录指引的错误说明。
+        """
+        text = self._strip_path_input(raw)
+        if not text:
+            return None, ""
+        allowed_hint = "；".join(self._allowed_root_display_paths()[:2]) or "插件数据目录"
+        if sys.platform != "win32" and _WINDOWS_ABSOLUTE_PATH.match(text):
+            # 非 Windows 平台上 Path("C:\\...") 会被当成相对路径拼到当前目录，
+            # 绕过允许根检查；Windows 绝对路径一律按"逃逸出数据目录"拒绝。
+            return (
+                None,
+                f"路径（path）为 Windows 本地路径，超出当前服务器允许的插件数据目录范围；请先将文件上传到以下目录后重试：{allowed_hint}",
+            )
+        normalized = text.replace(chr(92), "/")
+        if ".." in Path(normalized).parts:
+            return None, "路径（path）不能包含上级目录跳转（..），请填写允许目录内的完整路径"
+        try:
+            resolved = Path(text).expanduser().resolve(strict=False)
+        except OSError as exc:
+            return None, f"路径（path）无法解析：{clean_text(exc, 120)}"
+        for root in self._page_allowed_roots():
+            try:
+                base = root.expanduser().resolve(strict=False)
+            except OSError:
+                continue
+            if resolved == base or base in resolved.parents:
+                return resolved, ""
+        return (
+            None,
+            f"路径（path）超出允许的插件数据目录范围，请将文件放到以下目录后再填写路径：{allowed_hint}",
+        )
+
     async def import_preview(self):
-        configured = clean_text(request.args.get("path", ""), 1000)
-        report = self.plugin.service.migrator.preview(configured)
+        resolved, error = self._resolve_page_path(request.args.get("path", ""))
+        if error:
+            return self._err(error, 400)
+        report = self.plugin.service.migrator.preview(str(resolved) if resolved else "")
         return self._ok({"report": report})
 
     async def import_run(self):
         payload = await self._json()
+        resolved, error = self._resolve_page_path(payload.get("path"))
+        if error:
+            return self._err(error, 400)
         result = await self.plugin.service.import_livingmemory(
-            configured_path=clean_text(payload.get("path"), 1000)
+            configured_path=str(resolved) if resolved else ""
         )
         return self._ok({"data": result})
 
@@ -3294,8 +4631,11 @@ class PluginPageApi:
         return {key: payload[key] for key in fields if key in payload}
 
     @staticmethod
-    def _err(message: str, status: int = 500):
-        response = jsonify({"success": False, "error": message})
+    def _err(message: str, status: int = 500, extra: dict[str, Any] | None = None):
+        body: dict[str, Any] = {"success": False, "error": message}
+        if extra:
+            body.update(extra)
+        response = jsonify(body)
         response.status_code = status
         return response
 
@@ -3303,36 +4643,54 @@ class PluginPageApi:
         payload = await request.get_json(silent=True)
         return payload if isinstance(payload, dict) else {}
 
-    def _write_plugin_config(self, raw: dict[str, Any]) -> None:
-        path = self._plugin_config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        import os
-        import tempfile
-        fd, tmp_path = tempfile.mkstemp(
-            suffix=".tmp",
-            prefix=path.stem,
-            dir=str(path.parent),
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(raw, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, str(path))
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+    @staticmethod
+    def _strict_weight(raw: Any) -> int | None:
+        """0-100 的整数才接受；浮点、布尔、越界与乱码一律拒绝。"""
+        if isinstance(raw, bool):
+            return None
+        if isinstance(raw, int):
+            value = raw
+        elif isinstance(raw, str) and raw.strip().isdigit():
+            value = int(raw.strip())
+        else:
+            return None
+        if value < 0 or value > 100:
+            return None
+        return value
 
-    def _plugin_config_path(self) -> Path:
-        data_dir = Path(getattr(self.plugin.service, "data_dir", ""))
-        root = data_dir.parent.parent if data_dir.parent.name == "plugin_data" else data_dir.parent
-        return root / "config" / f"{PLUGIN_NAME}_config.json"
+    @staticmethod
+    def _bounded_payload_text(
+        payload: dict[str, Any], key: str, limit: int, label: str
+    ) -> tuple[str, str]:
+        """超长不再静默截断：超限直接报错，返回 (文本, 错误信息)。"""
+        raw = payload.get(key)
+        if raw is None:
+            return "", ""
+        if not isinstance(raw, (str, int, float)):
+            return "", f"{label}（{key}）必须是文本"
+        text = str(raw).strip()
+        if len(text) > limit:
+            return "", f"{label}（{key}）最长 {limit} 个字符"
+        return clean_text(text, limit), ""
+
+    def _write_plugin_config(self, updates: dict[str, Any]) -> None:
+        persist_runtime_config(self.plugin.service.config.raw, updates)
 
     def _load_config_schema(self) -> dict[str, Any]:
         path = Path(__file__).with_name("_conf_schema.json")
+        try:
+            stat = path.stat()
+            cache_key = (str(path), stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            cache_key = None
+        cached = getattr(self, "_config_schema_cache", None)
+        if cache_key is not None and isinstance(cached, tuple) and cached[0] == cache_key:
+            return cached[1]
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
+        result = data if isinstance(data, dict) else {}
+        if cache_key is not None:
+            self._config_schema_cache = (cache_key, result)
+        return result
 
     def _schema_config_values(self, schema: dict[str, Any]) -> dict[str, dict[str, Any]]:
         result: dict[str, dict[str, Any]] = {}

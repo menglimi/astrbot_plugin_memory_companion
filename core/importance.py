@@ -1,25 +1,113 @@
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
+from .astrbot_compat import logger
 from .models import MemoryRecord, clean_text
 
 
 class ImportanceEvaluator:
     """Calibrate memory importance around long-term conversational value."""
 
-    version = "persona_dimensions_v5"
+    version = "persona_dimensions_v6"
+    # S6：重要度特征词表外置到 core/lexicon/importance_lexicon.json。代码里不再
+    # 硬编码中文词表与特征权重：词表缺失/损坏时退回「无词表」模式（所有维度
+    # 取中性分），只降级、不抛错，保证老部署仍能正常写入记忆。
+    LEXICON_FILENAME = "importance_lexicon.json"
+    _LEXICON_CACHE: dict[str, Any] | None = None
 
-    def __init__(self, mention_policy_relax: bool = False) -> None:
+    def __init__(
+        self,
+        mention_policy_relax: bool = False,
+        *,
+        lexicon: dict[str, Any] | None = None,
+    ) -> None:
         # mention_policy_relax=False 时行为与历史版本完全一致；
         # 开启后放宽写入侧 mention_policy 的 tone_only 降级（见 _mention_policy）。
         self.mention_policy_relax = mention_policy_relax
+        self.lexicon = lexicon if isinstance(lexicon, dict) and lexicon else self._load_lexicon()
+        self._semantic_base = self._scoring_value("semantic_base", 0.30)
+        self._hit_base = self._scoring_value("hit_base", 0.26)
+        self._hit_step = self._scoring_value("hit_step", 0.16)
+        self._hit_ceiling = self._scoring_value("hit_ceiling", 0.85)
+        # 中性分：词表没命中时给「没有证据」的中性值，而不是 0.0（0.0 等于
+        # 明确判定「不含该维度」，会把词表外的正常记忆一起压到底）。
+        self._neutral_score = self._scoring_value("neutral_score", 0.12)
+        self._marker_ceiling = self._scoring_value("marker_bonus_ceiling", 0.30)
+        self._base_mix = self._evaluate_weight("base_mix", 0.52)
+        self._semantic_mix = self._evaluate_weight("semantic_mix", 0.48)
+
+    @classmethod
+    def _lexicon_path(cls) -> Path:
+        return Path(__file__).resolve().with_name("lexicon") / cls.LEXICON_FILENAME
+
+    @classmethod
+    def _load_lexicon(cls) -> dict[str, Any]:
+        """读取外置词表；失败时返回空词表（降级为中性打分，不抛错）。"""
+
+        if cls._LEXICON_CACHE is not None:
+            return cls._LEXICON_CACHE
+        data: dict[str, Any] = {}
+        try:
+            with cls._lexicon_path().open("r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if not isinstance(loaded, dict):
+                raise ValueError("lexicon root must be a JSON object")
+            data = loaded
+        except Exception as exc:  # noqa: BLE001 - 词表坏了不能让写记忆失败
+            logger.warning(
+                "[MemoryCompanion] 重要度词表加载失败，降级为无词表中性打分: %s", exc
+            )
+        cls._LEXICON_CACHE = data
+        return data
+
+    def _scoring_value(self, key: str, default: float) -> float:
+        scoring = self.lexicon.get("scoring")
+        value = scoring.get(key) if isinstance(scoring, dict) else None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _evaluate_weight(self, key: str, default: float) -> float:
+        weights = self.lexicon.get("evaluate_weights")
+        value = weights.get(key) if isinstance(weights, dict) else None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _dimension_markers(self, dimension: str) -> tuple[str, ...]:
+        dimensions = self.lexicon.get("dimensions")
+        values = dimensions.get(dimension) if isinstance(dimensions, dict) else None
+        if not isinstance(values, (list, tuple)):
+            return ()
+        return tuple(
+            text for text in (clean_text(value, 40) for value in values) if text
+        )
+
+    def _guard_markers(self, key: str) -> tuple[str, ...]:
+        """S6：伤痕/情绪债/关系阶段/持久短语的守卫词表，同样外置可配。"""
+
+        guards = self.lexicon.get("guards")
+        values = guards.get(key) if isinstance(guards, dict) else None
+        if not isinstance(values, (list, tuple)):
+            return ()
+        return tuple(
+            text for text in (clean_text(value, 40) for value in values) if text
+        )
 
     def calibrate(self, record: MemoryRecord, *, source: str = "") -> MemoryRecord:
         base = self._base_importance(record.importance)
         dimensions = self.persona_dimensions(record)
+        # S6：把逐项特征贡献一并写进 metadata，事后可以解释「为什么这条记忆重要」。
+        text = self._memory_text(record)
+        compact = re.sub(r"\s+", "", text.lower())
+        features = self._semantic_features(record, compact, text, dimensions)
         score = self.evaluate(record, base=base, dimensions=dimensions)
         record.importance = score
         metadata = record.metadata if isinstance(record.metadata, dict) else {}
@@ -44,6 +132,9 @@ class ImportanceEvaluator:
         metadata.setdefault("mention_policy_source", self.version)
         metadata["memory_reason"] = dimensions["memory_reason"]
         metadata["persona_dimensions"] = dimensions["active_dimensions"]
+        metadata["importance_features"] = {
+            key: round(value, 4) for key, value in features.items()
+        }
         metadata["intimacy_weight"] = dimensions["intimacy_weight"]
         metadata["vulnerability_weight"] = dimensions["vulnerability_weight"]
         if source:
@@ -62,25 +153,62 @@ class ImportanceEvaluator:
         text = self._memory_text(record)
         compact = re.sub(r"\s+", "", text.lower())
         dimensions = dimensions or self.persona_dimensions(record)
-        semantic = 0.30
+        # S6：语义分改为「基线 + 逐项命名特征贡献」，权重全部来自外置词表，
+        # 并可用 explain() 逐项复盘（旧实现把 12 个加权项串成一坨加法，改不了也看不出）。
+        features = self._semantic_features(record, compact, text, dimensions)
+        semantic = self._semantic_base + sum(features.values())
 
-        semantic += self._memory_type_bonus(record)
-        semantic += self._lifecycle_bonus(record)
-        semantic += self._marker_bonus(compact)
-        semantic += self._metadata_bonus(record)
-        semantic += float(dimensions.get("persona_importance", 0.0) or 0.0) * 0.18
-        semantic += float(dimensions.get("freshness_weight", 0.0) or 0.0) * 0.05
-        semantic += float(dimensions.get("scar_weight", 0.0) or 0.0) * 0.06
-        semantic += float(dimensions.get("intimacy_weight", 0.0) or 0.0) * 0.04
-        semantic += float(dimensions.get("vulnerability_weight", 0.0) or 0.0) * 0.05
-        semantic += self._length_bonus(text)
-        semantic += self._confidence_bonus(record)
-        semantic -= self._low_value_penalty(compact, record)
-
-        final = base_score * 0.52 + semantic * 0.48
+        final = base_score * self._base_mix + semantic * self._semantic_mix
         final = max(final, self._source_preserved_floor(record, base_score))
         final = max(self._min_floor(record), min(self._max_ceiling(record, compact), final))
         return round(max(0.0, min(1.0, final)), 3)
+
+    def _semantic_features(
+        self,
+        record: MemoryRecord,
+        compact: str,
+        text: str,
+        dimensions: dict[str, Any],
+    ) -> dict[str, float]:
+        """S6：语义分的逐项特征贡献（相加即语义分，正负号自带语义）。"""
+
+        def dimension_weight(name: str) -> float:
+            return float(dimensions.get(name, 0.0) or 0.0)
+
+        return {
+            "memory_type": self._memory_type_bonus(record),
+            "lifecycle": self._lifecycle_bonus(record),
+            "markers": self._marker_bonus(compact),
+            "metadata": self._metadata_bonus(record),
+            "persona": dimension_weight("persona_importance") * self._evaluate_weight("persona", 0.18),
+            "freshness": dimension_weight("freshness_weight") * self._evaluate_weight("freshness", 0.05),
+            "scar": dimension_weight("scar_weight") * self._evaluate_weight("scar", 0.06),
+            "intimacy": dimension_weight("intimacy_weight") * self._evaluate_weight("intimacy", 0.04),
+            "vulnerability": dimension_weight("vulnerability_weight") * self._evaluate_weight("vulnerability", 0.05),
+            "length": self._length_bonus(text),
+            "confidence": self._confidence_bonus(record),
+            "low_value": -self._low_value_penalty(compact, record),
+        }
+
+    def explain(self, record: MemoryRecord) -> dict[str, Any]:
+        """S6：可解释打分——返回每一项特征贡献与最终分，便于排查/调词表。"""
+
+        base = self._base_importance(record.importance)
+        dimensions = self.persona_dimensions(record)
+        text = self._memory_text(record)
+        compact = re.sub(r"\s+", "", text.lower())
+        features = self._semantic_features(record, compact, text, dimensions)
+        semantic = self._semantic_base + sum(features.values())
+        return {
+            "version": self.version,
+            "lexicon": str(self._lexicon_path()),
+            "base_importance": round(base, 3),
+            "semantic_base": round(self._semantic_base, 3),
+            "features": {key: round(value, 4) for key, value in features.items()},
+            "semantic_score": round(semantic, 3),
+            "dimensions": dimensions,
+            "final": self.evaluate(record, base=base, dimensions=dimensions),
+        }
 
     def persona_dimensions(self, record: MemoryRecord) -> dict[str, Any]:
         text = self._memory_text(record)
@@ -90,138 +218,17 @@ class ImportanceEvaluator:
         tags = {clean_text(tag, 80).lower() for tag in record.tags or []}
         occurred_at = self._event_time(record)
 
-        preference = self._dimension_score(
-            compact,
-            ("喜欢", "讨厌", "不喜欢", "偏好", "生日", "名字", "称呼", "叫我", "我是", "习惯", "口味", "雷点"),
-        )
-        relationship = self._dimension_score(
-            compact,
-            ("关系", "朋友", "主人", "信任", "陪", "在意", "依赖", "亲近", "疏远", "和好", "误会", "吃醋", "边界", "称呼"),
-        )
-        promise = self._dimension_score(
-            compact,
-            ("约定", "承诺", "答应", "说好", "以后", "记住", "别忘", "提醒", "下次", "明天", "保证", "要做", "会继续"),
-        )
-        open_loop = self._dimension_score(
-            compact,
-            (
-                "未完成",
-                "没完成",
-                "没做完",
-                "没写完",
-                "未写完",
-                "没整理完",
-                "还没",
-                "继续",
-                "下次",
-                "待续",
-                "回头",
-                "待办",
-                "待补",
-                "todo",
-                "提醒",
-                "之后再",
-                "先记着",
-                "没展开",
-                "没有展开",
-                "没聊完",
-                "被打断",
-                "打断",
-                "欠着",
-                "欠",
-            ),
-        )
-        creative = self._dimension_score(
-            compact,
-            ("作品", "设定", "角色", "剧情", "画", "写了", "创作", "文档", "脚本", "草稿", "世界观", "分镜", "人设", "命名"),
-        )
-        emotional = self._dimension_score(
-            compact,
-            (
-                "难过",
-                "开心",
-                "生气",
-                "害怕",
-                "压力",
-                "低落",
-                "崩溃",
-                "委屈",
-                "感动",
-                "安心",
-                "哭",
-                "累",
-                "情绪",
-                "转折",
-                "冲突",
-                "吵架",
-                "道歉",
-                "安慰",
-                "受伤",
-                "失望",
-            ),
-        )
-        self_continuity = self._dimension_score(
-            compact,
-            ("日程", "计划", "自主", "主动", "我做了", "我想", "我记得", "睡眠", "休息", "状态"),
-        )
-        intimacy = self._dimension_score(
-            compact,
-            (
-                "想你",
-                "喜欢你",
-                "爱你",
-                "舍不得",
-                "依赖",
-                "离不开",
-                "信任",
-                "在意",
-                "在乎",
-                "珍惜",
-                "特别",
-                "唯一",
-                "最重要",
-                "心里话",
-                "秘密",
-                "只跟你",
-                "没跟别人说过",
-                "依靠",
-                "倾诉",
-                "贴贴",
-                "抱抱",
-                "依靠你",
-                "不想分开",
-                "你是我的",
-            ),
-        )
-        vulnerability = self._dimension_score(
-            compact,
-            (
-                "累",
-                "难过",
-                "哭",
-                "害怕",
-                "孤独",
-                "委屈",
-                "崩溃",
-                "焦虑",
-                "压力",
-                "不安",
-                "迷茫",
-                "无助",
-                "压抑",
-                "绝望",
-                "没安全感",
-                "睡不着",
-                "噩梦",
-                "撑不住",
-                "想消失",
-                "没意义",
-                "没人懂",
-                "好寂寞",
-                "好孤单",
-                "心疼",
-            ),
-        )
+        # S6：维度词表已外置到 core/lexicon/importance_lexicon.json，这里只传维度名，
+        # 词表命中数与打分曲线由 _dimension_score 统一处理（可解释、可配置）。
+        preference = self._dimension_score(compact, "preference")
+        relationship = self._dimension_score(compact, "relationship")
+        promise = self._dimension_score(compact, "promise")
+        open_loop = self._dimension_score(compact, "open_loop")
+        creative = self._dimension_score(compact, "creative")
+        emotional = self._dimension_score(compact, "emotional")
+        self_continuity = self._dimension_score(compact, "self_continuity")
+        intimacy = self._dimension_score(compact, "intimacy")
+        vulnerability = self._dimension_score(compact, "vulnerability")
 
         if memory_type in {"user_profile", "user_preference", "user_habit"}:
             preference = max(preference, 0.72)
@@ -368,12 +375,24 @@ class ImportanceEvaluator:
             return "direct", 0.66
         return "soft_echo", 0.50
 
-    @staticmethod
-    def _dimension_score(compact: str, markers: tuple[str, ...]) -> float:
-        hits = sum(1 for marker in markers if marker in compact)
+    def _dimension_score(self, compact: str, dimension: str | tuple[str, ...]) -> float:
+        """单个维度的特征分（S6：可解释 + 词表可配）。
+
+        - dimension 传维度名时从 core/lexicon/importance_lexicon.json 取词表；
+          传显式词序列时直接用调用方给的词（兼容旧调用）。
+        - 未命中任何词返回中性分（默认 0.12）而不是 0.0：0.0 等于「明确判定
+          不含该维度」，会把词表之外的正常记忆一起压到最低分；中性分表示
+          「没有证据」，既不抬高也不判负。
+        """
+
+        if isinstance(dimension, str):
+            markers = self._dimension_markers(dimension)
+        else:
+            markers = tuple(dimension)
+        hits = sum(1 for marker in markers if marker and marker in compact)
         if hits <= 0:
-            return 0.0
-        return min(0.85, 0.26 + hits * 0.16)
+            return self._neutral_score
+        return min(self._hit_ceiling, self._hit_base + hits * self._hit_step)
 
     @staticmethod
     def _memory_reason(active: list[str], weights: dict[str, Any]) -> str:
@@ -423,8 +442,8 @@ class ImportanceEvaluator:
         sensitivity = max(emotional, relationship * 0.82, open_loop * 0.9, promise * 0.88, 0.18)
         return sensitivity * self._exp_decay(days, 10.0)
 
-    @staticmethod
     def _scar_weight(
+        self,
         compact: str,
         relationship: float,
         emotional: float,
@@ -433,29 +452,15 @@ class ImportanceEvaluator:
         creative: float,
         phase: str,
     ) -> float:
-        scar_markers = (
-            "冲突",
-            "吵架",
-            "误会",
-            "和好",
-            "道歉",
-            "安慰",
-            "受伤",
-            "失望",
-            "崩溃",
-            "委屈",
-            "哭",
-            "别再",
-            "不要再",
-        )
+        scar_markers = self._guard_markers("scar_markers")
         marker_score = 0.22 if any(marker in compact for marker in scar_markers) else 0.0
         if phase in {"conflict", "repair", "comfort"}:
             marker_score += 0.18
         blended = max(emotional * 0.58 + relationship * 0.30, promise * 0.45 + open_loop * 0.35, creative * 0.25)
         return min(0.95, marker_score + blended)
 
-    @staticmethod
     def _emotional_debt_weight(
+        self,
         compact: str,
         emotional: float,
         relationship: float,
@@ -463,25 +468,7 @@ class ImportanceEvaluator:
         promise: float,
         phase: str,
     ) -> float:
-        debt_markers = (
-            "没展开",
-            "没有展开",
-            "没说完",
-            "没聊完",
-            "被打断",
-            "打断",
-            "之后再说",
-            "下次再说",
-            "先不说",
-            "不想说",
-            "算了",
-            "低落",
-            "难过",
-            "委屈",
-            "崩溃",
-            "压力",
-            "安慰",
-        )
+        debt_markers = self._guard_markers("debt_markers")
         marker_score = 0.0
         hits = sum(1 for marker in debt_markers if marker in compact)
         if hits:
@@ -490,15 +477,14 @@ class ImportanceEvaluator:
             marker_score += 0.12
         return min(0.95, marker_score + emotional * 0.44 + relationship * 0.18 + max(open_loop, promise) * 0.20)
 
-    @staticmethod
-    def _relationship_phase(compact: str, relationship: float, emotional: float, promise: float) -> str:
-        if any(marker in compact for marker in ("冲突", "吵架", "误会", "生气", "失望", "受伤", "别再", "不要再")):
+    def _relationship_phase(self, compact: str, relationship: float, emotional: float, promise: float) -> str:
+        if any(marker in compact for marker in self._guard_markers("phase_conflict")):
             return "conflict"
-        if any(marker in compact for marker in ("和好", "道歉", "解释清楚", "重新", "修复")):
+        if any(marker in compact for marker in self._guard_markers("phase_repair")):
             return "repair"
-        if any(marker in compact for marker in ("安慰", "陪着", "抱抱", "安心", "没事了", "被理解")):
+        if any(marker in compact for marker in self._guard_markers("phase_comfort")):
             return "comfort"
-        if any(marker in compact for marker in ("信任", "依赖", "亲近", "在意", "重要")):
+        if any(marker in compact for marker in self._guard_markers("phase_closeness")):
             return "closeness"
         if promise >= 0.45:
             return "promise"
@@ -619,21 +605,25 @@ class ImportanceEvaluator:
             return -0.08
         return 0.0
 
-    @staticmethod
-    def _marker_bonus(compact: str) -> float:
-        groups = (
-            (0.14, ("记住", "别忘", "你要记得", "以后", "约定", "承诺", "答应", "密码")),
-            (0.12, ("喜欢", "讨厌", "不喜欢", "偏好", "生日", "名字", "称呼", "叫我", "我是")),
-            (0.10, ("关系", "朋友", "主人", "重要", "在意", "难过", "开心", "生气", "害怕", "压力")),
-            (0.08, ("日程", "计划", "安排", "待办", "提醒", "明天", "下周", "今天")),
-            (0.08, ("作品", "设定", "角色", "剧情", "画", "写了", "创作", "文档")),
-            (0.06, ("决定", "结论", "原因", "复盘", "总结", "进展")),
-        )
+    def _marker_bonus(self, compact: str) -> float:
+        """S6：关键短语加权，词表与权重读 core/lexicon/importance_lexicon.json。"""
+
+        groups = self.lexicon.get("marker_bonus_groups")
         bonus = 0.0
-        for value, markers in groups:
-            if any(marker in compact for marker in markers):
-                bonus += value
-        return min(0.30, bonus)
+        if isinstance(groups, (list, tuple)):
+            for entry in groups:
+                if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                    continue
+                try:
+                    value = float(entry[0])
+                except (TypeError, ValueError):
+                    continue
+                markers = entry[1] if isinstance(entry[1], (list, tuple)) else ()
+                if any(
+                    marker and clean_text(marker, 40) in compact for marker in markers
+                ):
+                    bonus += value
+        return min(self._marker_ceiling, bonus)
 
     @staticmethod
     def _metadata_bonus(record: MemoryRecord) -> float:
@@ -679,12 +669,17 @@ class ImportanceEvaluator:
             confidence = 0.5
         return (confidence - 0.5) * 0.10
 
-    @staticmethod
-    def _low_value_penalty(compact: str, record: MemoryRecord) -> float:
+    def _low_value_penalty(self, compact: str, record: MemoryRecord) -> float:
         if not compact:
             return 0.12
         penalty = 0.0
-        low_markers = ("哈哈", "草", "笑死", "嗯嗯", "好的", "收到", "摸摸", "早安", "晚安")
+        # S6：低信息量词表也外置，改词表不用改代码。
+        raw_low = self.lexicon.get("low_value_markers")
+        low_markers = (
+            tuple(clean_text(marker, 40) for marker in raw_low if clean_text(marker, 40))
+            if isinstance(raw_low, (list, tuple))
+            else ()
+        )
         if len(compact) <= 12 and any(marker in compact for marker in low_markers):
             penalty += 0.10
         if record.lifecycle == "raw_event" and len(compact) <= 24:
@@ -716,9 +711,8 @@ class ImportanceEvaluator:
             return base_score * 0.92
         return 0.0
 
-    @staticmethod
-    def _max_ceiling(record: MemoryRecord, compact: str) -> float:
-        durable_markers = ("记住", "别忘", "喜欢", "生日", "约定", "承诺", "冲突", "和好", "安慰", "作品", "设定", "继续")
+    def _max_ceiling(self, record: MemoryRecord, compact: str) -> float:
+        durable_markers = self._guard_markers("durable_markers")
         if record.lifecycle == "raw_event" and not any(marker in compact for marker in durable_markers):
             return 0.56
         if record.memory_type == "memory_decay_summary":

@@ -14,7 +14,14 @@ from typing import Any
 from .models import json_dumps, stable_fingerprint
 from .query_session import query_context
 from .source_evidence import record_source_read
-from .source_query import SourceQueryError, _instant, _text, source_partition
+from .source_query import (
+    SourceQueryError,
+    _EMPTY_RANGE_HINT,
+    _instant,
+    _text,
+    default_range_end_at,
+    source_partition,
+)
 
 
 SOURCE_QUERY_PROFILE_V2 = "memory.local-source-query.v2"
@@ -47,8 +54,10 @@ def rejected(error: str) -> dict[str, Any]:
 def _parse(parameters: dict[str, Any], cursor: str, limit: Any) -> tuple[str, str]:
     if set(parameters) - _FIELDS:
         raise SourceQueryError("unknown_parameter")
-    if isinstance(limit, bool) or not isinstance(limit, int) or limit != 0:
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
         raise SourceQueryError("range_batch_uses_server_budget")
+    if cursor and limit != 0:
+        raise SourceQueryError("cursor_requires_no_query_parameters")
     if (parameters.get("terms") not in (None, [])
             or parameters.get("source_ref", "") != ""
             or parameters.get("direction", "around") != "around"
@@ -64,7 +73,12 @@ def _parse(parameters: dict[str, Any], cursor: str, limit: Any) -> tuple[str, st
         return "", ""
     if action != "range_batch":
         raise SourceQueryError("unsupported_action")
-    start, end = _instant(parameters.get("start_at", "")), _instant(parameters.get("end_at", ""))
+    raw_end = parameters.get("end_at", "")
+    if raw_end is None:
+        raw_end = ""
+    start, end = _instant(parameters.get("start_at", "")), _instant(raw_end)
+    if start and not end:
+        end = default_range_end_at()
     if not start or not end:
         raise SourceQueryError("range_requires_start_end_without_terms")
     if datetime.fromisoformat(start) >= datetime.fromisoformat(end):
@@ -105,7 +119,12 @@ async def query_range_batch(service: Any, event: Any, *, cursor: str = "", limit
         ctx = service._normalized_session_context(await query_context(service, event))
         if not service._scope_feature_enabled(ctx, "recall"):
             raise SourceQueryError("scope_recall_disabled")
-        source_partition(ctx)
+        group_policy = (
+            await service._authorized_private_group_read_policy(ctx)
+            if ctx.scope == "private" and hasattr(service, "_authorized_private_group_read_policy")
+            else None
+        )
+        source_partition(ctx, group_policy=group_policy)
         if (not service.config.bool("memory_tools.enable_source_query_v2", False)
                 or not binding_matches(service, event, ctx)):
             raise SourceQueryError("source_query_v2_not_offered")
@@ -123,7 +142,9 @@ async def query_range_batch(service: Any, event: Any, *, cursor: str = "", limit
         limits = previous["limits"] if previous else _limits(service)
         query = {"action": "range_batch", "start_at": start, "end_at": end}
         signature = stable_fingerprint("source_range_batch", cursor or json_dumps(query), json_dumps(limits))
-        budget = await service._reserve_reconstruction_step(event, ctx, signature)
+        budget = await service._reserve_reconstruction_step(
+            event, ctx, signature, allow_source_fallback=True,
+        )
         if not budget["accepted"]:
             raise SourceQueryError(budget["error"])
         expires_at = previous["expires_at"] if previous else started + 120.0
@@ -137,6 +158,7 @@ async def query_range_batch(service: Any, event: Any, *, cursor: str = "", limit
             ctx, start_at=start, end_at=end, limit=limits["max_messages"],
             boundary=previous["boundary"] if previous else None,
             expected_revision=previous["source_revision"] if previous else None,
+            group_policy=group_policy,
         )
         next_cursor = "srcb_" + secrets.token_urlsafe(24)
         totals = dict(previous["totals"]) if previous else {
@@ -202,8 +224,14 @@ async def query_range_batch(service: Any, event: Any, *, cursor: str = "", limit
             position = [row["source_sort_time"], row["created_at"], row["id"]]
             if (row["source_content_chars"] or 0) > 262144 or (row["source_metadata_chars"] or 0) > 65536:
                 raise SourceQueryError("source_processing_budget_exceeded")
-            text = service._navigation_source_text(ctx, row)
-            template = service._serialize_navigation_source(ctx, row, prepared_text=text) if text else None
+            text = service._navigation_source_text(ctx, row, group_policy=group_policy)
+            template = (
+                service._serialize_navigation_source(
+                    ctx, row, prepared_text=text, group_policy=group_policy,
+                )
+                if text
+                else None
+            )
             visited = offset > 0
             if template is None:
                 suppressed += 1
@@ -280,10 +308,17 @@ async def query_range_batch(service: Any, event: Any, *, cursor: str = "", limit
             pending_excerpt=resume_offset > 0,
         )
         result["status"] = "partial" if incomplete else ("batch" if sources else "empty")
+        if result["status"] == "empty" and budget["remaining_steps"] > 0:
+            result["hint"] = _EMPTY_RANGE_HINT
         result["usage"].update(returned_chars=sum(len(item["excerpt"]) for item in sources),
                                 elapsed_ms=max(0, round((time.monotonic() - started) * 1000)))
         if _meter(result) > limits["max_bytes"]:
-            raise SourceQueryError("range_batch_budget_too_small")
+            if "hint" in result:
+                result.pop("hint", None)
+                if _meter(result) > limits["max_bytes"]:
+                    raise SourceQueryError("range_batch_budget_too_small")
+            else:
+                raise SourceQueryError("range_batch_budget_too_small")
         if time.monotonic() >= expires_at or not service._scope_feature_enabled(ctx, "recall"):
             raise SourceQueryError("source_query_expired_or_disabled")
         if (not service.config.bool("memory_tools.enable_source_query_v2", False)

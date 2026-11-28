@@ -276,6 +276,9 @@ class RerankConvexFusionTests(unittest.IsolatedAsyncioTestCase):
             None,
             retrieval_mode="auto",
             rerank_provider=provider,
+            # R5：人工锚定改为可配置且默认关闭；这条用例验证的是「开启后」
+            # 的 floor 行为，所以显式打开。
+            anchor_floor_enabled=True,
         )
 
         results = await engine._maybe_rerank_results("蓝风铃 花语", [anchor, leader, other], 2)
@@ -304,6 +307,7 @@ class RerankConvexFusionTests(unittest.IsolatedAsyncioTestCase):
             None,
             retrieval_mode="auto",
             rerank_provider=provider,
+            anchor_floor_enabled=True,
         )
 
         results = await engine._maybe_rerank_results("蓝风铃 花语", [anchor, other], 2)

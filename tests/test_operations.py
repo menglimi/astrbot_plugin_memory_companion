@@ -5,6 +5,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from astrbot.api import AstrBotConfig
 
 
 try:
@@ -53,24 +56,68 @@ class OperationPresetTests(unittest.TestCase):
     def test_standard_preset_defaults_to_fewer_complete_memories(self) -> None:
         schema = json.loads((Path(__file__).resolve().parents[1] / "_conf_schema.json").read_text(encoding="utf-8"))
         injection = schema["memory_injection"]["items"]
-        self.assertEqual(4, injection["top_k"]["default"])
+        self.assertEqual(8, injection["top_k"]["default"])
         self.assertEqual(4000, injection["max_chars"]["default"])
-        self.assertEqual(320, injection["max_item_chars"]["default"])
+        self.assertEqual(240, injection["max_item_chars"]["default"])
         self.assertEqual(4, PRESETS["standard"]["memory_injection.top_k"])
         self.assertEqual(1800, PRESETS["standard"]["memory_injection.max_chars"])
-        self.assertEqual(320, PRESETS["standard"]["memory_injection.max_item_chars"])
+        self.assertEqual(240, PRESETS["standard"]["memory_injection.max_item_chars"])
         self.assertEqual(5, schema["memory_summary"]["items"]["max_retries"]["default"])
         self.assertEqual(24, schema["memory_summary"]["items"]["max_calls_per_session_hour"]["default"])
+        self.assertEqual(0, schema["memory_summary"]["items"]["max_calls_per_session_hour"]["min"])
+        self.assertEqual(0, schema["memory_summary"]["items"]["max_calls_per_session_hour"]["slider"]["min"])
         self.assertEqual(300, schema["memory_summary"]["items"]["provider_timeout_seconds"]["default"])
 
-    def test_persist_runtime_config_is_utf8_and_atomic_target(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            data_dir = Path(temp) / "plugin_data" / "astrbot_plugin_memory_companion"
-            data_dir.mkdir(parents=True)
-            path = persist_runtime_config({"备注": "中文配置"}, data_dir)
+    def test_summary_recovery_controls_have_expected_schema_types_and_defaults(self) -> None:
+        schema = json.loads((Path(__file__).resolve().parents[1] / "_conf_schema.json").read_text(encoding="utf-8"))
+        items = schema["memory_summary"]["items"]
+        expected = {
+            "recovery_enabled": ("bool", True),
+            "recovery_startup_delay_seconds": ("int", 60),
+            "recovery_poll_interval_seconds": ("int", 60),
+            "recovery_sessions_per_round": ("int", 1),
+            "recovery_identity_retry_seconds": ("int", 3600),
+            "recovery_disabled_retry_seconds": ("int", 3600),
+        }
 
-            self.assertEqual("astrbot_plugin_memory_companion_config.json", path.name)
+        expected_bounds = {
+            "recovery_startup_delay_seconds": (0, 3600, 10),
+            "recovery_poll_interval_seconds": (5, 3600, 5),
+            "recovery_sessions_per_round": (1, 32, 1),
+            "recovery_identity_retry_seconds": (60, 604800, 60),
+            "recovery_disabled_retry_seconds": (60, 604800, 60),
+        }
+
+        for key, (expected_type, expected_default) in expected.items():
+            with self.subTest(key=key):
+                self.assertEqual(expected_type, items[key]["type"])
+                self.assertEqual(expected_default, items[key]["default"])
+                self.assertTrue(items[key]["description"])
+                self.assertTrue(items[key]["hint"])
+                if key in expected_bounds:
+                    lo, hi, step = expected_bounds[key]
+                    self.assertEqual(lo, items[key]["min"])
+                    self.assertEqual(hi, items[key]["max"])
+                    self.assertEqual({"min": lo, "max": hi, "step": step}, items[key]["slider"])
+
+    def test_persist_runtime_config_uses_host_path_and_utf8(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "plugin-settings.json"
+            raw = AstrBotConfig(config_path=str(path), default_config={"备注": ""})
+
+            self.assertEqual(str(path), persist_runtime_config(raw, {"备注": "中文配置"}))
             self.assertIn("中文配置", path.read_text(encoding="utf-8"))
+
+    def test_persist_runtime_config_rolls_back_on_save_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "plugin-settings.json"
+            raw = AstrBotConfig(config_path=str(path), default_config={"retrieval": {"mode": "auto"}})
+
+            with patch.object(AstrBotConfig, "save_config", side_effect=OSError("disk full")):
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    persist_runtime_config(raw, {"retrieval": {"mode": "basic"}})
+
+            self.assertEqual({"retrieval": {"mode": "auto"}}, dict(raw))
 
 
 class PluginConflictTests(unittest.TestCase):

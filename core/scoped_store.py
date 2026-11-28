@@ -9,7 +9,9 @@ from __future__ import annotations
 from contextlib import contextmanager
 import hashlib
 import json
+import math
 from pathlib import Path
+import shutil
 import sqlite3
 import threading
 import time
@@ -81,11 +83,20 @@ class ScopedStore:
         *,
         clock: Any = None,
         initialize: bool = True,
+        synchronous: str = "NORMAL",
     ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock if callable(clock) else time.time
+        sync_mode = str(synchronous or "NORMAL").strip().upper()
+        self._synchronous = sync_mode if sync_mode in {"OFF", "NORMAL", "FULL", "EXTRA"} else "NORMAL"
         self._lock = threading.RLock()
+        # 复用连接：每次操作都 sqlite3.connect() + close() 会让机械盘上的
+        # WAL/fsync 成本被放大数倍（见 issue #61），这里改成每线程一条长连接。
+        self._local = threading.local()
+        self._connections: list[sqlite3.Connection] = []
+        self._connections_lock = threading.Lock()
+        self._closed = False
         self._active_epoch = ""
         self._active_policy_version = ""
         self._epoch_revision = 0
@@ -94,11 +105,57 @@ class ScopedStore:
             self.initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.path), timeout=15.0, isolation_level=None)
+        # check_same_thread=False：连接仍然按线程隔离（每线程一条），
+        # 但 close() 需要能从任意线程关掉其它线程的连接——默认的
+        # check_same_thread=True 会让跨线程 close() 抛 ProgrammingError，
+        # 在 Windows 上表现为 sqlite 文件被锁死、临时目录删不掉。
+        conn = sqlite3.connect(
+            str(self.path), timeout=15.0, isolation_level=None, check_same_thread=False
+        )
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=15000")
+        try:
+            if int(conn.execute("PRAGMA page_count").fetchone()[0] or 0) == 0:
+                conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        except sqlite3.OperationalError:
+            pass
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute(f"PRAGMA synchronous={self._synchronous}")
+        conn.execute("PRAGMA wal_autocheckpoint=500")
         conn.execute("PRAGMA secure_delete=ON")
+        try:
+            from .store import _sqlite_hardware_tier
+            tier = _sqlite_hardware_tier()
+        except Exception:
+            tier = "mid"
+        if tier == "low":
+            pragmas = ("PRAGMA cache_size=-4096", "PRAGMA temp_store=MEMORY", "PRAGMA mmap_size=0")
+        elif tier == "high":
+            pragmas = ("PRAGMA cache_size=-16384", "PRAGMA temp_store=MEMORY", "PRAGMA mmap_size=134217728")
+        else:
+            pragmas = ("PRAGMA cache_size=-8192", "PRAGMA temp_store=MEMORY", "PRAGMA mmap_size=33554432")
+        for pragma in pragmas:
+            try:
+                conn.execute(pragma)
+            except sqlite3.OperationalError:
+                pass
+        return conn
+
+    def _thread_connection(self) -> sqlite3.Connection:
+        """Return this thread's reusable connection, opening it on first use."""
+        if self._closed:
+            raise ScopedStoreError("scoped_store_closed")
+        conn = getattr(self._local, "connection", None)
+        if conn is not None:
+            return conn
+        conn = self._connect()
+        self._local.connection = conn
+        with self._connections_lock:
+            if self._closed:
+                conn.close()
+                self._local.connection = None
+                raise ScopedStoreError("scoped_store_closed")
+            self._connections.append(conn)
         return conn
 
     def _truncate_wal(self) -> None:
@@ -107,16 +164,26 @@ class ScopedStore:
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        conn = self._connect()
+        conn = self._thread_connection()
         try:
             yield conn
-        finally:
-            conn.close()
+        except Exception:
+            # 只读路径不该留悬挂事务；显式回滚，别把坏状态留给下一个调用。
+            if conn.in_transaction:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+            raise
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
-            conn = self._connect()
+            conn = self._thread_connection()
+            if conn.in_transaction:
+                # 嵌套调用复用外层事务，避免第二次 BEGIN 直接报错。
+                yield conn
+                return
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 yield conn
@@ -126,8 +193,38 @@ class ScopedStore:
                 if conn.in_transaction:
                     conn.execute("ROLLBACK")
                 raise
-            finally:
+
+    def close(self) -> None:
+        """Close every connection this store opened, on all threads."""
+        with self._connections_lock:
+            connections = list(self._connections)
+            self._connections.clear()
+            self._closed = True
+        for conn in connections:
+            try:
                 conn.close()
+            except Exception:  # pragma: no cover - 收尾失败不该盖住调用方
+                pass
+        try:
+            self._local.connection = None
+        except Exception:  # pragma: no cover
+            pass
+
+    def reset_connection_after_failed_initialize(self) -> None:
+        """Recycle thread-local handles after a failed initialize()."""
+        with self._connections_lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        for conn in connections:
+            try:
+                conn.close()
+            except Exception:  # pragma: no cover
+                pass
+        try:
+            self._local.connection = None
+        except Exception:  # pragma: no cover
+            pass
+        self._closed = False
 
     def initialize(self) -> None:
         with self._lock:
@@ -138,6 +235,12 @@ class ScopedStore:
 
     def _initialize(self) -> None:
         with self._connection() as conn:
+            try:
+                page_count = int(conn.execute("PRAGMA page_count").fetchone()[0] or 0)
+                if page_count == 0:
+                    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+            except sqlite3.OperationalError:
+                pass
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS scoped_records (
@@ -150,6 +253,7 @@ class ScopedStore:
                     policy_version TEXT NOT NULL,
                     migration_epoch TEXT NOT NULL,
                     deleted INTEGER NOT NULL DEFAULT 0,
+                    erased INTEGER NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY(namespace_scope, record_kind, record_id)
                 );
@@ -163,6 +267,8 @@ class ScopedStore:
                     created_at REAL NOT NULL,
                     PRIMARY KEY(event_id, migration_epoch)
                 );
+                CREATE INDEX IF NOT EXISTS idx_scoped_operations_created
+                    ON scoped_operations(created_at);
                 CREATE TABLE IF NOT EXISTS scoped_epoch_state (
                     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                     migration_epoch TEXT NOT NULL,
@@ -188,6 +294,14 @@ class ScopedStore:
                 );
                 """
             )
+            columns = {
+                str(row["name"]) for row in conn.execute("PRAGMA table_info(scoped_records)").fetchall()
+            }
+            if "erased" not in columns:
+                # 旧库兼容：擦除标记列用幂等 ALTER 补上，默认 0，历史行全部可读。
+                conn.execute(
+                    "ALTER TABLE scoped_records ADD COLUMN erased INTEGER NOT NULL DEFAULT 0"
+                )
             state = conn.execute(
                 "SELECT migration_epoch,policy_version,revision FROM scoped_epoch_state WHERE singleton=1"
             ).fetchone()
@@ -195,6 +309,10 @@ class ScopedStore:
                 self._active_epoch = state["migration_epoch"]
                 self._active_policy_version = state["policy_version"]
                 self._epoch_revision = int(state["revision"])
+            try:
+                conn.execute("PRAGMA optimize")
+            except sqlite3.OperationalError:
+                pass
 
     def _authorize(self, context: NamespaceContext | None, record_kind: str, *, write: bool) -> None:
         if record_kind not in RECORD_KINDS:
@@ -330,7 +448,7 @@ class ScopedStore:
                     raise ScopedRecordConflict("scoped_event_conflict")
                 return "duplicate"
             row = conn.execute(
-                "SELECT revision,payload_hash,deleted FROM scoped_records WHERE namespace_scope=? AND record_kind=? AND record_id=?",
+                "SELECT revision,payload_hash,deleted,erased FROM scoped_records WHERE namespace_scope=? AND record_kind=? AND record_id=?",
                 (scope, record_kind, identifier),
             ).fetchone()
             if row is None:
@@ -351,12 +469,12 @@ class ScopedStore:
                 conn.execute(
                     """INSERT INTO scoped_records(
                         namespace_scope,record_kind,record_id,revision,payload_json,payload_hash,
-                        policy_version,migration_epoch,deleted,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,0,?)
+                        policy_version,migration_epoch,deleted,erased,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,0,0,?)
                     ON CONFLICT(namespace_scope,record_kind,record_id) DO UPDATE SET
                         revision=excluded.revision,payload_json=excluded.payload_json,payload_hash=excluded.payload_hash,
                         policy_version=excluded.policy_version,migration_epoch=excluded.migration_epoch,
-                        deleted=0,updated_at=excluded.updated_at""",
+                        deleted=0,erased=0,updated_at=excluded.updated_at""",
                     (
                         scope, record_kind, identifier, revision, encoded, digest,
                         context.policy_version, context.migration_epoch, now,
@@ -399,6 +517,7 @@ class ScopedStore:
             rows = conn.execute(
                 """SELECT record_id,revision,payload_json,payload_hash,policy_version,migration_epoch,updated_at
                 FROM scoped_records WHERE namespace_scope=? AND record_kind=? AND deleted=0
+                AND erased=0
                 ORDER BY revision,record_id LIMIT ?""",
                 (self._scope(context), record_kind, safe_limit),
             ).fetchall()
@@ -450,7 +569,7 @@ class ScopedStore:
             if int(row["deleted"]) == 1:
                 raise ScopedRecordConflict("scoped_record_tombstoned")
             conn.execute(
-                """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,deleted=1,updated_at=?
+                """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,deleted=1,erased=1,updated_at=?
                    WHERE namespace_scope=? AND record_kind=? AND record_id=?""",
                 (revision, _ERASED_PAYLOAD_JSON, _ERASED_PAYLOAD_HASH, now, scope, record_kind, identifier),
             )
@@ -504,7 +623,7 @@ class ScopedStore:
             ).fetchall()
             for row in rows:
                 conn.execute(
-                    """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,deleted=1,updated_at=?
+                    """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,deleted=1,erased=1,updated_at=?
                        WHERE namespace_scope=? AND record_kind=? AND record_id=? AND deleted=0""",
                     (
                         int(row["revision"]) + 1, _ERASED_PAYLOAD_JSON, _ERASED_PAYLOAD_HASH,
@@ -574,10 +693,15 @@ class ScopedStore:
                 if prior["request_hash"] != request_hash:
                     raise ScopedRecordConflict("scoped_namespace_operation_conflict")
                 return json.loads(prior["result_json"])
+            # 同一类 bug：真实 record_id 是 uuid，按前缀匹配会假成功；归属字段在
+            # namespace_scope JSON 里，先 instr() 粗筛再按 kind/persona/identity 精判。
+            persona_needle = '"persona_id":' + _canonical(context.persona_id)
+            identity_needle = '"identity_id":' + _canonical(context.identity_id)
             candidates = conn.execute(
                 """SELECT namespace_scope,record_kind,record_id,revision FROM scoped_records
-                   WHERE deleted=0 AND record_id LIKE ? ORDER BY namespace_scope,record_kind,record_id""",
-                (f"{prefix}%",),
+                   WHERE deleted=0 AND instr(namespace_scope, ?) > 0 AND instr(namespace_scope, ?) > 0
+                   ORDER BY namespace_scope,record_kind,record_id""",
+                (persona_needle, identity_needle),
             ).fetchall()
             rows: list[sqlite3.Row] = []
             scopes: set[str] = set()
@@ -597,7 +721,7 @@ class ScopedStore:
                     scopes.add(str(row["namespace_scope"]))
             for row in rows:
                 conn.execute(
-                    """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,deleted=1,updated_at=?
+                    """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,deleted=1,erased=1,updated_at=?
                        WHERE namespace_scope=? AND record_kind=? AND record_id=? AND deleted=0""",
                     (
                         int(row["revision"]) + 1, _ERASED_PAYLOAD_JSON, _ERASED_PAYLOAD_HASH,
@@ -608,6 +732,7 @@ class ScopedStore:
             result = {
                 "code": "identity_scopes_tombstoned" if rows else "identity_scopes_already_empty",
                 "count": len(rows),
+                "deleted": len(rows),
                 "namespace_count": len(scopes),
                 "reason_code": reason,
             }
@@ -660,14 +785,26 @@ class ScopedStore:
                 if prior["request_hash"] != request_hash:
                     raise ScopedRecordConflict("scoped_namespace_operation_conflict")
                 return json.loads(prior["result_json"])
+            # 真实 record_id 是 uuid，旧实现用 record_id LIKE 'req041-%' 只能命中
+            # 测试数据，线上一条都擦不到（返回成功但库里什么都没擦）。归属信息
+            # 在 namespace_scope 的 JSON 里，按 persona_id/group_id 精确匹配；
+            # instr() 只做便宜的前置过滤，真正的判定仍在下面按 JSON 字段做。
+            # record_prefix 仍保留在 request_hash 里，只为旧 operation 幂等兼容。
+            persona_needle = '"persona_id":' + _canonical(context.persona_id)
+            group_needle = '"group_id":' + _canonical(context.group_id)
             candidates = conn.execute(
-                """SELECT namespace_scope,record_kind,record_id,revision,payload_json FROM scoped_records
-                   WHERE deleted=0 AND record_id LIKE ? ORDER BY namespace_scope,record_kind,record_id""",
-                (f"{prefix}%",),
+                """SELECT namespace_scope,record_kind,record_id,revision,payload_json,payload_hash,erased
+                   FROM scoped_records
+                   WHERE deleted=0 AND instr(namespace_scope, ?) > 0 AND instr(namespace_scope, ?) > 0
+                   ORDER BY namespace_scope,record_kind,record_id""",
+                (persona_needle, group_needle),
             ).fetchall()
             rows: list[tuple[sqlite3.Row, str, str]] = []
             scopes: set[str] = set()
             for row in candidates:
+                if int(row["erased"]):
+                    # 已经擦空的行不重复 bump revision；用新 operation_id 再擦是 no-op。
+                    continue
                 try:
                     owner = json.loads(row["namespace_scope"])
                     payload = json.loads(row["payload_json"])
@@ -705,7 +842,7 @@ class ScopedStore:
                 scopes.add(str(row["namespace_scope"]))
             for row, encoded, digest in rows:
                 conn.execute(
-                    """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,updated_at=?
+                    """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,erased=1,updated_at=?
                        WHERE namespace_scope=? AND record_kind=? AND record_id=? AND deleted=0""",
                     (
                         int(row["revision"]) + 1, encoded, digest, now, row["namespace_scope"],
@@ -714,7 +851,8 @@ class ScopedStore:
                 )
             result = {
                 "code": "group_scopes_erased" if rows else "group_scopes_already_empty",
-                "count": len(rows), "namespace_count": len(scopes), "reason_code": reason,
+                "count": len(rows), "deleted": len(rows),
+                "namespace_count": len(scopes), "reason_code": reason,
             }
             conn.execute(
                 """INSERT INTO scoped_namespace_operations(
@@ -763,15 +901,22 @@ class ScopedStore:
                 if prior["request_hash"] != request_hash:
                     raise ScopedRecordConflict("scoped_namespace_operation_conflict")
                 return json.loads(prior["result_json"])
+            # 同 erase_group_scopes：真实 record_id 是 uuid，按 owner 的
+            # namespace_scope 里 persona_id 精确匹配，前缀只用于旧 operation 哈希。
+            persona_needle = '"persona_id":' + _canonical(context.persona_id)
             candidates = conn.execute(
-                """SELECT namespace_scope,record_kind,record_id,revision,payload_json FROM scoped_records
-                   WHERE deleted=0 AND record_id LIKE ? ORDER BY namespace_scope,record_kind,record_id""",
-                (f"{prefix}%",),
+                """SELECT namespace_scope,record_kind,record_id,revision,payload_json,payload_hash,erased
+                   FROM scoped_records
+                   WHERE deleted=0 AND instr(namespace_scope, ?) > 0
+                   ORDER BY namespace_scope,record_kind,record_id""",
+                (persona_needle,),
             ).fetchall()
             rows: list[tuple[sqlite3.Row, str, str]] = []
             scopes: set[str] = set()
             kinds: set[str] = set()
             for row in candidates:
+                if int(row["erased"]):
+                    continue
                 try:
                     owner = json.loads(row["namespace_scope"])
                     payload = json.loads(row["payload_json"])
@@ -806,7 +951,7 @@ class ScopedStore:
                 kinds.add(str(owner.get("kind") or ""))
             for row, encoded, digest in rows:
                 conn.execute(
-                    """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,updated_at=?
+                    """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,erased=1,updated_at=?
                        WHERE namespace_scope=? AND record_kind=? AND record_id=? AND deleted=0""",
                     (
                         int(row["revision"]) + 1, encoded, digest, now, row["namespace_scope"],
@@ -815,7 +960,7 @@ class ScopedStore:
                 )
             result = {
                 "code": "persona_scopes_erased" if rows else "persona_scopes_already_empty",
-                "count": len(rows), "namespace_count": len(scopes),
+                "count": len(rows), "deleted": len(rows), "namespace_count": len(scopes),
                 "namespace_kinds": sorted(kinds), "reason_code": reason,
             }
             conn.execute(
@@ -827,12 +972,177 @@ class ScopedStore:
         self._truncate_wal()
         return result
 
-    def initialize(self) -> None:
+    def _available_disk_bytes(self) -> int | None:
+        try:
+            target_dir = self.path.parent if self.path.parent.exists() else Path(".")
+            return int(shutil.disk_usage(target_dir).free)
+        except OSError:
+            return None
+
+    def _full_vacuum_disk_preflight(self, db_bytes: int) -> dict[str, Any]:
+        """Pre-flight disk check for scoped DB full VACUUM: require >= 2.2x DB + 64 MiB free (fail-closed)."""
+        size_bytes = max(0, int(db_bytes))
+        required_free_bytes = int(math.ceil(size_bytes * 2.2)) + 64 * 1024 * 1024
+        available_free_bytes = self._available_disk_bytes()
+        if available_free_bytes is None:
+            req_mb = required_free_bytes / (1024 * 1024)
+            return {
+                "ok": False,
+                "reason": "disk_usage_unavailable",
+                "db_bytes": size_bytes,
+                "required_free_bytes": required_free_bytes,
+                "available_free_bytes": None,
+                "message": (
+                    f"无法读取副库磁盘剩余空间，出于安全保护已阻断副库深度整理压缩（全量 VACUUM，"
+                    f"需确认至少预留 2.2 倍副库空间 + 64 MiB，约 {req_mb:.1f} MiB）。"
+                    f"建议改用「一键常规无损瘦身」。"
+                ),
+            }
+        ok = available_free_bytes >= required_free_bytes
+        if ok:
+            reason = ""
+            message = ""
+        else:
+            reason = "insufficient_disk_space"
+            db_mb = size_bytes / (1024 * 1024)
+            req_mb = required_free_bytes / (1024 * 1024)
+            free_mb = available_free_bytes / (1024 * 1024)
+            message = (
+                f"副库所在磁盘剩余空间不足，已安全阻断副库全量 VACUUM。"
+                f"当前副库约 {db_mb:.1f} MiB，需至少预留 2.2 倍副库空间 + 64 MiB（约 {req_mb:.1f} MiB），"
+                f"当前磁盘仅剩约 {free_mb:.1f} MiB。建议改用「一键常规无损瘦身」。"
+            )
+        return {
+            "ok": ok,
+            "reason": reason,
+            "db_bytes": size_bytes,
+            "required_free_bytes": required_free_bytes,
+            "available_free_bytes": available_free_bytes,
+            "message": message,
+        }
+
+    def prune_expired_operations(
+        self,
+        *,
+        older_than_seconds: float = 14 * 86400.0,
+        limit: int = 20000,
+        vacuum_pages: int = 256,
+        run_full_vacuum: bool = False,
+    ) -> dict[str, Any]:
+        """Prune aged idempotency rows from ``scoped_operations`` and reclaim free pages."""
+        retention = max(60.0, float(older_than_seconds or (14 * 86400.0)))
+        cutoff = float(self._clock()) - retention
+        max_delete = max(0, int(limit or 0))
+        batch_size = 2000
+        deleted_total = 0
+        while max_delete == 0 or deleted_total < max_delete:
+            take = batch_size if max_delete == 0 else min(batch_size, max_delete - deleted_total)
+            with self._transaction() as conn:
+                cur = conn.execute(
+                    """DELETE FROM scoped_operations
+                       WHERE rowid IN (
+                           SELECT rowid FROM scoped_operations
+                           WHERE created_at < ?
+                           ORDER BY created_at ASC
+                           LIMIT ?
+                       )""",
+                    (cutoff, take),
+                )
+                removed = max(0, int(cur.rowcount or 0))
+            deleted_total += removed
+            if removed < take:
+                break
+        vacuumed = False
+        vacuum_mode = "none"
+        disk_preflight: dict[str, Any] | None = None
         with self._lock:
-            if self._initialized:
-                return
-            self._initialize()
-            self._initialized = True
+            with self._connection() as conn:
+                try:
+                    auto_vacuum = int(conn.execute("PRAGMA auto_vacuum").fetchone()[0] or 0)
+                except sqlite3.OperationalError:
+                    auto_vacuum = 0
+                if run_full_vacuum and (deleted_total > 0 or auto_vacuum != 2):
+                    db_bytes = self.path.stat().st_size if self.path.exists() else 0
+                    disk_preflight = self._full_vacuum_disk_preflight(db_bytes)
+                    if not disk_preflight["ok"]:
+                        reason = str(disk_preflight.get("reason") or "insufficient_disk_space")
+                        vacuum_mode = f"full_vacuum_blocked_{reason}"
+                        if auto_vacuum == 2 and vacuum_pages > 0:
+                            try:
+                                conn.execute(f"PRAGMA incremental_vacuum({max(1, int(vacuum_pages))})")
+                                vacuumed = True
+                            except sqlite3.OperationalError:
+                                pass
+                    else:
+                        try:
+                            if auto_vacuum != 2:
+                                conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                            conn.execute("VACUUM")
+                            vacuumed = True
+                            vacuum_mode = "full_vacuum_incremental_enabled"
+                        except sqlite3.OperationalError:
+                            vacuum_mode = "full_vacuum_skipped"
+                elif auto_vacuum == 2 and vacuum_pages > 0:
+                    try:
+                        conn.execute(f"PRAGMA incremental_vacuum({max(1, int(vacuum_pages))})")
+                        vacuumed = True
+                        vacuum_mode = "incremental_vacuum"
+                    except sqlite3.OperationalError:
+                        pass
+                try:
+                    conn.execute("PRAGMA optimize")
+                except sqlite3.OperationalError:
+                    pass
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.OperationalError:
+                    pass
+        result: dict[str, Any] = {
+            "deleted_operations": deleted_total,
+            "cutoff_ts": cutoff,
+            "vacuumed": vacuumed,
+            "vacuum_mode": vacuum_mode,
+        }
+        if disk_preflight is not None:
+            result["disk_preflight"] = disk_preflight
+            if not disk_preflight["ok"]:
+                result["vacuum_skipped_reason"] = str(disk_preflight.get("reason") or "insufficient_disk_space")
+                result["vacuum_skipped_message"] = str(disk_preflight.get("message") or "")
+        return result
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Read-only storage metrics for ``req041_scoped.db``."""
+        db_bytes = self.path.stat().st_size if self.path.exists() else 0
+        wal_path = Path(f"{self.path}-wal")
+        shm_path = Path(f"{self.path}-shm")
+        wal_bytes = wal_path.stat().st_size if wal_path.exists() else 0
+        shm_bytes = shm_path.stat().st_size if shm_path.exists() else 0
+        disk_preflight = self._full_vacuum_disk_preflight(db_bytes)
+        with self._connection() as conn:
+            records = int(conn.execute("SELECT COUNT(*) FROM scoped_records").fetchone()[0] or 0)
+            operations = int(conn.execute("SELECT COUNT(*) FROM scoped_operations").fetchone()[0] or 0)
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0] or 4096)
+            page_count = int(conn.execute("PRAGMA page_count").fetchone()[0] or 0)
+            freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0] or 0)
+            auto_vacuum = int(conn.execute("PRAGMA auto_vacuum").fetchone()[0] or 0)
+            journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0] or "")
+        return {
+            "path": str(self.path),
+            "db_bytes": db_bytes,
+            "wal_bytes": wal_bytes,
+            "shm_bytes": shm_bytes,
+            "total_bytes": db_bytes + wal_bytes + shm_bytes,
+            "scoped_records": records,
+            "disk_preflight": disk_preflight,
+            "scoped_operations": operations,
+            "page_size": page_size,
+            "page_count": page_count,
+            "freelist_count": freelist_count,
+            "freelist_bytes": freelist_count * page_size,
+            "auto_vacuum": auto_vacuum,
+            "journal_mode": journal_mode,
+            "synchronous": self._synchronous,
+        }
 
 
 __all__ = [

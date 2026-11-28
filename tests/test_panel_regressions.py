@@ -248,20 +248,14 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn('state.filters = { scope: filter.slice(6), q: "", visibility: "", lifecycle: "", memoryType: "", target: "" };', self.script)
         self.assertIn('if (filter === "profile") {', self.script)
 
-    def test_relations_view_keeps_portrait_and_memory_sections_in_flow(self) -> None:
-        # 关系视图在 2.1.0 被知识星图与互动协同取代，滚动与溢出语义随之迁移：
-        # 星图区必须有确定高度，卡片不得被内容撑破。
-        starmap_card = re.search(r"\.starmap-card\s*\{([^}]*)\}", self.styles)
-        self.assertIsNotNone(starmap_card)
-        self.assertIn("overflow: hidden", starmap_card.group(1))
-        self.assertIn("min-height: 560px", starmap_card.group(1))
-        self.assertIn("height: 620px", re.search(r"\.starmap-canvas\s*\{([^}]*)\}", self.styles).group(1))
-        self.assertIn(".starmap-canvas { height: 480px; }", self.styles)
-        self.assertIn(".starmap-wrap { grid-template-columns: minmax(0, 1fr); }", self.styles)
-        self.assertIn('defineView("starmap"', self.script)
-        self.assertIn("class GalaxyView {", self.script)
-        self.assertIn("function buildGalaxy(memories, centerId)", self.script)
-        self.assertIn("function relationScore(center, other)", self.script)
+    def test_starmap_view_is_removed_from_panel(self) -> None:
+        # 2.6.4 起知识星图整块下线：视图定义、脚本类与样式都不该再出现。
+        self.assertNotIn('defineView("starmap"', self.script)
+        self.assertNotIn("class GalaxyView {", self.script)
+        self.assertNotIn("class ConstellationView {", self.script)
+        self.assertNotIn("function buildGalaxy(", self.script)
+        self.assertNotIn(".starmap-card", self.styles)
+        self.assertNotIn(".starmap-canvas", self.styles)
 
 
 if __name__ == "__main__":

@@ -31,16 +31,17 @@ class HookStageTimerTests(unittest.TestCase):
         # Inject the nanosecond clock so rounding behavior is deterministic.
         with patch(
             "astrbot_plugin_memory_companion.core.service.time.perf_counter_ns",
-            side_effect=[1_000_000_000, 1_000_400_000, 5_999_800_000],
+            side_effect=[1_000_000_000, 1_000_400_000, 5_999_800_000, 6_000_000_000],
         ):
             timer = _HookStageTimer(True)
             timer.mark("first")
             timer.mark("second")
+            total_ms = timer.total_ms()
         summary = timer.summary()
         self.assertIn("first=", summary)
         self.assertIn("second=", summary)
         self.assertEqual("first=0ms second=4999ms", summary)
-        self.assertEqual(4999, timer.total_ms())
+        self.assertEqual(5000, total_ms)
 
     def test_enabled_timer_zero_initial_state(self):
         timer = _HookStageTimer(True)
