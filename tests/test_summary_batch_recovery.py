@@ -85,6 +85,62 @@ class SummaryBatchRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         return await self.service.store.get_summary_batch(batch_id)
 
+    async def test_new_summary_batch_persists_current_persona_id(self):
+        ctx = SessionContext(
+            session_id=self.ctx.session_id, scope='private', platform='qq',
+            user_id='u1', bot_id='b1', persona_id='persona-1',
+        )
+        event_id = await self.event(ctx=ctx)
+        provider = Provider([self.payload(event_id)])
+        self.use(provider)
+
+        self.assertTrue(await self.service.maybe_summarize_session(ctx))
+
+        batch = self.batches()[0]
+        self.assertEqual('persona-1', json.loads(batch['metadata'])['persona_id'])
+
+    async def test_recovery_quarantines_missing_persona_and_keeps_event_owned(self):
+        self.config['memory_summary'].update({
+            'recovery_startup_delay_seconds': 0,
+            'recovery_sessions_per_round': 1,
+        })
+        self.service._background_grace_seconds = 0
+        incomplete_identity = {
+            'platform': 'qq',
+            'owner_bot_id': 'b1',
+            'participant_user_id': 'u1',
+        }
+        batch = await self.persisted_batch(
+            scope='private',
+            session_id=self.ctx.session_id,
+            batch_metadata=incomplete_identity,
+            events=[{
+                'subject_id': 'u1',
+                'object_id': 'u1',
+                'metadata': incomplete_identity,
+            }],
+        )
+
+        self.service._ensure_summary_recovery_dispatcher()
+
+        async def wait_for_quarantine():
+            deadline = asyncio.get_running_loop().time() + 2
+            while asyncio.get_running_loop().time() < deadline:
+                current = await self.service.store.get_summary_batch(batch['id'])
+                if current['state'] == 'quarantined':
+                    return current
+                await asyncio.sleep(0.01)
+            self.fail('recovery dispatcher did not quarantine the identity-incomplete batch')
+
+        quarantined = await wait_for_quarantine()
+        self.assertTrue(quarantined['last_error'].startswith('recovery_identity_quarantined:persona_missing'))
+        event_ids = [row[0] for row in self.service.store._conn.execute(
+            'SELECT event_id FROM summary_batch_events WHERE batch_id=?', (batch['id'],)
+        )]
+        self.assertEqual(1, len(event_ids))
+        event = (await self.service.store.get_timeline_by_ids(event_ids))[event_ids[0]]
+        self.assertFalse(event['summarized_at'])
+
     async def test_one_bad_batch_does_not_block_new_messages_or_get_retried(self):
         old = await self.event()
         bad = Provider(['bad json', 'bad json', 'bad json'])
