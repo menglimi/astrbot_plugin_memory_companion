@@ -7311,20 +7311,14 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                             continue
                         if context is None:
                             skipped += 1
-                            delay = max(
-                                poll_interval,
-                                min(7 * 86400, self.config.int(
-                                    "memory_summary.recovery_identity_retry_seconds", 3600
-                                )),
-                            )
                             if batch_id:
                                 await self.store.defer_summary_batch(
-                                    batch_id, f"recovery_identity_skipped:{reason}",
-                                    delay=delay, only_if_due=True,
+                                    batch_id, f"recovery_identity_quarantined:{reason}",
+                                    quarantine=True, delay=0, only_if_due=True,
                                 )
                             self._summary_recovery_status["last_skip_reason"] = f"identity:{reason}"
                             logger.warning(
-                                "[MemoryCompanion] 摘要恢复因身份信息不完整或冲突而跳过: session=%s batch=%s reason=%s",
+                                "[MemoryCompanion] 摘要恢复因身份信息不完整或冲突已隔离批次: session=%s batch=%s reason=%s",
                                 session_id,
                                 batch_id,
                                 reason,
@@ -7876,6 +7870,7 @@ class MemoryCompanionService(SummaryAdmissionMethods, SummaryStatusMethods):
                         return ""
                     batch_metadata = {
                         **self._cross_window_event_metadata(ctx),
+                        "persona_id": clean_text(ctx.persona_id, 96),
                         "bot_id": clean_text(ctx.bot_id, 120),
                         "user_id": clean_text(ctx.user_id, 120),
                         "group_id": clean_text(ctx.group_id, 120),
