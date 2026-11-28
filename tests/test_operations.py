@@ -76,7 +76,6 @@ class OperationPresetTests(unittest.TestCase):
             "recovery_startup_delay_seconds": ("int", 60),
             "recovery_poll_interval_seconds": ("int", 60),
             "recovery_sessions_per_round": ("int", 1),
-            "recovery_identity_retry_seconds": ("int", 3600),
             "recovery_disabled_retry_seconds": ("int", 3600),
         }
 
@@ -84,7 +83,6 @@ class OperationPresetTests(unittest.TestCase):
             "recovery_startup_delay_seconds": (0, 3600, 10),
             "recovery_poll_interval_seconds": (5, 3600, 5),
             "recovery_sessions_per_round": (1, 32, 1),
-            "recovery_identity_retry_seconds": (60, 604800, 60),
             "recovery_disabled_retry_seconds": (60, 604800, 60),
         }
 
