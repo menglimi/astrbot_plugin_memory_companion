@@ -347,19 +347,6 @@
           "step": 1
         }
       },
-      "recovery_identity_retry_seconds": {
-        "description": "身份校验失败重试秒数",
-        "hint": "批次身份信息缺失或互相冲突时，等待多久再检查。插件不会猜测身份或把批次内容交给模型。运行时最长为 7 天。",
-        "type": "int",
-        "default": 3600,
-        "min": 60,
-        "max": 604800,
-        "slider": {
-          "min": 60,
-          "max": 604800,
-          "step": 60
-        }
-      },
       "recovery_disabled_retry_seconds": {
         "description": "捕获关闭重试秒数",
         "hint": "对应私聊或群聊的记忆捕获暂时关闭时，等待多久再检查该批次；开启后无需新消息即可继续恢复。运行时最长为 7 天。",
